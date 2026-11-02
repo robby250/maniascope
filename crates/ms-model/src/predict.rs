@@ -359,8 +359,8 @@ impl PredModel {
     /// across calls; its owner drops a chart whenever the chart's analyses change.
     #[allow(clippy::too_many_arguments)]
     pub fn score_into(&self, choices: &mut Choices, session: &PredSession, store: &FeatStore, jobs: &[ScoreJob],
-                      selected: &[String], tuning: &crate::skills::Tuning, target: f64, skills: bool, wants_vibro: bool, preference: bool, now: f64) -> Res<()> {
-        let ctx = Ctx { target, warm: session.warm, skills, wants_vibro, preference, version: store.version };
+                      selected: &[String], tuning: &crate::skills::Tuning, target: f64, rates: (f64, f64), skills: bool, wants_vibro: bool, preference: bool, now: f64) -> Res<()> {
+        let ctx = Ctx { target, rates, warm: session.warm, skills, wants_vibro, preference, version: store.version };
         let sel: Vec<Selection> = store.trees.iter().map(|t| t.select(selected, tuning)).collect();
         let included: Vec<&String> = selected.iter().filter(|k| !k.starts_with('!')).collect();
         static EMPTY: Vec<Entry> = Vec::new();
@@ -405,20 +405,20 @@ impl PredModel {
 
     /// nps.central_target.
     pub fn central_target(&self, target: f64, warm: bool) -> f64 {
-        let ctx = Ctx { target, warm, skills: false, wants_vibro: false, preference: false, version: 0 };
+        let ctx = Ctx { target, rates: (MIN_RATE, MAX_RATE), warm, skills: false, wants_vibro: false, preference: false, version: 0 };
         ctx.central()
     }
 
     /// nps.eligible: a prediction inside the tab's accuracy band.
     pub fn eligible(&self, p: &Prediction, target: f64, warm: bool) -> bool {
-        let ctx = Ctx { target, warm, skills: false, wants_vibro: false, preference: false, version: 0 };
+        let ctx = Ctx { target, rates: (MIN_RATE, MAX_RATE), warm, skills: false, wants_vibro: false, preference: false, version: 0 };
         ctx.eligible(p)
     }
 
     /// nps.Builder.initial_value: a known chart's density at the rate that meets the target, for analysis order.
     pub fn initial_value(&self, store: &FeatStore, job: &ScoreJob, rate: f64, session: &PredSession, target: f64) -> Res<f64> {
         let (Some(f), Some((notes, length))) = (store.feats(&job.sha, rate), store.size(&job.sha, rate)) else { return Ok(0.) };
-        let ctx = Ctx { target, warm: session.warm, skills: false, wants_vibro: false, preference: false, version: store.version };
+        let ctx = Ctx { target, rates: (MIN_RATE, MAX_RATE), warm: session.warm, skills: false, wants_vibro: false, preference: false, version: store.version };
         let p = self.predict(f, &job.key, job.bid, rate, session)?;
         let need = rate * (ctx.rate_shift(&p, ctx.central()) / p.slope).exp();
         Ok(notes / length.max(1000.) * need.min(MAX_RATE) * if need < MIN_RATE * 0.85 { 0.05 } else { 1. })
@@ -459,7 +459,12 @@ impl Offer {
             drill: num(st, "drill").unwrap_or(0.),
             vibro: st.and_then(|d| d.get("vibro_focused")).is_some_and(Val::truthy),
             family: st.and_then(|d| d.get("family")).filter(|v| !v.is_none()).map_or_else(String::new, text),
-            description: f.get("description").filter(|v| v.truthy()).map_or_else(String::new, text),
+            // ponytail: descriptions in feats computed before 2026-11-02 still say "Delay" (now one Stream family) until the
+            // next calculator run rewrites them; renamed here instead of recomputing every chart.
+            description: f.get("description").filter(|v| v.truthy()).map_or_else(String::new, |v| {
+                let d = text(v).replace("Delay", "Stream");
+                d.split_once(" / ").filter(|(a, b)| a == b).map_or(d.clone(), |(a, _)| a.to_string())
+            }),
         }
     }
 
@@ -495,9 +500,11 @@ struct Selection {
 impl Tree {
     fn select(&self, selected: &[String], tuning: &crate::skills::Tuning) -> Selection {
         let at = |k: &str| self.dims.iter().position(|d| d == k);
+        // A child only the other keymode has (Stream/Dump on 7K) still asks for its family; an exclusion of one stays narrow.
+        let wanted = |k: &str| at(k).or_else(|| k.split_once('/').and_then(|(p, _)| at(p)));
         Selection {
             excluded: selected.iter().filter_map(|k| k.strip_prefix('!')).map(|k| (at(k), tuning.hold(k))).collect(),
-            positive: selected.iter().filter(|k| !k.starts_with('!')).map(|k| at(k)).collect(),
+            positive: selected.iter().filter(|k| !k.starts_with('!')).map(|k| wanted(k)).collect(),
             other: tuning.other > 0.,
         }
     }
@@ -511,10 +518,7 @@ struct SkillValues {
 
 impl SkillValues {
     fn of(f: &Dict, tree: &Tree) -> SkillValues {
-        let sk = f.dict("sk");
-        let values: Vec<f64> = tree.members.iter().map(|members| {
-            members.iter().filter_map(|k| sk.and_then(|d| d.get(k))).fold(0f64, |m, v| m.max(0f64.max(v.f())))
-        }).collect();
+        let values: Vec<f64> = tree.members.iter().map(|members| crate::skills::member_value(f, members)).collect();
         let mut practice = Vec::new();
         // Technical practice needs actual technical character (tech_profile), not an awkward local peak.
         if let Some(profile) = f.dict("tech_profile").filter(|p| !p.0.is_empty()) {
@@ -697,6 +701,7 @@ const MAX_HIGH: f64 = 0.99;
 /// The request context of nps.candidates_from.
 struct Ctx {
     target: f64, // the tab's accuracy target (session.acc_target)
+    rates: (f64, f64), // the tab's HT/DT range: offered rates and proposals stay inside it
     warm: bool,
     skills: bool,
     wants_vibro: bool,
@@ -897,7 +902,7 @@ impl PredModel {
         let mut rated: Vec<(&Offer, &Feats, Prediction, Option<f64>)> = Vec::new();
         for e in entries {
             let (Some(feats), Some(skill)) = (&e.feats, &e.skill) else { continue };
-            if !e.offer.static_ok(ctx.version) {
+            if !e.offer.static_ok(ctx.version) || !(ctx.rates.0 - 1e-6..=ctx.rates.1 + 1e-6).contains(&e.offer.rate) {
                 continue;
             }
             let s = if ctx.skills { Some(skill.strength(&sel[usize::from(feats.keys != 4)])) } else { None };
@@ -940,16 +945,16 @@ impl PredModel {
             }
         }
         let shift = ctx.rate_shift(e, target) / slope;
-        let mut proposal = round2(MAX_RATE.min(MIN_RATE.max(r * shift.exp())));
+        let mut proposal = round2((r * shift.exp()).clamp(ctx.rates.0, ctx.rates.1));
         let has = |x: f64| entries.iter().any(|e| e.offer.rate == x);
         let eligible_a = ctx.eligible(e);
         if !eligible_a && has(proposal) && shift != 0. {
             let direction: i64 = if shift < 0. { -1 } else { 1 };
             let mut step = if direction < 0 { (r * 100. - 1e-8).floor() as i64 } else { (r * 100. + 1e-8).ceil() as i64 };
-            while (MIN_RATE..=MAX_RATE).contains(&(step as f64 / 100.)) && has(step as f64 / 100.) {
+            while (ctx.rates.0..=ctx.rates.1).contains(&(step as f64 / 100.)) && has(step as f64 / 100.) {
                 step += direction;
             }
-            if (MIN_RATE..=MAX_RATE).contains(&(step as f64 / 100.)) {
+            if (ctx.rates.0..=ctx.rates.1).contains(&(step as f64 / 100.)) {
                 proposal = step as f64 / 100.;
             }
         }
@@ -957,9 +962,9 @@ impl PredModel {
         if let Some(acc) = anchor_missed {
             // The anchor is a rate you just missed: move from your result, not the forecast.
             let shift = ((1. - target).ln() - (1. - acc).max(1e-6).ln()) / slope;
-            proposal = round2(MAX_RATE.min(MIN_RATE.max(r * shift.exp())));
+            proposal = round2((r * shift.exp()).clamp(ctx.rates.0, ctx.rates.1));
             if proposal == round2(r) {
-                proposal = round2(MAX_RATE.min(MIN_RATE.max(r + if shift > 0. { 0.01 } else { -0.01 })));
+                proposal = round2((r + if shift > 0. { 0.01 } else { -0.01 }).clamp(ctx.rates.0, ctx.rates.1));
             }
         }
         let mut prop = None;
@@ -1553,12 +1558,14 @@ mod skill_tests {
     #[test]
     fn trills_are_independent_and_old_choices_migrate() {
         let keys = |k: i64| tree(k).iter().map(|s| s.key.clone()).collect::<Vec<_>>();
-        assert!(keys(4).contains(&"jumptrill".to_string()) && keys(4).contains(&"splittrill".to_string()) && keys(7).contains(&"jumptrill".to_string()));
-        assert_eq!(normalize(&strings(&["!chordstream/jumptrill"])), strings(&["!jumptrill"]));
-        assert_eq!(normalize(&strings(&["jumpstream/splittrill"])), strings(&["splittrill"]));
+        assert!(keys(4).contains(&"trills".to_string()) && keys(7).contains(&"trills".to_string()));
+        assert_eq!(normalize(&strings(&["!chordstream/jumptrill"])), strings(&["!trills/jumptrill"]));
+        assert_eq!(normalize(&strings(&["jumpstream/splittrill"])), strings(&["trills/splittrill"]));
         let f = feature(7, &[("jumptrill", 1.)]);
-        assert_eq!(strength(&f, &["jumptrill"]), 1.);
-        assert_eq!((strength(&f, &["chordstream"]), strength(&f, &["splittrill"])), (0., 0.));
+        assert_eq!(strength(&f, &["trills/jumptrill"]), 1.);
+        assert_eq!((strength(&f, &["chordstream"]), strength(&f, &["trills/trill1h"])), (0., 0.));
+        // 7K has no Split Trill: asking for it there asks for its family.
+        assert_eq!(strength(&f, &["trills/splittrill"]), 1.);
     }
 
     #[test]
@@ -1585,13 +1592,13 @@ mod skill_tests {
     fn keymode_taxonomy() {
         let names = |k: i64| tree(k).iter().map(|s| s.name).collect::<Vec<_>>();
         let (four, wide) = (names(4), names(7));
-        for n in ["Stream", "Jumpstream", "Handstream", "Jackspeed", "Chordjack"] {
+        for n in ["Stream", "Jumpstream", "Handstream", "Trills", "Jacks", "Chordjack"] {
             assert!(four.contains(&n), "{n}");
         }
-        for n in ["Delay", "Chordstream", "Bracket", "Jackspeed", "Chordjack"] {
+        for n in ["Stream", "Chordstream", "Trills", "Jacks", "Chordjack"] {
             assert!(wide.contains(&n), "{n}");
         }
-        assert!(!["Chords", "Jacks", "Trills"].iter().any(|n| four.contains(n) || wide.contains(n)));
+        assert!(!["Chords", "Delay", "Bracket"].iter().any(|n| four.contains(n) || wide.contains(n)));
         assert!(wants_vibro(&strings(&["jackspeed/vibro"])) && !wants_vibro(&strings(&["jackspeed"])));
         assert!(!normalize(&strings(&["trill"])).is_empty() && !normalize(&strings(&["trill"])).contains(&"trill".to_string()));
     }
@@ -1638,9 +1645,9 @@ mod skill_tests {
     #[test]
     fn skill_shares() {
         let w = |v: &[(&str, f64)]| v.iter().map(|(k, x)| (k.to_string(), *x)).collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(shares(&strings(&["delay", "jackspeed", "!sv"]), &w(&[("delay", 2.)]), 0.), Some(w(&[("delay", 2.), ("jackspeed", 1.)])));
-        assert_eq!(shares(&strings(&["delay", "jackspeed"]), &w(&[]), 0.), None);
-        assert_eq!(shares(&strings(&["delay"]), &w(&[("delay", 3.)]), 0.), None);
+        assert_eq!(shares(&strings(&["stream", "jackspeed", "!sv"]), &w(&[("stream", 2.)]), 0.), Some(w(&[("stream", 2.), ("jackspeed", 1.)])));
+        assert_eq!(shares(&strings(&["stream", "jackspeed"]), &w(&[]), 0.), None);
+        assert_eq!(shares(&strings(&["stream"]), &w(&[("stream", 3.)]), 0.), None);
     }
 }
 
@@ -1649,7 +1656,7 @@ mod target_tests {
     use super::*;
 
     fn ctx(target: f64, warm: bool) -> Ctx {
-        Ctx { target, warm, skills: false, wants_vibro: false, preference: false, version: 1 }
+        Ctx { target, rates: (MIN_RATE, MAX_RATE), warm, skills: false, wants_vibro: false, preference: false, version: 1 }
     }
 
     fn prediction(acc: f64, opening: f64) -> Prediction {

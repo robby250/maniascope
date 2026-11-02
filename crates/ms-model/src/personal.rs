@@ -916,7 +916,7 @@ pub struct Fit {
     pub level_var: HashMap<i64, f64>,
     pub curve: HashMap<i64, (i64, Vec<f64>)>,
     pub sd: HashMap<i64, f64>,
-    pub monthly: HashMap<i64, (i64, Vec<f64>, Vec<f64>)>,
+    pub monthly: HashMap<i64, (i64, Vec<f64>, Vec<f64>, Vec<f64>)>, // first month; own plays' weighted sum, weight, count
     pub beta: HashMap<i64, Vec<f64>>,
     pub zmean: HashMap<i64, Vec<f64>>,
     pub zscale: HashMap<i64, Vec<f64>>,
@@ -982,7 +982,7 @@ pub fn personal_fit(c: &Consts, mut rows: Vec<Row>, feats: &[Feats], now: f64, l
         let g0 = *mb.iter().min().unwrap();
         let g1 = (*mb.iter().max().unwrap()).max(now as i64);
         let len = (g1 - g0 + 1) as usize;
-        let (mut sw, mut se, mut own_e, mut own_w) = (vec![0.; len], vec![0.; len], vec![0.; len], vec![0.; len]);
+        let (mut sw, mut se, mut own_e, mut own_w, mut own_n) = (vec![0.; len], vec![0.; len], vec![0.; len], vec![0.; len], vec![0.; len]);
         for (&i, &m) in s.iter().zip(&mb) {
             let at = (m - g0) as usize;
             sw[at] += w[i];
@@ -991,6 +991,7 @@ pub fn personal_fit(c: &Consts, mut rows: Vec<Row>, feats: &[Feats], now: f64, l
             let own = if rows[i].public || levels.get(&k).is_some_and(|l| lr[i] < l - history_zone) { 0. } else { w[i] };
             own_e[at] += own * e[i];
             own_w[at] += own;
+            own_n[at] += f64::from(own > 0.);
         }
         let kernel = |a: usize, b: usize| (-0.5 * ((a as f64 - b as f64) / level_bw).powi(2)).exp();
         let num: Vec<f64> = (0..len).map(|a| (0..len).map(|b| kernel(a, b) * se[b]).sum()).collect();
@@ -1005,7 +1006,7 @@ pub fn personal_fit(c: &Consts, mut rows: Vec<Row>, feats: &[Feats], now: f64, l
         out.sd.insert(k, sdk);
         out.level_var.insert(k, sdk * sdk / den[len - 1].max(1.));
         out.curve.insert(k, (g0, curve));
-        out.monthly.insert(k, (g0, own_e, own_w));
+        out.monthly.insert(k, (g0, own_e, own_w, own_n));
     }
 
     // Skill mix: ridge on what the level leaves, per keymode with enough rows.

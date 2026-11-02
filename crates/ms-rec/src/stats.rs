@@ -12,6 +12,7 @@ use ms_calc::py::round_digits;
 use ms_calc::val::Dict;
 use ms_data::store::{Db, Result};
 use ms_model::personal::{self, Fit, FATIGUE_ONSET};
+use ms_model::session::{WARMUP_MAX, WARMUP_MINUTES};
 use ms_model::predict::{Feats, HashMap, PredModel};
 use ms_model::skills;
 use ms_model::warmup::Model;
@@ -69,7 +70,7 @@ pub struct Page {
     pub keys: i64,
     pub groups: BTreeMap<String, Group>,
     pub order: Vec<String>,
-    pub history: Vec<(i64, f64)>,
+    pub history: Vec<(i64, f64, f64)>, // month, level, plays that month
     pub now: f64,
     pub dan_at: HashMap<String, (String, Option<f64>)>,
     pub dan_scale: std::collections::HashMap<String, f64>,
@@ -272,16 +273,16 @@ impl Ctx<'_> {
     /// [(month, ability)]: today's overall ability moved by how much better or worse each month's recorded plays went
     /// against their predictions. Lazer keeps every play; website/stable top-100s keep only bests and are left out, so a
     /// new install shows little or no history. Months with less than 20 (smoothed) plays are left out.
-    fn history(&self, keys: i64, overall: Option<&Group>) -> Vec<(i64, f64)> {
+    fn history(&self, keys: i64, overall: Option<&Group>) -> Vec<(i64, f64, f64)> {
         const SUPPORT: f64 = 20.;
-        let (Some(g), Some((start, se, sw))) = (overall.filter(|g| g.value.is_some()), self.fit.monthly.get(&keys)) else { return Vec::new() };
+        let (Some(g), Some((start, se, sw, count))) = (overall.filter(|g| g.value.is_some()), self.fit.monthly.get(&keys)) else { return Vec::new() };
         let n = sw.len();
         let smooth = |i: usize, v: &[f64]| (0..n).map(|j| (-0.5 * ((i as f64 - j as f64) / HISTORY_BW).powi(2)).exp() * v[j]).sum::<f64>();
-        let months: Vec<usize> = (0..n).filter(|&i| smooth(i, sw) >= SUPPORT && sw[i] > 0.).collect();
+        let months: Vec<usize> = (0..n).filter(|&i| smooth(i, count) >= SUPPORT && sw[i] > 0.).collect(); // plays, not their weights
         let Some(&last) = months.last() else { return Vec::new() };
         let level = |i: usize| smooth(i, se) / smooth(i, sw);
         let now = level(last); // the latest played month is today's ability
-        months.into_iter().map(|i| (start + i as i64, g.value.unwrap() * ((now - level(i)) / g.slope).exp())).collect()
+        months.into_iter().map(|i| (start + i as i64, g.value.unwrap() * ((now - level(i)) / g.slope).exp(), count[i])).collect()
     }
 
     /// The last sessions play by play: accuracy points against the model's rested expectation (at 95 %), each play marked
@@ -314,18 +315,20 @@ impl Ctx<'_> {
         let out = sessions.into_iter().map(|(_, plays)| {
             let at = |s: &personal::Step| local[s.row];
             let first = at(plays[0]).ts.unwrap_or(0.) - plays[0].seconds;
-            let values: Vec<(f64, f64, f64)> = plays.iter().map(|s| {
+            // Warm-up = the live phase's rule. The fitted readiness loss can't mark it: with 10-minute cooling it stays
+            // above any threshold all session, so every play read as warm-up (user 2026-11-02).
+            let cold = warm_up_marks(plays.iter().map(|s| s.seconds));
+            let values: Vec<(f64, f64, bool)> = plays.iter().zip(cold).map(|(s, cold)| {
                 let r = at(s);
                 let m = self.model.personal(self.feats(r), &r.chart, r.b, round_digits(r.rate, 3)).0;
                 let clock = (r.ts.unwrap_or(0.) - s.seconds - first) / 60.;
-                let cold = self.warmup.penalty(c, keys, Some(&c.families[s.family]), s.minutes, s.seconds, None, clock) - self.warmup.fatigue(keys, clock) * unit;
                 (clock, points(r.y_lazer - m), cold)
             }).collect();
             let n = values.len() as f64;
             let centre = values.iter().map(|v| v.1).sum::<f64>() / n;
             let spread = 0.3f64.max((values.iter().map(|v| (v.1 - centre).powi(2)).sum::<f64>() / n).sqrt());
             let marked: Vec<(f64, f64, &'static str)> = values.iter().map(|&(clock, value, cold)| {
-                let mark = if cold > 0.08 { "warm-up" } else if value < centre - spread { "bad" } else if clock >= FATIGUE_ONSET && value < centre { "fading" } else if value > centre + spread { "peak" } else { "" };
+                let mark = if cold { "warm-up" } else if value < centre - spread { "bad" } else if clock >= FATIGUE_ONSET && value < centre { "fading" } else if value > centre + spread { "peak" } else { "" };
                 (round_digits(clock, 1), round_digits(value, 2), mark)
             }).collect();
             FormSession { t: first, hours: marked[marked.len() - 1].0 / 60., plays: marked }
@@ -459,7 +462,7 @@ pub fn build(rec: &Engine, db: &Db) -> Result<Profile> {
         let local: Vec<&Evidence> = rows.iter().filter(|r| r.src != "public").copied().collect();
         let form = ctx.form_history(keys, &local);
         pages.insert(keys, Page { keys, order: names, history: history.clone(), now: month, dan_at, form, evidence: (local.len(), rows.len() - local.len(), rows.iter().map(|r| r.ts.unwrap_or(0.)).fold(0., f64::max)),
-                                  peak: history.iter().copied().max_by(|a, b| a.1.total_cmp(&b.1)), maps: charts.len(), plays: rows.len(),
+                                  peak: history.iter().map(|&(m, v, _)| (m, v)).max_by(|a, b| a.1.total_cmp(&b.1)), maps: charts.len(), plays: rows.len(),
                                   mash_maps: charts.values().filter(|r| ctx.dict(r).and_then(|d| d.dict("sk")).is_some_and(|sk| sk.fget("mash", 0.) >= 0.3)).count(), groups, ..Page::default() });
     }
     // Only frozen pre-play predictions can support a model-error diagnosis. Collapse retries by exact chart, and require
@@ -525,7 +528,7 @@ pub fn current(profile: &Profile, n: &Now, rec: &Engine) -> Current {
         let shown = |v: f64| displayed_value(v, keys, 8., factor, &rec.prm);
         // A displayed level × scale = the dan rating it matches on the player's predicted dan-song accuracy.
         page.dan_scale = old.dan_at.iter().filter_map(|(kind, (anchor, rating))| Some((kind.clone(), (*rating)? / page.groups.get(anchor)?.value?))).collect();
-        page.history = old.history.iter().map(|&(m, v)| (m, shown(v))).collect();
+        page.history = old.history.iter().map(|&(m, v, n)| (m, shown(v), n)).collect();
         page.peak = old.peak.map(|(m, v)| (m, shown(v)));
         // Before a session is warm the session marker only shows the cold start, not the player's form.
         page.session = view.activation(keys, None) >= 1.5;
@@ -535,9 +538,26 @@ pub fn current(profile: &Profile, n: &Now, rec: &Engine) -> Current {
     Current { target: TARGET, pages, phase: n.session.phase().to_string() }
 }
 
+/// Per play of a session (map lengths in seconds): still warming up, i.e. fewer than WARMUP_MAX maps and WARMUP_MINUTES
+/// played before it.
+fn warm_up_marks(seconds: impl Iterator<Item = f64>) -> Vec<bool> {
+    let mut played = 0.;
+    seconds.enumerate().map(|(i, s)| {
+        let cold = i < WARMUP_MAX && played < WARMUP_MINUTES;
+        played += s / 60.;
+        cold
+    }).collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{carry_down, fit_line, peak_line, slope_source, steepened, Group, Page};
+    use super::{carry_down, fit_line, peak_line, slope_source, steepened, warm_up_marks, Group, Page};
+
+    #[test]
+    fn a_session_warms_after_three_maps_or_eight_minutes() {
+        assert_eq!(warm_up_marks([120., 120., 120., 120., 120.].into_iter()), [true, true, true, false, false]);
+        assert_eq!(warm_up_marks([300., 300., 120.].into_iter()), [true, true, false]);
+    }
     use super::crossing;
     use std::collections::BTreeMap;
 

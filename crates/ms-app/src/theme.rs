@@ -130,26 +130,28 @@ fn lerp(stops: &[Color32], f: f32) -> Color32 {
 /// star badge). The rest of the text takes the last colour. Glyph quads are tinted per corner, so the gradient runs inside a
 /// glyph.
 pub fn gradient(ui: &mut Ui, text: &str, size: f32, tail: Option<(&str, f32)>, stops: &[Color32], pill: Option<Color32>) -> egui::Response {
-    let bold = FontId::new(size, FontFamily::Name("bold".into()));
     let mut j = LayoutJob::default();
-    j.append(text, 0., TextFormat { font_id: bold, color: Color32::WHITE, ..TextFormat::default() });
-    if let Some((t, px)) = tail {
-        j.append(t, 0., TextFormat { font_id: FontId::proportional(px), color: Color32::WHITE, valign: egui::Align::Center, ..TextFormat::default() });
-    }
+    j.append(text, 0., TextFormat { font_id: FontId::new(size, FontFamily::Name("bold".into())), color: Color32::WHITE, ..TextFormat::default() });
     let galley = ui.fonts_mut(|f| f.layout_job(j));
-    let number = {
-        let mut j = LayoutJob::default();
-        j.append(text, 0., TextFormat { font_id: FontId::new(size, FontFamily::Name("bold".into())), color: Color32::WHITE, ..TextFormat::default() });
-        ui.fonts_mut(|f| f.layout_job(j)).size().x
-    };
+    let number = galley.size().x;
+    // The tail is an ordinary galley in the last colour: through the hand-made mesh its small glyphs showed a seam
+    // ("looks cut off", user 2026-11-02).
+    let tail = tail.map(|(t, px)| ui.fonts_mut(|f| f.layout_no_wrap(t.to_string(), FontId::proportional(px), *stops.last().unwrap_or(&Color32::WHITE))));
     let h = galley.size().y;
     let pad = if pill.is_some() { (h * 0.2).round() } else { 0. };
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(galley.size().x + 2. * pad, h), Sense::hover());
-    let painter = ui.painter_at(rect.expand(1.));
+    let width = number + tail.as_ref().map_or(0., |t| t.size().x);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width + 2. * pad, h), Sense::hover());
+    if let Some(t) = tail {
+        let at = egui::pos2(rect.left() + pad + number, rect.center().y - t.size().y / 2.);
+        ui.painter().galley(at, t, Color32::WHITE);
+    }
+    // Unclipped, glyphs on whole physical pixels like the tessellator does for galleys: a clip at the row box and a
+    // fractional origin both shaved the digits' tops at 1.25× (user 2026-11-02).
+    let painter = ui.painter();
     if let Some(c) = pill {
         painter.rect_filled(rect, CornerRadius::same((h / 2.) as u8), c);
     }
-    let origin = rect.min + Vec2::new(pad, 0.);
+    let origin = egui::emath::GuiRounding::round_to_pixels(rect.min + Vec2::new(pad, 0.), ui.pixels_per_point());
     // Galley meshes keep texel UVs: the tessellator normalizes them, and a hand-made mesh skips it.
     let atlas = ui.fonts_mut(|f| f.font_image_size());
     for row in &galley.rows {
@@ -172,4 +174,90 @@ pub fn bar(ui: &mut Ui, fraction: f32) {
     let mut fill = rect;
     fill.set_width(rect.width() * fraction.clamp(0., 1.));
     p.rect_filled(fill, CornerRadius::same(2), ACCENT);
+}
+
+/// Two knobs on one track (user 2026-11-02: "a single slider that has 2 knobs"): low and high of a range on a `step`
+/// grid inside `bounds`, low ≤ high, both may meet. A press takes the nearer knob (the one on its side when they meet)
+/// and keeps it for the whole drag; double- or right-click resets to `default`.
+pub fn range_slider(ui: &mut Ui, name: &str, value: &mut (f64, f64), bounds: (f64, f64), step: f64, default: (f64, f64)) -> egui::Response {
+    let size = Vec2::new(ui.available_width().max(60.), ui.spacing().interact_size.y);
+    let (rect, mut response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Slider, true, name));
+    let knob = 7.;
+    let track = rect.shrink2(Vec2::new(knob, 0.));
+    let x_of = |v: f64| track.left() + ((v - bounds.0) / (bounds.1 - bounds.0)) as f32 * track.width();
+    let snap = |x: f32| {
+        let v = bounds.0 + ((x - track.left()) / track.width()).clamp(0., 1.) as f64 * (bounds.1 - bounds.0);
+        (((v - bounds.0) / step).round() * step + bounds.0).clamp(bounds.0, bounds.1)
+    };
+    let before = *value;
+    let held = response.id.with("knob");
+    if response.double_clicked() || response.secondary_clicked() {
+        *value = default;
+    } else if let Some(p) = response.interact_pointer_pos().filter(|_| response.dragged() || response.clicked()) {
+        let nearest = || {
+            let at = ui.input(|i| i.pointer.press_origin()).unwrap_or(p).x; // where the press began, not where the drag is
+            let (a, b) = ((at - x_of(value.0)).abs(), (at - x_of(value.1)).abs());
+            if (a - b).abs() < 0.5 { at > x_of(value.1) } else { b < a }
+        };
+        let high = match ui.data(|d| d.get_temp::<bool>(held)) {
+            Some(h) if !response.drag_started() => h,
+            _ => nearest(),
+        };
+        if response.dragged() {
+            ui.data_mut(|d| d.insert_temp(held, high));
+        }
+        let v = snap(p.x);
+        if high { value.1 = v.max(value.0) } else { value.0 = v.min(value.1) }
+    }
+    if !response.dragged() {
+        ui.data_mut(|d| d.remove::<bool>(held));
+    }
+    if *value != before {
+        response.mark_changed();
+    }
+    let p = ui.painter();
+    let rail = egui::Rect::from_center_size(rect.center(), Vec2::new(track.width(), 4.));
+    p.rect_filled(rail, CornerRadius::same(2), BUTTON);
+    let (a, b) = (x_of(value.0), x_of(value.1));
+    p.rect_filled(egui::Rect::from_x_y_ranges(a..=b.max(a + 1.), rail.y_range()), CornerRadius::same(2), ACCENT);
+    let stroke = Stroke::new(1., if response.hovered() || response.dragged() { ACCENT } else { BORDER });
+    for x in [a, b] {
+        p.circle(egui::pos2(x, rect.center().y), knob, BUTTON, stroke);
+    }
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{pos2, vec2};
+    use egui_kittest::kittest::Queryable;
+    use egui_kittest::Harness;
+
+    #[test]
+    fn each_knob_drags_alone_low_stays_under_high_and_both_can_meet_at_one() {
+        let mut h = Harness::builder().with_size(vec2(400., 40.)).build_ui_state(|ui, v: &mut (f64, f64)| {
+            ui.spacing_mut().item_spacing = Vec2::ZERO;
+            range_slider(ui, "Range", v, (0.7, 1.5), 0.05, (0.75, 1.5));
+        }, (0.75, 1.5));
+        h.run();
+        let r = h.get_by_label("Range").rect();
+        let y = r.center().y;
+        let x = move |v: f64| r.left() + 7. + ((v - 0.7) / 0.8) as f32 * (r.width() - 14.); // knob radius 7
+        let drag = |h: &mut Harness<(f64, f64)>, from: f32, to: f32| {
+            h.drag_at(pos2(from, y));
+            h.run();
+            h.hover_at(pos2(to, y));
+            h.run();
+            h.drop_at(pos2(to, y));
+            h.run();
+        };
+        drag(&mut h, x(1.5), x(1.0));
+        assert_eq!(*h.state(), (0.75, 1.0));
+        drag(&mut h, x(0.75), x(1.3)); // the low knob stops at the high one
+        assert!((h.state().0 - 1.0).abs() < 1e-9 && (h.state().1 - 1.0).abs() < 1e-9, "{:?}", h.state());
+        drag(&mut h, x(1.0) + 10., x(1.2)); // met: right of them takes the high knob
+        assert!((h.state().0 - 1.0).abs() < 1e-9 && (h.state().1 - 1.2).abs() < 1e-9, "{:?}", h.state());
+    }
 }

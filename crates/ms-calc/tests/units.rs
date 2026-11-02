@@ -124,6 +124,10 @@ fn fresh_and_cached_reference_units_preserve_labels_and_other_modes() {
             assert_eq!(ms_calc::card::describe(&fresh, &enabled.k).0, ms_calc::card::describe(&old, &disabled.k).0);
             let names = |r: &Dict| ms_calc::card::card(r).iter().map(|e| if let Val::Dict(d) = e { format!("{:?}", d.get("name")) } else { String::new() }).collect::<Vec<_>>();
             assert_eq!(names(&fresh), names(&old));
+            // The 6-entry card starts like the 3-entry one.
+            let six: Vec<String> = ms_calc::card::card_top(&fresh, 6).iter().map(|e| if let Val::Dict(d) = e { format!("{:?}", d.get("name")) } else { String::new() }).collect();
+            let three = names(&fresh);
+            assert!(six.len() >= three.len() && six[..three.len()] == three[..], "{six:?} vs {three:?}");
             let mut again = expected.clone();
             convert_units(&mut again, &enabled);
             assert_eq!(again, expected, "converting twice changes nothing");

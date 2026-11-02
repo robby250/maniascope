@@ -8,7 +8,7 @@ use crate::skills::{combine, horizon_levels, skills, stamina, Series, Sk, LN_KIN
 use crate::val::{Dict, Key, Val};
 
 const TECH_NAMES: [(Sk, &str); 19] = [
-    (Sk::stream, "Tech Stream"), (Sk::delay, "Tech Delay"), (Sk::chordstream, "Tech Chordstream"),
+    (Sk::stream, "Tech Stream"), (Sk::delay, "Tech Stream"), (Sk::chordstream, "Tech Chordstream"),
     (Sk::dump, "Tech Dump"), (Sk::jumptrill, "Tech Jumptrill"), (Sk::splittrill, "Tech Split Trill"),
     (Sk::jumpstream, "Tech Jumpstream"), (Sk::handstream, "Tech Handstream"), (Sk::jack, "Tech Jacks"),
     (Sk::jackspeed, "Tech Jacks"), (Sk::chordjack, "Tech Chordjack"), (Sk::minijack, "Tech Minijack"),
@@ -18,7 +18,7 @@ const TECH_NAMES: [(Sk, &str); 19] = [
 ];
 const TECH_ANCHOR: (Sk, &str) = (Sk::anchor, "Tech Anchor");
 const STAMINA_NAMES: [(Sk, &str); 17] = [
-    (Sk::stream, "Stream Stamina"), (Sk::delay, "Delay Stamina"), (Sk::chordstream, "Chordstream Stam"),
+    (Sk::stream, "Stream Stamina"), (Sk::delay, "Stream Stamina"), (Sk::chordstream, "Chordstream Stam"),
     (Sk::dump, "Dump Stamina"), (Sk::jumptrill, "JT Stamina"), (Sk::splittrill, "Split Stamina"),
     (Sk::jumpstream, "JS Stamina"), (Sk::handstream, "HS Stamina"), (Sk::jack, "Jack Stamina"),
     (Sk::jackspeed, "Jack Stamina"), (Sk::longjack, "Jack Stamina"), (Sk::chordjack, "CJ Stamina"),
@@ -40,8 +40,23 @@ fn describes(s: &str) -> &'static [&'static str] {
     match s {
         "dump" => &["stream"],
         "trill1h" | "anchor" => &["stream", "delay"],
+        // Both show as "Stream" (user 2026-11-02: one Stream family), so one card entry covers the other.
+        "stream" => &["delay"],
+        "delay" => &["stream"],
         _ => &[],
     }
+}
+
+/// How much a map counts as Hybrid LN for display and Skills: LN and rice must both be a real share of it (user
+/// 2026-11-02: "a map with like 30% LN is usually considered hybrid", not one held LN under rice). Ramps 10→25% on
+/// each side. The calculator's hybrid strain and the difficulty number are untouched.
+pub fn hybrid_mix(ln_share: f64) -> f64 {
+    let ramp = |x: f64| ((x - 0.10) / 0.15).clamp(0., 1.);
+    ramp(ln_share) * ramp(1. - ln_share)
+}
+
+fn ln_share(res: &Dict) -> f64 {
+    res.fget("ln_notes", 0.) / res.fget("notes", 0.).max(1.)
 }
 
 pub fn display_name(s: Sk) -> &'static str {
@@ -49,7 +64,7 @@ pub fn display_name(s: Sk) -> &'static str {
         Sk::stream => "Stream", Sk::jumpstream => "Jumpstream", Sk::handstream => "Handstream",
         Sk::quadstream => "Quadstream", Sk::sv_fast => "Fast SV", Sk::sv_slow => "Slowjam SV",
         Sk::sv_accel => "Accel SV", Sk::sv_stutter => "Stutter SV", Sk::sv_brake => "Brakes",
-        Sk::jackspeed => "Jackspeed", Sk::chordjack => "Chordjack", Sk::delay => "Delay",
+        Sk::jackspeed => "Jackspeed", Sk::chordjack => "Chordjack", Sk::delay => "Stream",
         Sk::chordstream => "Chordstream", Sk::bracket => "Bracket", Sk::jack => "Jack", Sk::dump => "Dump",
         Sk::jumptrill => "Jumptrill", Sk::splittrill => "Split Trill", Sk::technical => "Technical",
         Sk::patterntech => "Pattern Tech", Sk::rhythmtech => "Rhythm Tech", Sk::trill1h => "1H Trill",
@@ -258,8 +273,17 @@ fn tech_profile_of(res: &Dict) -> Option<[f64; 3]> {
 
 /// skill_calc.card.
 pub fn card(res: &Dict) -> Vec<Val> {
+    card_top(res, 3)
+}
+
+/// Most entries a card holds: the main window's "Skills shown" goes to 6 (user 2026-11-02).
+pub const CARD_MAX: usize = 6;
+
+/// The card with up to `n` entries. Picking is greedy, so the first 3 of a longer card are the 3-entry card. The stored
+/// `unit_card` is taken before the unit conversion: rebuilding from the converted result dropped entries.
+pub fn card_top(res: &Dict, n: usize) -> Vec<Val> {
     if let Some(Val::List(uc)) = res.get("unit_card") {
-        return uc.clone();
+        return uc.iter().take(n).cloned().collect();
     }
     let sc = res.dict("scores").unwrap();
     if sc.f("overall") < 0.1 {
@@ -269,6 +293,8 @@ pub fn card(res: &Dict) -> Vec<Val> {
     let profile = tech_profile_of(res);
     let names = names_for(res);
     let scf = |p: &str| sc.f(p);
+    let mix = hybrid_mix(ln_share(res));
+    let gate = |p: &str| if p == "hybrid" { mix } else { 1. };
     // (score, order, entry)
     let mut cands: Vec<(f64, u8, Dict)> = Vec::new();
     if let Some(Val::List(archs)) = res.get("archetypes") {
@@ -279,6 +305,10 @@ pub fn card(res: &Dict) -> Vec<Val> {
                 continue;
             }
             let parts = parts_of(a);
+            let g = parts.iter().map(|p| gate(p)).fold(1., f64::min);
+            if g <= 0. {
+                continue;
+            }
             let mut mx = a.f("rating");
             for p in &parts {
                 if !TECH_KEYS.iter().any(|t| t.name() == p) {
@@ -291,24 +321,27 @@ pub fn card(res: &Dict) -> Vec<Val> {
             let of = str_of(a, "of");
             let first = of.as_deref().is_some_and(|o| matches!(o, "dump" | "trill1h" | "anchor"))
                 || parts.iter().any(|p| p == "ln") && parts.iter().any(|p| LN_KINDS.iter().any(|l| l.name() == p));
-            cands.push((mx, if first { 0 } else { 1 }, a.clone()));
+            let mut a = a.clone();
+            a.set("rating", a.f("rating") * g);
+            cands.push((mx * g, if first { 0 } else { 1 }, a));
         }
     }
     for kk in ranked(res) {
-        if TECH_KEYS.contains(&kk) || SV_KINDS.contains(&kk) || s(sc, kk) <= 0.0 {
+        let v = s(sc, kk) * gate(kk.name());
+        if TECH_KEYS.contains(&kk) || SV_KINDS.contains(&kk) || v <= 0.0 {
             continue;
         }
         let mut d = Dict::new();
         d.set("name", names(kk.name()));
-        d.set("rating", s(sc, kk));
+        d.set("rating", v);
         d.set("parts", Val::strs(&[kk.name()]));
-        cands.push((s(sc, kk), 2, d));
+        cands.push((v, 2, d));
     }
     cands.sort_by(|a, b| (-py::round_digits(a.0, 6), a.1).partial_cmp(&(-py::round_digits(b.0, 6), b.1)).unwrap());
     let mut picked: Vec<Dict> = Vec::new();
     let mut used: Vec<String> = Vec::new();
     for (_, _, e) in cands {
-        if picked.len() == 3 || (!picked.is_empty() && e.f("rating") < 0.3 * picked[0].f("rating")) {
+        if picked.len() == n || (!picked.is_empty() && e.f("rating") < 0.3 * picked[0].f("rating")) {
             break;
         }
         let parts = parts_of(&e);
@@ -353,7 +386,7 @@ pub fn card(res: &Dict) -> Vec<Val> {
     }
     let ln_cs = res.dict("archetype_profile").map(|p| p.f("ln_chordstream"));
     let sk_wo: Vec<(String, f64)> = sc.0.iter().filter_map(|(k, v)| match k {
-        Key::S(k) if k != "overall" => Some((k.clone(), v.f())),
+        Key::S(k) if k != "overall" => Some((k.clone(), v.f() * gate(k))),
         _ => None,
     }).collect();
     names_card(picked, &sk_wo, ln_cs, res.f("keys") as usize).into_iter().map(Val::Dict).collect()
@@ -438,7 +471,7 @@ fn descriptor(sk: &[(String, f64)], ln_cs: Option<f64>, keys: usize) -> Option<(
 fn an_name(k: &str) -> &str {
     match k {
         "stream" => "Stream", "dump" => "Dump", "jumpstream" => "Jumpstream", "handstream" => "Handstream",
-        "delay" => "Delay", "chordstream" => "Chordstream", "bracket" => "Bracket", "minijack" => "Minijack",
+        "delay" => "Stream", "chordstream" => "Chordstream", "bracket" => "Bracket", "minijack" => "Minijack",
         "anchor" => "Anchor", "ln" => "LN", "hybrid" => "Hybrid LN", "release" => "LN Release", _ => k,
     }
 }
@@ -511,6 +544,8 @@ pub fn describe(res: &Dict, k: &Knobs) -> (String, Vec<String>) {
     }
     let shown: Vec<String> = entries.iter().flat_map(|e| if let Val::Dict(d) = e { parts_of(d) } else { Vec::new() }).collect();
     let names = names_for(res);
+    let mix = hybrid_mix(ln_share(res));
+    let val = |g: &str| sc.f(g) * if g == "hybrid" { mix } else { 1. };
     let mut extra = Vec::new();
     let groups: [(&[&str], f64); 4] = [
         (&["sv"], k.ALSO_SPECIAL),
@@ -524,7 +559,7 @@ pub fn describe(res: &Dict, k: &Knobs) -> (String, Vec<String>) {
         }
         let mut best: Option<&str> = None;
         for g in group {
-            if sc.has(g) && best.is_none_or(|b| sc.f(g) > sc.f(b)) {
+            if sc.has(g) && best.is_none_or(|b| val(g) > val(b)) {
                 best = Some(g);
             }
         }
@@ -535,8 +570,8 @@ pub fn describe(res: &Dict, k: &Knobs) -> (String, Vec<String>) {
         {
             continue;
         }
-        if sc.f(kk) >= share * a.f("rating") {
-            extra.push(format!("{} {:.1}", names(kk), sc.f(kk)));
+        if val(kk) > 0. && val(kk) >= share * a.f("rating") {
+            extra.push(format!("{} {:.1}", names(kk), val(kk)));
         }
     }
     if !extra.is_empty() {

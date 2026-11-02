@@ -42,6 +42,7 @@ pub struct Reader {
     chart: Option<(String, (i64, f64, f64))>,
     last: Option<Value>,
     tried: Option<Instant>,
+    memo: Option<PathBuf>,
 }
 
 const RETRY: Duration = Duration::from_secs(60);
@@ -92,7 +93,13 @@ impl Default for Reader {
 
 impl Reader {
     pub fn new() -> Reader {
-        Reader { game: None, client: "", time: None, chart: None, last: None, tried: None }
+        Reader { game: None, client: "", time: None, chart: None, last: None, tried: None, memo: None }
+    }
+
+    /// Remember where lazer's game object was in `path`, so a restart beside the same running game needs no memory scan.
+    pub fn remembering(mut self, path: PathBuf) -> Reader {
+        self.memo = Some(path);
+        self
     }
 
     fn attach(&mut self, prefer: &str) {
@@ -104,7 +111,7 @@ impl Reader {
         let game = if *client == "stable" {
             Process::open(*pid, false).map(|p| Game::Stable(stable::Stable::new(p, path)))
         } else {
-            Process::open(*pid, true).and_then(|p| lazer::Lazer::new(p, path)).map(Game::Lazer)
+            Process::open(*pid, true).and_then(|p| lazer::Lazer::new(p, path, self.memo.clone())).map(Game::Lazer)
         };
         self.tried = game.is_none().then(Instant::now);
         self.game = game;

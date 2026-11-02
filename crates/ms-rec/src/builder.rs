@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
-pub const STRUCTURE_VERSION: i64 = 2;
+pub const STRUCTURE_VERSION: i64 = 2; // = ms_calc::structure::STRUCTURE_VERSION: offers of another version are skipped
 pub const DEFAULT_TARGET: f64 = 0.95;
 const LEAD: usize = 300; // charts re-predicted first after a play or refit (the shown 20 come from the top ~60)
 const STABLE_RATES: [f64; 3] = [0.75, 1., 1.5]; // stable has HT/NM/DT only (user 2026-10-31)
@@ -51,6 +51,19 @@ pub fn web_factor(value: f64) -> f64 {
 /// The tab's displayed-accuracy target (Settings slider): 88–98 %, default 95 %.
 pub fn normalize_target(value: f64) -> f64 {
     if value.is_finite() { value.clamp(0.88, 0.98) } else { DEFAULT_TARGET }
+}
+
+/// NPS and Skills HT/DT range (user 2026-11-02: "default 0.75-1.5 … can be set to be 1.0-1.0 too in order to disable HT/DT").
+pub const DEFAULT_RATES: (f64, f64) = (0.75, 1.5);
+
+/// Inside the analysed rates, low ≤ high, on the 0.05 grid.
+pub fn normalize_rates((lo, hi): (f64, f64)) -> (f64, f64) {
+    if !lo.is_finite() || !hi.is_finite() {
+        return DEFAULT_RATES;
+    }
+    let grid = |x: f64| ((x * 20.).round() / 20.).clamp(MIN_RATE, MAX_RATE);
+    let (lo, hi) = (grid(lo), grid(hi));
+    (lo.min(hi), hi.max(lo))
 }
 
 /// {keys: (lo, hi)} ratings that can land near the target: website charts outside are never loaded. The level +
@@ -129,6 +142,7 @@ pub struct Request {
     pub predictor: String,
     pub client: String,
     pub target: f64,
+    pub rates: (f64, f64), // this tab's HT/DT range
     pub keys: Vec<i64>,
     pub skills_keys: Vec<i64>,
     pub selected_skills: Vec<String>,
@@ -222,7 +236,7 @@ impl Builder {
         let selected = skills::normalize(&r.selected_skills);
         let mut memo = Choices::new(order.clone(), Forecast { calc: r.calc.clone(), predictor: r.predictor.clone(), band_z: ms_model::predict::BAND_Z });
         let jobs: Vec<ScoreJob> = order.iter().map(|s| publish_job(s, &catalog[s], &r.public)).collect();
-        r.model.score_into(&mut memo, &tables, &store, &jobs, &selected, &r.tuning, r.target, r.mode == "skills", skills::wants_vibro(&selected), !selected.is_empty(), ms_data::store::now())
+        r.model.score_into(&mut memo, &tables, &store, &jobs, &selected, &r.tuning, r.target, r.rates, r.mode == "skills", skills::wants_vibro(&selected), !selected.is_empty(), ms_data::store::now())
             .map_err(rusqlite::Error::InvalidParameterName)?;
         *self.store.write().unwrap() = store;
         Ok((Arc::new(memo.snapshot()), Arc::new(catalog)))
@@ -477,7 +491,7 @@ impl Builder {
         let forecast = Forecast { calc: r.calc.clone(), predictor: r.predictor.clone(), band_z: ms_model::predict::BAND_Z };
         let score = |choices: &mut Choices, shas: &[String], catalog: &HashMap<String, Arc<Inst>>, store: &FeatStore, now: f64| -> std::result::Result<(), String> {
             let jobs: Vec<ScoreJob> = shas.iter().filter_map(|s| catalog.get(s).map(|i| publish_job(s, i, &r.public))).collect();
-            r.model.score_into(choices, &tables, store, &jobs, &selected, &r.tuning, r.target, skills_mode, skills::wants_vibro(&selected), !selected.is_empty(), now)
+            r.model.score_into(choices, &tables, store, &jobs, &selected, &r.tuning, r.target, r.rates, skills_mode, skills::wants_vibro(&selected), !selected.is_empty(), now)
         };
         let now = ms_data::store::now();
         // A play or refit re-predicts the whole library. The previous request's leading charts go first, so the shown

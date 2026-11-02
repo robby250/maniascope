@@ -16,6 +16,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_SKILLS: usize = 3;
+pub const MAX_SKILLS: usize = ms_calc::card::CARD_MAX;
 
 fn window(ctx: &egui::Context, id: &str, title: &str, size: [f32; 2], above: bool, mut add: impl FnMut(&mut Ui)) -> bool {
     let mut builder = ViewportBuilder::default().with_title(title).with_inner_size(size).with_app_id("maniascope");
@@ -225,8 +226,9 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label("osu! ★ at 1.0×");
                 let (mut lo, mut hi) = self.web.stars.unwrap_or((5., 10.));
-                changed |= ui.add(egui::DragValue::new(&mut lo).range(0.0..=15.).speed(0.5).fixed_decimals(1)).changed();
-                changed |= ui.add(egui::DragValue::new(&mut hi).range(0.0..=15.).speed(0.5).fixed_decimals(1)).changed();
+                ui.spacing_mut().slider_width = 90.;
+                changed |= ui.add(egui::Slider::new(&mut lo, 0.0..=15.).step_by(0.5).fixed_decimals(1)).changed();
+                changed |= ui.add(egui::Slider::new(&mut hi, 0.0..=15.).step_by(0.5).fixed_decimals(1)).changed();
                 self.web.stars = Some((lo, hi));
                 if let Some(r) = self.recommended_stars(&keys) {
                     theme::dim(ui, format!("(your plays suggest {}–{})", r.0, r.1));
@@ -313,10 +315,6 @@ impl App {
             }
         });
         ui.separator();
-        if ui.button("Skip warmup").on_hover_text("Already warm: remove the cold-session prior for PP, NPS and Skills").clicked() {
-            self.q.put(Task::SkipWarmup);
-            close = true;
-        }
         if ui.checkbox(&mut self.s.auto_next, "Auto next after finishing the pick").on_hover_text("Finishing the recommended map picks the next one and copies its search, as if you pressed Next").changed() {
             self.request_save();
         }
@@ -372,15 +370,20 @@ impl App {
     fn display_ui(&mut self, ui: &mut Ui) {
         let d = &mut self.s.display;
         let mut changed = false;
+        // In the window's row order, one switch per row (user 2026-11-02).
+        changed |= ui.checkbox(&mut d.title, "Title and artist").changed();
+        changed |= ui.checkbox(&mut d.version, "Difficulty and mapper").changed();
+        changed |= ui.checkbox(&mut d.info, "Keys, dan, rate, length, LN %").changed();
+        changed |= ui.checkbox(&mut d.prediction, "Expected accuracy, form, PP gain").on_hover_text("Shown once you have 50 plays in the keymode. PP gain on the PP tab, or for a PP map the NPS list mixed in.").changed();
         changed |= ui.checkbox(&mut d.rating, "Difficulty rating").changed();
-        changed |= ui.checkbox(&mut d.dan, "Dan level").changed();
-        changed |= ui.checkbox(&mut d.nps, "NPS").changed();
-        changed |= ui.checkbox(&mut d.ln, "LN %").changed();
-        changed |= ui.checkbox(&mut d.timeline, "Difficulty timeline").changed();
         ui.horizontal(|ui| {
             ui.label("Skills shown");
-            changed |= ui.add(egui::DragValue::new(&mut d.skills).range(1..=6)).on_hover_text(format!("Default {DEFAULT_SKILLS}")).changed();
+            // A slider, not a drag field: a number box gave no hint it could change (user 2026-11-02). 0 hides the skills.
+            changed |= ui.add(egui::Slider::new(&mut d.skills, 0..=MAX_SKILLS)).on_hover_text(format!("Default {DEFAULT_SKILLS}")).changed();
         });
+        changed |= ui.checkbox(&mut d.nps, "NPS").changed();
+        changed |= ui.checkbox(&mut d.timeline, "Difficulty timeline").changed();
+        changed |= ui.checkbox(&mut d.status, "Status line").on_hover_text("The small line at the bottom: import and analysis progress").changed();
         if changed {
             self.request_save();
         }

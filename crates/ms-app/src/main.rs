@@ -216,7 +216,7 @@ fn main() {
     log_to_file();
     crash_log();
     let s = settings::Ui::load();
-    let (w, h) = if s.details { s.details_win } else { s.win };
+    let (w, h) = s.win; // details add their rows once an analysis shows
     let mut view = ViewportBuilder::default().with_title("ManiaScope").with_app_id("maniascope").with_inner_size([w, h]).with_min_inner_size([200., 120.]);
     if let Some(p) = s.win_pos {
         view = view.with_position(p);

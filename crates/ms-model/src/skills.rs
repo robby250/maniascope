@@ -20,7 +20,7 @@ fn family(key: &str, name: &'static str, members: &[&'static str], children: &[(
     }
 }
 
-fn shared() -> [Skill; 9] {
+fn shared() -> [Skill; 7] {
     [
         family("ln", "LN", &["ln", "release", "inverse", "hybrid", "shield"], &[
             ("release", "LN Release", "Timing and coordinating hold endings."),
@@ -37,15 +37,16 @@ fn shared() -> [Skill; 9] {
             ("sv_stutter", "Stutters", "Repeated meaningful speed-direction changes."),
             ("sv_brake", "Brakes", "Decreasing approach speed and timing uncertainty near judgement.")], ""),
         family("stamina", "Stamina", &["stamina"], &[], "Sustained effort, not simply a long song."),
-        family("jackspeed", "Jackspeed", &["jackspeed", "jack", "minijack", "longjack", "vibro"], &[
+        family("jackspeed", "Jacks", &["jackspeed", "jack", "minijack", "longjack", "vibro"], &[
             ("minijack", "Minijacks", "Short repeated-column bursts inside other patterns."),
             ("longjack", "Longjacks", "Sustained single-column repetition."),
             ("vibro", "Vibro", "Specialist ultra-fast repetition. Only explicitly selecting Vibro includes pure vibro drills.")],
             "Single-column repetition and short jack bursts; distinct from changing overlapping chords."),
         family("chordjack", "Chordjack", &["chordjack"], &[], "Repeated or partly overlapping chords."),
-        family("jumptrill", "Jumptrill", &["jumptrill"], &[], "Alternating hand impulses, including timing-feasible rolls. Separate from chordstream/jumpstream."),
-        family("splittrill", "Split Trill", &["splittrill"], &[], "Both hands alternate fingers independently; not ordinary Jumptrill. The wide-key counterpart is Bracket."),
-        family("bracket", "Bracket", &["bracket"], &[], "A hand alternating between disjoint finger groups, with a chord in at least one group."),
+        family("trills", "Trills", &["jumptrill", "trill1h", "splittrill"], &[
+            ("jumptrill", "Jumptrill", "Alternating hand impulses, including timing-feasible rolls."),
+            ("trill1h", "1H Trill", "Alternation between fingers on one hand."),
+            ("splittrill", "Split Trill", "Both hands alternate fingers independently; not ordinary Jumptrill.")], ""),
     ]
 }
 
@@ -58,32 +59,40 @@ struct Trees {
 fn trees() -> &'static Trees {
     static T: OnceLock<Trees> = OnceLock::new();
     T.get_or_init(|| {
-        let [ln, tech, sv, stamina, jacks, chordjack, jumptrill, splittrill, bracket] = shared();
+        // The model's families (consts.json `members`), user 2026-11-02: 1H Trill and Anchors under Delay were "awkward";
+        // Stream and Delay are one Stream here (the calculator keeps both fitted parts). Wide keys have no Split Trill
+        // (its counterpart is Bracket, a chordstream texture: "multiple trills on nearby columns", osu! ranking criteria).
+        let [ln, tech, sv, stamina, jacks, chordjack, trills] = shared();
+        let anchors = ("anchor", "Anchors", "A repeated column embedded in flowing notes.");
         let four = vec![
-            family("stream", "Stream", &["stream", "dump", "trill1h", "anchor"], &[
-                ("dump", "Dump", "Very fast rice that still needs individual finger control."),
-                ("trill1h", "1H Trill", "Alternation between fingers on one hand."),
-                ("anchor", "Anchors", "A repeated column embedded in flowing notes.")], ""),
+            family("stream", "Stream", &["stream", "dump", "anchor"], &[
+                ("dump", "Dump", "Very fast rice that still needs individual finger control."), anchors], ""),
             family("jumpstream", "Jumpstream", &["jumpstream"], &[], ""),
-            jumptrill.clone(), splittrill,
             family("handstream", "Handstream", &["handstream", "quadstream"], &[
                 ("quadstream", "Quadstream", "Single → quad → single stream texture with embedded minijacks; not every quad or chordjack.")], ""),
-            jacks.clone(), chordjack.clone(), ln.clone(), tech.clone(), stamina.clone(), sv.clone(),
+            trills.clone(), jacks.clone(), chordjack.clone(), ln.clone(), tech.clone(), stamina.clone(), sv.clone(),
         ];
+        let mut wide_trills = trills;
+        wide_trills.members.retain(|m| *m != "splittrill");
+        wide_trills.children.retain(|c| c.key != "trills/splittrill");
         let wide = vec![
-            family("delay", "Delay", &["delay", "stream", "trill1h", "anchor"], &[
-                ("stream", "Stream", "Slower flowing single-note rice."),
-                ("trill1h", "1H Trill", "One-hand finger alternation, not an alternating-hand Jumptrill."),
-                ("anchor", "Anchors", "Repeated columns inside rice.")], ""),
-            family("chordstream", "Chordstream", &["chordstream"], &[], ""),
-            jumptrill, bracket, chordjack, jacks, ln, tech, stamina, sv,
+            family("stream", "Stream", &["stream", "delay", "anchor"], &[anchors], "Single-note rice, slow or fast."),
+            family("chordstream", "Chordstream", &["chordstream", "bracket"], &[
+                ("bracket", "Bracket", "A hand alternating between disjoint finger groups, with a chord in at least one group.")], ""),
+            wide_trills, chordjack, jacks, ln, tech, stamina, sv,
         ];
+        // A family in both trees with different children (Stream, Trills) holds the union, so a selection made on one
+        // keymode keeps its meaning on the other.
         let mut all: Vec<Skill> = Vec::new();
         for tree in [&four, &wide] {
             for parent in tree {
                 for node in std::iter::once(parent).chain(&parent.children) {
-                    if !all.iter().any(|n| n.key == node.key) {
-                        all.push(node.clone());
+                    match all.iter_mut().find(|n| n.key == node.key) {
+                        Some(n) => {
+                            n.members.extend(node.members.iter().filter(|m| !n.members.contains(m)).copied().collect::<Vec<_>>());
+                            n.children.extend(node.children.iter().filter(|c| !n.children.iter().any(|x| x.key == c.key)).cloned().collect::<Vec<_>>());
+                        }
+                        None => all.push(node.clone()),
                     }
                 }
             }
@@ -109,12 +118,19 @@ pub fn name(key: &str) -> &'static str {
     node(key).map_or("", |n| n.name)
 }
 
+/// The strongest of a dimension's members, Hybrid LN only as far as the map mixes LN and rice (card::hybrid_mix).
+pub fn member_value<S: AsRef<str>>(f: &ms_calc::val::Dict, members: &[S]) -> f64 {
+    let (sk, mix) = (f.dict("sk"), ms_calc::card::hybrid_mix(f.fget("ln", 0.)));
+    members.iter().filter_map(|m| Some((m.as_ref(), sk?.get(m.as_ref())?.f().max(0.))))
+        .fold(0f64, |a, (m, v)| a.max(if m == "hybrid" { v * mix } else { v }))
+}
+
 /// skill_practice.strengths and practice_strengths of one chart-rate: (key, raw, practice) per dimension.
 fn strengths(f: &ms_calc::val::Dict) -> Vec<(&'static str, f64, f64)> {
     let keys = f.get("keys").map_or(7, |k| k.f() as i64);
-    let (sk, profile) = (f.dict("sk"), f.dict("tech_profile"));
+    let profile = f.dict("tech_profile");
     dimensions(keys).into_iter().map(|node| {
-        let raw = node.members.iter().filter_map(|m| sk.and_then(|d| d.get(m))).fold(0f64, |a, v| a.max(v.f().max(0.)));
+        let raw = member_value(f, &node.members);
         // Technical practice needs actual technical character, not just an awkward local peak in a smooth chart.
         let leaf = node.key.rsplit('/').next().unwrap_or("");
         let technical = matches!(node.key.as_str(), "technical" | "technical/patterntech" | "technical/rhythmtech");
@@ -149,23 +165,37 @@ pub fn feat_trees() -> Vec<Vec<(String, Vec<String>)>> {
     [4, 7].iter().map(|&k| dimensions(k).iter().map(|n| (n.key.clone(), n.members.iter().map(|m| m.to_string()).collect())).collect()).collect()
 }
 
-const LEGACY: [(&str, &[&str]); 7] = [
-    ("rice", &["stream", "delay", "jumpstream", "handstream"]),
-    ("chords", &["jumpstream", "handstream", "chordstream", "bracket"]),
+/// Saved keys of older trees → their place now. Exclusions keep their "!".
+const LEGACY: [(&str, &[&str]); 15] = [
+    ("rice", &["stream", "jumpstream", "handstream"]),
+    ("chords", &["jumpstream", "handstream", "chordstream"]),
     ("jack", &["jackspeed"]),
-    ("trill", &["stream/trill1h", "delay/trill1h", "jumptrill", "splittrill", "bracket"]),
-    ("jumpstream/jumptrill", &["jumptrill"]),
-    ("chordstream/jumptrill", &["jumptrill"]),
-    ("jumpstream/splittrill", &["splittrill"]),
+    ("trill", &["trills", "chordstream/bracket"]),
+    ("jumpstream/jumptrill", &["trills/jumptrill"]),
+    ("chordstream/jumptrill", &["trills/jumptrill"]),
+    ("jumpstream/splittrill", &["trills/splittrill"]),
+    // 2026-11-02 regroup: Delay merged into Stream; 1H Trill, Jumptrill and Split Trill under Trills; Bracket under Chordstream.
+    ("delay", &["stream"]),
+    ("delay/stream", &["stream"]),
+    ("delay/anchor", &["stream/anchor"]),
+    ("delay/trill1h", &["trills/trill1h"]),
+    ("stream/trill1h", &["trills/trill1h"]),
+    ("bracket", &["chordstream/bracket"]),
+    ("jumptrill", &["trills/jumptrill"]),
+    ("splittrill", &["trills/splittrill"]),
 ];
+
+/// A saved key's current keys (settings keep weights and avoid levels under these too).
+pub fn migrate(key: &str) -> Vec<&str> {
+    LEGACY.iter().find(|l| l.0 == key).map_or_else(|| vec![key], |l| l.1.to_vec())
+}
 
 /// Canonical signed choices. Opposite child overrides survive; positive-only preferences migrate.
 pub fn normalize(selected: &[String]) -> Vec<String> {
     let mut states: HashMap<String, i8> = HashMap::new();
     for token in selected {
         let (negative, key) = token.strip_prefix('!').map_or((false, token.as_str()), |k| (true, k));
-        let names: Vec<&str> = LEGACY.iter().find(|l| l.0 == key).map_or_else(|| vec![key], |l| l.1.to_vec());
-        for k in names {
+        for k in migrate(key) {
             if node(k).is_some() {
                 // An explicit exclusion wins conflicting restored preferences.
                 let at = states.entry(k.to_string()).or_insert(1);
@@ -340,6 +370,37 @@ mod tests {
         assert_eq!(normalize(&v(&["ln", "!ln"])), v(&["!ln"]));
         let n = normalize(&v(&["!ln", "ln/release"]));
         assert!(n.contains(&"ln/release".to_string()) && n.contains(&"!ln/inverse".to_string()) && !n.contains(&"!ln".to_string()));
+    }
+
+    #[test]
+    fn the_trees_follow_the_model_families_and_old_keys_move_with_their_sign() {
+        let parents = |k: i64| tree(k).iter().map(|n| n.name).collect::<Vec<_>>();
+        assert_eq!(parents(7), ["Stream", "Chordstream", "Trills", "Chordjack", "Jacks", "LN", "Technical", "Stamina", "SV"]);
+        assert_eq!(parents(4), ["Stream", "Jumpstream", "Handstream", "Trills", "Jacks", "Chordjack", "LN", "Technical", "Stamina", "SV"]);
+        let children = |k: i64, p: &str| tree(k).iter().find(|n| n.key == p).unwrap().children.iter().map(|c| c.key.as_str()).collect::<Vec<_>>();
+        assert_eq!(children(7, "stream"), ["stream/anchor"]);
+        assert_eq!(children(7, "trills"), ["trills/jumptrill", "trills/trill1h"]);
+        assert_eq!(children(4, "trills"), ["trills/jumptrill", "trills/trill1h", "trills/splittrill"]);
+        for (old, new) in [("delay", "stream"), ("delay/stream", "stream"), ("delay/anchor", "stream/anchor"), ("delay/trill1h", "trills/trill1h"),
+                           ("stream/trill1h", "trills/trill1h"), ("bracket", "chordstream/bracket"), ("jumptrill", "trills/jumptrill"), ("splittrill", "trills/splittrill")] {
+            assert_eq!(normalize(&v(&[old])), v(&[new]), "{old}");
+            assert_eq!(normalize(&v(&[&format!("!{old}")])), v(&[&format!("!{new}")]), "!{old}");
+        }
+    }
+
+    #[test]
+    fn hybrid_counts_only_where_the_map_mixes_ln_and_rice() {
+        let f = |ln: f64| {
+            let mut sk = ms_calc::val::Dict::new();
+            sk.set("hybrid", 1.0);
+            let mut f = ms_calc::val::Dict::new();
+            f.set("keys", 7i64);
+            f.set("ln", ln);
+            f.set("sk", sk);
+            strengths(&f).into_iter().find(|s| s.0 == "ln/hybrid").unwrap().1
+        };
+        assert_eq!((f(0.01), f(0.30), f(0.95)), (0., 1., 0.));
+        assert!(f(0.17) > 0. && f(0.17) < 1.);
     }
 
     #[test]

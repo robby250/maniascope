@@ -14,14 +14,14 @@ fn month_name(m: i64) -> String {
     format!("{} {}", MONTHS[m.rem_euclid(12) as usize], 2000 + m.div_euclid(12))
 }
 
-/// [(level, short name)] of the keymode's main dan series inside lo..hi: the level matching each dan (its rating / the
-/// page's dan scale).
-fn dan_ticks(keys: i64, lo: f64, hi: f64, factor: f64) -> Vec<(f64, String)> {
+/// [(level, short name, full name)] of the keymode's main dan series inside lo..hi: the level matching each dan (its
+/// rating / the page's dan scale).
+fn dan_ticks(keys: i64, lo: f64, hi: f64, factor: f64) -> Vec<(f64, String, String)> {
     let Some(series) = dans::series(keys, "rice") else { return Vec::new() };
     let prefix = dans::short(series).trim();
     dans::tiers(series).map_or_else(Vec::new, |t| t.iter().map(|(tier, v)| (v.exp() / factor, tier)).filter(|x| lo <= x.0 && x.0 <= hi).map(|(v, tier)| {
         let name = tier.replace(prefix, "");
-        (v, if name.trim().is_empty() { tier.clone() } else { name.trim().to_string() })
+        (v, if name.trim().is_empty() { tier.clone() } else { name.trim().to_string() }, tier.clone())
     }).collect())
 }
 
@@ -37,6 +37,10 @@ impl Scale {
     fn x(&self, v: f64, r: Rect) -> f32 {
         r.left() + 6. + (r.width() - 12.) * (((v - self.lo) / (self.hi - self.lo)).clamp(0., 1.)) as f32
     }
+
+    fn level(&self, x: f32, r: Rect) -> f64 {
+        self.lo + (self.hi - self.lo) * (((x - r.left() - 6.) / (r.width() - 12.)).clamp(0., 1.)) as f64
+    }
 }
 
 fn small_font() -> FontId {
@@ -47,13 +51,15 @@ fn date(t: f64, f: &str) -> String {
     ms_data::store::local_format(t, f)
 }
 
+/// Hover: the nearest tier's full name and level, names hidden for space included.
 fn dan_axis(ui: &mut Ui, keys: i64, scale: Scale, width: f32) {
-    let (r, _) = ui.allocate_exact_size(vec2(width, 18.), Sense::hover());
+    let (r, response) = ui.allocate_exact_size(vec2(width, 18.), Sense::hover());
     let p = ui.painter();
     let mut last = f32::MIN;
-    for (stars, name) in dan_ticks(keys, scale.lo, scale.hi, scale.dan) {
-        let x = scale.x(stars, r);
-        let g = p.layout_no_wrap(name, small_font(), TEXT.gamma_multiply(0.55));
+    let ticks = dan_ticks(keys, scale.lo, scale.hi, scale.dan);
+    for (stars, name, _) in &ticks {
+        let x = scale.x(*stars, r);
+        let g = p.layout_no_wrap(name.clone(), small_font(), TEXT.gamma_multiply(0.55));
         let left = (x - g.size().x / 2.).max(r.left()).min(r.right() - g.size().x); // edge names stay whole
         if left < last + 4. {
             continue; // crowded tiers: keep every other name readable
@@ -62,17 +68,26 @@ fn dan_axis(ui: &mut Ui, keys: i64, scale: Scale, width: f32) {
         p.galley(pos2(left, r.top()), g, TEXT);
         p.vline(x, (r.top() + 13.)..=r.bottom(), Stroke::new(1., TEXT.gamma_multiply(0.55)));
     }
+    if let Some(at) = response.hover_pos() {
+        if let Some((stars, _, full)) = ticks.iter().min_by(|a, b| (scale.x(a.0, r) - at.x).abs().total_cmp(&(scale.x(b.0, r) - at.x).abs())) {
+            response.on_hover_text_at_pointer(format!("{full} · level {stars:.2}"));
+        }
+    }
 }
 
-/// ● your level, a faint band for its uncertainty, ○ this session (only once warm).
-fn skill_bar(ui: &mut Ui, keys: i64, g: Option<&Group>, scale: Scale, session: bool, width: f32) -> egui::Response {
+/// ● your level, a faint band for its uncertainty, ○ this session (only once warm), and the line another hovered bar
+/// set (one shared level across all bars).
+fn skill_bar(ui: &mut Ui, keys: i64, g: Option<&Group>, scale: Scale, session: bool, width: f32, line: Option<f64>) -> egui::Response {
     let (r, response) = ui.allocate_exact_size(vec2(width, 22.), Sense::hover());
     let p = ui.painter();
     let y = r.center().y;
     let ink = TEXT.gamma_multiply(0.10);
     p.hline((r.left() + 6.)..=(r.right() - 6.), y, Stroke::new(2., ink));
-    for (stars, _) in dan_ticks(keys, scale.lo, scale.hi, scale.dan) {
+    for (stars, _, _) in dan_ticks(keys, scale.lo, scale.hi, scale.dan) {
         p.vline(scale.x(stars, r), (y - 4.)..=(y + 4.), Stroke::new(1., ink));
+    }
+    if let Some(l) = line {
+        p.vline(scale.x(l, r), r.y_range(), Stroke::new(1., TEXT.gamma_multiply(0.45)));
     }
     let Some(g) = g else { return response };
     let Some(value) = g.value else { return response };
@@ -85,20 +100,96 @@ fn skill_bar(ui: &mut Ui, keys: i64, g: Option<&Group>, scale: Scale, session: b
     response
 }
 
-/// Overall level per month, dan lines behind it, peak and today marked.
-fn history_chart(ui: &mut Ui, keys: i64, h: &[(i64, f64)], peak: (i64, f64), dan: f64) {
-    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 110.), Sense::hover());
+/// A chart that zooms along x: the wheel zooms around the cursor, a drag pans once zoomed, a double-click resets.
+/// Shift+drag marks a range instead (a click clears it). Returns the response, x(fraction of the whole span) for the
+/// visible part, `plot` = the x-range it maps onto, and the marked range in pixels.
+#[allow(clippy::type_complexity)]
+fn zoomable(ui: &mut Ui, salt: impl std::hash::Hash + std::fmt::Debug, height: f32, plot: impl Fn(Rect) -> (f32, f32)) -> (Rect, egui::Response, impl Fn(f64) -> f32, Option<(f32, f32)>) {
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    let response = ui.interact(r, ui.scope_id().with(salt), Sense::click_and_drag());
+    let (left, right) = plot(r);
+    let width = (right - left).max(1.) as f64;
+    let (mut lo, mut hi) = ui.data(|d| d.get_temp::<(f64, f64)>(response.id)).unwrap_or((0., 1.));
+    let marked = response.id.with("range");
+    let mut range = ui.data(|d| d.get_temp::<(f64, f64)>(marked));
+    if response.double_clicked() {
+        (lo, hi) = (0., 1.);
+    }
+    if response.clicked() || response.double_clicked() {
+        range = None;
+    }
+    let frac = |x: f32, lo: f64, hi: f64| lo + (hi - lo) * ((x - left) as f64 / width).clamp(0., 1.);
+    if let Some(at) = response.hover_pos() {
+        // The wheel over a chart zooms it instead of scrolling the page.
+        let wheel = ui.ctx().input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta.y));
+        let factor = (-wheel as f64 / 300.).exp() / ui.input(|i| i.zoom_delta()) as f64;
+        if factor != 1. {
+            let anchor = frac(at.x, lo, hi);
+            let span = ((hi - lo) * factor).clamp(0.02, 1.);
+            lo = anchor - (anchor - lo) * span / (hi - lo);
+            hi = lo + span;
+        }
+    }
+    if response.dragged() && ui.input(|i| i.modifiers.shift) {
+        if let (Some(from), Some(to)) = (ui.input(|i| i.pointer.press_origin()), response.interact_pointer_pos()) {
+            range = Some((frac(from.x, lo, hi), frac(to.x, lo, hi)));
+        }
+    } else if response.dragged() {
+        let shift = response.drag_delta().x as f64 / width * (hi - lo);
+        (lo, hi) = (lo - shift, hi - shift);
+    }
+    let span = hi - lo;
+    lo = lo.clamp(0., 1. - span);
+    ui.data_mut(|d| {
+        d.insert_temp(response.id, (lo, lo + span));
+        match range {
+            Some(m) => { d.insert_temp(marked, m); }
+            None => d.remove::<(f64, f64)>(marked),
+        }
+    });
+    let response = if span < 1. { response.on_hover_cursor(egui::CursorIcon::Grab) } else { response };
+    let fx = move |f: f64| left + (width * (f - lo) / span) as f32;
+    let pixels = range.map(|(a, b)| (fx(a.min(b)), fx(a.max(b))));
+    (r, response, fx, pixels)
+}
+
+/// The zoom hint, for the first few chart hovers only (user 2026-11-02: it could stop showing after the first times).
+fn hint(ui: &Ui, response: &egui::Response, hints: &mut u32) -> &'static str {
+    let id = response.id.with("hovering");
+    let (was, now) = (ui.data(|d| d.get_temp::<bool>(id).unwrap_or(false)), response.hovered());
+    if now != was {
+        ui.data_mut(|d| d.insert_temp(id, now));
+        if now {
+            *hints += 1;
+        }
+    }
+    if *hints <= HINTS { "\nScroll to zoom, drag to move, Shift+drag to measure, double-click to reset" } else { "" }
+}
+
+const HINTS: u32 = 5;
+
+/// A marked range: a band and its text along the top.
+fn mark(p: &egui::Painter, r: Rect, (a, b): (f32, f32), text: String) {
+    p.rect_filled(Rect::from_x_y_ranges(a..=b.max(a + 1.), r.y_range()), 0., ACCENT.gamma_multiply(0.12));
+    p.text(pos2((a + b) / 2., r.top() + 2.), Align2::CENTER_TOP, text, small_font(), TEXT);
+}
+
+/// Overall level per month, dan lines behind it, peak and today marked; hover for a month's level, its change and plays.
+fn history_chart(ui: &mut Ui, keys: i64, h: &[(i64, f64, f64)], peak: (i64, f64), page: &Page, hints: &mut u32) {
+    let dan = page.dan_scale.get("rice").copied().unwrap_or(1.);
+    let (r, response, fx, marked) = zoomable(ui, ("history", keys), 110., |r| (r.left() + 8., r.right() - 74.));
     let values: Vec<f64> = h.iter().map(|x| x.1).collect();
     let lo = values.iter().copied().fold(f64::MAX, f64::min) * 0.97;
     let hi = values.iter().copied().fold(f64::MIN, f64::max) * 1.03;
     let (m0, m1) = (h[0].0, h[h.len() - 1].0);
-    let x = |m: i64| r.left() + 8. + (r.width() - 82.) * ((m - m0) as f32 / (m1 - m0).max(1) as f32);
+    let x = |m: i64| fx((m - m0) as f64 / (m1 - m0).max(1) as f64);
     let y = |v: f64| r.bottom() - 16. - (r.height() - 24.) * ((v - lo) / (hi - lo).max(1e-6)) as f32;
     let p = ui.painter();
+    let plot = ui.painter_at(Rect::from_x_y_ranges((r.left() + 2.)..=(r.right() - 68.), r.y_range()));
     let mut ticks = dan_ticks(keys, lo, hi, dan);
     ticks.sort_by(|a, b| b.0.total_cmp(&a.0));
     let mut last: Option<f32> = None;
-    for (stars, name) in ticks {
+    for (stars, name, _) in ticks {
         if last.is_some_and(|l| y(stars) - l < 11.) {
             continue; // crowded low tiers: every other line stays readable
         }
@@ -106,46 +197,86 @@ fn history_chart(ui: &mut Ui, keys: i64, h: &[(i64, f64)], peak: (i64, f64), dan
         p.hline((r.left() + 8.)..=(r.right() - 68.), y(stars), Stroke::new(1., TEXT.gamma_multiply(0.12)));
         p.text(pos2(r.right() - 62., y(stars)), Align2::LEFT_CENTER, name, small_font(), TEXT.gamma_multiply(0.55));
     }
-    p.add(egui::Shape::line(h.iter().map(|&(m, v)| pos2(x(m), y(v))).collect(), Stroke::new(2., ACCENT)));
-    p.circle_stroke(pos2(x(peak.0), y(peak.1)), 4., Stroke::new(2., ACCENT));
+    plot.add(egui::Shape::line(h.iter().map(|&(m, v, _)| pos2(x(m), y(v))).collect(), Stroke::new(2., ACCENT)));
+    plot.circle_stroke(pos2(x(peak.0), y(peak.1)), 4., Stroke::new(2., ACCENT));
     let end = h[h.len() - 1];
-    p.circle_filled(pos2(x(end.0), y(end.1)), 4., ACCENT);
-    p.text(pos2(x(m0), r.bottom() - 3.), Align2::LEFT_BOTTOM, month_name(m0), small_font(), TEXT.gamma_multiply(0.55));
-    p.text(pos2(x(m1), r.bottom() - 3.), Align2::RIGHT_BOTTOM, month_name(m1), small_font(), TEXT.gamma_multiply(0.55));
+    plot.circle_filled(pos2(x(end.0), y(end.1)), 4., ACCENT);
+    // Edge months of what is visible, once zoomed too.
+    let at = |px: f32| h.iter().min_by(|a, b| (x(a.0) - px).abs().total_cmp(&(x(b.0) - px).abs())).unwrap().0;
+    let (first, last) = (at(r.left() + 8.), at(r.right() - 74.));
+    p.text(pos2(r.left() + 8., r.bottom() - 3.), Align2::LEFT_BOTTOM, month_name(first), small_font(), TEXT.gamma_multiply(0.55));
+    p.text(pos2(r.right() - 74., r.bottom() - 3.), Align2::RIGHT_BOTTOM, month_name(last), small_font(), TEXT.gamma_multiply(0.55));
+    if let Some((a, b)) = marked {
+        let inside: Vec<&(i64, f64, f64)> = h.iter().filter(|e| (a..=b).contains(&x(e.0))).collect();
+        if let (Some(f), Some(l)) = (inside.first(), inside.last()) {
+            mark(&plot, r, (a, b), format!("{:+.2} over these {} months", l.1 - f.1, l.0 - f.0 + 1));
+        }
+    }
+    let hint = hint(ui, &response, hints);
+    if let Some(hover) = response.hover_pos().filter(|_| !response.dragged()) {
+        let near_peak = (x(peak.0) - hover.x).abs() <= 6.;
+        let i = h.iter().enumerate().min_by(|a, b| (x(a.1 .0) - hover.x).abs().total_cmp(&(x(b.1 .0) - hover.x).abs())).unwrap().0;
+        let (m, v, plays) = if near_peak { h.iter().copied().find(|e| e.0 == peak.0).unwrap_or(h[i]) } else { h[i] };
+        plot.vline(x(m), (r.top() + 4.)..=(r.bottom() - 16.), Stroke::new(1., TEXT.gamma_multiply(0.35)));
+        plot.circle_filled(pos2(x(m), y(v)), 4., TEXT);
+        let dan = dans::ability(keys, v, "overall", &page.dan_scale).map_or(String::new(), |d| format!(" · ≈ {d}"));
+        let text = if near_peak {
+            let ago = (page.now - m as f64).round() as i64;
+            format!("Peak {v:.1} · {} · {}{dan}", month_name(m), match ago { 0 => "this month".to_string(), 1 => "a month ago".to_string(), n => format!("{n} months ago") })
+        } else {
+            let before = h.iter().rev().find(|e| e.0 < m).map_or(String::new(), |e| format!(" ({:+.2} on {})", v - e.1, month_name(e.0)));
+            format!("{} · level {v:.2}{before} · {plays:.0} plays{dan}", month_name(m))
+        };
+        response.on_hover_text_at_pointer(format!("{text}{hint}"));
+    }
 }
 
-/// The last sessions play by play, against the rested expectation; hover a dot for its session and mark.
-fn form_chart(ui: &mut Ui, form: &FormHistory) {
+/// The last sessions play by play, against the rested expectation; hover a dot for its session and mark: the session
+/// lights up, the others dim.
+fn form_chart(ui: &mut Ui, form: &FormHistory, hints: &mut u32) {
     let (mut dots, mut gaps, mut count) = (Vec::new(), Vec::new(), 0usize);
-    for s in &form.sessions {
+    for (s, session) in form.sessions.iter().enumerate() {
         gaps.push(count);
-        let day = date(s.t, "%d %b %H:%M");
-        for &(clock, value, mark) in &s.plays {
-            dots.push((count, value, mark, format!("{day} · {clock:.0} min in · {value:+.1}%{}", if mark.is_empty() { String::new() } else { format!(" · {mark}") })));
+        let day = date(session.t, "%d %b %H:%M");
+        for &(clock, value, mark) in &session.plays {
+            dots.push((count, value, mark, format!("{day} · {clock:.0} min in · {value:+.1}%{}", if mark.is_empty() { String::new() } else { format!(" · {mark}") }), s));
             count += 1;
         }
         count += 2;
     }
     let top = dots.iter().map(|d| d.1.abs()).fold(0.5, f64::max);
-    let (r, response) = ui.allocate_exact_size(vec2(ui.available_width(), 90.), Sense::hover());
-    let x = |i: usize| r.left() + 6. + (r.width() - 12.) * i as f32 / count.max(1) as f32;
+    let (r, response, fx, marked) = zoomable(ui, "form", 90., |r| (r.left() + 6., r.right() - 6.));
+    let x = |i: usize| fx(i as f64 / count.max(1) as f64);
     let y = |v: f64| r.center().y - (r.height() / 2. - 6.) * (v / top) as f32;
-    let p = ui.painter();
+    let p = ui.painter_at(r);
     let ink = Stroke::new(1., TEXT.gamma_multiply(0.15));
     p.hline(r.x_range(), y(0.), ink);
     for start in gaps.iter().skip(1) {
         p.vline(x(start - 1), (r.top() + 2.)..=(r.bottom() - 2.), ink);
     }
-    for (i, value, mark, _) in &dots {
+    let hovered = response.hover_pos().filter(|_| !response.dragged()).and_then(|at| dots.iter().min_by(|a, b| (x(a.0) - at.x).abs().total_cmp(&(x(b.0) - at.x).abs())));
+    for (i, value, mark, _, s) in &dots {
+        let dim = if hovered.is_some_and(|h| h.4 != *s) { 0.25 } else { 1. };
         match FORM.iter().find(|f| f.0 == *mark) {
-            Some(f) => p.circle_filled(pos2(x(*i), y(*value)), 3., f.1),
-            None => p.circle_filled(pos2(x(*i), y(*value)), 2., TEXT.gamma_multiply(0.45)),
+            Some(f) => p.circle_filled(pos2(x(*i), y(*value)), 3., f.1.gamma_multiply(dim)),
+            None => p.circle_filled(pos2(x(*i), y(*value)), 2., TEXT.gamma_multiply(0.45 * dim)),
         };
     }
-    if let Some(at) = response.hover_pos() {
-        if let Some(dot) = dots.iter().min_by(|a, b| (x(a.0) - at.x).abs().total_cmp(&(x(b.0) - at.x).abs())) {
-            response.on_hover_text_at_pointer(&dot.3);
+    if response.hovered() {
+        p.text(pos2(r.right() - 4., y(0.) - 2.), Align2::RIGHT_BOTTOM, "rested expectation", small_font(), TEXT.gamma_multiply(0.55));
+    }
+    if let Some((a, b)) = marked {
+        let inside: Vec<f64> = dots.iter().filter(|d| (a..=b).contains(&x(d.0))).map(|d| d.1).collect();
+        if !inside.is_empty() {
+            mark(&p, r, (a, b), format!("mean {:+.1}% over {} plays", inside.iter().sum::<f64>() / inside.len() as f64, inside.len()));
         }
+    }
+    let hint = hint(ui, &response, hints);
+    if let Some(dot) = hovered {
+        let s = &form.sessions[dot.4];
+        let mean = s.plays.iter().map(|p| p.1).sum::<f64>() / s.plays.len().max(1) as f64;
+        let length = s.plays.last().map_or(0., |p| p.0);
+        response.on_hover_text_at_pointer(format!("{}\nSession: {length:.0} min · {} plays · mean {mean:+.1}%{hint}", dot.3, s.plays.len()));
     }
 }
 
@@ -156,7 +287,10 @@ struct Layout {
 }
 
 impl App {
-    fn skill_row(&mut self, ui: &mut Ui, keys: i64, node: &Skill, page: &Page, scale: Scale, l: &Layout, indent: bool, toggle: Option<&mut bool>) {
+    /// One skill: name, bar, level. Returns the level under the pointer when its bar is hovered (the shared line).
+    #[allow(clippy::too_many_arguments)]
+    fn skill_row(&mut self, ui: &mut Ui, keys: i64, node: &Skill, page: &Page, scale: Scale, l: &Layout, indent: bool, toggle: Option<&mut bool>, line: Option<f64>) -> Option<f64> {
+        let mut pointed = None;
         let row = page.groups.get(&node.key);
         let value = row.and_then(|g| g.value);
         let dan = value.and_then(|v| dans::ability(keys, v, &node.key, &page.dan_scale));
@@ -178,14 +312,21 @@ impl App {
                     label.on_hover_text(node.tip);
                 }
             });
-            let bar = skill_bar(ui, keys, row, scale, page.session, l.bar);
+            let bar = skill_bar(ui, keys, row, scale, page.session, l.bar, line);
+            let at = bar.hover_pos().map(|p| scale.level(p.x, bar.rect));
+            pointed = at;
+            let at = at.map_or(String::new(), |v| format!("\nAt the line: level {v:.2}{}", dans::ability(keys, v, &node.key, &page.dan_scale).map_or(String::new(), |d| format!(" ≈ {d}"))));
             if let Some(g) = row {
                 if let Some(v) = g.value {
                     let examples: Vec<String> = g.examples.iter().map(|(t, r, d)| format!("{t} · {r:.2}× · difficulty {d:.1}")).collect();
-                    bar.on_hover_text(format!("Level {v:.2}; likely between {:.2} and {:.2}. {} plays on {} charts.{}", g.low, g.high, g.plays, g.maps, if examples.is_empty() { String::new() } else { format!("\n{}", examples.join("\n")) }));
+                    bar.on_hover_text(format!("Level {v:.2}; likely between {:.2} and {:.2}. {} plays on {} charts.{}{at}", g.low, g.high, g.plays, g.maps, if examples.is_empty() { String::new() } else { format!("\n{}", examples.join("\n")) }));
                 } else if g.extrapolated {
-                    bar.on_hover_text(format!("Evidence reaches difficulty {:.1}; the fitted limit is not measured.", g.tested_to));
+                    bar.on_hover_text(format!("Evidence reaches difficulty {:.1}; the fitted limit is not measured.{at}", g.tested_to));
+                } else if !at.is_empty() {
+                    bar.on_hover_text(at.trim_start().to_string());
                 }
+            } else if !at.is_empty() {
+                bar.on_hover_text(at.trim_start().to_string());
             }
             ui.scope(|ui| {
                 ui.set_width(l.tail);
@@ -200,7 +341,7 @@ impl App {
                         None => { ui.label("—"); }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(egui::Button::new("Practice").frame(false)).on_hover_text(format!("Practice {} in {keys}K", node.name)).clicked() {
+                        if ui.add(egui::Button::new("Practice").frame(false)).on_hover_text(format!("Skills tab · {} · {keys}K · target {:.0}%", node.name, 100. * self.s.targets["skills"])).clicked() {
                             self.practice_from_stats(keys, &node.key);
                         }
                     });
@@ -214,6 +355,7 @@ impl App {
             ui.add_space(l.name + 8.);
             theme::dim_small(ui, format!("{confidence} · {} charts{session}", ms_rec::engine::commas(maps)));
         });
+        pointed
     }
 
     fn page_ui(&mut self, ui: &mut Ui, keys: i64, page: &Page) {
@@ -257,11 +399,12 @@ impl App {
         let target = format!("{}%", target.trim_end_matches('0').trim_end_matches('.'));
         let rice = dan_scale.get("rice").copied().unwrap_or(1.);
         if page.history.len() >= 2 {
-            history_chart(ui, keys, &page.history, peak.unwrap_or(page.history[page.history.len() - 1]), rice);
+            let end = page.history[page.history.len() - 1];
+            history_chart(ui, keys, &page.history, peak.unwrap_or((end.0, end.1)), page, &mut self.s.chart_hints);
         }
         if let Some(form) = page.form.as_ref().filter(|f| !f.sessions.is_empty()) {
             ui.label("Form, play by play (last sessions)");
-            form_chart(ui, form);
+            form_chart(ui, form, &mut self.s.chart_hints);
             ui.horizontal(|ui| {
                 for (name, colour) in FORM {
                     ui.label(RichText::new("●").color(colour).size(theme::SMALL));
@@ -290,22 +433,37 @@ impl App {
             dan_axis(ui, keys, scale, l.bar);
         });
         let parents = skills::tree(keys);
+        // One line across every bar at the hovered level: drawn from the last frame's pointer, rows above included.
+        let line_id = ui.scope_id().with(("skill-line", keys));
+        let line = ui.data(|d| d.get_temp::<f64>(line_id));
+        let mut pointed = None;
         for parent in parents {
             if parent.children.is_empty() {
-                self.skill_row(ui, keys, parent, page, scale, &l, false, None);
+                pointed = pointed.or(self.skill_row(ui, keys, parent, page, scale, &l, false, None, line));
                 continue;
             }
             let id = (keys, parent.key.clone());
-            let mut open = self.expanded.contains(&id);
-            self.skill_row(ui, keys, parent, page, scale, &l, false, Some(&mut open));
+            let was = self.s.expanded.contains(&id);
+            let mut open = was;
+            pointed = pointed.or(self.skill_row(ui, keys, parent, page, scale, &l, false, Some(&mut open), line));
             if open {
-                self.expanded.insert(id);
+                self.s.expanded.insert(id);
                 for child in &parent.children {
-                    self.skill_row(ui, keys, child, page, scale, &l, true, None);
+                    pointed = pointed.or(self.skill_row(ui, keys, child, page, scale, &l, true, None, line));
                 }
             } else {
-                self.expanded.remove(&id);
+                self.s.expanded.remove(&id);
             }
+            if open != was {
+                self.request_save();
+            }
+        }
+        if pointed != line {
+            ui.data_mut(|d| match pointed {
+                Some(v) => { d.insert_temp(line_id, v); }
+                None => d.remove::<f64>(line_id),
+            });
+            ui.ctx().request_repaint();
         }
         let reliable: Vec<(&str, &Group)> = parents.iter().filter_map(|p| groups.get(&p.key).filter(|g| g.value.is_some() && g.maps >= 10).map(|g| (p.name, g))).collect();
         if value.is_some() {
@@ -331,13 +489,17 @@ impl App {
 
     pub fn stats_ui(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            let label = self.stats_keys.map_or("All keymodes".to_string(), |k| format!("{k}K"));
+            let label = self.s.stats_keys.map_or("All keymodes".to_string(), |k| format!("{k}K"));
+            let before = self.s.stats_keys;
             egui::ComboBox::from_id_salt("stats-keys").selected_text(label).show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.stats_keys, None, "All keymodes");
+                ui.selectable_value(&mut self.s.stats_keys, None, "All keymodes");
                 for k in SUPPORTED_KEYS {
-                    ui.selectable_value(&mut self.stats_keys, Some(k), format!("{k}K"));
+                    ui.selectable_value(&mut self.s.stats_keys, Some(k), format!("{k}K"));
                 }
             });
+            if self.s.stats_keys != before {
+                self.request_save();
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new("PLAYER STATS").color(DIM));
             });
@@ -354,7 +516,7 @@ impl App {
                 ui.label("Reading your score history… (it appears here as soon as your plays are read and analysed; progress is shown above)");
                 return;
             };
-            match self.stats_keys {
+            match self.s.stats_keys {
                 None => {
                     ui.label("Your keymodes");
                     theme::dim(ui, "Each rating uses its own keymode's difficulty scale. There is no cross-keymode average.");
@@ -363,7 +525,8 @@ impl App {
                         let value = page.and_then(|p| p.groups.get("overall")).and_then(|g| g.value).map_or("—".to_string(), |v| format!("{v:.1}"));
                         let (maps, plays) = page.map_or((0, 0), |p| (p.maps, p.plays));
                         if ui.add(egui::Button::new(format!("{k}K     {value}    ·    {} charts / {} plays", ms_rec::engine::commas(maps), ms_rec::engine::commas(plays))).frame(false)).clicked() {
-                            self.stats_keys = Some(k);
+                            self.s.stats_keys = Some(k);
+                            self.request_save();
                         }
                     }
                 }
@@ -387,5 +550,63 @@ trait Cmp {
 impl Cmp for Option<f64> {
     fn total_cmp_opt(&self, other: &Self) -> std::cmp::Ordering {
         self.unwrap_or(0.).total_cmp(&other.unwrap_or(0.))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui_kittest::Harness;
+
+    #[test]
+    fn a_chart_zooms_at_the_cursor_and_pans_once_zoomed() {
+        let mut h = Harness::builder().with_size(vec2(400., 120.)).build_ui_state(|ui, ends: &mut (f32, f32)| {
+            let (_, _, fx, _) = zoomable(ui, "t", 100., |r| (r.left(), r.right()));
+            *ends = (fx(0.), fx(1.));
+        }, (0., 0.));
+        h.run();
+        let full = *h.state();
+        h.hover_at(pos2(300., 50.));
+        h.event(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0., 300.), phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel, modifiers: egui::Modifiers::NONE });
+        h.run();
+        let zoomed = *h.state();
+        assert!(zoomed.1 - zoomed.0 > 1.5 * (full.1 - full.0), "{full:?} {zoomed:?}");
+        let at = |e: (f32, f32), x: f32| (x - e.0) / (e.1 - e.0);
+        assert!((at(zoomed, 300.) - at(full, 300.)).abs() < 0.01, "the point under the cursor stays put");
+        h.drag_at(pos2(300., 50.));
+        h.run();
+        h.hover_at(pos2(340., 50.));
+        h.run();
+        h.drop_at(pos2(340., 50.));
+        h.run();
+        let moved = *h.state();
+        assert!((moved.0 - zoomed.0 - 40.).abs() < 1., "{zoomed:?} {moved:?}");
+    }
+
+    #[test]
+    fn shift_drag_marks_a_range_without_panning_and_a_click_clears_it() {
+        let mut h = Harness::builder().with_size(vec2(400., 120.)).build_ui_state(|ui, out: &mut ((f32, f32), Option<(f32, f32)>)| {
+            let (_, _, fx, marked) = zoomable(ui, "t", 100., |r| (r.left(), r.right()));
+            *out = ((fx(0.), fx(1.)), marked);
+        }, ((0., 0.), None));
+        h.run();
+        let ends = h.state().0;
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::SHIFT));
+        h.drag_at(pos2(100., 50.));
+        h.run();
+        h.hover_at(pos2(200., 50.));
+        h.run();
+        h.drop_at(pos2(200., 50.));
+        h.run();
+        let (after, marked) = *h.state();
+        assert_eq!(after, ends, "no pan");
+        let (a, b) = marked.expect("a marked range");
+        assert!((a - 100.).abs() < 2. && (b - 200.).abs() < 2., "{a} {b}");
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        h.drag_at(pos2(300., 50.));
+        h.run();
+        h.drop_at(pos2(300., 50.));
+        h.run();
+        assert!(h.state().1.is_none());
     }
 }

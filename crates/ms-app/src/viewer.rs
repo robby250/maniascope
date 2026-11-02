@@ -1,5 +1,5 @@
 //! The selected chart: its own analysis, independent of the recommender. The newest request replaces pending ones.
-use ms_calc::card::{card, describe, display_name};
+use ms_calc::card::{card_top, describe, display_name};
 use ms_calc::chart::{parse, Chart};
 use ms_calc::features::compute_selected;
 use ms_calc::params::Params;
@@ -42,7 +42,9 @@ pub struct Analysis {
     pub timeline: Vec<f64>,
     pub entries: Vec<Entry>,
     pub tags: Vec<String>,
-    pub bars: Vec<(String, f64)>, // display name, value: this keymode's skills
+    pub bars: Vec<(String, String, f64)>, // skill key, display name, value: this keymode's skills
+    pub peak_nps: Option<(f64, f64)>, // the densest 2 s at this rate: NPS, where it starts (ms of chart time)
+    pub bid: Option<i64>, // the chart's BeatmapID, for its website page
     pub names: Vec<(String, String)>, // key, display name
     pub tech: Vec<Tech>,
     pub sv_ignored: bool,
@@ -53,6 +55,28 @@ pub struct Analysis {
 pub fn raw_nps(c: &Chart, rate: f64) -> Option<f64> {
     let span = c.t.last()? - c.t.first()?;
     (rate.is_finite() && rate > 0. && span > 0.).then(|| c.len() as f64 * rate * 1000. / span)
+}
+
+/// The densest 2 s of real time at `rate`: (NPS, chart ms where that window starts).
+pub fn peak_nps(c: &Chart, rate: f64) -> Option<(f64, f64)> {
+    let window = 2000. * rate;
+    let mut t = c.t.clone();
+    t.sort_by(f64::total_cmp);
+    let (mut from, mut best) = (0, None::<(usize, f64)>);
+    for (i, x) in t.iter().enumerate() {
+        while x - t[from] >= window {
+            from += 1;
+        }
+        if best.is_none_or(|b| i + 1 - from > b.0) {
+            best = Some((i + 1 - from, t[from]));
+        }
+    }
+    best.map(|(n, at)| (n as f64 / 2., at))
+}
+
+/// `BeatmapID:` of the .osu text, when it has one.
+fn beatmap_id(data: &[u8]) -> Option<i64> {
+    String::from_utf8_lossy(data).lines().find_map(|l| l.trim().strip_prefix("BeatmapID:")).and_then(|v| v.trim().parse().ok()).filter(|b| *b > 0)
 }
 
 fn strings(v: Option<&Val>) -> Vec<String> {
@@ -66,6 +90,19 @@ fn text(d: &Dict, k: &str) -> String {
     if let Some(Val::Str(s)) = d.get(k) { s.clone() } else { String::new() }
 }
 
+/// One bar per shown name (7K Stream and Delay are both "Stream": the stronger), Hybrid LN as far as the map mixes LN and rice.
+fn bars(names: &[(String, String)], sc: &Dict, ln_share: f64) -> Vec<(String, String, f64)> {
+    let mut out: Vec<(String, String, f64)> = Vec::new();
+    for (k, n) in names {
+        let v = sc.fget(k, 0.) * if k == "hybrid" { ms_calc::card::hybrid_mix(ln_share) } else { 1. };
+        match out.iter_mut().find(|b| b.1 == *n) {
+            Some(b) => b.2 = b.2.max(v),
+            None => out.push((k.clone(), n.clone(), v)),
+        }
+    }
+    out
+}
+
 pub fn analyse(path: &Path, rate: f64, sv: bool, prm: &Params) -> Result<Analysis, String> {
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     let chart = parse(&data).map_err(|e| format!("{e:?}"))?;
@@ -73,16 +110,16 @@ pub fn analyse(path: &Path, rate: f64, sv: bool, prm: &Params) -> Result<Analysi
     let sc = res.dict("scores").ok_or("no scores")?;
     let keys = chart.keys as i64;
     let names: Vec<(String, String)> = skills(chart.keys).iter().map(|s| (s.name().to_string(), display_name(*s).to_string())).collect();
-    let entries = card(&res).iter().filter_map(|e| if let Val::Dict(e) = e { Some(Entry { name: text(e, "name"), rating: e.f("rating"), parts: strings(e.get("parts")) }) } else { None }).collect();
+    let entries = card_top(&res, crate::windows::MAX_SKILLS).iter().filter_map(|e| if let Val::Dict(e) = e { Some(Entry { name: text(e, "name"), rating: e.f("rating"), parts: strings(e.get("parts")) }) } else { None }).collect();
     let tech = match res.get("tech_where") {
         Some(Val::List(l)) => l.iter().filter_map(|w| if let Val::Dict(w) = w { Some(Tech { t: w.f("t"), pattern: w.f("pattern"), rhythm: w.f("rhythm"), why: text(w, "why") }) } else { None }).collect(),
         _ => Vec::new(),
     };
     let notes: Vec<(f64, usize)> = chart.t.iter().zip(&chart.col).map(|(t, c)| (*t, *c as usize)).collect();
     Ok(Analysis {
-        path: path.to_path_buf(), rate, sv, keys, overall: sc.f("overall"), notes: res.fget("notes", 0.) as usize, ln_notes: res.fget("ln_notes", 0.), nps: raw_nps(&chart, rate),
+        path: path.to_path_buf(), rate, sv, keys, overall: sc.f("overall"), notes: res.fget("notes", 0.) as usize, ln_notes: res.fget("ln_notes", 0.), nps: raw_nps(&chart, rate), peak_nps: peak_nps(&chart, rate), bid: beatmap_id(&data),
         span: (chart.len() >= 2).then(|| (chart.t[0], chart.last_end())), timeline: res.get("timeline").map_or_else(Vec::new, Val::list_f), entries, tags: describe(&res, &prm.k).1,
-        bars: names.iter().map(|(k, n)| (n.clone(), sc.fget(k, 0.))).collect(), names, tech, sv_ignored: matches!(res.get("sv"), Some(Val::Str(s)) if s == "ignored"),
+        bars: bars(&names, sc, res.fget("ln_notes", 0.) / res.fget("notes", 0.).max(1.)), names, tech, sv_ignored: matches!(res.get("sv"), Some(Val::Str(s)) if s == "ignored"),
         dan_vibro: ms_rec::dans::vibro_runs(&notes, rate), title: chart.title.clone(), artist: chart.artist.clone(), version: chart.version.clone(), creator: chart.creator.clone(),
     })
 }

@@ -106,7 +106,8 @@ fn history_follows_the_monthly_level_and_marks_the_peak() {
     assert!(page.history.len() >= 2, "{:?}", page.history);
     assert!((page.history.last().unwrap().1 - now).abs() < 1e-9);
     let peak = page.peak.unwrap();
-    assert_eq!(peak, page.history[0]);
+    assert_eq!(peak, (page.history[0].0, page.history[0].1));
+    assert!(page.history.iter().all(|h| h.2 >= 1.), "each month counts its plays");
     assert!(peak.1 > now);
     let shown = ms_rec::stats::current(&profile, &e.state_at(&w.db, 0.94, ms_data::store::now()).unwrap(), &e);
     assert!(!shown.pages[&7].session && shown.pages[&7].peak.unwrap().1 > shown.pages[&7].groups["overall"].value.unwrap());

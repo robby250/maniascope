@@ -511,6 +511,20 @@ fn only_analysed_rates_are_offered_and_a_broken_chart_counts_as_done() {
 }
 
 #[test]
+fn a_one_rate_range_offers_only_that_rate() {
+    let mut l = live("one-rate", 240, busy(false));
+    l.w.rates.insert("nps", (1., 1.));
+    let (_, updates) = built(&mut l, "nps", |_| {});
+    let refs = last_ready(&updates).candidates.restart_refs();
+    assert!(!refs.is_empty());
+    assert!(refs.iter().all(|(_, rate)| *rate == 1.), "{refs:?}");
+    // The fixture's charts are analysed at 1.00× only: a range above it keeps them all out.
+    l.w.rates.insert("nps", (1.05, 1.5));
+    let (_, updates) = built(&mut l, "nps", |_| {});
+    assert!(last_ready(&updates).candidates.restart_refs().iter().all(|(_, rate)| *rate >= 1.05));
+}
+
+#[test]
 fn a_restart_keeps_the_saved_lists_converts() {
     let mut l = live("restart-converts", 240, busy(false));
     let saved = l.w.states["nps"].catalog.keys().next().unwrap().clone();

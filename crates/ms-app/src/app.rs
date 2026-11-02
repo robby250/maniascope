@@ -61,6 +61,8 @@ pub struct View {
     pub revision: u64,
     pub hover: bool,
     pub settings: bool,
+    pub warmup: bool, // the list's phase: Skip warmup shows only then
+    pub played: bool, // the target was finished: Next moves on instead of skipping it
 }
 
 pub struct Selected {
@@ -114,9 +116,7 @@ pub struct App {
     pub views: HashMap<&'static str, View>,
     pub stats: Option<Box<Current>>,
     pub stats_open: bool,
-    pub stats_keys: Option<i64>, // None: all keymodes
     pub stats_wait: Option<(String, usize, usize)>,
-    pub expanded: HashSet<(i64, String)>,
     pub chips_open: HashSet<(i64, String)>,
     pub revision: u64,
     pub selection_id: u64,
@@ -134,12 +134,15 @@ pub struct App {
     pub debug: bool,
     pub web: crate::windows::WebView,
     pub resized: Option<(f32, f32)>,
+    pub extra: f32, // height the details rows add to the window now
     pub clipboard: Option<arboard::Clipboard>,
+    pub flash: Option<(String, Instant)>, // a short footer note ("Copied") and when it goes
+    profile_asked: bool, // the Stats pages are built once in the background for the main window's "you" comparisons
     keys_checked: Option<Instant>,
 }
 
 fn view() -> View {
-    View { shown: Vec::new(), pending: None, ready: false, target: None, target_msg: String::new(), target_tip: None, note: String::new(), note_tip: String::new(), loaded: false, analysing: None, revision: 0, hover: false, settings: false }
+    View { shown: Vec::new(), pending: None, ready: false, target: None, target_msg: String::new(), target_tip: None, note: String::new(), note_tip: String::new(), loaded: false, analysing: None, revision: 0, hover: false, settings: false, warmup: false, played: false }
 }
 
 /// Only source/debug runs get the pause switch (user 2026-10-01). Release builds have no way back on, so an old pause is
@@ -173,9 +176,9 @@ impl App {
         let mut app = App {
             s, rx, mail: mail.clone(), q: q.clone(), halt: halt.clone(), play: play.clone(), busy: busy.clone(), game: game.clone(), client_name: Arc::new(Mutex::new(client.clone())), viewer: Arc::default(), db,
             obs: Obs { note: "starting…".into(), ..Obs::default() }, shown: None, pending: None, generation: 0, requested: None, live: None, card: None, card_note: None,
-            views: MODES.into_iter().map(|m| (m, view())).collect(), stats: None, stats_open: false, stats_keys: Some(7), stats_wait: None, expanded: HashSet::new(), chips_open: HashSet::new(), revision: 0, selection_id: 0,
+            views: MODES.into_iter().map(|m| (m, view())).collect(), stats: None, stats_open: false, stats_wait: None, chips_open: HashSet::new(), revision: 0, selection_id: 0,
             units: Shown { client, miss_ratio }, result: None, status_text: String::new(), bg_progress: None, blocker: None, foot: String::new(), recs_opened: None, open: Open::default(), save_at: None, page: None, tracking, debug,
-            web: Default::default(), resized: None, clipboard: arboard::Clipboard::new().ok(), keys_checked: None,
+            web: Default::default(), resized: None, extra: 0., clipboard: arboard::Clipboard::new().ok(), flash: None, profile_asked: false, keys_checked: None,
         };
         app.auto_keys(true);
         if !debug && asks_profile(&app.db) {
@@ -245,7 +248,7 @@ impl App {
         let s = &self.s;
         self.q.put(Task::Configure(Box::new(Config {
             mode: s.mode.clone(), keys: s.keys.clone(), action: s.next_action.clone(), revision: self.revision, practice_skills: Some(s.practice.clone()), nps_focus: Some(s.nps_focus),
-            acc_targets: s.targets.clone(), web_bias: s.web_bias.clone(), web_weighted: s.web_weighted.clone(), converts: s.converts.clone(), pp_settings: Some(s.pp.clone()), pp_mix: Some(s.mix.clone()), skill_weights: Some(s.skill_weights.clone()), skill_tuning: Some(s.skill_tuning()),
+            acc_targets: s.targets.clone(), rates: s.rates.clone(), web_bias: s.web_bias.clone(), web_weighted: s.web_weighted.clone(), converts: s.converts.clone(), pp_settings: Some(s.pp.clone()), pp_mix: Some(s.mix.clone()), skill_weights: Some(s.skill_weights.clone()), skill_tuning: Some(s.skill_tuning()),
         })));
         self.request_save();
     }
@@ -300,6 +303,11 @@ impl App {
     pub fn set_stats(&mut self, open: bool) {
         if open != self.stats_open {
             self.stats_open = open;
+            // Opens on the selected map's keymode, else the one viewed last.
+            if let Some(k) = self.analysis().map(|a| a.keys).filter(|_| open) {
+                self.s.stats_keys = Some(k);
+                self.request_save();
+            }
             self.q.put(Task::Stats(open));
         }
     }
@@ -308,8 +316,10 @@ impl App {
         !self.s.keys[self.mode()].is_empty() && self.views[self.mode()].ready
     }
 
-    pub fn next(&mut self, skip: bool) {
+    /// One button for Next and Skip (user 2026-11-02): a pick left unplayed is skipped, kept away about 12 h.
+    pub fn next(&mut self) {
         let mode = self.mode();
+        let skip = self.views[mode].target.is_some() && !self.views[mode].played;
         self.flush_pool(mode);
         if !self.views[mode].shown.is_empty() {
             self.activate(mode, 0, Some(skip));
@@ -359,6 +369,7 @@ impl App {
         if !shown.is_empty() {
             self.blocker = None;
         }
+        view.warmup = phase == "warmup";
         let phase = match phase.as_str() { "warmup" => "Warming up", "build" => "Warmed up", "push" => "Strong form", "recover" => "Easing off", "fading" => "Fading", other => other };
         view.note = if note.is_empty() { phase.to_string() } else { format!("{phase} · {note}") };
         view.note_tip = [view.note.as_str(), summary.as_str()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n");
@@ -373,6 +384,7 @@ impl App {
         view.target_tip = Some([Some(msg.as_str()), c.as_ref().map(|c| c.why.as_str()), copy.as_deref()].into_iter().flatten().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n")).filter(|t| !t.is_empty());
         view.target = c.map(|c| *c);
         view.target_msg = msg;
+        view.played = false;
         if let (Some(text), Some(clip)) = (copy, self.clipboard.as_mut()) {
             let _ = clip.set_text(text);
         }
@@ -397,6 +409,10 @@ impl App {
                 }
             }
             Out::Pool { mode, revision, selection_id, phase, shown, note, summary, progress } => {
+                if !self.profile_asked {
+                    self.profile_asked = true;
+                    self.q.put(Task::Profile); // a model is ready: the main window can compare maps with you
+                }
                 let Some(m) = MODES.into_iter().find(|m| *m == mode) else { return };
                 if revision != self.revision || selection_id < self.selection_id {
                     return;
@@ -409,9 +425,14 @@ impl App {
             }
             Out::Result(v) => {
                 let v: Box<Verdict> = v;
-                self.result = Some((fmt::result_lines(&v), format!("{}\n{}", v.title, v.text)));
+                // The words stay on screen; the hover gives the number behind them.
+                let sigma = v.z.map_or(String::new(), |z| format!("\n{z:+.1}σ from the prediction{}", v.expected.map_or(String::new(), |e| format!(" (~{:.2}%)", 100. * e))));
+                self.result = Some((fmt::result_lines(&v), format!("{}\n{}{sigma}", v.title, v.text)));
+                for m in MODES.into_iter().filter(|m| v.targets.iter().any(|t| t == m)) {
+                    self.views.get_mut(m).expect("a tab").played = true;
+                }
                 if self.s.auto_next && v.targets.iter().any(|m| *m == self.s.mode) && self.next_enabled() {
-                    self.next(false);
+                    self.next();
                 }
             }
             Out::History(text) => self.open.history_text = text,
@@ -581,7 +602,7 @@ impl App {
         let mut state = json!({});
         if let Some(a) = self.analysis() {
             let step = (a.timeline.len() / 120).max(1);
-            let dan = self.s.display.dan.then(|| ms_rec::dans::label(a.keys, a.overall, a.ln_notes / a.notes.max(1) as f64, Some(&a.dan_vibro))).flatten();
+            let dan = self.s.display.info.then(|| ms_rec::dans::label(a.keys, a.overall, a.ln_notes / a.notes.max(1) as f64, Some(&a.dan_vibro))).flatten();
             state = json!({"title": a.title, "artist": a.artist, "version": format!("[{}]  {}", a.version, a.creator), "rating": a.overall, "context": fmt::context(a, dan.as_deref(), ""), "nps": a.nps,
                            "ln": (100. * a.ln_notes / a.notes.max(1) as f64).round(), "skills": a.entries.iter().take(self.s.display.skills).map(|e| json!({"name": e.name, "rating": e.rating})).collect::<Vec<_>>(),
                            "timeline": a.timeline.chunks(step).map(|c| c.iter().copied().fold(f64::MIN, f64::max)).collect::<Vec<_>>()});
@@ -654,3 +675,24 @@ impl App {
 #[cfg(test)]
 #[path = "ui_tests.rs"]
 mod ui_tests;
+
+/// A web page or folder in the desktop's default app.
+pub fn open_external(target: &str) {
+    let program = if cfg!(windows) { "explorer" } else { "xdg-open" };
+    let _ = std::process::Command::new(program).arg(target).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+}
+
+impl App {
+    /// Text to the clipboard, and "Copied" in the main window's footer for 2 s.
+    pub fn copy(&mut self, text: String) {
+        if let Some(clip) = self.clipboard.as_mut() {
+            let _ = clip.set_text(text);
+        }
+        self.flash = Some(("Copied".to_string(), Instant::now() + Duration::from_secs(2)));
+    }
+
+    /// The keymode's Stats page, once the background profile is in.
+    pub fn you(&self, keys: i64) -> Option<&ms_rec::stats::Page> {
+        self.stats.as_ref()?.pages.get(&keys)
+    }
+}

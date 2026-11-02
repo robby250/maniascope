@@ -265,6 +265,17 @@ fn played_and_offered_maps_stay_back_for_days_until_the_pool_cycles() {
 }
 
 #[test]
+fn a_snoozed_map_is_out_of_every_tab_for_12_hours_then_back() {
+    let t = now();
+    let ev = vec![event(t - 60., "snooze", Some("9"), json!({"mode": "nps"}))];
+    for mode in ["nps", "skills"] {
+        assert!(fresh_in(&session(ev.clone(), t), "9", mode, 400.) < 1e-5, "{mode}");
+    }
+    assert!(fresh(&session(ev.clone(), t + 11. * 3600.), "9", 120.) < 1e-5);
+    assert_eq!(fresh(&session(ev, t + 13. * 3600.), "9", 120.), 1.);
+}
+
+#[test]
 fn skip_is_not_permanent_and_render_is_not_exposure() {
     let t = now();
     let ev = vec![event(t - 30., "start", Some("1"), json!({})), event(t - 20., "skip", Some("9"), json!({}))];

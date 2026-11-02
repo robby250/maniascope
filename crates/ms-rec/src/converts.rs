@@ -226,7 +226,8 @@ fn needs_original(p: &Pick, db: &Db, stable: bool) -> bool {
 /// 2026-11-01, no ids needed). A website set arrives as one .osz with the diff inside. lazer has no such folder and an
 /// import can't add to a set: the same online id replaces the set (online ids reset, offsets and last played lost), so
 /// a convert is its own set there; its audio and images are stored once by hash (one extra file, 36 KB, same test).
-/// For a website map on lazer the original goes first.
+/// For a website map on lazer the original goes first: the whole set is imported beside the convert, which reuses its
+/// audio and images (user 2026-11-02: "fine if it also imports the set").
 pub fn deliver(p: &Pick, db: &Db, client: &str, root: &Path) -> std::result::Result<(), String> {
     let (source, set) = (p.convert_of.as_deref().ok_or("not a convert")?, p.set_id.unwrap_or(0));
     let data = std::fs::read(source_path(source, p.source_web, root).ok_or("the source chart is gone")?).map_err(|e| e.to_string())?;

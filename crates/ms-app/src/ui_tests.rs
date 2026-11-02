@@ -45,13 +45,130 @@ fn nexts(t: &[Task]) -> usize {
 fn the_expected_accuracy_waits_for_enough_of_the_players_own_plays() {
     let ctx = egui::Context::default();
     let mut a = app(prefs(), &ctx);
-    a.card = Some(Box::new(ms_rec::engine::Card { acc_mid: 0.962, sure: false, ..Default::default() }));
+    a.pending = Some(crate::app::Pending { title: "Map".into(), artist: String::new(), version: String::new(), creator: String::new(), context: String::new() });
+    a.card_note = Some("Waiting for osu! to report the playback rate and mods".into());
     let mut h = Harness::builder().with_size(egui::vec2(430., 240.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.main_ui(ui), a);
     h.step();
-    assert!(h.query_by_label_contains("Expected").is_none());
+    h.get_by_label_contains("Waiting for osu!");
+    h.state_mut().card = Some(Box::new(ms_rec::engine::Card { acc_mid: 0.962, sure: false, ..Default::default() }));
+    h.step();
+    assert!(h.query_by_label_contains("Expected").is_none() && h.query_by_label_contains("Waiting").is_none());
     h.state_mut().card.as_mut().unwrap().sure = true;
     h.step();
-    h.get_by_label("Expected ~96.2%");
+    h.get_by_label_contains("Expected ~96.2%");
+    h.state_mut().s.display.prediction = false;
+    h.step();
+    assert!(h.query_by_label_contains("Expected").is_none(), "its switch hides it");
+}
+
+#[test]
+fn each_main_window_row_has_its_switch() {
+    let ctx = egui::Context::default();
+    let mut a = app(prefs(), &ctx);
+    a.pending = Some(crate::app::Pending { title: "Gems Pack".into(), artist: "gems".into(), version: "Kamaboko".into(), creator: "gemboyong".into(), context: "4K · 1.00×".into() });
+    a.foot = "Importing scores".into();
+    let mut h = Harness::builder().with_size(egui::vec2(430., 240.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.main_ui(ui), a);
+    h.step();
+    let rows = ["Gems Pack", "Kamaboko", "4K · 1.00×", "Importing scores"];
+    for r in rows {
+        h.get_by_label_contains(r);
+    }
+    let d = &mut h.state_mut().s.display;
+    (d.title, d.version, d.info, d.status) = (false, false, false, false);
+    h.step();
+    for r in rows {
+        assert!(h.query_by_label_contains(r).is_none(), "{r} still shown");
+    }
+}
+
+#[test]
+fn each_skill_is_smaller_than_the_one_before() {
+    let s = crate::mainview::skill_sizes(&[7.6, 7.5, 7.5, 2.]);
+    assert_eq!(s[0], 1.);
+    assert!(s.windows(2).all(|w| w[1] < w[0] || w[1] == 0.), "{s:?}");
+    assert_eq!(s[3], 0.);
+}
+
+#[test]
+fn the_main_window_saves_its_size_without_a_window_position() {
+    let ctx = egui::Context::default();
+    let mut a = app(prefs(), &ctx);
+    a.s.win = (400., 200.);
+    let mut h = Harness::builder().with_size(egui::vec2(430., 240.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| {
+        a.main_ui(ui);
+        a.track_window(&ui.ctx().clone());
+    }, a);
+    h.step();
+    assert_eq!(h.state().s.win, (430., 240.), "the harness has no inner_rect, like Wayland");
+    h.get_by_label_contains("Details").click();
+    h.step();
+    assert!(h.state().s.details && h.state().s.win == (430., 240.));
+}
+
+#[test]
+fn an_empty_pick_hints_at_next_and_a_pp_pick_keeps_its_gain() {
+    let ctx = egui::Context::default();
+    let mut a = app(prefs(), &ctx);
+    a.sync_rec();
+    let mut p = pick('a');
+    (p.purpose, p.gain, p.p_up) = ("nps_mix".into(), Some(3.2), Some(0.4));
+    let list = pool(&a, "nps", a.revision, vec![p]);
+    a.on_rec(list);
+    let mut h = harness(a);
+    h.step();
+    h.get_by_label_contains("Press Next");
+    h.state_mut().next();
+    h.step();
+    assert!(h.query_by_label_contains("Press Next").is_none());
+    h.get_by_label("PP +3.2pp · 40%");
+}
+
+fn next_skips(t: &[Task]) -> Vec<bool> {
+    t.iter().filter_map(|x| if let Task::Next { skip, .. } = x { Some(*skip) } else { None }).collect()
+}
+
+#[test]
+fn next_skips_an_unplayed_pick_and_moves_on_from_a_played_one() {
+    let ctx = egui::Context::default();
+    let mut a = app(prefs(), &ctx);
+    a.sync_rec();
+    tasks(&a);
+    let list = pool(&a, "nps", a.revision, vec![pick('a'), pick('b'), pick('c')]);
+    a.on_rec(list);
+    a.next();
+    a.next();
+    assert_eq!(next_skips(&tasks(&a)), [false, true], "no pick yet, then pick a left unplayed");
+    a.on_rec(Out::Result(verdict(&["nps"])));
+    a.next();
+    assert_eq!(next_skips(&tasks(&a)), [false], "pick b was played");
+}
+
+#[test]
+fn skip_warmup_shows_only_while_the_tab_warms_up() {
+    let ctx = egui::Context::default();
+    let mut a = app(prefs(), &ctx);
+    a.sync_rec();
+    let list = pool(&a, "nps", a.revision, vec![pick('a')]);
+    a.on_rec(list);
+    let mut h = harness(a);
+    h.step();
+    h.get_by_label("Skip warmup").click();
+    h.step();
+    assert!(tasks(h.state()).iter().any(|t| matches!(t, Task::SkipWarmup)));
+    let Out::Pool { mode, revision, selection_id, shown, note, summary, progress, .. } = pool(h.state(), "nps", h.state().revision, vec![pick('a')]) else { unreachable!() };
+    h.state_mut().on_rec(Out::Pool { mode, revision, selection_id, phase: "build".into(), shown, note, summary, progress });
+    h.step();
+    assert!(h.query_by_label("Skip warmup").is_none());
+}
+
+#[test]
+fn the_playlist_no_longer_repeats_the_selected_map() {
+    let ctx = egui::Context::default();
+    let mut a = app(prefs(), &ctx);
+    a.card = Some(Box::new(ms_rec::engine::Card { acc_mid: 0.962, sure: true, ..Default::default() }));
+    let mut h = harness(a);
+    h.step();
+    assert!(h.query_by_label_contains("SELECTED").is_none() && h.query_by_label_contains("Expected").is_none());
 }
 
 #[test]
@@ -99,7 +216,7 @@ fn a_stale_list_is_ignored_and_the_current_one_enables_next() {
     assert!(a.next_enabled());
     let mut h = harness(a);
     h.step();
-    h.get_by_label_contains("Next · NPS");
+    h.get_by_label("Next");
 }
 
 #[test]
@@ -133,11 +250,11 @@ fn next_uses_the_finished_list_and_a_hover_only_defers_painting() {
     let revision = a.revision;
     let first = pool(&a, "nps", revision, vec![pick('a')]);
     a.on_rec(first);
-    a.next(false); // a fake worker never drains its queue: Next still navigates
+    a.next(); // a fake worker never drains its queue: Next still navigates
     assert_eq!(nexts(&tasks(&a)), 1);
     assert_eq!(a.views["nps"].target.as_ref().map(|t| t.sha.clone()), Some(pick('a').sha));
     assert!(!a.next_enabled(), "the pick left the list");
-    a.next(false);
+    a.next();
     assert_eq!(nexts(&tasks(&a)), 0, "a second press with nothing left is no task");
     // A completed refresh wins even when hover deferred painting it.
     a.views.get_mut("nps").unwrap().hover = true;
@@ -145,7 +262,7 @@ fn next_uses_the_finished_list_and_a_hover_only_defers_painting() {
     b.pred.acc_mid = 0.951;
     let fresh = pool(&a, "nps", revision, vec![b, pick('c')]);
     a.on_rec(fresh);
-    a.next(false);
+    a.next();
     assert_eq!(a.views["nps"].target.as_ref().map(|t| t.pred.acc_mid), Some(0.951));
     assert!(a.next_enabled());
     // A stale target can't move the selection.
@@ -236,7 +353,7 @@ fn the_convert_row_needs_a_selected_map() {
     for gone in ["Next playlist", "Rate", "New session", "Follow osu!'s rate (Auto)"] {
         assert!(h.query_by_label(gone).is_none(), "{gone}");
     }
-    h.get_by_label("Dan level");
+    h.get_by_label("Keys, dan, rate, length, LN %");
 }
 
 #[test]
@@ -301,7 +418,7 @@ fn every_skill_chip_stays_inside_the_settings_page() {
         let mut h = Harness::builder().with_size(egui::vec2(width, 760.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.playlist_ui(ui), a);
         h.step();
         h.get_by_label("Any");
-        for chip in ["Delay", "Chordstream", "Jumptrill", "Bracket", "Chordjack", "Jackspeed", "LN", "Technical", "Stamina", "SV"] {
+        for chip in ["Stream", "Chordstream", "Trills", "Chordjack", "Jacks", "LN", "Technical", "Stamina", "SV"] {
             let right = h.get_by_label(chip).rect().right() as f32;
             assert!(right <= width, "{chip} ends at {right} of {width}");
         }
@@ -332,7 +449,7 @@ fn a_pp_map_in_the_nps_list_keeps_its_pp_details_on_the_row() {
     let mut h = harness(a);
     h.step();
     h.get_by_label_contains("+3.1pp");
-    h.get_by_label_contains("best 400pp");
+    assert!(h.get_all_by_label_contains("best 400pp").count() >= 1);
 }
 
 #[test]
@@ -423,4 +540,91 @@ fn every_character_in_the_window_is_in_the_embedded_fonts() {
     let font = egui::FontId::proportional(crate::theme::BODY);
     let missing: std::collections::BTreeSet<char> = sources.iter().flat_map(|s| s.chars()).filter(|c| !c.is_ascii()).filter(|&c| !ctx.fonts_mut(|f| f.has_glyph(&font, c))).collect();
     assert!(missing.is_empty(), "{missing:?}");
+}
+
+#[test]
+fn clicking_the_title_copies_its_search_text_and_says_so() {
+    let ctx = egui::Context::default();
+    let mut a = app(prefs(), &ctx);
+    let dir = std::env::temp_dir().join(format!("ms-ui-title-{}", std::process::id()));
+    let file = osu_file(&dir, "a.osu");
+    a.obs = observed(&file, 1.);
+    a.refresh();
+    let result = viewer::analyse(&file, 1., true, &standard_params()).map(Arc::new);
+    let generation = a.generation;
+    a.on_analysed(viewer::Done { request: viewer::Request { generation, path: file.clone(), rate: 1., sv: true }, result });
+    let mut h = Harness::builder().with_size(egui::vec2(430., 300.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.main_ui(ui), a);
+    h.step();
+    assert!(h.query_by_label_contains("Copied").is_none());
+    h.get_by_label_contains("[v]").click();
+    h.run();
+    h.get_by_label_contains("Copied");
+    assert_eq!(crate::mainview::search_text(h.state().analysis().unwrap()), " - t [v]");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn ctrl_click_copies_a_row_without_picking_or_skipping() {
+    let ctx = egui::Context::default();
+    let mut a = app(prefs(), &ctx);
+    a.sync_rec();
+    let list = pool(&a, "nps", a.revision, vec![pick('a'), Pick { version: Some("Second".into()), ..pick('b') }]);
+    a.on_rec(list);
+    tasks(&a);
+    let mut h = harness(a);
+    h.step();
+    h.get_by_label_contains("Second").click_modifiers(egui::Modifiers::COMMAND);
+    h.run();
+    let t = tasks(h.state());
+    assert!(!t.iter().any(|x| matches!(x, Task::Next { .. } | Task::Open { .. })), "no pick");
+    assert!(h.state().flash.is_some(), "copied");
+    h.get_by_label_contains("Second").click();
+    h.run();
+    assert!(tasks(h.state()).iter().any(|x| matches!(x, Task::Open { .. } | Task::Next { .. })), "a plain click still picks");
+}
+
+#[test]
+fn right_click_next_skips_the_current_pick_for_12_hours() {
+    let ctx = egui::Context::default();
+    let mut a = app(prefs(), &ctx);
+    a.sync_rec();
+    let list = pool(&a, "nps", a.revision, vec![pick('a'), pick('b')]);
+    a.on_rec(list);
+    a.views.get_mut("nps").unwrap().target = Some(pick('c'));
+    tasks(&a);
+    let mut h = harness(a);
+    h.step();
+    h.get_by_label("Next").click_secondary();
+    h.run();
+    h.get_by_label("Skip for 12 h").click();
+    h.run();
+    let t = tasks(h.state());
+    assert!(t.iter().any(|x| matches!(x, Task::Snooze { pick, mode } if mode == "nps" && pick.sha == pick_sha('c'))), "a snooze of the current pick");
+    assert_eq!(nexts(&t), 0);
+}
+
+fn pick_sha(sha: char) -> Option<String> {
+    pick(sha).sha
+}
+
+#[test]
+fn stats_open_on_the_selected_maps_keymode_and_remember_the_last_one() {
+    let ctx = egui::Context::default();
+    let mut a = app(json!({"stats_keys": 4, "stats_expanded": ["7:ln"]}), &ctx);
+    assert_eq!(a.s.stats_keys, Some(4));
+    a.set_stats(true);
+    a.set_stats(false);
+    assert_eq!(a.s.stats_keys, Some(4), "no map selected: the last one viewed");
+    let dir = std::env::temp_dir().join(format!("ms-ui-stats-{}", std::process::id()));
+    let file = osu_file(&dir, "a.osu");
+    a.obs = observed(&file, 1.);
+    a.refresh();
+    let result = viewer::analyse(&file, 1., true, &standard_params()).map(Arc::new);
+    let generation = a.generation;
+    a.on_analysed(viewer::Done { request: viewer::Request { generation, path: file.clone(), rate: 1., sv: true }, result });
+    a.set_stats(true);
+    assert_eq!(a.s.stats_keys, Some(7));
+    let back = Settings::from_json(&a.s.to_json());
+    assert_eq!((back.stats_keys, back.expanded.iter().cloned().collect::<Vec<_>>()), (Some(7), vec![(7, "ln".to_string())]));
+    let _ = std::fs::remove_dir_all(dir);
 }

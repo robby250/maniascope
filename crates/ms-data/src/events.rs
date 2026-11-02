@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 pub const HISTORY_S: f64 = 3. * 86400.;       // events that shape form and predictions
 pub const EXPOSURE_S: f64 = 14. * 86400.;     // offers and plays that keep a map back
-const EXPOSURE_KINDS: [&str; 9] = ["offer", "next", "open", "skip", "start", "finish", "abort", "reset", "void"];
+const EXPOSURE_KINDS: [&str; 10] = ["offer", "next", "open", "skip", "snooze", "start", "finish", "abort", "reset", "void"];
 const EXPOSURE_FIELDS: [&str; 8] = ["md5", "sha", "bid", "mode", "length", "played_seconds", "progress", "start_id"];
 
 pub fn positive_id(v: &Value) -> Option<i64> {

@@ -12,10 +12,12 @@ use std::sync::Arc;
 pub const SESSION_GAP: f64 = 3000.;
 pub const HISTORY_S: f64 = 3. * 86400.;
 pub const EXPOSURE_S: f64 = 14. * 86400.;
+pub const SNOOZE_S: f64 = 12. * 3600.; // a right-click "Skip for 12 h"
 pub const FORM_NOTICE: f64 = 0.08; // log error: about .4 point at 95 %, under it the readout says nothing
 const PESSIMISM: f64 = 0.25;
 const PUSH_DOWN: f64 = 2.;
-const WARMUP_MAX: usize = 3;
+pub const WARMUP_MAX: usize = 3; // a session warms after this many finished maps…
+pub const WARMUP_MINUTES: f64 = 8.; // …or this many minutes played, whichever comes first
 const FAMILIES_DIM: usize = 8;
 
 fn truthy(v: Option<&Value>) -> bool {
@@ -197,7 +199,12 @@ impl Session {
                 _ => {}
             }
         }
-        let warm_flag = current_events.iter().any(|e| e.kind == "skip_warmup");
+        // A press after the last play and close before this session belongs to it: the session only begins at its first play,
+        // so Skip warmup before that play was dropped (user 2026-11-02: the PP list stayed warm-up).
+        let begin = current_events.first().map_or(now, |e| e.t);
+        let early = ev[..start].iter().rev().take_while(|e| !matches!(e.kind.as_str(), "start" | "finish" | "abort" | "reset"))
+            .any(|e| e.kind == "skip_warmup" && begin - e.t <= SESSION_GAP);
+        let warm_flag = early || current_events.iter().any(|e| e.kind == "skip_warmup");
         let mut events_by_map: HashMap<String, Vec<Arc<Event>>> = HashMap::default();
         let mut offer_times: HashMap<Option<String>, Vec<f64>> = HashMap::default();
         let name = |b: &Option<String>| b.clone().unwrap_or_else(|| "None".to_string());
@@ -491,7 +498,7 @@ impl Session {
         let minutes: f64 = zs.iter().filter(|x| x.1 > -1.)
             .map(|(a, _)| (a.end - a.t).max(0.).min(a.num("length").filter(|&l| l != 0.).unwrap_or(900.)) / 60.).sum();
         let strong = zs.iter().any(|(a, z)| *z >= 0.5 && a.text("purpose") != Some("warmup"));
-        if !(self.warm_flag || strong || n >= 3 || warmups >= WARMUP_MAX || minutes >= 8.) {
+        if !(self.warm_flag || strong || n >= WARMUP_MAX || warmups >= WARMUP_MAX || minutes >= WARMUP_MINUTES) {
             return "warmup";
         }
         if self.current_keys().is_some_and(|k| self.form_state(k).0 == Some("fading")) {
@@ -534,6 +541,9 @@ impl Session {
                     }
                     f *= if self.current.contains(&e.id) { 0.1 } else { 1. - 0.9 * (-dt / 43200.).exp() };
                 }
+                // "Skip for 12 h" from a right-click: gone from every tab until then. No "never show again": without an undo it
+                // was too dangerous (user 2026-11-02).
+                "snooze" if dt < SNOOZE_S => f = 0.,
                 _ => {}
             }
         }

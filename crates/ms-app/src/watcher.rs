@@ -327,7 +327,7 @@ impl LogTail {
 /// with no game running a second between looks. `client` picks between two running clients.
 pub fn run(mut t: Tracker, halt: Arc<AtomicBool>, client: impl Fn() -> String) {
     let mut tail = LogTail { log: None, display: None, index: None, reindexed: None, job: None };
-    let mut reader = Reader::new();
+    let mut reader = Reader::new().remembering(ms_data::paths::cache().join("lazer-game"));
     while !halt.load(Ordering::Relaxed) {
         let Some(d) = reader.poll(&client()) else {
             t.live = None;

@@ -424,7 +424,7 @@ pub fn compute(chart: &Chart, rate: f64, sv: bool, prm: &Params) -> Result<Dict,
     result.set("archetype_profile", ap);
     let unit = &prm.model["score_units"]["modes"][chart.keys.to_string()];
     if unit.as_object().is_some_and(|o| !o.is_empty()) && result.get("horizon").is_some_and(|h| h.truthy()) {
-        let uc = card::card(&result);
+        let uc = card::card_top(&result, card::CARD_MAX);
         result.set("unit_card", Val::List(uc));
         let description = card::describe(&result, &prm.k).0;
         model::units_apply(prm, &mut result);

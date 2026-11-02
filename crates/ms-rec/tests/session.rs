@@ -200,7 +200,17 @@ fn the_warm_up_override_reaches_both_targets() {
     let m = cold(Vec::new());
     assert!(!session(Vec::new(), 1000., Some(m.clone())).display_view(m.clone()).warm_flag);
     let skip = vec![event(1, 999., "skip_warmup", "", json!({}))];
-    assert!(session(skip, 1000., Some(m.clone())).display_view(m).warm_flag);
+    assert!(session(skip, 1000., Some(m.clone())).display_view(m.clone()).warm_flag);
+    // Pressed hours after the last play, before this session's first (user 2026-11-02: the list stayed warm-up).
+    let gap = ms_model::session::SESSION_GAP;
+    let mut ev = vec![event(1, 1000., "start", "md5:a", json!({"length": 120})), event(2, 1120., "finish", "md5:a", json!({"start_id": 1})), event(3, 1120. + 3. * gap, "skip_warmup", "", json!({}))];
+    let at = 1120. + 3. * gap + 60.;
+    assert!(session(ev.clone(), at, Some(m.clone())).warm_flag, "before the first play");
+    ev.push(event(4, at, "start", "md5:b", json!({"length": 120})));
+    assert!(session(ev.clone(), at + 10., Some(m.clone())).warm_flag, "after it starts");
+    assert!(!session(ev[..2].to_vec(), 1120. + 3. * gap + 60., Some(m.clone())).warm_flag);
+    let stale = vec![ev[0].clone(), ev[1].clone(), event(3, 1200., "skip_warmup", "", json!({})), event(4, at, "start", "md5:b", json!({"length": 120}))];
+    assert!(!session(stale, at + 10., Some(m)).warm_flag, "last session's press does not carry over");
 }
 
 #[test]

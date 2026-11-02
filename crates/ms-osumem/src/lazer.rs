@@ -37,6 +37,7 @@ pub struct Lazer {
     wait: Duration,
     mods: HashMap<u64, &'static str>,
     menu_mods: Value,
+    memo: Option<PathBuf>, // "pid address" of the game object last found: a restart beside a running game skips the scan
 }
 
 /// The program's folder. /proc/<pid>/root: flatpak's program path is its own.
@@ -46,11 +47,18 @@ fn dlls(pid: u32, exe: &Path) -> Option<PathBuf> {
 }
 
 impl Lazer {
-    pub fn new(p: Process, exe: &Path) -> Option<Lazer> {
+    pub fn new(p: Process, exe: &Path, memo: Option<PathBuf>) -> Option<Lazer> {
+        let t = Instant::now();
         let mut layouts = Layouts::new(&dlls(p.pid, exe)?);
         let size = layouts.class(&ASSEMBLIES, GAME_CLASS)?.base_size() as i64;
         let o = CLASSES.iter().filter_map(|c| Some((*c, layouts.class(&ASSEMBLIES, c)?.fields))).collect();
-        Some(Lazer { p, o, size, base: 0, scanned: None, wait: crate::SCAN_WAIT, mods: HashMap::new(), menu_mods: json!({"array": [], "name": ""}) })
+        eprintln!("osu!lazer layouts read in {:.2} s", t.elapsed().as_secs_f64());
+        // Only a hint: game() checks it is still the game object before use.
+        let base = memo.as_ref().and_then(|m| std::fs::read_to_string(m).ok()).and_then(|s| {
+            let (pid, at) = s.trim().split_once(' ')?;
+            (pid.parse() == Ok(p.pid)).then(|| at.parse().ok()).flatten()
+        }).unwrap_or(0);
+        Some(Lazer { p, o, size, base, scanned: None, wait: crate::SCAN_WAIT, mods: HashMap::new(), menu_mods: json!({"array": [], "name": ""}), memo })
     }
 
     pub fn alive(&self) -> bool {
@@ -81,8 +89,18 @@ impl Lazer {
     fn game(&mut self) -> Option<u64> {
         if !self.is_game(self.base) && self.scanned.is_none_or(|t| t.elapsed() > self.wait) {
             self.wait = if self.scanned.is_some() { (self.wait * 2).min(crate::SCAN_WAIT_MAX) } else { self.wait };
-            self.scanned = Some(Instant::now());
-            self.base = self.p.scan_all(&Pattern::new(ANCHOR)).into_iter().find_map(|a| self.from_anchor(a)).unwrap_or(0);
+            let t = Instant::now();
+            self.scanned = Some(t);
+            let mut found = 0;
+            self.p.scan_each(&Pattern::new(ANCHOR), |a| {
+                found = self.from_anchor(a).unwrap_or(0);
+                found == 0 // the first anchor that leads to the game ends the scan
+            });
+            self.base = found;
+            eprintln!("osu!lazer game object {} after {:.2} s", if found != 0 { "found" } else { "not found" }, t.elapsed().as_secs_f64());
+            if let Some(m) = self.memo.as_ref().filter(|_| found != 0) {
+                let _ = std::fs::write(m, format!("{} {found}", self.p.pid));
+            }
         }
         (self.base != 0 && self.is_game(self.base)).then_some(self.base)
     }

@@ -56,8 +56,8 @@ pub fn wanted_mod(rate: f64) -> &'static str {
     if (rate - 1.).abs() < 0.0005 { "NM" } else if rate < 1. { "HT" } else { "DT" }
 }
 
-/// The picked map: [rate to set (green once osu! shows it) and expectation, title], so they never move.
-pub fn target_lines(c: &Pick, obs: &Obs, shown: &Shown) -> Vec<Line> {
+/// Whether osu! shows the pick as it should be played: (osu! reports a rate, it matches, what is off).
+pub fn set_check(c: &Pick, obs: &Obs) -> (bool, bool, Vec<String>) {
     let wanted = wanted_mod(c.rate);
     let known = obs.source == Some("game") && obs.rate.is_some();
     let observed = obs.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -66,7 +66,27 @@ pub fn target_lines(c: &Pick, obs: &Obs, shown: &Shown) -> Vec<Line> {
     let has = |set: &[&str]| mods.iter().any(|m| set.contains(&m.as_str()));
     let speed = has(&["DT", "NC", "HT", "DC", "WU", "WD", "AS"]);
     let mod_ok = match wanted { "NM" => !speed, "HT" => has(&["HT", "DC"]), _ => has(&["DT", "NC"]) };
-    let correct = known && same && obs.rate.is_some_and(|a| (a - c.rate).abs() < 0.0005) && mod_ok;
+    let mut off = Vec::new();
+    if known {
+        if !same {
+            off.push("osu! has another map selected".to_string());
+        }
+        if let Some(a) = obs.rate.filter(|a| (a - c.rate).abs() >= 0.0005) {
+            off.push(format!("osu! plays it at {a:.2}×, the pick is {:.2}×", c.rate));
+        }
+        if !mod_ok {
+            off.push(match wanted { "NM" => "take off the speed mod".to_string(), "HT" => "it needs HT (or DC)".to_string(), _ => "it needs DT (or NC)".to_string() });
+        }
+    }
+    (known, known && off.is_empty(), off)
+}
+
+/// The picked map: [rate to set (green once osu! shows it) and expectation, title], so they never move.
+pub fn target_lines(c: &Pick, obs: &Obs, shown: &Shown) -> Vec<Line> {
+    let wanted = wanted_mod(c.rate);
+    let observed = obs.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let same = same_map(c, Some(&observed), None, obs.bid);
+    let (known, correct, _) = set_check(c, obs);
     let colour = if correct { GREEN } else if known { RED } else { GREY };
     let expected = if same && c.sha.as_deref().is_some_and(|s| s != observed) { "Updated chart selected".to_string() } else { format!("~{:.1}%", 100. * shown.acc(c.pred.acc_mid)) };
     vec![vec![Span { text: format!("{} SET {:.2}× · {wanted}", if correct { "✓" } else { "→" }, c.rate), bold: true, small: false, color: Some(colour) }, plain("  "), bold(expected)], pick_line(c)]
@@ -84,42 +104,34 @@ pub fn clock(seconds: f64) -> String {
     format!("{}:{:02}", s / 60, s % 60)
 }
 
-/// The selected map: [numbers, title, details], numbers at a fixed place whatever the title (user 2026-10-30). PP gain
-/// leads the details line, so the numbers line never wraps. The full card is its tooltip.
-pub fn card_lines(c: Option<&Card>, pp: bool, note: Option<&str>, shown: &Shown) -> (Vec<Line>, Option<String>) {
-    let Some(c) = c else { return (vec![vec![small(note.unwrap_or("Select a map to see its prediction"))]], None) };
+/// The selected map's prediction, one line in the main window: title, rate, length, skill and NPS are already there, so
+/// the playlist no longer repeats them (user 2026-11-02). `pp`: only on the PP tab or for a PP map the NPS list mixed
+/// in. The full prediction is its tooltip.
+pub fn prediction_line(c: &Card, pp: bool, shown: &Shown) -> (Line, String) {
     let pct = |x: f64| 100. * shown.acc(x);
     let (mid, lo, hi) = (pct(c.acc_mid), pct(c.acc_lo), pct(c.acc_hi));
-    let skill = c.skill.as_deref().and_then(ms_calc::skills::Sk::from_name).map_or_else(|| c.skill.clone().unwrap_or_default(), |s| ms_calc::card::display_name(s).to_string());
-    let length = clock(c.length);
-    let line = vec![small("SELECTED"), plain("  expected "), bold(format!("~{mid:.1}%")), plain(" "), small(format!("({lo:.1}–{hi:.1}%)")), plain("  "), bold(format!("{:.2}×", c.rate))];
-    let rest = [length.clone(), skill.clone(), c.nps.map_or(String::new(), |n| format!("{n:.1} NPS"))].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" · ");
-    let mut details = Vec::new();
+    let mut parts: Vec<Line> = vec![vec![bold(format!("Expected ~{mid:.1}%")), plain(" "), small(format!("({lo:.1}–{hi:.1}%)"))]];
     let form = form_text(c.form, c.acc_mid, shown);
     if !form.is_empty() {
-        details.extend([Span { bold: true, ..small(form.clone()) }, small(" · ")]);
+        parts.push(vec![Span { bold: true, ..small(form.clone()) }]);
     }
     if let (true, true, Some((_, _, best, gain, up))) = (pp, c.ranked, c.pp) {
-        details.extend([Span { bold: true, ..small(format!("+{gain:.1}pp")) }, small(format!(" · {:.0}% to {} · ", 100. * up, if best.is_some() { "beat" } else { "count" }))]);
+        parts.push(vec![Span { bold: true, ..small(format!("+{gain:.1}pp")) }, small(format!(" {:.0}% to {}", 100. * up, if best.is_some() { "beat" } else { "count" }))]);
     }
-    details.push(small(rest));
-    let mut tip = vec![format!("Expected ~{mid:.1}%, usually {lo:.1}–{hi:.1}%"), format!("{:.2}× · {length} · {skill}", c.rate)];
+    let line = parts.join(&small(" · "));
+    let mut tip = vec![format!("Your expected accuracy on this map at this rate, from your own plays: ~{mid:.1}%, usually {lo:.1}–{hi:.1}%")];
     if !form.is_empty() {
-        tip.insert(1, format!("Form now: {form} against your rested level on this map"));
+        tip.push(format!("Form now: {form} against your rested level on this map"));
     }
     match c.pp.filter(|_| c.ranked) {
         None => tip.push("No pp (unranked or unranked rate)".into()),
         Some((low, high, best, gain, up)) => tip.push(format!("{low:.0}–{high:.0}pp · {}+{gain:.1}pp expected · {:.0}% to {}", best.map_or(String::new(), |b| format!("best {b:.0} · ")), 100. * up, if best.is_some() { "beat" } else { "count" })),
     }
-    if let Some(n) = c.nps {
-        tip.push(format!("{n:.1} raw NPS"));
-    }
     if let Some((stars, n)) = c.plays_like {
         // User 2026-10-02 could not tell whose stars or whose scores ("7.4* osu SR? or our SR?").
         tip.push(format!("Top-1000 players score on it like a {stars:.1}★ map (ManiaScope ★, their best of {} scores at {:.2}×)", ms_rec::engine::commas(n as usize), c.rate));
     }
-    let title = map_line(&c.title, c.artist.as_deref(), c.song.as_deref(), c.version.as_deref(), c.keys);
-    (vec![line, title, details], Some(tip.join("\n")))
+    (line, tip.join("\n"))
 }
 
 pub fn verdict_words(z: f64) -> &'static str {

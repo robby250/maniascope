@@ -1,6 +1,6 @@
 //! The NPS/Skills choice list from the Builder's scoring to the shown list: one record per chart (its best exact
 //! rate) and the worker's prepare → weighting → shuffle → web mix over all of them.
-use crate::predict::{HashMap, Prediction, MAX_RATE, MIN_RATE};
+use crate::predict::{HashMap, Prediction};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -200,9 +200,9 @@ impl ChoiceList {
 
     /// The worker's prepared pool: choices of `keys` at an offered rate whose chart is still here (a website
     /// chart, or installed and in `local_shas`).
-    pub fn prepare(self: &Arc<Self>, keys: &[i64], local_shas: &dyn Fn(&str) -> bool) -> Prepared {
+    pub fn prepare(self: &Arc<Self>, keys: &[i64], rates: (f64, f64), local_shas: &dyn Fn(&str) -> bool) -> Prepared {
         let kept: Vec<usize> = self.items.iter().enumerate()
-            .filter(|(_, c)| !(c.installed && !local_shas(&c.sha)) && keys.contains(&c.keys) && (MIN_RATE..=MAX_RATE).contains(&c.rate))
+            .filter(|(_, c)| !(c.installed && !local_shas(&c.sha)) && keys.contains(&c.keys) && (rates.0 - 1e-6..=rates.1 + 1e-6).contains(&c.rate))
             .map(|x| x.0).collect();
         let by_identity = kept.iter().map(|&i| (self.items[i].identity(), i)).collect();
         Prepared { list: self.clone(), kept, by_identity }
@@ -599,7 +599,7 @@ mod list_tests {
         for (slot, c) in memo.slots.iter_mut().zip(rows) {
             *slot = Some((Some(Arc::new(c)), None));
         }
-        Arc::new(memo.snapshot()).prepare(keys, &|_| true)
+        Arc::new(memo.snapshot()).prepare(keys, (crate::predict::MIN_RATE, crate::predict::MAX_RATE), &|_| true)
     }
 
     struct Ask {

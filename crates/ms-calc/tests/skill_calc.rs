@@ -522,11 +522,11 @@ fn with_archetype(scores_of: &[(&str, f64)], name: &str, rating: f64, parts: &[&
 
 #[test]
 fn preexisting_tech_archetype_obeys_same_profile_qualification() {
-    let of = |t| card(&with_archetype(&[("overall", 10.), ("delay", 9.), ("stamina", 8.8), ("technical", 8.7)], "Tech Delay", 9., &["delay", "technical"], Some("delay"), t));
+    let of = |t| card(&with_archetype(&[("overall", 10.), ("delay", 9.), ("stamina", 8.8), ("technical", 8.7)], "Tech Stream", 9., &["delay", "technical"], Some("delay"), t));
     let legacy = of(None);
-    assert_eq!(name_of(&legacy[0]), "Tech Delay");
+    assert_eq!(name_of(&legacy[0]), "Tech Stream");
     let qualified = of(Some(0.3));
-    assert_eq!(name_of(&qualified[0]), "Delay");
+    assert_eq!(name_of(&qualified[0]), "Stream"); // 7K Delay shows as Stream (one family, 2026-11-02)
     let rating = |e: &Val| if let Val::Dict(d) = e { d.f("rating") } else { panic!() };
     assert_eq!(qualified.iter().map(rating).collect::<Vec<_>>(), legacy.iter().map(rating).collect::<Vec<_>>());
     assert_eq!(parts_of(&qualified[0]), ["delay"]);
@@ -551,7 +551,7 @@ fn existing_tech_description_can_be_requalified_and_legacy_is_preserved() {
 }
 
 #[test]
-fn delay_keeps_its_name_without_ln_tech_prevalence() {
+fn delay_keeps_its_stream_name_without_ln_tech_prevalence() {
     let res = with_archetype(&[("overall", 10.), ("delay", 8.54), ("ln", 8.27), ("release", 7.18), ("technical", 5.17), ("bracket", 7.49)], "x", 0., &[], None, None);
     let mut res = res;
     res.set("archetypes", Val::List(Vec::new()));
@@ -560,5 +560,5 @@ fn delay_keeps_its_name_without_ln_tech_prevalence() {
     let mut p = Dict::new();
     p.set("technical", 0.43);
     res.set("tech_profile", p);
-    assert_eq!(name_of(&card(&res)[0]), "Delay");
+    assert_eq!(name_of(&card(&res)[0]), "Stream");
 }

@@ -55,6 +55,7 @@ pub struct Config {
     pub practice_skills: Option<Vec<String>>,
     pub nps_focus: Option<f64>,
     pub acc_targets: std::collections::HashMap<String, f64>,
+    pub rates: std::collections::HashMap<String, (f64, f64)>, // NPS and Skills HT/DT ranges
     pub web_bias: std::collections::HashMap<String, f64>,
     pub pp_settings: Option<PpSettings>,
     pub pp_mix: Option<PpMix>,
@@ -82,6 +83,8 @@ pub enum Task {
     Refresh,
     WebUpdated,
     Stats(bool),
+    Snooze { pick: Box<Pick>, mode: String }, // "Skip for 12 h": out of every list until then; the current pick moves on
+    Profile, // the Stats pages without opening Stats: the main window compares maps with them
     NpsUpdate(Update),
     SkipWarmup,
     Lock(Option<i64>),
@@ -243,6 +246,7 @@ pub struct Worker {
     skill_weights: std::collections::HashMap<String, f64>,
     skill_tuning: skills::Tuning,
     acc_targets: std::collections::HashMap<&'static str, f64>,
+    rates: std::collections::HashMap<&'static str, (f64, f64)>,
     pp_mix: PpMix,
     settings: PpSettings,
     practice_skills: Vec<String>,
@@ -279,6 +283,11 @@ struct Jobs {
     importing: AtomicBool,
     archiving: AtomicBool,
     filling: AtomicBool,
+}
+
+/// "0.75–1.50×", or "1.00× only" when HT/DT is off.
+pub fn rate_text((lo, hi): (f64, f64)) -> String {
+    if (hi - lo).abs() < 1e-9 { format!("{lo:.2}× only") } else { format!("{lo:.2}–{hi:.2}×") }
 }
 
 fn key_mode(mode: &str) -> &'static str {
@@ -351,7 +360,7 @@ impl Worker {
             keys: [("pp", SUPPORTED_KEYS.collect()), ("nps", vec![7]), ("skills", vec![7])].into_iter().collect(),
             target: None, targets: Default::default(), playlists: empty(), consumed: VecDeque::new(), nps_focus: 0.5, web_bias: [("nps", 0.5), ("skills", 0.5)].into_iter().collect(), skill_weights: Default::default(), skill_tuning: Default::default(), web_weighted: [("nps", true), ("skills", true)].into_iter().collect(),
             converts: [("nps", BTreeMap::new()), ("skills", BTreeMap::new())].into_iter().collect(), odds: [("nps", [1., 1., 0.]), ("skills", [1., 1., 0.])].into_iter().collect(), convert_turn: Arc::new(AtomicU64::new(0)),
-            acc_targets: [("nps", DEFAULT_TARGET), ("skills", DEFAULT_TARGET)].into_iter().collect(), pp_mix: PpMix::default(), settings: PpSettings::default(), practice_skills: Vec::new(),
+            acc_targets: [("nps", DEFAULT_TARGET), ("skills", DEFAULT_TARGET)].into_iter().collect(), rates: [("nps", builder::DEFAULT_RATES), ("skills", builder::DEFAULT_RATES)].into_iter().collect(), pp_mix: PpMix::default(), settings: PpSettings::default(), practice_skills: Vec::new(),
             states: [("nps", ListState::default()), ("skills", ListState::default())].into_iter().collect(), credible: Default::default(), restored: HashSet::new(),
             shown: Shown { client, miss_ratio }, session_cache: None, taste_cache: (None, HashMap::default()), sel: (None, None, None), loading: None, learning: Arc::default(), first_import, refresh_queued: false,
             refit_due: false, refit_running: false, refit_again: false, last_refit: now(), last_idle_check: Instant::now(), nps_requested: Instant::now(), replay_due: Some(Instant::now() + Duration::from_secs(10)),
@@ -547,6 +556,8 @@ impl Worker {
             Task::WebUpdated => self.request_nps(),
             Task::ConvertSelected(target) => self.t_convert_selected(target),
             Task::Stats(v) => self.t_stats(v)?,
+            Task::Profile => self.emit_stats()?,
+            Task::Snooze { pick, mode } => self.t_snooze(&pick, mode)?,
             Task::NpsUpdate(u) => self.t_nps_update(u)?,
             Task::SkipWarmup => {
                 log_event(&self.db, "skip_warmup", None, None, &json!({}))?;
@@ -669,10 +680,14 @@ impl Worker {
         self.rec.as_ref().expect("a fitted model").r.local_shas.clone()
     }
 
+    fn rate_range(&self, mode: &str) -> (f64, f64) {
+        self.rates.get(key_mode(mode)).copied().unwrap_or(builder::DEFAULT_RATES)
+    }
+
     fn prepared(&self, mode: &'static str) -> (ListState, Prepared) {
         let st = self.states[mode].clone();
         let shas = self.local_shas();
-        let p = st.candidates.prepare(&self.keys[mode], &|s| shas.contains(s));
+        let p = st.candidates.prepare(&self.keys[mode], self.rate_range(mode), &|s| shas.contains(s));
         (st, p)
     }
 
@@ -732,7 +747,7 @@ impl Worker {
             note = format!("{} · {note}", skills::label(&self.practice_skills));
         }
         if shown.is_empty() && !st.build_failed {
-            note += if incomplete { " · looking for maps that fit your target…" } else { " · no map fits your accuracy target at 0.70–1.50× (try another target or keymode)" };
+            note += &if incomplete { " · looking for maps that fit your target…".to_string() } else { format!(" · no map fits your accuracy target at {} (try another target, rate range or keymode)", rate_text(self.rate_range(mode))) };
         }
         if st.failed != 0 {
             note += &format!(" · {} unreadable", st.failed);
@@ -892,7 +907,7 @@ impl Worker {
         let rec = self.rec.as_ref().unwrap();
         let view = n.view.clone();
         Ok(Request { model: rec.r.fitted.display.as_ref().map_or_else(|| rec.r.fitted.pp.model.clone(), |d| d.model.clone()), tables_for: Arc::new(move |k| view.tables(k)), session: n.session.clone(),
-                     public: rec.public.clone(), calc: CALC_ID.to_string(), predictor: PREDICTOR_ID.to_string(), client: self.shown.client.clone(), target: n.target, keys: self.keys["nps"].clone(),
+                     public: rec.public.clone(), calc: CALC_ID.to_string(), predictor: PREDICTOR_ID.to_string(), client: self.shown.client.clone(), target: n.target, rates: self.rate_range(mode), keys: self.keys["nps"].clone(),
                      skills_keys: self.keys["skills"].clone(), selected_skills: self.practice_skills.clone(), tuning: self.skill_tuning.clone(), converts: self.converts.get(key_mode(mode)).map_or_else(Vec::new, |s| converts::pairs(s, &self.keys[key_mode(mode)])), mode: mode.to_string(), revision: self.local_request, generation: self.generation })
     }
 
@@ -931,6 +946,10 @@ impl Worker {
         if !visible {
             return self.publish(None);
         }
+        self.emit_stats()
+    }
+
+    fn emit_stats(&mut self) -> Result<()> {
         if self.rec.is_none() {
             return Ok(());
         }
@@ -1069,6 +1088,14 @@ impl Worker {
             let (m, value) = (key_mode(m), builder::normalize_target(*value));
             if self.acc_targets.get(m).is_some_and(|v| *v != value) {
                 self.acc_targets.insert(m, value);
+                retarget = true;
+                self.playlists.insert(m, Vec::new());
+            }
+        }
+        for (m, value) in &c.rates {
+            let (m, value) = (key_mode(m), builder::normalize_rates(*value));
+            if self.rates.get(m).is_some_and(|v| *v != value) {
+                self.rates.insert(m, value);
                 retarget = true;
                 self.playlists.insert(m, Vec::new());
             }
@@ -1377,6 +1404,18 @@ impl Worker {
         // Let pending selections log before refreshing the remainder.
         self.q.put(Task::Publish);
         Ok(())
+    }
+
+    fn t_snooze(&mut self, pick: &Pick, mode: String) -> Result<()> {
+        let key = pick.identity();
+        log_event(&self.db, "snooze", key.as_deref(), None, &json!({"mode": mode, "md5": pick.md5, "sha": pick.sha}))?;
+        for list in self.playlists.values_mut() {
+            list.retain(|p| p.identity() != key);
+        }
+        if self.targets.get(key_mode(&mode)).is_some_and(|t| t.identity() == key) {
+            return self.t_next(false, Some(mode), None, None, None, None, self.selection_id);
+        }
+        self.publish(None)
     }
 
     fn t_open(&mut self, pick: Box<Pick>, mode: Option<String>, revision: Option<u64>, result: Option<Done>, selected_at: Option<f64>, selection_id: u64) -> Result<()> {

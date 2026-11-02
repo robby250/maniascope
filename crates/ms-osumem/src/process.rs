@@ -25,12 +25,11 @@ impl Pattern {
     }
 
     fn find(&self, data: &[u8], mut each: impl FnMut(usize) -> bool) {
-        if data.len() < self.bytes.len() {
-            return;
-        }
-        let first = self.bytes[0]; // every pattern starts with a known byte
-        for i in 0..=data.len() - self.bytes.len() {
-            if data[i] == first && self.at(&data[i..]) && !each(i) {
+        // SIMD search for the known lead (every pattern starts with a known byte), then the wildcards: a byte loop over
+        // lazer's 4.5 GB of heap took seconds at startup (user 2026-11-02).
+        let lead = self.known.iter().take_while(|k| **k).count();
+        for i in memchr::memmem::find_iter(data, &self.bytes[..lead]) {
+            if i + self.bytes.len() <= data.len() && self.at(&data[i..]) && !each(i) {
                 return;
             }
         }
@@ -134,14 +133,23 @@ impl Process {
 
     pub fn scan_all(&self, pattern: &Pattern) -> Vec<u64> {
         let mut hits = Vec::new();
-        self.each_chunk(pattern.bytes.len(), &mut |base, data| {
-            pattern.find(data, |i| {
-                hits.push(base + i as u64);
-                true
-            });
+        self.scan_each(pattern, |a| {
+            hits.push(a);
             true
         });
         hits
+    }
+
+    /// Every match in address order until `each` returns false.
+    pub fn scan_each(&self, pattern: &Pattern, mut each: impl FnMut(u64) -> bool) {
+        self.each_chunk(pattern.bytes.len(), &mut |base, data| {
+            let mut more = true;
+            pattern.find(data, |i| {
+                more = each(base + i as u64);
+                more
+            });
+            more
+        });
     }
 
     fn each_chunk(&self, overlap: usize, each: &mut dyn FnMut(u64, &[u8]) -> bool) {
