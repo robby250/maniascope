@@ -170,6 +170,8 @@ fn row_tip(c: &Pick, shown: &ms_rec::history::Shown) -> String {
         facts.push(format!("{} website plays", ms_rec::engine::commas(n as usize)));
     }
     let why = if c.why.is_empty() { String::new() } else { format!("{}\n", c.why) };
+    let from: Vec<&str> = badges(c).iter().map(|b| b.2).collect();
+    let why = if from.is_empty() { why } else { format!("{why}{}\n", from.join(" · ")) };
     format!("{why}{}\n\nCtrl+click: copy its search. Right-click: skip for 12 h, copy, website.", facts.join(" · "))
 }
 
@@ -180,11 +182,34 @@ fn pp_tip(c: &Pick) -> String {
     format!("{best} → expected {:.0}{range}, {:.0}% to {}", c.pp_mid.unwrap_or(0.), 100. * c.p_up.unwrap_or(0.), if c.best.is_some_and(|b| b > 0.) { "beat" } else { "count" })
 }
 
+/// Where a row comes from, as small filled badges on the right under the number (user 2026-11-03: "website or convert or both … easy to
+/// read"): a website map not installed yet, a keymode convert, or a convert of a website map.
+fn badges(c: &Pick) -> Vec<(String, Color32, &'static str)> {
+    let mut out = Vec::new();
+    if c.convert_of.as_ref().map_or(!c.installed, |_| c.source_web) {
+        out.push(("WEB".to_string(), theme::ACCENT, "From the website, not installed yet"));
+    }
+    if c.convert_of.is_some() {
+        out.push((format!("{}K→{}K", c.source_keys, c.keys), theme::CONVERT, "A keymode convert, written and imported when picked"));
+    }
+    out
+}
+
+/// Small badges right-aligned in a right-to-left layout, so the title never moves (user 2026-11-03: "somewhere in the right
+/// where they don't shift the text and make them smaller").
+fn draw_badges(ui: &mut Ui, c: &Pick) {
+    ui.spacing_mut().item_spacing.x = 3.;
+    for (text, fill, _) in badges(c).into_iter().rev() {
+        egui::Frame::new().fill(fill).corner_radius(2).inner_margin(egui::Margin::symmetric(3, 0)).show(ui, |ui| {
+            ui.label(RichText::new(text).size(9.5).color(theme::VIEW));
+        });
+    }
+}
+
 fn row_text(c: &Pick, mode: &str, shown: &ms_rec::history::Shown) -> (String, Vec<String>) {
     let length = fmt::clock(c.length);
     let acc = 100. * shown.acc(c.pred.acc_mid);
-    let convert = c.convert_of.as_ref().map(|_| format!("{}K→{}K", c.source_keys, c.keys));
-    let (number, mut sub) = if pp_row(c, mode) {
+    let (number, sub) = if pp_row(c, mode) {
         let n = format!("{}+{:.1}pp · {:.0}%", if mode != "pp" { "PP " } else { "" }, c.gain.unwrap_or(0.), 100. * c.p_up.unwrap_or(0.));
         (n, vec![c.var.clone(), c.stars.map_or(String::new(), |s| format!("{s:.1}★")), c.best.filter(|b| *b != 0.).map_or("new".to_string(), |b| format!("best {b:.0}pp")), length])
     } else if mode == "pp" {
@@ -194,11 +219,6 @@ fn row_text(c: &Pick, mode: &str, shown: &ms_rec::history::Shown) -> (String, Ve
         sub.extend([length, if c.description.is_empty() { c.skill.clone().unwrap_or_default() } else { c.description.clone() }]);
         (format!("~{acc:.1}%"), sub)
     };
-    if let Some(c) = convert {
-        sub.push(c);
-    } else if !c.installed {
-        sub.push(if mode != "pp" { "download" } else { "not installed" }.to_string());
-    }
     (number, sub.into_iter().filter(|s| !s.is_empty()).collect())
 }
 
@@ -534,16 +554,18 @@ impl App {
             let tip = [v.target_tip.clone(), (!off.is_empty()).then(|| format!("Not set yet: {}.", off.join("; ")))].into_iter().flatten().reduce(|a, b| format!("{a}\n{b}"));
             egui::Frame::new().fill(theme::ROW_CURRENT).inner_margin(egui::Margin::symmetric(6, 5)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                let marked = !badges(c).is_empty();
                 ui.horizontal(|ui| {
                     ui.scope(|ui| {
-                        ui.set_max_width((ui.available_width() - if number.is_some() { 104. } else { 0. }).max(60.));
+                        ui.set_max_width((ui.available_width() - if number.is_some() || marked { 104. } else { 0. }).max(60.));
                         theme::block(ui, &[(lines[0].clone(), 1), (lines[1].clone(), 2)], tip.as_deref());
                     });
-                    if let Some(n) = &number {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+                        if let Some(n) = &number {
                             ui.label(RichText::new(n).family(egui::FontFamily::Name("bold".into())));
-                        });
-                    }
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| draw_badges(ui, c));
+                    });
                 });
             });
         } else if !v.target_msg.is_empty() {
@@ -585,7 +607,10 @@ impl App {
                                 ui.label(RichText::new(&number).family(egui::FontFamily::Name("bold".into()))).rect
                             }).inner
                         }).inner;
-                        theme::dim_small(ui, sub.join(" · "));
+                        ui.horizontal(|ui| {
+                            theme::dim_small(ui, sub.join(" · "));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| draw_badges(ui, c));
+                        });
                         number_rect
                     }).inner
                 });
@@ -768,5 +793,20 @@ impl App {
             self.s.recs_pos = at;
             self.request_save();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn badges_say_website_convert_or_both() {
+        let text = |c: Pick| badges(&c).into_iter().map(|b| b.0).collect::<Vec<_>>().join(" ");
+        assert_eq!(text(Pick { installed: true, ..Pick::default() }), "");
+        assert_eq!(text(Pick { installed: false, ..Pick::default() }), "WEB");
+        let convert = Pick { convert_of: Some("src".into()), source_keys: 7, keys: 10, ..Pick::default() };
+        assert_eq!(text(Pick { installed: true, ..convert.clone() }), "7K→10K", "an imported convert stays one");
+        assert_eq!(text(Pick { source_web: true, ..convert }), "WEB 7K→10K");
     }
 }

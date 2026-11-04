@@ -86,7 +86,7 @@ fn the_ability_number_inverts_the_shared_model_and_the_session_overlay_is_separa
 
 #[test]
 fn sparse_and_unmeasured_limits_are_not_numeric_ratings() {
-    let w = world("sparse", |o| 1. - 0.002 * (o / 2.).powi(2), 240);
+    let w = world("sparse", |o| 1. - 0.0005 * (o / 2.).powi(2), 240); // ≥ 99 % up to the hardest fixture chart (9★)
     let profile = ms_rec::stats::build(&engine(&w), &w.db).unwrap();
     let g = &profile.pages[&7].groups["overall"];
     assert!(g.value.is_none() && g.extrapolated, "{:?}", g.value);
@@ -115,10 +115,13 @@ fn history_follows_the_monthly_level_and_marks_the_peak() {
 
 #[test]
 fn the_saved_list_is_published_before_the_background_import_can_finish() {
-    let w = world("saved", sloped, 240);
+    let w = world("saved", spread, 240);
     let shas = install(&w);
     kv_set(&w.db, "realm_import", &json!({"t": 1})).unwrap();
-    kv_set(&w.db, "playlist_cache:nps", &json!({"version": 1, "calc": "previous", "choices": [[shas[3].0, 1.0], ["f".repeat(64), 1.0]], "analyzed": 2})).unwrap();
+    // Every installed chart and one unknown: which of them the band offers depends on the calculator, so the check is the set.
+    let mut choices: Vec<serde_json::Value> = shas.iter().map(|s| json!([s.0, 1.0])).collect();
+    choices.push(json!(["f".repeat(64), 1.0]));
+    kv_set(&w.db, "playlist_cache:nps", &json!({"version": 1, "calc": "previous", "choices": choices, "analyzed": shas.len() + 1})).unwrap();
     // busy: the import thread is held for as long as the test runs.
     let r = run(&w, true);
     r.q.put(Task::Configure(Box::new(Config { mode: "nps".into(), revision: 1, ..Config::default() })));
@@ -126,7 +129,7 @@ fn the_saved_list_is_published_before_the_background_import_can_finish() {
         Out::Pool { mode, shown, .. } if mode == "nps" && !shown.is_empty() => Some(shown),
         _ => None,
     });
-    assert_eq!(saved.iter().map(|p| p.sha.clone().unwrap()).collect::<Vec<_>>(), [shas[3].0.clone()], "the unknown chart stays out");
+    assert!(saved.iter().all(|p| shas.iter().any(|s| Some(&s.0) == p.sha.as_ref())), "the unknown chart stays out");
     // Still answers the UI while the import waits.
     r.q.put(Task::History(false));
     r.wait("history", |m| matches!(m, Out::History(_)).then_some(()));
@@ -200,7 +203,7 @@ fn a_new_ranked_revision_is_not_hidden_by_its_snapshot_status() {
 
 #[test]
 fn the_card_matches_its_list_entry_and_a_custom_rate_shows_no_pp() {
-    let w = world("cardlist", sloped, 240);
+    let w = world("cardlist", spread, 240);
     let shas = install(&w);
     let mut e = engine(&w);
     let n = e.state_at(&w.db, 0.94, ms_data::store::now()).unwrap();

@@ -1,4 +1,4 @@
-//! Chart-only fitted stages: difficulty_model.py, structural_residual.py, score_units.py.
+//! Chart-only fitted stages: the population link (modes) and the families fit (joint) with its descriptors.
 use crate::py;
 use crate::val::{Dict, Val};
 use crate::params::Params;
@@ -117,94 +117,29 @@ pub fn vector(res: &Dict, od: f64) -> [f64; 12] {
     ]
 }
 
-/// Inverse of the fitted monotone log-rating curve (shared by the three stages).
-fn invert(x: f64, slope: f64, curve: f64, delta: f64) -> f64 {
-    if curve < 1e-8 {
-        return delta / 1f64.max(slope);
-    }
-    let knee = (1.0 - slope) / (2.0 * curve);
-    let u = x - knee;
-    let mut y = if u >= 0.0 { u * (1.0 + curve * u) } else { u };
-    y += delta;
-    let v = if y >= 0.0 { 2.0 * y / (1.0 + (1.0 + 4.0 * curve * y).sqrt()) } else { y };
-    v - u
+/// Each keymode's scale: the population link from raw demand to its rating (`modes.<keys>.scale`).
+fn scale(prm: &Params, keys: usize) -> f64 {
+    num(&mode(&prm.model, None, keys)["scale"], 1.0)
 }
 
-pub fn adjustment(prm: &Params, keys: usize, raw: f64, features: &[f64]) -> f64 {
-    let m = &prm.model;
-    let p = mode(m, None, keys);
-    let coeff = if p["coeff"].is_array() { nums(&p["coeff"]) } else { vec![0.0; FEATURES.len()] };
-    let slope = num(&p["slope"], 2.0);
-    let curve = 0f64.max(num(&p["curve"], 0.0));
-    let x = 0.01f64.max(raw).ln();
-    let reliability = 1f64.min((0f64.max(raw) / 4.0).powf(2.0));
-    let delta = py::sum(coeff.iter().zip(features).map(|(a, b)| a * b)) * num(&p["strength"], 1.0) * reliability;
-    let shift = invert(x, slope, curve, delta);
-    (-0.7f64).max(0.7f64.min(shift)).exp() * num(&p["scale"], 1.0)
-}
-
-fn exec_f(execution: Option<&Dict>, name: &str) -> f64 {
-    execution.map_or(0.0, |e| e.fget(name, 0.0))
-}
-
-pub fn baseline_rating(prm: &Params, keys: usize, raw: f64, features: &[f64], execution: Option<&Dict>) -> f64 {
-    let m = &prm.model;
+/// The rating before the families shift. A scroll-read chart keeps the ratio of its raw demand to its no-SV demand.
+pub fn baseline_rating(prm: &Params, keys: usize, raw: f64, execution: Option<&Dict>) -> f64 {
     if let Some(Val::Dict(physical)) = execution.and_then(|e| e.get("scroll_base")) {
         let praw = physical.f("raw");
         if praw > 0.0 {
-            let pf = physical.get("features").unwrap().list_f();
-            return raw / praw * baseline_rating(prm, keys, praw, &pf, physical.dict("execution"));
+            return raw / praw * baseline_rating(prm, keys, praw, physical.dict("execution"));
         }
     }
-    let base = raw * adjustment(prm, keys, raw, features);
-    let p = mode(m, Some("execution"), keys);
-    if !present(p) {
-        return gesture_rating(prm, keys, base, raw, execution);
-    }
-    let center = if p["center"].is_array() { nums(&p["center"]) } else { vec![0.0; EXTRA_FEATURES.len()] };
-    let coeff = nums(&p["coeff"]);
-    let mut delta = py::sum(EXTRA_FEATURES.iter().zip(&coeff).zip(&center).map(|((name, c), mm)| c * (exec_f(execution, name) - mm)));
-    let bc = nums(&p["base_coeff"]);
-    let bm = nums(&p["base_center"]);
-    delta += py::sum(bc.iter().zip(features).zip(&bm).map(|((c, v), mm)| c * (v - mm)));
-    delta *= 1f64.min((raw / 4.0).powf(2.0));
-    let slope = num(&p["slope"], f64::NAN);
-    let curve = 0f64.max(num(&p["curve"], 0.0));
-    let x = 0.05f64.max(base).ln();
-    let shift = invert(x, slope, curve, delta);
-    gesture_rating(prm, keys, base * (-0.5f64).max(0.5f64.min(shift)).exp(), raw, execution)
+    raw * scale(prm, keys)
 }
 
-pub fn gesture_rating(prm: &Params, keys: usize, base: f64, raw: f64, execution: Option<&Dict>) -> f64 {
-    let m = &prm.model;
-    let stage = &m["gestures"];
-    let p = &stage["modes"][keys.to_string()];
-    if !present(p) || base <= 0.0 {
-        return base;
-    }
-    let names: Vec<&str> = stage["features"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
-    let coeff = nums(&p["coeff"]);
-    let mut delta = py::sum(names.iter().zip(&coeff).map(|(name, c)| c * exec_f(execution, name)));
-    if delta == 0.0 {
-        return base;
-    }
-    delta *= 1f64.min((0f64.max(raw) / 4.0).powf(2.0));
-    let slope = num(&p["slope"], f64::NAN);
-    let curve = 0f64.max(num(&p["curve"], 0.0));
-    let x = 0.05f64.max(base).ln();
-    let shift = invert(x, slope, curve, delta);
-    base * (-0.5f64).max(0.5f64.min(shift)).exp()
+pub fn final_rating(prm: &Params, keys: usize, raw: f64, execution: Option<&Dict>) -> f64 {
+    let base = baseline_rating(prm, keys, raw, execution);
+    final_from_base(base, execution)
 }
 
-pub fn final_rating(prm: &Params, keys: usize, raw: f64, features: &[f64], execution: Option<&Dict>) -> f64 {
-    let base = baseline_rating(prm, keys, raw, features, execution);
-    final_from_base(prm, keys, base, execution)
-}
-
-fn final_from_base(prm: &Params, keys: usize, base: f64, execution: Option<&Dict>) -> f64 {
-    let values = execution.and_then(|e| e.get("residual_vector")).map(|v| v.list_f());
-    let value = correction(prm, keys, base, values.as_deref()) * tree_shift(prm, keys, base, values.as_deref()).exp();
-    value * execution.map_or(1.0, |e| e.fget("rolled_factor", 1.0) * e.fget("joint_factor", 1.0))
+fn final_from_base(base: f64, execution: Option<&Dict>) -> f64 {
+    base * execution.map_or(1.0, |e| e.fget("joint_factor", 1.0))
 }
 
 /// The joint stage: stages fitted one over another each kept its credit, so one refit over all their inputs corrects what they
@@ -212,13 +147,16 @@ fn final_from_base(prm: &Params, keys: usize, base: f64, execution: Option<&Dict
 const JOINT_LIMIT: f64 = 0.35;
 
 pub fn joint_shift(model: &Value, row: &[f64]) -> f64 {
+    let wide;
+    let row = if model["spec"].is_object() { wide = crate::flow::extended(row, &model["spec"]); &wide[..] } else { row };
     let (lo, hi, mean, sd, coeff) = (nums(&model["low"]), nums(&model["high"]), nums(&model["mean"]), nums(&model["sd"]), nums(&model["coeff"]));
     let at = model["columns"].as_array().map_or_else(Vec::new, |c| c.iter().filter_map(Value::as_u64).map(|c| c as usize).collect());
     let shift: f64 = (0..at.len()).filter(|&i| sd[i] >= 1e-9).map(|i| coeff[i] * (row[at[i]].clamp(lo[i], hi[i]) - mean[i]) / sd[i]).sum(); // a column flat in the fit reads 0
-    shift.clamp(-JOINT_LIMIT, JOINT_LIMIT)
+    let limit = model["limit"].as_f64().unwrap_or(JOINT_LIMIT); // the families fit carries every stage's share, so it reaches further
+    shift.clamp(-limit, limit)
 }
 
-// ---- structural_residual ----
+// ---- descriptors (the families fit reads them) ----
 
 pub const SR_SKILLS: [&str; 25] = [
     "stream", "jumpstream", "handstream", "delay", "chordstream", "bracket", "chordjack", "minijack", "longjack",
@@ -299,135 +237,6 @@ pub fn sr_vector(sk_raw: &[(String, f64)], st: &Dict, ex: &Dict, en: &Dict, rate
     values.into_iter().map(|v| if v.is_finite() { v } else { 0.0 }).collect()
 }
 
-pub fn basis(values: &[f64], model: &Value) -> Vec<f64> {
-    let (lo, hi, mean, scale) = (nums(&model["low"]), nums(&model["high"]), nums(&model["mean"]), nums(&model["scale"]));
-    let z: Vec<f64> = values.iter().zip(&lo).zip(&hi).map(|((&x, &l), &h)| l.max(h.min(x))).collect();
-    let mut cols: Vec<f64> = z.iter().zip(&mean).zip(&scale).map(|((v, m), s)| (v - m) / s).collect();
-    if let Some(hs) = model["hinges"].as_array() {
-        for h in hs {
-            let a = h.as_array().unwrap();
-            let (index, knot, m, s) = (a[0].as_u64().unwrap() as usize, num(&a[1], 0.0), num(&a[2], 0.0), num(&a[3], 1.0));
-            cols.push((0f64.max(z[index] - knot) - m) / s);
-        }
-    }
-    cols
-}
-
-pub fn correction(prm: &Params, keys: usize, baseline: f64, values: Option<&[f64]>) -> f64 {
-    let m = &prm.model;
-    correction_with(prm, &m["structural_residual"]["modes"][keys.to_string()], keys, baseline, values, None)
-}
-
-fn correction_with(prm: &Params, model: &Value, _keys: usize, baseline: f64, values: Option<&[f64]>, coeff: Option<&[f64]>) -> f64 {
-    let m = &prm.model;
-    let stage = &m["structural_residual"];
-    let Some(values) = values else { return baseline };
-    if !present(model) || baseline <= 0.0 || values.len() != SR_NAMES_LEN {
-        return baseline;
-    }
-    let own = nums(&model["coeff"]);
-    let coeff = coeff.unwrap_or(&own);
-    let mut delta = py::sum(basis(values, model).iter().zip(coeff).map(|(a, b)| a * b)) + num(&model["intercept"], 0.0);
-    let mx = num(&stage["max_log_shift"], 0.25);
-    delta = (-mx).max(mx.min(delta));
-    delta *= 1f64.min((baseline / 4.0).powf(2.0));
-    baseline * delta.exp()
-}
-
-/// Typed tree ensemble (structure-of-arrays) for one keymode.
-pub struct Trees {
-    pub intercept: f64,
-    pub scales: Option<Vec<f64>>,
-    pub depth3: bool,
-    pub feats: Vec<[usize; 3]>,
-    pub cuts: Vec<[f64; 3]>,
-    pub leaves: Vec<[f64; 8]>,
-    /// Generic trees (any depth): (feats, cuts, leaves).
-    pub generic: Vec<(Vec<usize>, Vec<f64>, Vec<f64>)>,
-}
-
-pub fn trees(model: &Value) -> Option<Trees> {
-    if !present(model) {
-        return None;
-    }
-    let scales = model["scales"].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect::<Vec<f64>>());
-    let mut t = Trees { intercept: num(&model["intercept"], 0.0), scales, depth3: true, feats: vec![], cuts: vec![], leaves: vec![], generic: vec![] };
-    for tree in model["trees"].as_array().unwrap() {
-        let a = tree.as_array().unwrap();
-        let f: Vec<usize> = a[0].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as usize).collect();
-        let c = nums(&a[1]);
-        let l = nums(&a[2]);
-        t.generic.push((f, c, l));
-    }
-    t.depth3 = t.scales.is_some() && t.generic.iter().all(|(f, _, l)| f.len() == 3 && l.len() == 8);
-    if t.depth3 {
-        for (f, c, l) in &t.generic {
-            t.feats.push([f[0], f[1], f[2]]);
-            t.cuts.push([c[0], c[1], c[2]]);
-            t.leaves.push(std::array::from_fn(|i| l[i]));
-        }
-    }
-    Some(t)
-}
-
-pub fn tree_shift(prm: &Params, keys: usize, baseline: f64, values: Option<&[f64]>) -> f64 {
-    let Some(values) = values else { return 0.0 };
-    let Some(t) = prm.trees(keys) else { return 0.0 };
-    if baseline <= 0.0 || values.len() != SR_NAMES_LEN {
-        return 0.0;
-    }
-    tree_eval(t, baseline, values)
-}
-
-pub fn tree_eval(t: &Trees, baseline: f64, values: &[f64]) -> f64 {
-    let mut x = values.to_vec();
-    x.push(0.05f64.max(baseline).ln());
-    let mut out = t.intercept;
-    let p = |xv: f64, c: f64, s: f64| 1.0 / (1.0 + (-(-60f64).max(60f64.min((xv - c) / s))).exp());
-    if t.depth3 {
-        let sc = t.scales.as_ref().unwrap();
-        for i in 0..t.feats.len() {
-            let [f, g, h] = t.feats[i];
-            let c = t.cuts[i];
-            let l = &t.leaves[i];
-            let p0 = p(x[f], c[0], sc[f]);
-            let p1 = p(x[g], c[1], sc[g]);
-            let p2 = p(x[h], c[2], sc[h]);
-            let (a0, a1) = (1.0 - p0, p0);
-            let (b0, b1, b2, b3) = (a0 * (1.0 - p1), a0 * p1, a1 * (1.0 - p1), a1 * p1);
-            out += py::sum([
-                b0 * (1.0 - p2) * l[0], b0 * p2 * l[1], b1 * (1.0 - p2) * l[2], b1 * p2 * l[3],
-                b2 * (1.0 - p2) * l[4], b2 * p2 * l[5], b3 * (1.0 - p2) * l[6], b3 * p2 * l[7],
-            ]);
-        }
-    } else {
-        for (feats, cuts, leaves) in &t.generic {
-            match &t.scales {
-                None => {
-                    let mut i = 0usize;
-                    for (&f, &c) in feats.iter().zip(cuts) {
-                        i = 2 * i + (x[f] > c) as usize;
-                    }
-                    out += leaves[i];
-                }
-                Some(sc) => {
-                    let mut weight = vec![1.0f64];
-                    for (&f, &c) in feats.iter().zip(cuts) {
-                        let q = p(x[f], c, sc[f]);
-                        weight = weight.iter().flat_map(|&w| [w * (1.0 - q), w * q]).collect();
-                    }
-                    out += py::sum(weight.iter().zip(leaves).map(|(w, v)| w * v));
-                }
-            }
-        }
-    }
-    tree_limit(out, baseline)
-}
-
-pub fn tree_limit(shift: f64, baseline: f64) -> f64 {
-    (-0.25f64).max(0.25f64.min(shift)) * 1f64.min((baseline / 4.0).powf(2.0))
-}
-
 /// difficulty_model.apply on the result dict.
 pub fn apply(prm: &Params, res: &mut Dict, od: f64, rate: f64) {
     let keys = res.f("keys") as usize;
@@ -442,7 +251,7 @@ pub fn apply(prm: &Params, res: &mut Dict, od: f64, rate: f64) {
         }).collect();
         let notes = res.f("notes");
         let empty = Dict::new();
-        let stam = res.dict("levels").and_then(|l| l.0.iter().find(|(k, _)| matches!(k, crate::val::Key::F(x) if *x == 120.0)).map(|(_, v)| v.f())).unwrap_or(raw) / raw;
+        let stam = res.dict("scores").unwrap().fget("stamina", raw) / raw;
         let rv = sr_vector(
             &sk,
             res.dict("structure").unwrap_or(&empty),
@@ -459,26 +268,21 @@ pub fn apply(prm: &Params, res: &mut Dict, od: f64, rate: f64) {
         let joint = &prm.model["joint"]["modes"][keys.to_string()];
         if present(joint) {
             let e = res.dict("execution").unwrap();
-            let f = crate::flow::Flow { broken: e.fget("flow_broken", 0.0), skip: e.fget("flow_skip", 0.0), change: e.fget("flow_change", 0.0), fast_ln: e.fget("fast_ln", 0.0) };
-            let factor = joint_shift(joint, &crate::flow::joint_row(&rv, res.fget("length", 0.0), raw, rate, f)).exp();
+            let f = crate::flow::Flow { broken: e.fget("flow_broken", 0.0), skip: e.fget("flow_skip", 0.0), change: e.fget("flow_change", 0.0), fast_ln: e.fget("fast_ln", 0.0), split: e.fget("flow_split", 0.0) };
+            let factor = joint_shift(joint, &crate::flow::joint_row(&rv, res.fget("length", 0.0), raw, rate, f, &crate::flow::extra_inputs(&cf, e, od))).exp(); // `od`, not res["od"]: that is set below, so the window column read OD 8 (fixed 2026-11-04)
             res.dict_mut("execution").unwrap().set("joint_factor", factor);
         }
         res.dict_mut("execution").unwrap().set("residual_vector", Val::floats(&rv));
     }
-    let base = baseline_rating(prm, keys, raw, &cf, res.dict("execution"));
+    let base = baseline_rating(prm, keys, raw, res.dict("execution"));
     res.set("baseline_overall", base);
-    let multiplier = if raw != 0.0 { final_from_base(prm, keys, base, res.dict("execution")) / 0.000001f64.max(raw) } else { 1.0 };
+    let multiplier = if raw != 0.0 { final_from_base(base, res.dict("execution")) / 0.000001f64.max(raw) } else { 1.0 };
     res.dict_mut("scores").unwrap().map_values(|v| v * multiplier);
     scale_archetypes(res, multiplier);
     if let Some(Val::List(tl)) = res.get_mut("timeline") {
         for v in tl.iter_mut() {
             *v = Val::F(v.f() * multiplier);
         }
-    }
-    if let Some(l) = res.dict_mut("levels") {
-        l.map_values(|v| v * multiplier);
-    } else {
-        res.set("levels", Dict::new());
     }
     res.set("od", od);
     let sc = res.dict("scores").unwrap().f("overall");
@@ -494,98 +298,4 @@ pub fn scale_archetypes(res: &mut Dict, k: f64) {
             }
         }
     }
-}
-
-// ---- score_units ----
-
-pub fn unit_rating(value: f64, od: f64, model: &Value) -> f64 {
-    if value <= 0.0 {
-        return value;
-    }
-    let knee = num(&model["knee"], 4.0);
-    let x = value.ln();
-    let inp = nums(&model["input"]);
-    let (a, b) = (inp[0], inp[1]);
-    let mut target = a * x + b * 0f64.max(x - knee.ln()).powf(2.0);
-    target += num(&model["window"], 0.0) * ((64.0 - 3.0 * 0f64.max(10f64.min(od))) / (64.0 - 3.0 * num(&model["reference_od"], 8.0))).ln();
-    let r = nums(&model["reference"]);
-    let (origin, slope, curve) = (r[0], r[1], r[2]);
-    let delta = target - origin - slope * knee.ln();
-    if delta <= 0.0 || curve == 0.0 {
-        return ((target - origin) / slope).exp();
-    }
-    knee * (2.0 * delta / (slope + (slope * slope + 4.0 * curve * delta).sqrt())).exp()
-}
-
-pub fn display_rating(value: f64, od: f64, model: &Value) -> f64 {
-    (value + unit_rating(value, od, model)) / 2.0
-}
-
-pub fn display_factor(prm: &Params, keys: usize, baseline: f64, execution: Option<&Dict>, original: f64) -> f64 {
-    let m = &prm.model;
-    let unit = &m["score_units"]["modes"][keys.to_string()];
-    let coeff = &unit["display_coeff"];
-    let values = execution.and_then(|e| e.get("residual_vector")).map(|v| v.list_f());
-    if coeff.is_null() || values.is_none() || original <= 0.0 {
-        return 1.0;
-    }
-    let coeff = nums(coeff);
-    let model = &m["structural_residual"]["modes"][keys.to_string()];
-    let rolled = execution.map_or(1.0, |e| e.fget("rolled_factor", 1.0));
-    let corrected = correction_with(prm, model, keys, baseline / rolled, values.as_deref(), Some(&coeff))
-        * rolled
-        * execution.map_or(1.0, |e| e.fget("joint_factor", 1.0))
-        * tree_shift(prm, keys, baseline, values.as_deref()).exp();
-    corrected / original
-}
-
-/// score_units.apply (after card/describe were taken from the pre-unit result).
-pub fn units_apply(prm: &Params, res: &mut Dict) {
-    let m = &prm.model;
-    let keys = res.f("keys") as usize;
-    let model = &m["score_units"]["modes"][keys.to_string()];
-    if !present(model) || !res.get("horizon").is_some_and(|h| h.truthy()) {
-        return;
-    }
-    let od = res.f("od");
-    let factor = display_factor(prm, keys, res.f("baseline_overall"), res.dict("execution"), res.dict("scores").unwrap().f("overall"));
-    let convert = |v: f64| display_rating(v * factor, od, model);
-    let mut pre = Dict::new();
-    for k in ["scores", "levels", "baseline_overall"] {
-        pre.set(k, res.get(k).unwrap().clone());
-    }
-    res.set("preunit_result", pre);
-    let o = res.dict("scores").unwrap().f("overall");
-    res.set("preunit_overall", o);
-    res.dict_mut("scores").unwrap().map_values(convert);
-    res.dict_mut("levels").unwrap().map_values(convert);
-    if let Some(Val::List(tl)) = res.get_mut("timeline") {
-        for v in tl.iter_mut() {
-            *v = Val::F(convert(v.f()));
-        }
-    }
-    for field in ["archetypes", "unit_card"] {
-        if let Some(Val::List(items)) = res.get_mut(field) {
-            for a in items.iter_mut() {
-                if let Val::Dict(d) = a {
-                    let r = d.f("rating");
-                    d.set("rating", convert(r));
-                }
-            }
-        }
-    }
-    let b = res.f("baseline_overall");
-    res.set("baseline_overall", display_rating(b, od, model));
-    if res.has("no_sv_overall") {
-        let mut no_sv_factor = factor;
-        if let Some(physical) = res.dict("execution").and_then(|e| e.dict("scroll_base")) {
-            let pf = physical.get("features").unwrap().list_f();
-            let baseline = baseline_rating(prm, keys, physical.f("raw"), &pf, physical.dict("execution"));
-            no_sv_factor = display_factor(prm, keys, baseline, physical.dict("execution"), res.f("no_sv_overall"));
-        }
-        let v = res.f("no_sv_overall");
-        res.set("no_sv_overall", display_rating(v * no_sv_factor, od, model));
-    }
-    let sc = res.dict("scores").unwrap().f("overall");
-    res.set("structural_correction", sc - res.f("baseline_overall"));
 }

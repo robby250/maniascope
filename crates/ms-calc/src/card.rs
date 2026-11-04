@@ -4,7 +4,7 @@ use crate::demand::{Parts, P};
 use crate::params::Knobs;
 use crate::pattern::technical_title;
 use crate::py;
-use crate::skills::{combine, horizon_levels, skills, stamina, Series, Sk, LN_KINDS, SV_KINDS, TECH_KEYS};
+use crate::skills::{rating, skills, stamina_rating, Judged, Series, Sk, LN_KINDS, SV_KINDS, TECH_KEYS};
 use crate::val::{Dict, Key, Val};
 
 const TECH_NAMES: [(Sk, &str); 19] = [
@@ -95,7 +95,8 @@ fn min_series(a: &[f64], b: &[f64]) -> Vec<f64> {
 }
 
 /// skill_calc._archetypes.
-pub fn archetypes(series: &Series, sc: &Dict, notes: usize, switch: &[f64], k: &Knobs) -> Vec<Val> {
+pub fn archetypes(series: &Series, sc: &Dict, judged: &Judged, keys: usize, switch: &[f64], k: &Knobs) -> Vec<Val> {
+    let local = |s: &[f64]| rating(s, judged, keys, k);
     let mut out: Vec<Val> = Vec::new();
     let mut top = f64::NEG_INFINITY;
     for (key, v) in &sc.0 {
@@ -119,7 +120,7 @@ pub fn archetypes(series: &Series, sc: &Dict, notes: usize, switch: &[f64], k: &
         if !series.has(*key) || s(sc, *key) < k.ARCH_MATERIAL * top {
             continue;
         }
-        let r = combine(&horizon_levels(&min_series(series.get(*key), tech), k), notes, k);
+        let r = local(&min_series(series.get(*key), tech));
         let sk = s(sc, *key);
         if r >= k.ARCH_TECH * sk && r >= 0.80 * s(sc, Sk::overall) {
             let whole = r >= k.TECH_WHOLE * sk;
@@ -133,7 +134,7 @@ pub fn archetypes(series: &Series, sc: &Dict, notes: usize, switch: &[f64], k: &
         }
     }
     if !switch.is_empty() {
-        let r = combine(&horizon_levels(&min_series(switch, tech), k), notes, k);
+        let r = local(&min_series(switch, tech));
         if r >= k.ARCH_MATERIAL * top && best < k.REFINE_Q * r {
             out.push(arch(TECH_CONTROL, r, &["technical", "patterntech"], None));
         }
@@ -167,10 +168,9 @@ pub fn archetypes(series: &Series, sc: &Dict, notes: usize, switch: &[f64], k: &
         if !series.has(key) || s(sc, key) < k.ARCH_MATERIAL * top || teched.iter().any(|t| t == key.name()) {
             continue;
         }
-        let lv = horizon_levels(series.get(key), k);
-        let mx = lv.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let sk = s(sc, key);
-        if mx > 0.0 && stamina(series.get(key), k) * sk / mx >= k.STAMINA_SUSTAIN * sk {
+        let (sk, short) = (s(sc, key), local(series.get(key)));
+        // Sustained: the skill keeps its rating when its demand is averaged over minutes.
+        if short > 0.0 && stamina_rating(series.get(key), judged, keys, k) >= k.STAMINA_SUSTAIN * short {
             out.push(arch(name, sk, &[key.name(), "stamina"], None));
         }
     }
@@ -537,9 +537,9 @@ pub fn describe(res: &Dict, k: &Knobs) -> (String, Vec<String>) {
         dom = pd;
     }
     let mut tags = Vec::new();
-    let lv = res.dict("levels").unwrap();
-    let l30 = lv.0.iter().find(|(kk, _)| matches!(kk, Key::F(x) if *x == 30.0)).map(|(_, v)| v.f()).unwrap_or(0.0);
-    if res.get("horizon").is_some_and(|h| matches!(h, Val::F(x) if *x == 2.0)) && l30 < 0.75 * sc.f("overall") {
+    // A spike far above what the whole chart plays like.
+    let peak = res.get("timeline").map_or(0.0, |t| Val::list_f(t).into_iter().fold(0.0, f64::max));
+    if peak >= k.BURST_TAG * sc.f("overall") && sc.f("overall") > 0.0 {
         tags.push("short burst".to_string());
     }
     let shown: Vec<String> = entries.iter().flat_map(|e| if let Val::Dict(d) = e { parts_of(d) } else { Vec::new() }).collect();

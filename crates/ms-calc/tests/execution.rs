@@ -3,13 +3,10 @@ mod common;
 use common::*;
 use ms_calc::card::{card, profile};
 use ms_calc::features::standard_params;
-use ms_calc::model::final_rating;
-use ms_calc::params::Params;
 use ms_calc::pattern::technical_title;
 use ms_calc::scroll::reading;
 use ms_calc::skills::skills;
 use ms_calc::val::{Dict, Val};
-use serde_json::{json, Value};
 
 #[test]
 fn compact_pseudo_chords_are_not_continuous_delay_or_jumptrills() {
@@ -40,22 +37,6 @@ fn changing_columns_and_independent_holds_still_require_control() {
     // Tail synchronization is evidence separate from head width, not a rule erasing independent LN mechanics.
     let unsynced = chart((0..50).flat_map(|i| (0..7).map(move |c| (1000. + 400. * i as f64, 1070. + 400. * i as f64 + 45. * c as f64, c as u8))).collect(), 7, 5.);
     assert!(execution(&run(&unsynced, 1.), "mash") < execution(&b, "mash"));
-}
-
-#[test]
-fn execution_effect_is_fitted_not_an_unconditional_mash_discount() {
-    let f = [0.; 12];
-    let ex = |name: &str| {
-        let mut d = Dict::new();
-        d.set(name, 1.);
-        d
-    };
-    let none = Params::new(json!({}), &Value::Null).unwrap();
-    assert_eq!(final_rating(&none, 7, 8., &f, Some(&ex("pseudo_mash"))), 8.);
-    let fitted = Params::new(json!({"execution": {"modes": {"7": {"slope": 2., "curve": 0., "coeff": [0., -0.4, 0., 0., 0.3, 0.]}}}}), &Value::Null).unwrap();
-    assert!(final_rating(&fitted, 7, 8., &f, Some(&ex("pseudo_mash"))) < 8.);
-    assert!(final_rating(&fitted, 7, 8., &f, Some(&ex("peak_pressure"))) > 8.);
-    assert_eq!(final_rating(&fitted, 9, 8., &f, Some(&ex("pseudo_mash"))), 8., "an unvalidated mode stays unchanged");
 }
 
 #[test]

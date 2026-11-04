@@ -693,8 +693,10 @@ fn round2(x: f64) -> f64 {
 }
 
 const MISS_TOL: f64 = 0.005;
-pub const MIN_RATE: f64 = 0.70; // nps.MIN_RATE / MAX_RATE / MAX_TARGET / MAX_HIGH
-pub const MAX_RATE: f64 = 1.50;
+// lazer's HT/DT range (user 2026-11-03: "0.5 to 2.0 max because that's the lazer range"). The fits saw plays at
+// 0.70–1.50; rates past that come from the rate slope.
+pub const MIN_RATE: f64 = 0.50;
+pub const MAX_RATE: f64 = 2.00;
 const MAX_TARGET: f64 = 0.985;
 const MAX_HIGH: f64 = 0.99;
 
@@ -1680,6 +1682,13 @@ mod target_tests {
         assert!(!c.eligible(&prediction(0.944, 0.91)));
         assert!(c.eligible(&prediction(0.946, 0.94)));
         assert!(ctx(0.94, true).eligible(&prediction(0.944, 0.91)));
+    }
+
+    #[test]
+    fn lazer_rates_half_to_double_are_offerable() {
+        let offer = |rate| Offer { rate, notes: 500., length: 60000., version: Some(1), nps: 8., play_span: None, drill: 0., vibro: false, family: String::new(), description: String::new() };
+        assert!([0.5, 0.55, 1.8, 2.0].iter().all(|&r| offer(r).static_ok(1)));
+        assert!(!offer(0.45).static_ok(1) && !offer(2.05).static_ok(1));
     }
 
     #[test]

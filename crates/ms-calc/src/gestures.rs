@@ -157,26 +157,12 @@ fn packets(notes: &Notes, rows: &Rows, hand_of: &[u8], window: f64) -> Vec<Packe
     out
 }
 
-#[derive(Clone, Debug)]
-pub struct Plan {
-    pub ids: Vec<usize>,
-    pub time: f64,
-    pub strength: f64,
-    pub control: f64,
-    pub anchor: f64,
-    pub span: f64,
-    pub offsets: Vec<f64>,
-}
-
 /// [rolled, jumptrill, control, anchor, jumptrill_easy] per note.
-fn jumptrills(notes: &Notes, rows: &Rows, hand_of: &[u8], window: f64, mut plans: Option<&mut Vec<Plan>>) -> [Vec<f64>; 5] {
+fn jumptrills(notes: &Notes, rows: &Rows, hand_of: &[u8], window: f64) -> [Vec<f64>; 5] {
     let n = notes.t.len();
     let mut res: [Vec<f64>; 5] = std::array::from_fn(|_| vec![0.0; n]);
     let packets = packets(notes, rows, hand_of, window);
     let np = packets.len();
-    let want = plans.is_some();
-    let mut support = vec![0.0f64; if want { np } else { 0 }];
-    let mut positions: Vec<Vec<(f64, f64)>> = vec![Vec::new(); if want { np } else { 0 }];
     let mut cross = vec![false; n];
     for &(_, a, z) in rows {
         let hs = (a..z).fold(0u8, |m, i| m | 1 << hand_of[notes.c[i] as usize]);
@@ -247,21 +233,6 @@ fn jumptrills(notes: &Notes, rows: &Rows, hand_of: &[u8], window: f64, mut plans
         let speed_of = || {
             seg.iter().filter(|p| p.span > 0.003).map(|p| 1.0 - smooth(p.gap, 0.025, 0.045)).fold(f64::INFINITY, |m, x| if x < m { x } else { m })
         };
-        if want && rolled {
-            let pl = seg.iter().enumerate().map(|(j, p)| p.center - window - j as f64 * gap).fold(f64::NEG_INFINITY, |m, x| if x > m { x } else { m });
-            let ph = seg.iter().enumerate().map(|(j, p)| p.center + window - j as f64 * gap).fold(f64::INFINITY, |m, x| if x < m { x } else { m });
-            let mut ps = speed_of();
-            ps *= smooth((ph - pl) / (2.0 * window), 0.0, 0.35);
-            if ph > pl && ps > 0.0 {
-                for (jj, p) in seg.iter().enumerate() {
-                    let j = r - 3 + jj;
-                    if p.span > 0.003 {
-                        support[j] = support[j].max(ps);
-                        positions[j].push(((pl + ph) * 0.5 + jj as f64 * gap, ps));
-                    }
-                }
-            }
-        }
         let strength = if rolled {
             let mut lo = f64::NEG_INFINITY;
             let mut hi = f64::INFINITY;
@@ -301,31 +272,6 @@ fn jumptrills(notes: &Notes, rows: &Rows, hand_of: &[u8], window: f64, mut plans
                 res[3][i] = res[3][i].max(strength * anchors[j]);
                 res[4][i] = res[4][i].max(strength * quick * (1.0 - cj));
             }
-        }
-    }
-    if let Some(plans) = plans.as_deref_mut() {
-        let mut row_sizes = vec![0usize; n];
-        for &(_, a, z) in rows {
-            for x in &mut row_sizes[a..z] {
-                *x = z - a;
-            }
-        }
-        for j in 0..np {
-            let p = &packets[j];
-            if support[j] == 0.0 || p.span <= 0.003 || p.held != 0.0 || p.ids.iter().any(|&i| row_sizes[i] != 1) {
-                continue;
-            }
-            let target = py::sum(positions[j].iter().map(|&(t, w)| t * w)) / py::sum(positions[j].iter().map(|&(_, w)| w));
-            control_at(j, &mut controls, &mut anchors);
-            plans.push(Plan {
-                ids: p.ids.clone(),
-                time: target,
-                strength: support[j],
-                control: controls[j].unwrap(),
-                anchor: anchors[j],
-                span: p.span,
-                offsets: p.ids.iter().map(|&i| notes.t[i] - p.center).collect(),
-            });
         }
     }
     res
@@ -436,19 +382,17 @@ fn vibro(notes: &Notes, rows: &Rows) -> [Vec<f64>; 5] {
 pub struct Analysis {
     pub series: [Vec<f64>; 13],
     pub features: [f64; 8],
-    /// centre_left (false, true) → plans
-    pub plans: Option<Vec<(bool, Vec<Plan>)>>,
     pub notes: Notes,
     pub rows: Rows,
 }
 
-pub fn analyse(chart: &Chart, rate: f64, bin_seconds: f64, with_plans: bool) -> Analysis {
+pub fn analyse(chart: &Chart, rate: f64, bin_seconds: f64) -> Analysis {
     let origin = chart.t.first().copied().unwrap_or(0.0);
     let conv = |x: f64| (x - origin) * 0.001 / rate;
     let notes = Notes { t: chart.t.iter().map(|&x| conv(x)).collect(), e: chart.end.iter().map(|&x| conv(x)).collect(), c: chart.col.clone() };
     let nn = notes.t.len();
     if nn == 0 {
-        return Analysis { series: std::array::from_fn(|_| Vec::new()), features: [0.0; 8], plans: None, notes, rows: Vec::new() };
+        return Analysis { series: std::array::from_fn(|_| Vec::new()), features: [0.0; 8], notes, rows: Vec::new() };
     }
     let first = notes.t[0];
     let max_e = notes.e.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -470,15 +414,10 @@ pub fn analyse(chart: &Chart, rate: f64, bin_seconds: f64, with_plans: bool) -> 
     let half = chart.keys / 2;
     let assignments: &[bool] = if chart.keys % 2 == 1 { &[false, true] } else { &[false] };
     let mut js: Vec<[Vec<f64>; 5]> = Vec::new();
-    let mut plans_out: Vec<(bool, Vec<Plan>)> = Vec::new();
     let window = great_window(chart.od);
     for &cl in assignments {
         let hand_of: Vec<u8> = (0..chart.keys).map(|c| if c < half || (cl && c == half) { 0 } else { 1 }).collect();
-        let mut selected: Vec<Plan> = Vec::new();
-        js.push(jumptrills(&notes, &rows, &hand_of, window, if with_plans { Some(&mut selected) } else { None }));
-        if with_plans {
-            plans_out.push((cl, selected));
-        }
+        js.push(jumptrills(&notes, &rows, &hand_of, window));
     }
     let point: [Vec<f64>; 5] = if js.len() == 2 {
         std::array::from_fn(|k| js[0][k].iter().zip(&js[1][k]).map(|(l, r)| (l + r) / 2.0).collect())
@@ -518,5 +457,5 @@ pub fn analyse(chart: &Chart, rate: f64, bin_seconds: f64, with_plans: bool) -> 
     let feat_idx = [s::VIBRO_EASY, s::VIBRO_CONTROL, s::VIBRO_SUSTAIN, s::JUMPTRILL_EASY, s::ROLL_CONTROL, s::ROLL_ANCHOR, s::JUMPTRILL_SUSTAIN, s::VIBRO_LOCKED];
     let features: [f64; 8] =
         std::array::from_fn(|f| py::sum(series[feat_idx[f]].iter().zip(&weights).map(|(v, &w)| v * w as f64)) / denominator);
-    Analysis { series, features, plans: if with_plans { Some(plans_out) } else { None }, notes, rows }
+    Analysis { series, features, notes, rows }
 }

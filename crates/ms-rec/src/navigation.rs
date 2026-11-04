@@ -92,6 +92,13 @@ pub fn hand_over(path: &std::path::Path, client: &str) -> Result<(), String> {
     if client == "stable" && !paths::WINDOWS {
         return Ok(()); // the .osz is in Songs and stable imports it on entering song select (Wine, 2026-11-01); xdg-open would run whatever is registered, lazer included
     }
+    #[cfg(unix)]
+    if client == "lazer" {
+        match lazer_ipc(path) {
+            Ok(()) => return Ok(()),
+            Err(e) => eprintln!("lazer IPC hand-over failed, starting osu! with the file: {e}"),
+        }
+    }
     let home = std::env::var("HOME").unwrap_or_default();
     let mut command = if paths::WINDOWS {
         let mut c = Command::new(client_exe(client).ok_or("osu! has closed")?);
@@ -113,8 +120,50 @@ pub fn hand_over(path: &std::path::Path, client: &str) -> Result<(), String> {
     command.stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
+fn lazer_proc() -> Option<PathBuf> {
+    std::fs::read_dir("/proc").ok()?.flatten().find(|e| std::fs::read_to_string(e.path().join("comm")).is_ok_and(|c| c.trim() == "osu!")).map(|e| e.path())
+}
+
 fn running_lazer() -> Option<PathBuf> {
-    std::fs::read_dir("/proc").ok()?.flatten().find(|e| std::fs::read_to_string(e.path().join("comm")).is_ok_and(|c| c.trim() == "osu!")).and_then(|e| std::fs::read_link(e.path().join("exe")).ok())
+    std::fs::read_link(lazer_proc()?.join("exe")).ok()
+}
+
+/// lazer's import channel (osu-framework NamedPipeIpcProvider, osu.Game ArchiveImportIPCChannel): the message a second
+/// `osu! <file>` sends, without starting that process (flatpak run + .NET startup).
+/// ponytail: Linux/macOS only; Windows still starts osu!.exe with the file (its pipe is `\\.\pipe\osu-framework-<name>`).
+#[cfg(unix)]
+fn lazer_ipc(path: &std::path::Path) -> Result<(), String> {
+    use std::io::Write;
+    let proc = lazer_proc().ok_or("osu! has closed")?;
+    let root = proc.join("root"); // Flatpak: the sandbox's own /tmp and /app
+    let exe = std::fs::read_link(proc.join("exe")).map_err(|e| e.to_string())?;
+    let dll = root.join(exe.with_file_name("osu.Game.dll").strip_prefix("/").map_err(|e| e.to_string())?);
+    let version = assembly_version(&std::fs::read(&dll).map_err(|e| format!("{}: {e}", dll.display()))?).ok_or("osu.Game.dll has no version")?;
+    let environ = std::fs::read(proc.join("environ")).unwrap_or_default();
+    let tmp = environ.split(|b| *b == 0).find_map(|v| v.strip_prefix(b"TMPDIR=")).map_or("/tmp".into(), String::from_utf8_lossy);
+    // .NET's named pipe on Unix; the game names it ("osu-lazer" on 2026.804.2), so take the one osu-framework pipe there.
+    let socket = std::fs::read_dir(root.join(tmp.trim_start_matches('/'))).map_err(|e| e.to_string())?.flatten()
+        .find(|e| e.file_name().to_string_lossy().starts_with("CoreFxPipe_osu-framework-")).ok_or("osu! has no import pipe")?.path();
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket).map_err(|e| format!("{}: {e}", socket.display()))?;
+    stream.write_all(&ipc_frame(path, &version)).map_err(|e| e.to_string())
+}
+
+/// One IpcMessage: a little-endian i32 length (BitConverter on every lazer platform), then its JSON. lazer drops a
+/// message whose Type isn't its exact AssemblyQualifiedName, version included.
+fn ipc_frame(path: &std::path::Path, version: &str) -> Vec<u8> {
+    let kind = format!("osu.Game.IPC.ArchiveImportMessage, osu.Game, Version={version}, Culture=neutral, PublicKeyToken=null");
+    let json = serde_json::json!({"Type": kind, "Value": {"Path": path.to_string_lossy()}}).to_string();
+    let mut frame = (json.len() as u32).to_le_bytes().to_vec();
+    frame.extend(json.as_bytes());
+    frame
+}
+
+/// A .NET DLL's "Assembly Version" from its version resource (UTF-16, 4-byte aligned).
+fn assembly_version(dll: &[u8]) -> Option<String> {
+    let key: Vec<u8> = "Assembly Version".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let at = dll.windows(key.len()).position(|w| w == key.as_slice())? + key.len();
+    let units: Vec<u16> = dll[at..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).skip_while(|u| *u == 0).take_while(|u| *u != 0).collect();
+    String::from_utf16(&units).ok().filter(|v| !v.is_empty())
 }
 
 #[derive(Default)]
@@ -173,6 +222,18 @@ pub fn perform(p: &mut Pick, action: &str, client: &str) -> Performed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_import_message_is_a_length_then_lazers_json() {
+        let u16s = |t: &str| t.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+        let dll = [b"MZ..".to_vec(), u16s("Assembly Version"), vec![0; 4], u16s("2026.804.2.0"), vec![0; 2], u16s("junk")].concat();
+        let version = assembly_version(&dll).unwrap();
+        assert_eq!(version, "2026.804.2.0");
+        let frame = ipc_frame(std::path::Path::new("/d/maniascope/a.osz"), &version);
+        let json = &frame[4..];
+        assert_eq!(u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize, json.len());
+        assert_eq!(std::str::from_utf8(json).unwrap(), r#"{"Type":"osu.Game.IPC.ArchiveImportMessage, osu.Game, Version=2026.804.2.0, Culture=neutral, PublicKeyToken=null","Value":{"Path":"/d/maniascope/a.osz"}}"#);
+    }
 
     #[test]
     fn search_fragments_a_quoted_title_and_never_escapes() {

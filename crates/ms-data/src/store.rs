@@ -66,7 +66,7 @@ pub fn carry_feats(db: &Db, from: &str, to: &str, before: &ms_calc::params::Para
                 let name = key.rsplit_once('|').map_or("", |k| k.0);
                 let rate = name.rsplit_once('@').map_or(1., |(_, r)| r.parse().unwrap_or(1.));
                 let moved = match f {
-                    Some(ms_calc::val::Val::Dict(f)) => ms_calc::features::carried(&f, before, after, rules, rate, &chart),
+                    Some(ms_calc::val::Val::Dict(f)) => ms_calc::features::carried(&f, after, rules, rate, &chart),
                     _ => None,
                 };
                 (format!("{name}|{to}"), moved.map_or_else(|| data.clone(), |f| Sql::Blob(crate::codec::encode(&ms_calc::val::Val::Dict(f)))))
@@ -472,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn carried_features_move_only_the_charts_the_calibration_moved() {
+    fn carried_features_take_the_rating_the_new_calibration_gives() {
         use ms_calc::val::{Dict, Val};
         let after = ms_calc::features::standard_params();
         let before = ms_calc::features::params_of("3c695ee7a23f").unwrap();
@@ -486,16 +486,31 @@ mod tests {
             crate::codec::encode(&Val::Dict(f))
         };
         let db = db();
-        for (key, data) in [("a@1.000", chart(10, 0.95)), ("b@1.000", chart(10, 0.4)), ("c@1.000", chart(7, 0.95))] {
+        for (key, data) in [("a@1.000", chart(10, 0.95)), ("c@1.000", chart(7, 0.95))] {
             db.execute("INSERT INTO feats VALUES (?,?)", params![format!("{key}|old"), data]).unwrap();
         }
-        assert_eq!(carry_feats(&db, "old", "new", &before, &after, &|_| None).unwrap(), 3);
+        assert_eq!(carry_feats(&db, "old", "new", &before, &after, &|_| None).unwrap(), 2);
         assert_eq!(carry_feats(&db, "old", "new", &before, &after, &|_| None).unwrap(), 0, "a stopped run can repeat");
         let at = |key: &str| db.query_row("SELECT data FROM feats WHERE key=?", [key], |r| r.get::<_, Vec<u8>>(0)).unwrap();
-        let Val::Dict(moved) = crate::codec::decode(&at("a@1.000|new")).unwrap() else { panic!() };
-        assert!((moved.f("overall") - 5.).abs() > 0.1, "{}", moved.f("overall"));
-        assert_ne!(at("b@1.000|new"), at("b@1.000|old"));
-        assert_eq!(at("c@1.000|new"), at("c@1.000|old"));
+        for (key, keys) in [("a@1.000", 10), ("c@1.000", 7)] {
+            let Val::Dict(moved) = crate::codec::decode(&at(&format!("{key}|new"))).unwrap() else { panic!() };
+            let mut cf = vec![0.; 12];
+            (cf[1], cf[6]) = (0.95, 0.3);
+            // Not the stored 5 times a ratio: what `after` rates these inputs, as a fresh analysis would (the ratio kept old
+            // calibrations' shifts when "before" wasn't the old calibration, 2026-11-04).
+            let want = ms_calc::model::final_rating(&after, keys, 8., moved.dict("execution"));
+            assert!((moved.f("overall") - want).abs() < 1e-9, "{key}: {} vs {want}", moved.f("overall"));
+        }
+        // With its file, a row across a rule change is the fresh analysis, lazer's stars kept.
+        let c = ms_calc::chart::Chart { keys: 7, t: (0..400).map(|i| 1000. + 90. * f64::from(i)).collect(), end: (0..400).map(|i| 1000. + 90. * f64::from(i)).collect(),
+            col: (0..400).map(|i| (i * 3 % 7) as u8).collect(), ..Default::default() };
+        let mut old = Dict::new();
+        (old.set("keys", 7i64), old.set("overall", 5.), old.set("stars", 4.2));
+        db.execute("INSERT INTO feats VALUES (?,?)", params!["b@1.000|old", crate::codec::encode(&Val::Dict(old))]).unwrap();
+        carry_feats(&db, "old", "new", &before, &after, &|_| Some(c.clone())).unwrap();
+        let Val::Dict(moved) = crate::codec::decode(&at("b@1.000|new")).unwrap() else { panic!() };
+        let fresh = ms_calc::features::features_of(&ms_calc::compute::compute(&c, 1., true, &after).unwrap(), &after);
+        assert_eq!((moved.f("overall"), moved.f("stam"), moved.f("stars")), (fresh.f("overall"), fresh.f("stam"), 4.2));
     }
 
     #[test]

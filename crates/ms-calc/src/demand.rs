@@ -74,16 +74,6 @@ pub struct Run {
     pub fine: [Vec<f64>; 3],
 }
 
-/// Per-note motor action (rolled_execution's plans).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Action {
-    pub hand: u8,
-    pub rice: f64,
-    pub cross: f64,
-    pub protected: bool,
-    pub fb: usize,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct Row {
     pub t: f64,
@@ -316,13 +306,13 @@ pub fn demand(
     strain: Option<&[f64]>,
     kinds: Option<&[[f64; 5]]>,
     want_plain: bool,
-    mut motor: Option<&mut Vec<Action>>,
     k: &Knobs,
 ) -> (Run, Option<Run>) {
     let keys = chart.keys;
     let wide = keys >= 5;
     let v_fast = k.V_FAST * ((keys.max(7) as f64) / 7.0).powf(k.V_FAST_KEYS);
-    let w_jack = if keys == 7 { k.W_JACK_7K } else { k.W_JACK };
+    // One curve over keymodes (user 2026-11-03: "gradients over the 4k-10k spectrum").
+    let w_jack = if keys == 7 && k.W_JACK_7K > 0.0 { k.W_JACK_7K } else { k.W_JACK * (7.0 / keys as f64).powf(k.W_JACK_KEYS) };
     let w_group = k.W_GROUP * (keys.min(7) as f64 / 7.0).powf(k.GROUP_KEYS);
     let jack_share = k.JACK_SHARE * (7.0 / keys.max(7) as f64).powf(k.JACK_SHARE_KEYS);
     let hand_of = hand_of(keys, centre_left);
@@ -544,7 +534,8 @@ pub fn demand(
         if n_jack[0] != 0 && n_jack[1] != 0 {
             let mh = if n_jack[0] <= n_jack[1] { 0 } else { 1 };
             mirror[mh] = k.MIRROR;
-            if keys == 7 {
+            if keys == 7 || k.MIRROR_ALL > 0.0 {
+                // A partial mirror (some fingers of a hand jack, others move) on every keymode, not 7K alone.
                 let mut partial = false;
                 for h in 0..2 {
                     let old_width = previous_mask[h].count_ones() as usize;
@@ -669,15 +660,6 @@ pub fn demand(
             hands[h * nbins + b] += rice + e_ln;
             fine[h * nfine + fb] += rice + e_ln;
             comp[o(P::ln) + b] += e_ln;
-            if let Some(m) = motor.as_deref_mut() {
-                m[ni] = Action {
-                    hand: h as u8,
-                    rice,
-                    cross: (cross + tech) / size as f64,
-                    protected: jacked || e_ln > 0.0 || e - t > 0.003,
-                    fb,
-                };
-            }
             jrun[c] = if jacked { jrun[c] + 1 } else { 0 };
             if jacked
                 && prev_row_mask >> c & 1 == 1

@@ -22,7 +22,7 @@ pub struct Info {
     pub flow: f64,
 }
 
-pub fn analyse(chart: &Chart, g: &Geometry, bin_seconds: f64) -> Info {
+pub fn analyse(chart: &Chart, g: &Geometry, bin_seconds: f64, centre_split: bool) -> Info {
     let (times, ends, cols) = (&g.times, &g.ends, &g.columns);
     let n = times.len();
     if n == 0 {
@@ -93,17 +93,73 @@ pub fn analyse(chart: &Chart, g: &Geometry, bin_seconds: f64) -> Info {
     let mut count = vec![0.0f64; bins];
     let rows = &g.rows;
     let half = chart.keys / 2;
-    let lo_mask = ((1u64 << half) - 1) as u32;
     let roll = pattern::smooth_rolls(rows, chart.keys);
-    let mut last: [Option<f64>; 2] = [None, None];
-    let mut history: [std::collections::VecDeque<f64>; 2] = Default::default();
+    // Odd keymodes: the middle key with each hand in turn, averaged, as demand and smooth_rolls do (user 2026-11-03: "a
+    // thumb is a finger … do 3"); it went to the right hand only.
+    let splits: Vec<u32> = if chart.keys % 2 == 1 && centre_split { vec![((1u64 << (half + 1)) - 1) as u32, ((1u64 << half) - 1) as u32] } else { vec![((1u64 << half) - 1) as u32] };
+    let mut pulses = vec![(0.0f64, 0.0f64); rows.len()];
+    for &lo_mask in &splits {
+        for (ri, p) in hand_pulses(rows, lo_mask, &roll).into_iter().enumerate() {
+            pulses[ri].0 += p.0 / splits.len() as f64;
+            pulses[ri].1 += p.1 / splits.len() as f64;
+        }
+    }
     let mut tail_count = 0.0f64;
     let mut synced = 0.0f64;
-    let mut recent: Vec<f64> = Vec::with_capacity(6);
     for (ri, row) in rows.iter().enumerate() {
         let t = row.t;
         let (p, q) = (row.start, row.end);
         let b = (bins - 1).min(((t - first) / bin_seconds) as usize);
+        let (pulse, original_pulse) = pulses[ri];
+        let gap = if ri > 0 { t - rows[ri - 1].t } else { 1.0 };
+        let repeat = gap < 0.15 && row.mask & rows[if ri > 0 { ri - 1 } else { rows.len() - 1 }].mask != 0;
+        let rep = if repeat { 0.8 } else { 0.0 };
+        regular[b] += pulse;
+        switch[b] += pulse.max(rep);
+        regular_cal[b] += original_pulse;
+        switch_cal[b] += original_pulse.max(rep);
+        if q - p == 1 {
+            mash[b] += 0.0 + note_mash[p];
+            pseudo[b] += 0.0 + note_pseudo[p];
+        } else {
+            mash[b] += py::sum(note_mash[p..q].iter().copied()) / (q - p) as f64;
+            pseudo[b] += py::sum(note_pseudo[p..q].iter().copied()) / (q - p) as f64;
+        }
+        count[b] += 1.0;
+        for x in p..q {
+            let (nt, end) = (times[x], ends[x]);
+            if end - nt < 0.06 {
+                continue;
+            }
+            tail_count += 1.0;
+            let at = times.partition_point(|&h| h < end);
+            let mut nearest = if at > 0 { (times[at - 1] - end).abs() } else { 1.0 };
+            if at < n && (at == 0 || (times[at] - end).abs() < nearest) {
+                nearest = (times[at] - end).abs();
+            }
+            synced += 1.0 - smooth(nearest, 0.003, 0.025);
+        }
+    }
+    for v in [&mut mash, &mut pseudo, &mut regular, &mut switch, &mut regular_cal, &mut switch_cal] {
+        for (x, &c) in v.iter_mut().zip(&count) {
+            *x /= 1f64.max(c);
+        }
+    }
+    let release_sync = synced / 1f64.max(tail_count);
+    let irregular =
+        py::sum(regular_cal.iter().zip(&count).map(|(r, c)| r * c)) / 1f64.max(py::sum(count.iter().copied()));
+    let flow = release_sync * (1.0 - 1f64.min(irregular)) * tail_count / 1f64.max(n as f64);
+    Info { mash, pseudo, regular, switch, regular_cal, switch_cal, count, release_sync, flow }
+}
+
+/// Per row (pulse, unsmoothed pulse) of the hand-to-hand timing, the left hand playing `lo_mask`'s columns.
+fn hand_pulses(rows: &[crate::demand::Row], lo_mask: u32, roll: &[Vec<f64>; 2]) -> Vec<(f64, f64)> {
+    let mut last: [Option<f64>; 2] = [None, None];
+    let mut history: [std::collections::VecDeque<f64>; 2] = Default::default();
+    let mut recent: Vec<f64> = Vec::with_capacity(6);
+    let mut out = Vec::with_capacity(rows.len());
+    for (ri, row) in rows.iter().enumerate() {
+        let t = row.t;
         let has_lo = row.mask & lo_mask != 0;
         let has_hi = row.mask & !lo_mask != 0;
         let mut pulse: Option<f64> = None;
@@ -144,47 +200,9 @@ pub fn analyse(chart: &Chart, g: &Geometry, bin_seconds: f64) -> Info {
             }
             last[hand] = Some(t);
         }
-        let gap = if ri > 0 { t - rows[ri - 1].t } else { 1.0 };
-        let repeat = gap < 0.15 && row.mask & rows[if ri > 0 { ri - 1 } else { rows.len() - 1 }].mask != 0;
-        let pulse = pulse.unwrap_or(0.0);
-        let original_pulse = original_pulse.unwrap_or(0.0);
-        let rep = if repeat { 0.8 } else { 0.0 };
-        regular[b] += pulse;
-        switch[b] += pulse.max(rep);
-        regular_cal[b] += original_pulse;
-        switch_cal[b] += original_pulse.max(rep);
-        if q - p == 1 {
-            mash[b] += 0.0 + note_mash[p];
-            pseudo[b] += 0.0 + note_pseudo[p];
-        } else {
-            mash[b] += py::sum(note_mash[p..q].iter().copied()) / (q - p) as f64;
-            pseudo[b] += py::sum(note_pseudo[p..q].iter().copied()) / (q - p) as f64;
-        }
-        count[b] += 1.0;
-        for x in p..q {
-            let (nt, end) = (times[x], ends[x]);
-            if end - nt < 0.06 {
-                continue;
-            }
-            tail_count += 1.0;
-            let at = times.partition_point(|&h| h < end);
-            let mut nearest = if at > 0 { (times[at - 1] - end).abs() } else { 1.0 };
-            if at < n && (at == 0 || (times[at] - end).abs() < nearest) {
-                nearest = (times[at] - end).abs();
-            }
-            synced += 1.0 - smooth(nearest, 0.003, 0.025);
-        }
+        out.push((pulse.unwrap_or(0.0), original_pulse.unwrap_or(0.0)));
     }
-    for v in [&mut mash, &mut pseudo, &mut regular, &mut switch, &mut regular_cal, &mut switch_cal] {
-        for (x, &c) in v.iter_mut().zip(&count) {
-            *x /= 1f64.max(c);
-        }
-    }
-    let release_sync = synced / 1f64.max(tail_count);
-    let irregular =
-        py::sum(regular_cal.iter().zip(&count).map(|(r, c)| r * c)) / 1f64.max(py::sum(count.iter().copied()));
-    let flow = release_sync * (1.0 - 1f64.min(irregular)) * tail_count / 1f64.max(n as f64);
-    Info { mash, pseudo, regular, switch, regular_cal, switch_cal, count, release_sync, flow }
+    out
 }
 
 /// Per bin: share of notes inside same-column runs (absolute played-time bins, as execution.column_runs).

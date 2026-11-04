@@ -2,7 +2,7 @@
 use crate::background::background_map;
 use crate::chart;
 use crate::compute;
-use crate::model::{self, display_factor, unit_rating};
+use crate::model;
 use crate::params::Params;
 use crate::py::round_digits;
 use crate::val::{Dict, Key, Val};
@@ -79,55 +79,33 @@ pub fn params_of(calc: &str) -> Result<Params, String> {
     let patches: Value = serde_json::from_str(include_str!("../../../calib/carry.json")).map_err(|e| e.to_string())?;
     let mut model = standard_params().model;
     merge(&mut model, patches.get(calc).ok_or_else(|| format!("no calibration kept for {calc}"))?);
-    Params::new(model, &before_chord_rules())
+    Params::new(model, &knobs_of(calc))
 }
 
-/// Knobs of every calculator before 65c0a4cb63d6, for carrying from one of them.
-pub fn before_chord_rules() -> Value {
-    serde_json::json!({"W_GROUP": 0, "W_MIX": 0, "W_SHAPES": 0, "JACK_SHARE_KEYS": 0})
-}
-
-/// The parameters of a keymode's display conversion.
-pub fn unit_model(prm: &Params, keys: i64) -> Option<&Value> {
-    prm.model.get("score_units")?.get("modes")?.get(keys.to_string())
-}
-
-fn stam(levels: Option<&Dict>, overall: f64) -> f64 {
-    if overall == 0. {
-        return 1.;
+/// The rule knobs a past calculator ran with, for carrying from it.
+pub fn knobs_of(calc: &str) -> Value {
+    use serde_json::json;
+    // Newest first: (the last calculator before a rule change, the knobs it ran with). Older calculators take every later era's.
+    let eras = [
+        ("a88aea03e865", json!({"ACC_POWER": 0})), // the peak model: its rules can't be recomputed, the knob only marks the change
+        ("f9622a2b09c8", json!({"V_FINGER": 8})), // before the finger limit came from replays
+        ("65c0a4cb63d6", json!({"W_JACK": 3.3, "W_JACK_KEYS": 0, "W_JACK_7K": 3.0, "MIRROR_ALL": 0, "CENTRE_SPLIT": 0, "V_FAST_KEYS": 2})), // before the revamp
+        ("", json!({"W_GROUP": 0, "W_MIX": 0, "W_SHAPES": 0, "JACK_SHARE_KEYS": 0})), // before the chord rules
+    ];
+    let mut k = json!({});
+    if calc == crate::CALC_ID {
+        return k;
     }
-    let level = levels.and_then(|l| l.0.iter().find(|(k, _)| matches!(k, Key::F(x) if *x == 120.)).map(|x| x.1.f()).filter(|&x| x != 0.));
-    level.unwrap_or(overall) / overall
-}
-
-/// score_units.feature: the exact cache in display units, the pre-unit values kept.
-pub fn convert_units(f: &mut Dict, prm: &Params) {
-    let keys = f.f("keys") as i64;
-    let Some(model) = unit_model(prm, keys) else { return };
-    let (old, od) = (f.f("overall"), f.f("od"));
-    if old <= 0. || f.has("preunit_features") {
-        return;
-    }
-    let mut pre = Dict::new();
-    for k in ["overall", "sk", "stam", "baseline_overall"] {
-        pre.set(k, f.get(k).cloned().unwrap_or(Val::None));
-    }
-    f.set("preunit_features", Val::Dict(pre));
-    let convert = |v: f64| unit_rating(v, od, model);
-    f.set("preunit_overall", old);
-    let overall = convert(old);
-    f.set("overall", overall);
-    if let Some(Val::Dict(sk)) = f.get_mut("sk") {
-        for (_, v) in sk.0.iter_mut() {
-            *v = Val::F(round_digits(convert(v.f() * old) / overall, 4));
+    for (last, knobs) in eras {
+        knobs.as_object().into_iter().flatten().for_each(|(name, v)| k[name] = v.clone());
+        if calc == last {
+            break;
         }
     }
-    let (s, baseline) = (f.f("stam"), f.f("baseline_overall"));
-    f.set("stam", convert(s * old) / overall);
-    f.set("baseline_overall", convert(baseline));
+    k
 }
 
-/// score_units.restore_feature: calibration tools refit original coordinates before reapplying units.
+/// Rows stored under a calibration with display units (score_units, before 2026-11-04) back in rating units.
 pub fn restore_feature(f: &mut Dict) {
     if let Some(Val::Dict(pre)) = f.pop("preunit_features") {
         for (k, v) in pre.0 {
@@ -139,47 +117,54 @@ pub fn restore_feature(f: &mut Dict) {
     }
 }
 
-/// A chart's stored features moved from `before`'s calibration to `after`'s, without its file; None if it doesn't move.
-/// Ratios keep what the stages leave out (rate uniformity), and `sk`/`stam` are shares of the overall.
+/// A chart's stored features moved to `after`'s calibration, without its file; None if it doesn't move.
+/// `sk`/`stam` are shares of the overall, so they move with it.
 ///
 /// The joint stage reads the chart's per-hand flow, which older rows lack: `flow` finds it. No chart, no joint move.
-/// `rule` is the chart's rating under `after`'s rules over `before`'s when they differ: `rule_ratio`.
-pub fn recalibrated(f: &Dict, before: &Params, after: &Params, rate: f64, flow: &dyn Fn() -> Option<crate::flow::Flow>, rule: &dyn Fn() -> Option<f64>) -> Option<Dict> {
+pub fn recalibrated(f: &Dict, after: &Params, rate: f64, flow: &dyn Fn() -> Option<crate::flow::Flow>) -> Option<Dict> {
     let mut f = f.clone();
     restore_feature(&mut f);
     let keys = f.f("keys") as usize;
     let raw = f.fget("raw_overall", f.f("overall"));
-    let features = f.get("calibration_features").map_or_else(Vec::new, Val::list_f);
-    let old = f.dict("execution").cloned();
+    // The joint stage reads the chart's level: the one under `after`'s rules (it was read before the move, so wide keymodes'
+    // carried rows got their level-dependent columns at the old rules' level, 2026-11-04).
     with_joint(&mut f, after, rate, raw, flow);
-    // A 4K hand has two fingers: the chord rules can't move it.
-    let moved = if keys > 4 { rule().unwrap_or(1.) } else { 1. };
+    // The rating `after` gives, computed, not the stored one times after/before: a fresh analysis matches final_rating to
+    // ±1 %, but a row carried several times kept what each older calibration's ratio left behind (10K +.21 log, 2026-11-04).
     let (overall, baseline) = (
-        moved * model::final_rating(after, keys, raw, &features, f.dict("execution")) / model::final_rating(before, keys, raw, &features, old.as_ref()),
-        moved * model::baseline_rating(after, keys, raw, &features, f.dict("execution")) / model::baseline_rating(before, keys, raw, &features, old.as_ref()),
+        model::final_rating(after, keys, raw, f.dict("execution")),
+        model::baseline_rating(after, keys, raw, f.dict("execution")),
     );
-    if !overall.is_finite() || overall == 1. {
+    if !overall.is_finite() || overall <= 0. || (overall - f.f("overall")).abs() < 1e-12 {
         return None;
     }
-    f.set("overall", f.f("overall") * overall);
-    f.set("baseline_overall", f.f("baseline_overall") * baseline);
-    if moved != 1. {
-        f.set("raw_overall", raw * moved);
-    }
-    convert_units(&mut f, after);
+    f.set("overall", overall);
+    f.set("baseline_overall", baseline);
     Some(f)
 }
 
-/// A chart's rating under `after`'s rules over `before`'s: what a carry across a rule change moves a stored row by, without
-/// re-analysing it. The path the rule's gates read (`joint::moved_by`).
+/// A chart's rating under `after`'s rules over `before`'s (the chord-rule checks in `calib chordtest`).
 pub fn rule_ratio(c: &crate::chart::Chart, rate: f64, before: &Params, after: &Params) -> Option<f64> {
     let overall = |p: &Params| crate::compute::compute(c, rate, true, p).ok()?.dict("scores").map(|s| s.f("overall"));
     Some(overall(after)? / overall(before)?).filter(|r| r.is_finite() && *r > 0.)
 }
 
 /// One stored row carried, with its chart when that can be found.
-pub fn carried(f: &Dict, before: &Params, after: &Params, rules: bool, rate: f64, chart: &dyn Fn() -> Option<std::rc::Rc<crate::chart::Chart>>) -> Option<Dict> {
-    recalibrated(f, before, after, rate, &|| chart().map(|c| crate::flow::flow(&c, rate)), &|| if rules { rule_ratio(&*chart()?, rate, before, after) } else { None })
+/// The rules moved (`rules_differ`): the chart is analysed again, since a ratio would carry the old skill shares and
+/// stamina along (the rating's aggregation changed 2026-11-04). Without its file only the calibration moves.
+pub fn carried(f: &Dict, after: &Params, rules: bool, rate: f64, chart: &dyn Fn() -> Option<std::rc::Rc<crate::chart::Chart>>) -> Option<Dict> {
+    let found = if rules { chart() } else { None };
+    let Some(c) = found else {
+        return recalibrated(f, after, rate, &|| chart().map(|c| crate::flow::flow(&c, rate)));
+    };
+    let res = compute::compute(&c, rate, true, after).ok()?;
+    let mut fresh = features_of(&res, after);
+    for kept in ["stars", "hits"] { // lazer's own star rating, read from the file's bytes when the row was made
+        if let Some(v) = f.get(kept) {
+            fresh.set(kept, v.clone());
+        }
+    }
+    Some(fresh)
 }
 
 /// Whether two parameter sets rate a chart differently, not only calibrate it differently.
@@ -190,19 +175,21 @@ pub fn rules_differ(before: &Params, after: &Params) -> bool {
 fn with_joint(f: &mut Dict, after: &Params, rate: f64, raw: f64, flow: &dyn Fn() -> Option<crate::flow::Flow>) {
     let joint = &after.model["joint"]["modes"][(f.f("keys") as i64).to_string()];
     let length = f.fget("length", 0.);
+    let calibration = f.get("calibration_features").map_or_else(Vec::new, Val::list_f);
+    let od = f.fget("od", 8.);
     let Some(e) = f.dict_mut("execution").filter(|_| joint.is_object()) else { return };
     let Some(vector) = e.get("residual_vector").map(Val::list_f).filter(|v| !v.is_empty()) else { return };
-    let stored = e.get("flow_broken").map(|_| crate::flow::Flow { broken: e.fget("flow_broken", 0.), skip: e.fget("flow_skip", 0.), change: e.fget("flow_change", 0.), fast_ln: e.fget("fast_ln", 0.) });
-    let Some(found) = stored.or_else(flow) else { return };
+    let stored = e.get("flow_broken").map(|_| crate::flow::Flow { broken: e.fget("flow_broken", 0.), skip: e.fget("flow_skip", 0.), change: e.fget("flow_change", 0.), fast_ln: e.fget("fast_ln", 0.), split: e.fget("flow_split", 0.) });
+    // The chart's own flow first: a stored one is from the rules the row was analysed under (the middle key moved 2026-11-03).
+    let Some(found) = flow().or(stored) else { return };
     found.store(e);
-    e.set("joint_factor", model::joint_shift(joint, &crate::flow::joint_row(&vector, length, raw, rate, found)).exp());
+    e.set("joint_factor", model::joint_shift(joint, &crate::flow::joint_row(&vector, length, raw, rate, found, &crate::flow::extra_inputs(&calibration, e, od))).exp());
 }
 
 /// recdata._feats_at for a calculated result.
-pub fn features_of(res: &Dict, rate: f64, prm: &Params) -> Dict {
-    let demand = res.dict("preunit_result").unwrap_or(res);
+pub fn features_of(res: &Dict, prm: &Params) -> Dict {
+    let demand = res;
     let scores = demand.dict("scores").cloned().unwrap_or_default();
-    let horizon = res.get("horizon").is_some_and(Val::truthy);
     let o = scores.get("overall").filter(|v| v.truthy()).cloned().unwrap_or(Val::Int(0));
     let overall = o.f();
     let notes = res.get("notes").cloned().unwrap_or(Val::Int(0));
@@ -221,15 +208,11 @@ pub fn features_of(res: &Dict, rate: f64, prm: &Params) -> Dict {
     f.set("ln", res.f("ln_notes") / notes.f().max(1.));
     f.set("notes", notes);
     f.set("length", res.get("length").cloned().unwrap_or(Val::Int(0)));
-    let mut stamina = stam(if horizon { demand.dict("levels") } else { None }, overall);
-    // The fitted predictor's sustain coordinate predates the horizon display-unit repair: the schema stays until a
-    // validated refit.
-    if horizon && !res.get("rolled_correction").is_some_and(Val::truthy) {
-        stamina /= rate.powf(prm.k.RATE_G);
-    }
+    // Sustained share: the stamina rating (minutes-long windows) over the overall, 1 for an unrated chart.
+    let stamina = if overall != 0. { scores.fget("stamina", overall) / overall } else { 1. };
     f.set("stam", stamina);
     f.set("sk", Val::Dict(sk));
-    f.set("description", if horizon { crate::card::describe(res, &prm.k).0 } else { "Sparse".to_string() });
+    f.set("description", if res.fget("notes", 0.) >= 2. { crate::card::describe(res, &prm.k).0 } else { "Sparse".to_string() });
     let or_empty = |k: &str| res.get(k).cloned().unwrap_or_else(|| Val::Dict(Dict::new()));
     f.set("endurance", or_empty("endurance"));
     f.set("raw_overall", res.get("raw_overall").cloned().unwrap_or_else(|| Val::F(overall)));
@@ -241,7 +224,6 @@ pub fn features_of(res: &Dict, rate: f64, prm: &Params) -> Dict {
     f.set("baseline_overall", demand.get("baseline_overall").cloned().unwrap_or_else(|| Val::F(overall)));
     f.set("tech_profile", or_empty("tech_profile"));
     f.set("archetype_profile", or_empty("archetype_profile"));
-    convert_units(&mut f, prm);
     f
 }
 
@@ -271,7 +253,7 @@ fn features_with(data: &[u8], rates: &[f64], prm: &Params, calculate: &dyn Fn(&c
     let mut out = Vec::with_capacity(rates.len());
     for &rate in rates {
         let res = calculate(&parsed, rate)?;
-        out.push((rate, features_of(&res, rate, prm)));
+        out.push((rate, features_of(&res, prm)));
     }
     if out.iter().any(|x| matches!(x.0, r if r == 0.75 || r == 1. || r == 1.5)) {
         if let Ok(map) = rosu_pp::Beatmap::from_bytes(data) {
@@ -289,46 +271,6 @@ fn features_with(data: &[u8], rates: &[f64], prm: &Params, calculate: &dyn Fn(&c
 /// chart_features for many charts on `threads` background threads (0 = default); a broken chart is its own error.
 pub fn features_batch(jobs: &[(Vec<u8>, Vec<f64>)], threads: usize, prm: &Params) -> Vec<Result<Vec<(f64, Dict)>, String>> {
     background_map(jobs, threads, |(data, rates)| chart_features(data, rates, prm))
-}
-
-/// score_units.feature_display_factor
-pub fn feature_display_factor(f: &Dict, prm: &Params) -> f64 {
-    let raw = f.dict("preunit_features").unwrap_or(f);
-    let overall = raw.f("overall");
-    display_factor(prm, f.f("keys") as usize, raw.fget("baseline_overall", overall), f.dict("execution"), overall)
-}
-
-fn display_rating(value: f64, od: f64, model: &Value) -> f64 {
-    (value + unit_rating(value, od, model)) / 2.
-}
-
-/// score_units.displayed_feature: the rating a chart shows.
-pub fn displayed_feature(f: &Dict, prm: &Params) -> f64 {
-    let (factor, overall) = (feature_display_factor(f, prm), f.f("overall"));
-    let pre = f.fget("preunit_overall", overall);
-    if factor == 1. {
-        return (overall + pre) / 2.;
-    }
-    // Unconverted caches (63 of G835LX's 7K charts) hold the pre-unit rating as 'overall'.
-    unit_model(prm, f.f("keys") as i64).map_or((overall + pre) / 2., |model| display_rating(pre * factor, f.f("od"), model))
-}
-
-/// score_units.displayed_value: a fitted reference-coordinate estimate in display units, without refitting its model.
-pub fn displayed_value(value: f64, keys: i64, od: f64, factor: f64, prm: &Params) -> f64 {
-    let Some(model) = unit_model(prm, keys) else { return value };
-    if value <= 0. {
-        return value;
-    }
-    let knee = model.get("knee").and_then(Value::as_f64).unwrap_or(4.).ln();
-    let x = value.ln();
-    let at = |k: &str, i: usize| model[k][i].as_f64().unwrap_or(0.);
-    let mut target = at("reference", 0) + at("reference", 1) * x + at("reference", 2) * (x - knee).max(0.).powi(2);
-    let reference_od = model.get("reference_od").and_then(Value::as_f64).unwrap_or(8.);
-    target -= model["window"].as_f64().unwrap_or(0.) * ((64. - 3. * od.clamp(0., 10.)) / (64. - 3. * reference_od)).ln();
-    let (a, b) = (at("input", 0), at("input", 1));
-    let delta = target - a * knee;
-    let original = (if delta <= 0. || b == 0. { target / a } else { knee + 2. * delta / (a + (a * a + 4. * b * delta).sqrt()) }).exp();
-    if factor == 1. { (value + original) / 2. } else { display_rating(original * factor, od, model) }
 }
 
 #[cfg(test)]
@@ -363,8 +305,51 @@ mod shared_tests {
         assert_eq!(selected_features(text.as_bytes(), 1.1, &prm).unwrap(), chart_features(text.as_bytes(), &[1.1], &prm).unwrap());
         // A different calculator is a different key.
         let mut model = prm.model.clone();
-        model["rolled_execution"] = serde_json::json!({"modes": {"4": {"strength": 0.5}}});
+        model["joint"]["limit"] = serde_json::json!(0.1);
         assert_ne!(Params::new(model, &Value::Null).unwrap().id(), prm.id());
         assert_eq!(standard_params().id(), prm.id());
+    }
+}
+
+#[cfg(test)]
+mod revamp_rule_tests {
+    use super::*;
+
+    /// `keys` columns, 600 rows of `rows` cycled, `gap` ms apart.
+    fn chart_of(keys: usize, rows: &[&[usize]], gap: usize) -> chart::Chart {
+        let mut text = format!("osu file format v14\n[General]\nMode:3\n[Difficulty]\nCircleSize:{keys}\nOverallDifficulty:8\n[HitObjects]\n");
+        let mut t = 1000;
+        for i in 0..600 {
+            for &c in rows[i % rows.len()] {
+                text += &format!("{},192,{t},1,0,0:0:0:0:\n", (512 * c + 256) / keys);
+            }
+            t += gap + [0, 45, 15][i % 3]; // uneven, so hand timing has something to read
+        }
+        chart::parse(text.as_bytes()).unwrap()
+    }
+
+    fn overall(c: &chart::Chart, knobs: Value) -> f64 {
+        compute::compute(c, 1., false, &Params::new(standard_params().model, &knobs).unwrap()).unwrap().dict("scores").unwrap().f("overall")
+    }
+
+    #[test]
+    fn the_middle_key_rule_moves_odd_keymodes_only() {
+        // Hand timing goes to the execution numbers (and from there to the fitted columns), not to 7K's raw rating.
+        let k = standard_params().k;
+        let pulses = |c: &chart::Chart, split: bool| { let i = crate::execution::analyse(c, &crate::demand::geometry(c, 1., &k), k.BIN, split); (i.regular, i.switch) };
+        let seven = chart_of(7, &[&[2], &[3], &[4], &[3], &[1, 5]], 90);
+        assert_ne!(pulses(&seven, true), pulses(&seven, false));
+        let ten = chart_of(10, &[&[3], &[4], &[5], &[4], &[1, 8]], 90);
+        assert_eq!(pulses(&ten, true), pulses(&ten, false));
+    }
+
+    #[test]
+    fn the_partial_mirror_rule_reaches_every_keymode_and_needs_jacks() {
+        let (on, off) = (serde_json::json!({}), serde_json::json!({"MIRROR_ALL": 0}));
+        // Both hands jack at once, one with an extra finger moving: a partial mirror.
+        let jacks = chart_of(10, &[&[0, 1, 8], &[0, 2, 8]], 110);
+        assert_ne!(overall(&jacks, on.clone()), overall(&jacks, off.clone()));
+        let stream = chart_of(10, &[&[0], &[1], &[2], &[3], &[4], &[5], &[6], &[7], &[8], &[9]], 90);
+        assert_eq!(overall(&stream, on), overall(&stream, off));
     }
 }

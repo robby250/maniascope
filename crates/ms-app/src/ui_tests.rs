@@ -628,3 +628,21 @@ fn stats_open_on_the_selected_maps_keymode_and_remember_the_last_one() {
     assert_eq!((back.stats_keys, back.expanded.iter().cloned().collect::<Vec<_>>()), (Some(7), vec![(7, "ln".to_string())]));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn rows_carry_website_and_convert_badges() {
+    let ctx = egui::Context::default();
+    let mut a = app(prefs(), &ctx);
+    a.sync_rec();
+    let convert = |c, web| Pick { convert_of: Some("src".into()), source_keys: 4, source_web: web, ..pick(c) };
+    let list = pool(&a, "nps", a.revision, vec![Pick { installed: true, ..pick('a') }, pick('b'), convert('c', false), convert('d', true)]);
+    a.on_rec(list);
+    let mut h = harness(a);
+    h.step();
+    assert_eq!(h.query_all_by_label("WEB").count(), 2, "the website map and the website convert");
+    assert_eq!(h.query_all_by_label("4K→7K").count(), 2);
+    // On the right, so the rate and title start where an unmarked row's do (user 2026-11-03).
+    for b in h.query_all_by_label("WEB").chain(h.query_all_by_label("4K→7K")) {
+        assert!(b.rect().left() > 400., "badge at {:?}", b.rect());
+    }
+}

@@ -3,7 +3,7 @@ use crate::catalog::{installed_by_md5, local_shas, rate_label_pp, Inst, Pick};
 use crate::evidence::{now_months, FeatureSource};
 use crate::pp::{self, build_ledger, candidates, estimates, home_keys, newer_ranked, prepare, reference, score, status_of, typical, warmups, Ledger, PpSettings, Reference, Scoring, Variant};
 use crate::recommender::{family_transfer, fit, Fitted};
-use ms_calc::features::{displayed_feature, standard_params};
+use ms_calc::features::standard_params;
 use ms_calc::params::Params;
 use ms_calc::py::round_digits;
 use ms_calc::val::{Dict, Val};
@@ -24,10 +24,10 @@ use std::sync::{Arc, Mutex};
 /// recommend.predictor_id of the model the Rust port reproduces: forecasts stay comparable across the port. A change to
 /// the prediction model takes a new id, so old forecasts are not read as this model's.
 pub const PREDICTOR_ID: &str = "86660d70dccc";
-pub const CALC_ID: &str = "65c0a4cb63d6";
+pub const CALC_ID: &str = "7cee1dfdba7f";
 /// Differ from CALC_ID in calibration only (calib/carry.json), newest first: a crawl still running holds the website rows back a whole
 /// calculator, so those can start older than the library's. Each carry keeps its source row.
-pub const CARRIED_CALCS: [&str; 5] = ["9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f"];
+pub const CARRIED_CALCS: [&str; 8] = ["a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f"];
 const SURE_PLAYS: usize = 50; // of the player's own, on a keymode: fewer and the model is mostly the population's guess
 pub const ACTIVE_KEYS: std::ops::RangeInclusive<i64> = 4..=10;
 
@@ -350,13 +350,7 @@ impl Engine {
     pub fn plays_like(&self, f: &Dict, b: Option<i64>, rate: f64) -> Option<(f64, i64)> {
         let pop = self.r.fitted.display.as_ref().map_or(&self.r.fitted.pp.model.pop, |d| &d.model.pop);
         let (ratio, n) = plays_like_ratio(pop, f.f("keys") as i64, f.f("overall"), b?, rate)?;
-        // The card shows display stars; scale the rating before the display conversion, not after it.
-        let mut shown = f.clone();
-        shown.set("overall", f.f("overall") * ratio);
-        if f.has("preunit_overall") {
-            shown.set("preunit_overall", f.f("preunit_overall") * ratio);
-        }
-        Some((displayed_feature(&shown, &self.prm), n))
+        Some((f.f("overall") * ratio, n))
     }
 
     /// Selected-chart analysis: a panic in one chart loses that chart, not the app.

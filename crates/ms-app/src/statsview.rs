@@ -100,7 +100,7 @@ fn skill_bar(ui: &mut Ui, keys: i64, g: Option<&Group>, scale: Scale, session: b
     response
 }
 
-/// A chart that zooms along x: the wheel zooms around the cursor, a drag pans once zoomed, a double-click resets.
+/// A chart that zooms along x: Ctrl+wheel zooms around the cursor, a drag pans once zoomed, a double-click resets.
 /// Shift+drag marks a range instead (a click clears it). Returns the response, x(fraction of the whole span) for the
 /// visible part, `plot` = the x-range it maps onto, and the marked range in pixels.
 #[allow(clippy::type_complexity)]
@@ -120,9 +120,9 @@ fn zoomable(ui: &mut Ui, salt: impl std::hash::Hash + std::fmt::Debug, height: f
     }
     let frac = |x: f32, lo: f64, hi: f64| lo + (hi - lo) * ((x - left) as f64 / width).clamp(0., 1.);
     if let Some(at) = response.hover_pos() {
-        // The wheel over a chart zooms it instead of scrolling the page.
-        let wheel = ui.ctx().input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta.y));
-        let factor = (-wheel as f64 / 300.).exp() / ui.input(|i| i.zoom_delta()) as f64;
+        // Ctrl+wheel (egui's zoom gesture, pinch too) zooms; the plain wheel scrolls the page (user 2026-11-03: "the
+        // graphs steal the scroll").
+        let factor = 1. / ui.input(|i| i.zoom_delta()) as f64;
         if factor != 1. {
             let anchor = frac(at.x, lo, hi);
             let span = ((hi - lo) * factor).clamp(0.02, 1.);
@@ -163,7 +163,7 @@ fn hint(ui: &Ui, response: &egui::Response, hints: &mut u32) -> &'static str {
             *hints += 1;
         }
     }
-    if *hints <= HINTS { "\nScroll to zoom, drag to move, Shift+drag to measure, double-click to reset" } else { "" }
+    if *hints <= HINTS { "\nCtrl+scroll to zoom, drag to move, Shift+drag to measure, double-click to reset" } else { "" }
 }
 
 const HINTS: u32 = 5;
@@ -567,8 +567,13 @@ mod tests {
         h.run();
         let full = *h.state();
         h.hover_at(pos2(300., 50.));
-        h.event(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0., 300.), phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel, modifiers: egui::Modifiers::NONE });
-        h.run();
+        let wheel = |h: &mut Harness<(f32, f32)>, modifiers| {
+            h.event_modifiers(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0., 300.), phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel, modifiers }, modifiers);
+            h.run();
+        };
+        wheel(&mut h, egui::Modifiers::NONE);
+        assert_eq!(*h.state(), full, "the plain wheel is the page's");
+        wheel(&mut h, egui::Modifiers::COMMAND);
         let zoomed = *h.state();
         assert!(zoomed.1 - zoomed.0 > 1.5 * (full.1 - full.0), "{full:?} {zoomed:?}");
         let at = |e: (f32, f32), x: f32| (x - e.0) / (e.1 - e.0);

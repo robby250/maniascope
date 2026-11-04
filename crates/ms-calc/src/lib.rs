@@ -18,4 +18,4 @@ pub mod skills;
 pub mod structure;
 pub mod val;
 
-pub const CALC_ID: &str = "65c0a4cb63d6";
+pub const CALC_ID: &str = "7cee1dfdba7f";

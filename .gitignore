@@ -5,3 +5,6 @@ calc_id.txt
 
 # release assets
 dist/
+
+# cargo build output
+target/

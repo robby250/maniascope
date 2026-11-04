@@ -54,7 +54,7 @@ fn busy(on: bool) -> Check {
 /// A worker with its fit, and every chart in the NPS and Skills lists' restart caches.
 fn live(tag: &str, plays: usize, check: Check) -> Live {
     sandbox();
-    let world = world(tag, sloped, plays);
+    let world = world(tag, spread, plays);
     let shas = install(&world);
     let refs: Vec<Value> = shas.iter().map(|s| json!([s.0, 1.])).collect();
     for mode in ["nps", "skills"] {
@@ -307,7 +307,7 @@ fn pp_maps_mix_into_the_nps_list_only_when_on_and_stay_pp_rows() {
     l.w.publish(None).unwrap();
     let again = last(&l);
     assert!(again.iter().any(|c| c.purpose == "nps_mix" && c.gain.is_some()));
-    l.w.open(mixed, "nps", "list", Some(done()), Some(now()), 0).unwrap();
+    l.w.open(mixed, "nps", "list", Some(done()), Some(now()), 0, false).unwrap();
     let info = events(&l, "offer").pop().unwrap().1;
     assert_eq!((info["mode"].as_str(), info["purpose"].as_str()), (Some("pp"), Some("nps_mix")));
 }
@@ -410,7 +410,7 @@ fn an_updated_map_keeps_its_offer_link_without_reusing_the_old_revision() {
     let mut l = live("updated", 240, busy(false));
     let list = fresh_list(&mut l);
     let offered = Pick { bid: Some(1123210), rate: 1.25, var: "DT 1.25×".into(), purpose: "nps".into(), ..list[0].clone() };
-    l.w.open(offered.clone(), "nps", "list", Some(done()), None, 0).unwrap();
+    l.w.open(offered.clone(), "nps", "list", Some(done()), None, 0, false).unwrap();
     let path = l.world.dir.join("updated.osu");
     let text = "osu file format v14\n[Metadata]\nArtist:Artist\nTitle:Updated\nVersion:Hard\nBeatmapID:1123210\n";
     std::fs::write(&path, text).unwrap();

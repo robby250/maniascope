@@ -7,7 +7,6 @@ use crate::engine::{Engine, Now};
 use crate::evidence::{personal_row, Evidence, FeatureSource};
 use crate::history::play_history;
 use crate::catalog::SUPPORTED_KEYS;
-use ms_calc::features::{displayed_feature, displayed_value, feature_display_factor};
 use ms_calc::py::round_digits;
 use ms_calc::val::Dict;
 use ms_data::store::{Db, Result};
@@ -39,7 +38,6 @@ pub struct Group {
     pub high: f64,
     pub current: Option<f64>,
     pub slope: f64,
-    pub display_factor: f64,
     pub maps: usize,
     pub plays: usize,
     pub newest: f64,
@@ -388,8 +386,7 @@ pub fn build(rec: &Engine, db: &Db) -> Result<Profile> {
         };
         let representatives: Vec<&Evidence> = charts.values().filter(|r| overall(r) >= floor).copied().collect();
         // Each chart's display numbers once, not once per skill group it belongs to.
-        let shown = |r: &Evidence| ctx.dict(r).map_or(0., |d| displayed_feature(d, &rec.prm));
-        let factor = |r: &Evidence| ctx.dict(r).map_or(1., |d| feature_display_factor(d, &rec.prm));
+        let shown = |r: &Evidence| ctx.dict(r).map_or(0., |d| d.f("overall"));
         let mut names = vec!["overall".to_string()];
         names.extend(skills::dimensions(keys).iter().map(|n| n.key.clone()));
         let known = ctx.fit.keys.contains(&keys);
@@ -401,12 +398,12 @@ pub fn build(rec: &Engine, db: &Db) -> Result<Profile> {
             let newest = relevant.iter().map(|r| r.ts.unwrap_or(0.)).fold(0., f64::max);
             let count = relevant.len();
             if count < MIN_CHARTS || !known {
-                groups.insert(group.clone(), Group { maps: count, newest, confidence: "Not enough evidence", display_factor: 1., ..Group::default() });
+                groups.insert(group.clone(), Group { maps: count, newest, confidence: "Not enough evidence", ..Group::default() });
                 continue;
             }
             // Decade-old website bests on easy charts extrapolate: the user's 5K read 10.2 from 99 % scores on 3-stars.
             if !calibration.contains_key(group) && relevant.iter().map(|r| 0.5f64.powf((month - r.t).max(0.) / 12.)).sum::<f64>() < MIN_RECENT {
-                groups.insert(group.clone(), Group { maps: count, newest, confidence: "No recent plays", display_factor: 1., ..Group::default() });
+                groups.insert(group.clone(), Group { maps: count, newest, confidence: "No recent plays", ..Group::default() });
                 continue;
             }
             // Quantile-spaced shapes, not the most retried/favourite charts.
@@ -414,14 +411,12 @@ pub fn build(rec: &Engine, db: &Db) -> Result<Profile> {
             let n = count.min(32);
             let chosen: Vec<&Evidence> = (0..n).map(|i| relevant[((count - 1) as f64 * i as f64 / (n.max(2) - 1) as f64) as usize]).collect();
             let (c, d) = calibration.get(group).copied().unwrap_or((0., 1.));
-            let (mut values, mut slopes, mut weights, mut display) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let (mut values, mut slopes, mut weights) = (Vec::new(), Vec::new(), Vec::new());
             for row in &chosen {
                 let id = (row.chart.clone(), row.rate.to_bits(), c.to_bits(), d.to_bits());
                 let (value, slope) = *capacities.entry(id).or_insert_with(|| capacity(ctx.model, ctx.feats(row), (target_y - c) / d));
                 values.push(value);
                 slopes.push(d * slope); // per unit of the player's displayed y
-                // Ability has no single chart shape; the sample's median display correction, its fitted value intact.
-                display.push(factor(row));
                 weights.push(0.5f64.powf((month - row.t).max(0.) / 12.));
             }
             let (value, slope) = (quantile(&values, &weights, 0.5), quantile(&slopes, &weights, 0.5));
@@ -437,7 +432,7 @@ pub fn build(rec: &Engine, db: &Db) -> Result<Profile> {
                 let title = rec.r.installed.get(&r.chart).map(|i| i.name()).or_else(|| r.b.and_then(|b| rec.public.map_info(b)).map(|m| m.file.clone())).unwrap_or_else(|| "Unavailable chart title".to_string());
                 (title, r.rate, shown(r))
             }).collect();
-            let mut g = Group { value: Some(value), low: value * (-spread).exp(), high: value * spread.exp(), slope, display_factor: quantile(&display, &weights, 0.5), maps: count,
+            let mut g = Group { value: Some(value), low: value * (-spread).exp(), high: value * spread.exp(), slope, maps: count,
                                 plays: rows.iter().filter(|r| members.contains(r.chart.as_str())).count(), newest, confidence, references: chosen.len(), examples,
                                 tested_to: relevant.iter().map(|r| shown(r)).fold(0., f64::max), ..Group::default() };
             if value > highest * 1.35 {
@@ -514,18 +509,13 @@ pub fn current(profile: &Profile, n: &Now, rec: &Engine) -> Current {
             let skill = if group == "overall" { None } else { skills::session_skill(group, keys) };
             let family = skill.map(|s| rec.c.family(s));
             row.activation = view.activation(keys, family);
-            let od = 8.;
             if let Some(value) = row.value {
                 let cold = if view.warm_flag { 0. } else { warmup.penalty(&rec.c, keys, skill, row.activation, 0., None, view.session_clock()) };
                 let correction = view.correction(keys, skill) + cold;
-                row.current = Some(displayed_value(value * (-correction / row.slope).exp(), keys, od, row.display_factor, &rec.prm));
-                row.value = Some(displayed_value(value, keys, od, row.display_factor, &rec.prm));
-                row.low = displayed_value(row.low, keys, od, row.display_factor, &rec.prm);
-                row.high = displayed_value(row.high, keys, od, row.display_factor, &rec.prm);
+                row.current = Some(value * (-correction / row.slope).exp());
             }
         }
-        let factor = old.groups.get("overall").map_or(1., |g| g.display_factor);
-        let shown = |v: f64| displayed_value(v, keys, 8., factor, &rec.prm);
+        let shown = |v: f64| v;
         // A displayed level × scale = the dan rating it matches on the player's predicted dan-song accuracy.
         page.dan_scale = old.dan_at.iter().filter_map(|(kind, (anchor, rating))| Some((kind.clone(), (*rating)? / page.groups.get(anchor)?.value?))).collect();
         page.history = old.history.iter().map(|&(m, v, n)| (m, shown(v), n)).collect();

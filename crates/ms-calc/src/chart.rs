@@ -14,7 +14,7 @@ pub enum ChartError {
 pub struct Chart {
     pub keys: usize,
     /// Structure of arrays, sorted by (t, col, end); ms (integral for parsed charts, fractional for
-    /// rolled_execution's reference charts).
+    /// generated charts).
     pub t: Vec<f64>,
     pub end: Vec<f64>,
     pub col: Vec<u8>,

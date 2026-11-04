@@ -143,24 +143,16 @@ fn rate_sweep_is_smooth_and_uncapped() {
 }
 
 #[test]
-fn horizon_units_match_rate_adjusted_overall() {
+fn a_rate_scales_every_rating_alike() {
     let raw = empty_model();
     let (a, b) = (run_with(&file(&stream(1200, 100, 7), 7), 1.25, &raw), run_with(&file(&stream(1200, 80, 7), 7), 1., &raw));
     let factor = 1.25f64.powf(raw.k.RATE_G);
-    let level = |r: &Dict, h: f64| match r.get("levels") {
-        Some(Val::Dict(d)) => d.0.iter().find(|(k, _)| matches!(k, ms_calc::val::Key::F(x) if *x == h)).map(|x| x.1.f()).unwrap(),
-        _ => panic!(),
-    };
-    let Some(Val::Dict(levels)) = a.get("levels") else { panic!() };
-    assert!(!levels.0.is_empty());
-    for (h, value) in &levels.0 {
-        let ms_calc::val::Key::F(h) = h else { panic!() };
-        assert!((value.f() / factor / level(&b, *h) - 1.).abs() < 1e-10, "{h}");
+    for key in ["overall", "stamina"] {
+        assert!((score(&a, key) / factor / score(&b, key) - 1.).abs() < 1e-10, "{key}");
     }
-    let share = |r: &Dict| level(r, 120.) / r.dict("scores").unwrap().f("overall");
-    assert!((share(&a) / share(&b) - 1.).abs() < 1e-10);
-    let feature = ms_calc::features::features_of(&a, 1.25, &raw);
-    assert!((feature.f("stam") / (share(&a) / factor) - 1.).abs() < 1e-10);
+    let share = |r: &Dict| score(r, "stamina") / score(r, "overall");
+    let feature = ms_calc::features::features_of(&a, &raw);
+    assert!((feature.f("stam") / share(&a) - 1.).abs() < 1e-10);
 }
 
 #[test]
@@ -168,19 +160,23 @@ fn recovery_and_burst_vs_sustained() {
     let shift = |notes: &[Note], from: usize| -> Vec<Note> { notes.iter().enumerate().map(|(i, n)| (n.0 + if i >= from { 60000 } else { 0 }, n.1, n.2)).collect() };
     let base = stream(1200, 100, 7);
     let (a, b) = (sc(&base, 7), sc(&shift(&base, 600), 7));
-    assert!(b.f("stamina") < a.f("stamina") && b.f("overall") <= a.f("overall"));
-    // same pattern: 3 s burst in a 2 min map < 3 min sustained; easy padding does not erase a bottleneck
+    // Accuracy averages notes: a minute's rest inside the stream leaves the notes as hard (fatigue is the endurance
+    // term's), and lowers the sustained demand.
+    assert!((b.f("overall") / a.f("overall") - 1.).abs() < 0.03, "{} {}", a.f("overall"), b.f("overall"));
+    assert!(b.f("stamina") < a.f("stamina"));
+    // A 3 s burst is as hard per note as a long run, but has almost no sustained demand.
     let mut burst = stream(30, 100, 7);
     burst.push((125000, 0, None));
-    assert!(sc(&burst, 7).f("overall") < 0.9 * sc(&stream(1800, 100, 7), 7).f("overall"));
+    let long = sc(&stream(1800, 100, 7), 7);
+    assert!(sc(&burst, 7).f("stamina") < 0.6 * long.f("stamina"));
+    // Hard notes count by how many there are: 100 fast notes lift 600 slow ones a lot, not to the fast notes' level.
     let mut padded = stream(600, 400, 7);
     padded.extend(stream_at(100, 70, 7, 300000));
-    assert!(sc(&padded, 7).f("overall") > 1.3 * sc(&stream(600, 400, 7), 7).f("overall"));
-    let mut sprint = stream(60, 70, 7);
-    sprint.push((125000, 0, None));
-    assert_eq!(res(&sprint, 7).f("horizon"), 2.);
-    // Stamina is endurance, not a relabelled overall: a short burst has little, a long even run nearly all of its
-    // rating; rest never adds to it
+    let (slow, fast) = (sc(&stream(600, 400, 7), 7).f("overall"), sc(&stream(100, 70, 7), 7).f("overall"));
+    let p = sc(&padded, 7).f("overall");
+    assert!(p > 1.3 * slow && p < 0.8 * fast, "{slow} {p} {fast}");
+    // Stamina is sustained demand, not a relabelled overall: a short burst has little, a long even run nearly all of its
+    // rating; rest never adds to it.
     let (short, marathon) = (sc(&stream(60, 100, 7), 7), sc(&stream(3600, 100, 7), 7));
     assert!(short.f("stamina") < 0.6 * short.f("overall") && marathon.f("stamina") > 0.95 * marathon.f("overall"));
     assert!(sc(&shift(&stream(3600, 100, 7), 1800), 7).f("stamina") < marathon.f("stamina"));
@@ -262,7 +258,8 @@ fn ln_interaction() {
     assert!(a.f("ln") == 0. && a.f("overall") < b.f("overall") && b.f("overall") < c.f("overall"));
     // a long simple hold is not harder than a shorter one
     let holds = |len: i64| -> Vec<Note> { (0..40).map(|i| (1000 + 3000 * i, 3, Some(1000 + len + 3000 * i))).collect() };
-    assert!((sc(&holds(2400), 7).f("overall") - sc(&holds(1400), 7).f("overall")).abs() < 0.12);
+    let (long, short) = (sc(&holds(2400), 7).f("overall"), sc(&holds(1400), 7).f("overall"));
+    assert!((long - short).abs() < 0.12, "{long} {short}");
     // tapping under a same-hand hold costs more than under an other-hand hold
     let under = |low: i64| -> Vec<Note> {
         let mut n: Vec<Note> = (0..30).map(|i| (1000 + 4000 * i, 0, Some(4900 + 4000 * i))).collect();
@@ -337,7 +334,7 @@ fn changing_jumptrill() {
         for k in ["overall", "stamina"] {
             assert_eq!(score(&result, k), score(&plain, k));
         }
-        for k in ["levels", "horizon", "timeline"] {
+        for k in ["timeline"] {
             assert_eq!(result.get(k), plain.get(k));
         }
     }

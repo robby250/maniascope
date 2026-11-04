@@ -533,7 +533,7 @@ pub fn carry(from: &str, to: &str, before: &Params, after: &Params, chart: &(dyn
             let file = std::cell::OnceCell::new();
             let chart = || file.get_or_init(|| chart(sha).map(std::rc::Rc::new)).clone();
             let fs = read_cell(data).unwrap_or_default();
-            let moved: Vec<Option<Dict>> = fs.iter().map(|(r, f)| ms_calc::features::carried(f, before, after, rules, *r, &chart)).collect();
+            let moved: Vec<Option<Dict>> = fs.iter().map(|(r, f)| ms_calc::features::carried(f, after, rules, *r, &chart)).collect();
             Ok(if moved.iter().any(Option::is_some) {
                 write_cell(&fs.iter().zip(moved).map(|((r, f), m)| (*r, m.unwrap_or_else(|| f.clone()))).collect::<Vec<_>>())
             } else {

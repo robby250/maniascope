@@ -120,11 +120,14 @@ knobs! {
     STAR_A: f64 = 0.1743,
     STAR_B: f64 = 1.095,
     W_HAND: f64 = 1.0,
-    V_FAST_KEYS: f64 = 2.0,
+    V_FAST_KEYS: f64 = 1.0, // above 7K the fast-hand onset grows with the hand's fingers; ^2 put 10K's past v()'s 22.2/s cap, so it never fired
     V_FAST: f64 = 12.0,
     SPEED_P: f64 = 1.5,
-    W_JACK: f64 = 3.3,
-    W_JACK_7K: f64 = 3.0,
+    W_JACK: f64 = 3.0,      // on 7K; other keymodes as (7/keys)^W_JACK_KEYS: 3.3 on 4K as before, 2.82 on 10K (was 3.3 everywhere but 7K)
+    W_JACK_KEYS: f64 = 0.17,
+    W_JACK_7K: f64 = 0.0,   // > 0: 7K alone takes this and the rest W_JACK (calculators before the revamp: 3.0 and 3.3)
+    MIRROR_ALL: f64 = 1.0,  // 1: the partial-mirror jack rule on every keymode; 0: 7K only (before the revamp)
+    CENTRE_SPLIT: f64 = 1.0, // 1: an odd keymode's middle key with each hand in turn, averaged; 0: execution gave it to the right hand, the bracket gate to neither
     JACK_P: f64 = 0.5,
     W_IJACK: f64 = 0.4,
     JACK_SHARE: f64 = 0.7,
@@ -143,7 +146,7 @@ knobs! {
     LN_BASE: f64 = 10.0,
     ROW_SHARE: f64 = 0.3,
     FLAM: f64 = 0.045,
-    V_FINGER: f64 = 8.0,
+    V_FINGER: f64 = 6.0,    // a finger's own sustainable tap rate (finger-tapping studies: 5–7/s); replays: cost starts at 120–160 ms a column
     // Chord switching, measured on 5.2M notes of own replays at equal speed, width and play (docs/REPORT_2026-11-01_CHORD_SWITCH.md).
     W_GROUP: f64 = 0.5,     // each extra separate group of fingers in a hand's chord: `10110`, not `11100`
     GROUP_KEYS: f64 = 2.0,  // below 7K it fades as (keys/7)^this: 5K and 6K public maps allow about half
@@ -155,15 +158,15 @@ knobs! {
     SHAPES_T: f64 = 4.0,    // on 10K; narrower keymodes start later, as (10/keys)^SHAPES_KEYS
     SHAPES_KEYS: f64 = 2.0,
     JACK_SHARE_KEYS: f64 = 2.0, // above 7K the chordjack discount falls as (7/keys)^this
-    HORIZONS: [(f64, f64); 4] = [(2.0, 1.75), (8.0, 1.30), (30.0, 1.12), (120.0, 1.00)],
+    LOCAL_WINDOW: f64 = 2.0, // seconds of demand a note's local level reads (skills::local_levels)
+    LOCAL_TOL: f64 = 1.75,   // the star scale of that level (it was the 2 s horizon's tolerance)
     BIN: f64 = 0.5,
     PHASES: usize = 8,
-    H_WEIGHTS: [f64; 4] = [0.0, 0.2, 0.25, 0.35],
     RATE_G: f64 = 0.12,
-    G_NOTES: f64 = -0.03,
-    UNIFORM_WIN: f64 = 240.0,
-    UNIFORM_R0: f64 = 0.95,
-    UNIFORM_W: f64 = 0.3,
+    ACC_TARGET: f64 = 0.10, // the rating is the skill whose average note loses this much (skills::accuracy_rating)
+    FATIGUE_W: f64 = 0.2,   // a note's level × (1 + this·fatigue), fatigue from model::endurance (skills::note_levels)
+    FATIGUE_W_KEYS: f64 = 3.0, // that weight as (keys/7)^this: wide keymodes are finger-limited, so fatigue weighs more
+    ACC_POWER: f64 = 3.0,   // a note's loss grows as (local level / skill)^this (skills::rating)
     TECH_FULL: f64 = 0.09,
     RT_WIN: usize = 4,
     RT_FULL: f64 = 0.2,
@@ -189,7 +192,7 @@ knobs! {
     INV_FULL: f64 = 1.5,
     HYB_FULL: f64 = 0.8,
     REL_FULL: f64 = 0.6,
-    STAMINA_WINDOW: f64 = 240.0,
+    STAMINA_WINDOW: f64 = 60.0, // seconds of demand the stamina rating averages (skills::local_levels)
     SV_KIND_SHARE: f64 = 0.5,
     REFINE_Q: f64 = 0.9,
     ALSO_SHARE: f64 = 0.6,
@@ -198,6 +201,7 @@ knobs! {
     ARCH_TECH: f64 = 0.75,
     TECH_WHOLE: f64 = 0.85,
     STAMINA_SUSTAIN: f64 = 0.9,
+    BURST_TAG: f64 = 1.5,   // card tag "short burst": the 2 s timeline peaks this far above the overall
     SV_PIECES: usize = 3,
     W_WOB: f64 = 2.0,
     SV_VIS: f64 = 450.0,
@@ -205,16 +209,15 @@ knobs! {
 
 /// Components an ablation can switch off (overrides {"off": [...]}): each then contributes its neutral
 /// value and every stage reading it still runs. "fit:<section>" drops a fitted stage of difficulty.json.
-pub const COMPONENTS: [&str; 8] =
-    ["sv_reading", "gestures", "execution", "quadstream", "tech_profile", "archetype_profile", "rolled_execution", "endurance"];
-pub const FITTED: [&str; 7] = ["modes", "execution", "gestures", "scroll_reading", "structural_residual", "structural_trees", "score_units"];
+pub const COMPONENTS: [&str; 7] =
+    ["sv_reading", "gestures", "execution", "quadstream", "tech_profile", "archetype_profile", "endurance"];
+pub const FITTED: [&str; 3] = ["modes", "scroll_reading", "joint"];
 
 pub struct Params {
     pub k: Knobs,
     off: Vec<&'static str>,
     /// calib/difficulty.json (or a calibration candidate).
     pub model: Value,
-    trees: Vec<std::sync::OnceLock<Option<crate::model::Trees>>>,
     overrides: String,
     id: std::sync::OnceLock<u64>,
 }
@@ -254,15 +257,10 @@ impl Params {
                 }
             }
         }
-        Ok(Params { k, off, model, trees: (0..=18).map(|_| std::sync::OnceLock::new()).collect(), overrides: overrides.to_string(), id: std::sync::OnceLock::new() })
+        Ok(Params { k, off, model, overrides: overrides.to_string(), id: std::sync::OnceLock::new() })
     }
 
     pub fn off(&self, component: &str) -> bool {
         self.off.contains(&component)
-    }
-
-    /// Typed structural trees of a keymode, parsed once.
-    pub fn trees(&self, keys: usize) -> Option<&crate::model::Trees> {
-        self.trees.get(keys)?.get_or_init(|| crate::model::trees(&self.model["structural_trees"]["modes"][keys.to_string()])).as_ref()
     }
 }

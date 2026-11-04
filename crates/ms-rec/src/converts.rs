@@ -228,13 +228,16 @@ fn needs_original(p: &Pick, db: &Db, stable: bool) -> bool {
 /// a convert is its own set there; its audio and images are stored once by hash (one extra file, 36 KB, same test).
 /// For a website map on lazer the original goes first: the whole set is imported beside the convert, which reuses its
 /// audio and images (user 2026-11-02: "fine if it also imports the set").
-pub fn deliver(p: &Pick, db: &Db, client: &str, root: &Path) -> std::result::Result<(), String> {
+pub fn deliver(p: &Pick, db: &Db, client: &str, root: &Path, picked: Instant) -> std::result::Result<(), String> {
+    let stage = |what: &str| eprintln!("convert {}: {what} at {} ms", p.title, picked.elapsed().as_millis()); // where the wait after Next goes
+    stage("start");
     let (source, set) = (p.convert_of.as_deref().ok_or("not a convert")?, p.set_id.unwrap_or(0));
     let data = std::fs::read(source_path(source, p.source_web, root).ok_or("the source chart is gone")?).map_err(|e| e.to_string())?;
     let out = ms_convert::convert(&data, p.keys as usize).map_err(|e| e.to_string())?;
     if p.sha.as_deref() != Some(&hashes(&out.osu).0) {
         return Err("the converter changed: the list will catch up".to_string());
     }
+    stage("converted");
     let stable = client == "stable";
     if stable {
         if let Some(folder) = stable_folder(p, source, db)? {
@@ -252,6 +255,7 @@ pub fn deliver(p: &Pick, db: &Db, client: &str, root: &Path) -> std::result::Res
         std::fs::create_dir_all(&holder).map_err(|e| e.to_string())?;
         let original = holder.join(format!("{set}.osz"));
         download(set, &original)?;
+        stage("website set downloaded");
         owned = archive_files(&original, stable)?;
         if stable {
             let _ = std::fs::remove_file(&original);
@@ -267,7 +271,9 @@ pub fn deliver(p: &Pick, db: &Db, client: &str, root: &Path) -> std::result::Res
     let part = path.with_extension("part"); // stable would take a half-written .osz
     osz::write(&part, &entries).map_err(|e| e.to_string())?;
     std::fs::rename(&part, &path).map_err(|e| e.to_string())?;
+    stage("written");
     crate::navigation::hand_over(&path, client)?;
+    stage("handed over");
     if client == "stable" {
         return Ok(()); // stable writes its database when it closes: nothing to confirm against
     }
@@ -279,6 +285,7 @@ pub fn deliver(p: &Pick, db: &Db, client: &str, root: &Path) -> std::result::Res
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+    stage("in osu!'s store");
     let _ = std::fs::remove_file(&path);
     Ok(())
 }
@@ -348,7 +355,7 @@ mod tests {
         db.execute("INSERT INTO stable_files VALUES (?,0,0,?)", rusqlite::params![folder.join("a.osu").to_str().unwrap(), source]).unwrap();
         let out = ms_convert::convert(chart().as_bytes(), 10).unwrap();
         let p = Pick { convert_of: Some(source), keys: 10, sha: Some(hashes(&out.osu).0), set_id: Some(1), title: "T".into(), ..Pick::default() };
-        deliver(&p, &db, "stable", &store).unwrap();
+        deliver(&p, &db, "stable", &store, Instant::now()).unwrap();
         assert_eq!(std::fs::read(folder.join(&out.file_name)).unwrap(), out.osu);
         assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 1, "no archive beside it");
         let _ = std::fs::remove_dir_all(dir);

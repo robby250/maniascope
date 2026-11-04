@@ -56,7 +56,7 @@ pub fn normalize_target(value: f64) -> f64 {
 /// NPS and Skills HT/DT range (user 2026-11-02: "default 0.75-1.5 … can be set to be 1.0-1.0 too in order to disable HT/DT").
 pub const DEFAULT_RATES: (f64, f64) = (0.75, 1.5);
 
-/// Inside the analysed rates, low ≤ high, on the 0.05 grid.
+/// Inside lazer's HT/DT range, low ≤ high, on the 0.05 grid.
 pub fn normalize_rates((lo, hi): (f64, f64)) -> (f64, f64) {
     if !lo.is_finite() || !hi.is_finite() {
         return DEFAULT_RATES;
@@ -756,9 +756,6 @@ pub fn prepared_pick(prepared: &ms_model::choices::Prepared, i: usize, catalog: 
         source_web: inst.source_web, set_id: inst.set_id, ..Pick::default()
     })
 }
-
-/// Keeps MIN_RATE/MAX_RATE reachable for callers that show the rate range.
-pub const RATE_RANGE: (f64, f64) = (MIN_RATE, MAX_RATE);
 
 #[cfg(test)]
 mod convert_tests {

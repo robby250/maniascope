@@ -4,10 +4,10 @@ use common::*;
 use ms_calc::chart::Chart;
 use ms_calc::compute::compute;
 use ms_calc::features::standard_params;
-use ms_calc::gestures::{analyse, great_window, s, Analysis, FEATURES};
-use ms_calc::model::{final_rating, gesture_rating};
+use ms_calc::gestures::{analyse, s, Analysis, FEATURES};
+use ms_calc::model::final_rating;
 use ms_calc::params::Params;
-use ms_calc::val::{Dict, Val};
+use ms_calc::val::Dict;
 use serde_json::{json, Value};
 
 const BIN: f64 = 0.5;
@@ -25,7 +25,7 @@ fn repeated(pattern: &[&[u8]], gap: f64, n: usize) -> Chart {
 }
 
 fn g(c: &Chart) -> Analysis {
-    analyse(c, 1., BIN, false)
+    analyse(c, 1., BIN)
 }
 
 fn mean(a: &[f64]) -> f64 {
@@ -87,7 +87,7 @@ fn slow_rice_and_timing_infeasible_groups_do_not_become_jumptrills() {
 fn rate_is_applied_once_and_offsets_do_not_change_gestures() {
     let c = roll4(&[0, 1, 3, 2], 30.);
     let moved = |f: &dyn Fn(f64) -> f64| chart(notes(&c).into_iter().map(|(t, e, k)| (f(t), f(e), k)).collect(), 4, c.od);
-    let (a, b, z) = (analyse(&c, 1.5, BIN, false), g(&moved(&|x| x / 1.5)), analyse(&moved(&|x| x + 91234.), 1.5, BIN, false));
+    let (a, b, z) = (analyse(&c, 1.5, BIN), g(&moved(&|x| x / 1.5)), analyse(&moved(&|x| x + 91234.), 1.5, BIN));
     for i in 0..FEATURES.len() {
         assert!((a.features[i] - b.features[i]).abs() < 1e-8 && (a.features[i] - z.features[i]).abs() < 1e-8);
     }
@@ -150,7 +150,7 @@ fn bursts(gap_between: f64) -> Chart {
 #[test]
 fn vibro_support_does_not_jump_when_a_slower_gap_crosses_the_speed_gate() {
     let c = bursts(434.);
-    let (a, b) = (analyse(&c, 1.0259, BIN, false), analyse(&c, 1.0261, BIN, false));
+    let (a, b) = (analyse(&c, 1.0259, BIN), analyse(&c, 1.0261, BIN));
     for name in ["vibro_easy", "vibro_control", "vibro_sustain"] {
         assert!((feature(&a, name) - feature(&b, name)).abs() < 0.01);
     }
@@ -162,7 +162,7 @@ fn unfitted_execution_features_cannot_silently_discount_a_chart() {
     for f in FEATURES {
         ex.set(f, 1.);
     }
-    assert_eq!(final_rating(&Params::new(json!({}), &Value::Null).unwrap(), 4, 9., &[0.; 12], Some(&ex)), 9.);
+    assert_eq!(final_rating(&Params::new(json!({}), &Value::Null).unwrap(), 4, 9., Some(&ex)), 9.);
 }
 
 #[test]
@@ -175,151 +175,19 @@ fn long_stable_repetition_is_distinct_from_short_fixed_chords_inside_cj() {
 }
 
 #[test]
-fn gesture_calibration_is_local_to_evidence_and_inverts_the_score_link() {
-    let prm = Params::new(json!({"gestures": {"features": ["vibro_easy", "vibro_control"], "modes": {"4": {"coeff": [-0.4, 0.3], "slope": 2., "curve": 0.6}}}}), &Value::Null).unwrap();
-    let ex = |k: &str, v: f64| {
-        let mut d = Dict::new();
-        d.set(k, v);
-        d
-    };
-    assert_eq!(gesture_rating(&prm, 4, 9., 9., Some(&Dict::new())), 9.);
-    assert_eq!(gesture_rating(&prm, 7, 9., 9., Some(&ex("vibro_easy", 1.))), 9.);
-    let (lower, higher) = (gesture_rating(&prm, 4, 9., 9., Some(&ex("vibro_easy", 0.5))), gesture_rating(&prm, 4, 9., 9., Some(&ex("vibro_control", 0.5))));
-    let link = |v: f64| 2. * v.ln() + 0.6 * v.ln().powi(2);
-    assert!((link(lower) - link(9.) + 0.2).abs() < 1e-9 && (link(higher) - link(9.) - 0.15).abs() < 1e-9);
-    assert!(0. < lower && lower < 9. && 9. < higher);
-    assert_eq!(gesture_rating(&prm, 4, 0., 0., Some(&ex("vibro_easy", 1.))), 0.);
-}
-
-#[test]
 fn degenerate_input_is_explicit() {
     assert!(g(&chart(Vec::new(), 4, 5.)).features.iter().all(|f| *f == 0.));
     assert_eq!(feature(&g(&rice([(1000., 0), (1000., 1)], 4, 5.)), "vibro_easy"), 0.);
 }
 
-// ---- rolled execution ----
-
-fn configured(c: &Chart, strength: f64, rate: f64) -> Dict {
-    let mut model = standard_params().model.clone();
-    model["rolled_execution"] = json!({"modes": {c.keys.to_string(): {"strength": strength}}});
-    compute(c, rate, true, &Params::new(model, &Value::Null).unwrap()).unwrap()
-}
-
 #[test]
-fn planning_does_not_change_existing_calibration_features() {
-    for keys in 4..=10usize {
-        let cols: Vec<u8> = (0..keys / 2).chain((keys + 1) / 2..keys).map(|c| c as u8).collect();
-        let c = rolls(&cols, 12., 1200, keys, 8.);
-        let (old, new) = (g(&c), analyse(&c, 1., BIN, true));
-        assert!(new.series == old.series && new.features == old.features);
-        let plans = new.plans.unwrap();
-        assert!(plans.iter().any(|(_, p)| !p.is_empty()));
-        let window = great_window(c.od);
-        for p in plans.iter().flat_map(|(_, p)| p) {
-            let mut columns: Vec<u8> = p.ids.iter().map(|&i| c.col[i]).collect();
-            columns.sort();
-            columns.dedup();
-            assert_eq!(p.ids.len(), columns.len());
-            for (&i, offset) in p.ids.iter().zip(&p.offsets) {
-                assert!((p.time + offset - (c.t[i] - c.t[0]) * 0.001).abs() <= window + 1e-10);
-            }
-        }
-    }
-}
-
-#[test]
-fn rolls_share_cost_but_fixed_jt_split_trill_and_slow_stream_are_unchanged() {
-    for c in [repeated(&[&[0, 1], &[2, 3]], 60., 400), repeated(&[&[0, 2], &[1, 3]], 60., 400), roll4(&[0, 1, 2, 3], 70.), repeated(&[&[0, 1, 2, 3]], 60., 400)] {
-        assert_eq!(configured(&c, 1., 1.), configured(&c, 0., 1.));
-    }
-    let c = rolls(&[0, 1, 2, 3], 30., 2400, 4, 8.);
-    let (before, after) = (configured(&c, 0., 1.), configured(&c, 1., 1.));
-    assert!(score(&after, "overall") < score(&before, "overall") && score(&after, "jumptrill") > score(&after, "stream"));
-    assert!(execution(&after, "rolled_factor") < 1. && after.f("notes") == before.f("notes"));
-}
-
-#[test]
-fn interleaved_rolling_offsets_are_not_simultaneous_hit_errors() {
-    let c = rolls(&[0, 2, 1, 3], 27., 2400, 4, 8.);
-    let plans = analyse(&c, 1., BIN, true).plans.unwrap().into_iter().find(|(left, _)| !left).unwrap().1;
-    assert!(plans.len() > 100);
-    // Simultaneous feasibility has narrow margins in these regular hand cycles; rolling keeps the per-finger offsets.
-    assert!(plans.iter().map(|p| p.strength).sum::<f64>() / plans.len() as f64 > 0.9);
-    assert!(plans.iter().any(|p| p.span > 0.05));
-    assert!(score(&configured(&c, 1., 1.), "overall") < score(&configured(&c, 0., 1.), "overall"));
-}
-
-#[test]
-fn control_and_actual_repeats_limit_sharing() {
-    let support = |c: &Chart| configured(c, 1., 1.).dict("execution").unwrap().fget("rolled_support", 0.);
-    let (clean, turns) = (rolls(&[0, 1, 2, 3], 27., 2400, 4, 8.), rolls(&[0, 1, 2, 3, 1, 0, 3, 2], 27., 2400, 4, 8.));
-    assert!(support(&turns) < support(&clean));
-    assert!(support(&roll4(&[0, 1, 0, 2, 0, 3], 27.)) < 0.1);
-    let held = chart(notes(&clean).into_iter().map(|(t, _, k)| (t, t + 15., k)).collect(), 4, 8.);
-    assert_eq!(configured(&held, 1., 1.), configured(&held, 0., 1.));
-}
-
-#[test]
-fn no_metadata_effect_and_support_is_rate_specific() {
-    let c = rolls(&[0, 1, 3, 2], 35., 1600, 4, 8.);
-    let mut renamed = c.clone();
-    renamed.title = "Unsubmitted completely different song".into();
-    renamed.creator = "Unknown".into();
-    assert_eq!(configured(&c, 1., 1.), configured(&renamed, 1., 1.));
-    assert_eq!(configured(&c, 1., 0.5), configured(&c, 0., 0.5));
-    assert!(analyse(&c, 0.5, BIN, true).plans.unwrap().iter().all(|(_, p)| p.is_empty()));
-}
-
-#[test]
-fn locality_leaves_unrelated_phrase_timeline_untouched() {
-    let (plain, quick) = (rolls(&[0, 1, 2, 3], 90., 500, 4, 8.), rolls(&[0, 1, 2, 3], 27., 1400, 4, 8.));
-    let mut both = notes(&plain);
-    both.extend(notes(&quick).into_iter().map(|(t, e, k)| (t + 60000., e + 60000., k)));
-    let c = chart(both, 4, 8.);
-    let timeline = |d: &Dict| d.get("timeline").map(Val::list_f).unwrap();
-    let (before, after) = (timeline(&configured(&c, 0., 1.)), timeline(&configured(&c, 1., 1.)));
-    assert!(before[..75].iter().zip(&after[..75]).all(|(a, b)| (a - b).abs() < 1e-9));
-    assert!(after[125..].iter().sum::<f64>() < before[125..].iter().sum::<f64>());
-}
-
-#[test]
-fn sv_and_cached_feature_prediction_use_same_final_difficulty() {
+fn sv_and_constant_scroll_share_the_final_difficulty() {
     let mut c = rolls(&[0, 1, 3, 2], 27., 1600, 4, 8.);
     c.sv = vec![(0., 1.), (4000., 0.4), (5000., 1.8), (6000., 1.)];
-    let mut model = standard_params().model.clone();
-    model["rolled_execution"] = json!({"modes": {"4": {"strength": 1.}}});
-    let prm = Params::new(model, &Value::Null).unwrap();
+    let prm = standard_params();
     let (full, constant) = (compute(&c, 1., true, &prm).unwrap(), compute(&c, 1., false, &prm).unwrap());
     assert!((full.f("no_sv_overall") - score(&constant, "overall")).abs() < 1e-9);
     assert!(score(&full, "overall") >= score(&constant, "overall") - 1e-9);
-    let features = full.get("calibration_features").unwrap().list_f();
-    let rating = final_rating(&prm, 4, full.f("raw_overall"), &features, full.dict("execution"));
+    let rating = final_rating(&prm, 4, full.f("raw_overall"), full.dict("execution"));
     assert!((rating / score(&full, "overall") - 1.).abs() < 1e-12);
-}
-
-#[test]
-fn credit_fades_before_the_packet_timing_boundary() {
-    let c = rolls(&[0, 2, 1, 3], 28., 1400, 4, 10.);
-    let values: Vec<f64> = [0.8234, 0.8236, 0.8238].iter().map(|r| score(&configured(&c, 1., *r), "overall")).collect();
-    // Same-rate baseline drift is tiny here; no sudden grouped/un-grouped drop.
-    assert!(values.iter().cloned().fold(f64::MIN, f64::max) - values.iter().cloned().fold(f64::MAX, f64::min) < 0.02);
-}
-
-#[test]
-fn invalid_strength_is_explicit() {
-    let c = roll4(&[0, 1, 2, 3], 27.);
-    for strength in [-0.1, 1.1] {
-        let mut model = standard_params().model.clone();
-        model["rolled_execution"] = json!({"modes": {"4": {"strength": strength}}});
-        assert!(compute(&c, 1., true, &Params::new(model, &Value::Null).unwrap()).is_err());
-    }
-}
-
-#[test]
-fn feasible_rolling_offsets_can_plan_without_any_simultaneous_chord() {
-    let c = rolls(&[0, 3, 1, 2], 30., 40, 4, 10.);
-    assert_eq!(rolled(&c), 0.);
-    let plans = analyse(&c, 1., BIN, true).plans.unwrap().into_iter().find(|p| !p.0).unwrap().1;
-    assert_eq!(plans.len(), 20);
-    assert!((plans[0].control - 0.15882352941176467).abs() < 1e-15);
 }

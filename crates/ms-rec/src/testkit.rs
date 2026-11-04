@@ -147,3 +147,9 @@ pub fn install(w: &World) -> Vec<(String, String)> {
 pub fn sloped(o: f64) -> f64 {
     1. - 0.06 * (o / 2.).powi(2)
 }
+
+/// Accuracy spread over the fixture charts' whole range (2–9★ under 7cee1dfdba7f): some chart meets a ~95 % target on any
+/// calculator, where `sloped` ties the player to 2★.
+pub fn spread(o: f64) -> f64 {
+    1. - 0.01 * o
+}

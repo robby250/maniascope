@@ -227,73 +227,136 @@ pub fn star(level: f64, k: &Knobs) -> f64 {
     k.STAR_A * level.powf(k.STAR_B)
 }
 
-/// Hardest window of each horizon → required level (skill_calc._horizon_levels).
-pub fn horizon_levels(series: &[f64], k: &Knobs) -> [f64; 4] {
-    let mut out = [0.0; 4];
-    for (o, &(w, tol)) in out.iter_mut().zip(&k.HORIZONS) {
-        let n = 1usize.max((w / k.BIN) as usize).min(series.len());
-        let mut acc = 0.0f64;
-        let mut peak = 0.0f64;
-        for (i, &d) in series.iter().enumerate() {
-            let previous = if i >= n { series[i - n] } else { 0.0 };
-            acc += d - previous;
-            if acc > peak {
-                peak = acc;
+// ---- rating: the level at which a player's expected accuracy over the chart's notes reaches the target ----
+// One function rates the overall, every skill, stamina and the card's archetypes (user 2026-11-04: "i care about expected
+// accuracy in the final diff rating on all skillsets"). It replaced the peak model (hardest 2/8/30/120 s windows), which
+// let a short hard stretch rate a mostly easy chart as hard.
+
+/// What every rating of a chart weights and scales its bins by: the judgements in each bin (accuracy is an average over
+/// them; a long note is judged at its head and its release) and the hands' fatigue there (model::endurance).
+#[derive(Clone, Debug, Default)]
+pub struct Judged {
+    pub notes: Vec<f64>,
+    pub fatigue: Vec<f64>,
+}
+
+impl Judged {
+    pub fn new(times: &[f64], ends: &[f64], bins: usize, fatigue: Vec<f64>, k: &Knobs) -> Judged {
+        let mut notes = vec![0.0f64; bins];
+        if let (Some(&t0), Some(last)) = (times.first(), bins.checked_sub(1)) {
+            let mut add = |t: f64| notes[(((t - t0) / k.BIN).max(0.0) as usize).min(last)] += 1.0;
+            for (&t, &e) in times.iter().zip(ends) {
+                add(t);
+                if e > t {
+                    add(e);
+                }
             }
         }
-        *o = star(k.SCALE * (peak / n as f64).sqrt() / tol, k);
+        Judged { notes, fatigue }
     }
-    out
 }
 
-pub fn window_level(series: &[f64], w: f64, k: &Knobs) -> f64 {
-    let n = 1usize.max((w / k.BIN) as usize).min(series.len());
+/// Each bin's level from the mean demand of its trailing `window` seconds (a chart's first seconds have less behind them).
+/// At LOCAL_WINDOW it is the difficulty a note meets (the timeline); at STAMINA_WINDOW it is the sustained demand, so a
+/// short chart has little of it.
+pub fn local_levels(series: &[f64], window: f64, k: &Knobs) -> Vec<f64> {
+    let w = 1usize.max((window / k.BIN) as usize);
     let mut acc = 0.0f64;
-    let mut peak = 0.0f64;
-    for (i, &d) in series.iter().enumerate() {
-        acc += d - if i >= n { series[i - n] } else { 0.0 };
-        if acc > peak {
-            peak = acc;
-        }
-    }
-    star(k.SCALE * (peak / n as f64).sqrt(), k)
+    (0..series.len())
+        .map(|i| {
+            acc = 0f64.max(acc + series[i] - if i >= w { series[i - w] } else { 0.0 });
+            star(k.SCALE * (acc / w as f64).sqrt() / k.LOCAL_TOL, k)
+        })
+        .collect()
 }
 
-pub fn combine(levels: &[f64; 4], notes: usize, k: &Knobs) -> f64 {
-    let top = levels.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    if top <= 0.0 {
+/// The skill whose expected accuracy over the notes reaches the target, as MinaCalc searches the rating that reaches its
+/// goal accuracy. A note at level l loses 1 − exp(−(l/skill)^p) of its accuracy: little far below the skill, at most a
+/// miss far above it, so a short hard burst costs its own notes and not the whole chart (a peak model's error).
+pub fn rating(series: &[f64], judged: &Judged, keys: usize, k: &Knobs) -> f64 {
+    accuracy_rating(&note_levels(series, judged, keys, k), &judged.notes, k)
+}
+
+/// The stamina rating: the same accuracy level with the sustained demand (STAMINA_WINDOW) in place of the local one.
+pub fn stamina_rating(series: &[f64], judged: &Judged, keys: usize, k: &Knobs) -> f64 {
+    accuracy_rating(&fatigued(local_levels(series, k.STAMINA_WINDOW, k), &judged.fatigue, fatigue_weight(keys, k)), &judged.notes, k)
+}
+
+/// The level a note meets: its local demand, raised by the hands' fatigue at that moment, × (1 + w·fatigue).
+pub fn note_levels(series: &[f64], judged: &Judged, keys: usize, k: &Knobs) -> Vec<f64> {
+    fatigued(local_levels(series, k.LOCAL_WINDOW, k), &judged.fatigue, fatigue_weight(keys, k))
+}
+
+/// w = FATIGUE_W·(keys/7)^FATIGUE_W_KEYS.
+pub fn fatigue_weight(keys: usize, k: &Knobs) -> f64 {
+    k.FATIGUE_W * (keys as f64 / 7.0).powf(k.FATIGUE_W_KEYS)
+}
+
+/// `levels` × (1 + w·fatigue), bin by bin.
+pub fn fatigued(mut levels: Vec<f64>, fatigue: &[f64], w: f64) -> Vec<f64> {
+    if w != 0.0 {
+        levels.iter_mut().zip(fatigue).for_each(|(l, f)| *l *= 1.0 + w * f);
+    }
+    levels
+}
+
+/// `rating` from levels already made (the SV-reading calibration builds them from its own window sums).
+pub fn accuracy_rating(levels: &[f64], notes: &[f64], k: &Knobs) -> f64 {
+    let den: f64 = notes.iter().sum();
+    let p = k.ACC_POWER;
+    // the power mean brackets the search: the loss at the mean is the right order for any chart
+    let mean = (levels.iter().zip(notes).map(|(l, n)| n * l.powf(p)).sum::<f64>() / den.max(1e-9)).powf(1.0 / p);
+    if den <= 0.0 || mean <= 0.0 {
         return 0.0;
     }
-    let mut f = 1.0f64;
-    for (&lv, &b) in levels.iter().zip(&k.H_WEIGHTS) {
-        f *= (lv.max(1e-9) / top).powf(b);
-    }
-    top * f * ((notes.max(1) as f64) / 2000.0).powf(k.G_NOTES)
-}
-
-pub fn stamina(total: &[f64], k: &Knobs) -> f64 {
-    let n = (k.STAMINA_WINDOW / k.BIN) as usize;
-    let mut acc = 0.0f64;
-    let mut peak = 0.0f64;
-    for (i, &d) in total.iter().enumerate() {
-        let previous = if i >= n { total[i - n] } else { 0.0 };
-        acc += d - previous;
-        peak = peak.max(acc);
-    }
-    star(k.SCALE * (peak / n as f64).sqrt() / k.HORIZONS[3].1, k)
-}
-
-/// Demand totals for a bin-grid offset (skill_calc._phase_total).
-pub fn phase_total(fine: &[Vec<f64>; 3], p: usize, k: &Knobs) -> Vec<f64> {
-    let phases = k.PHASES;
-    let n = (fine[0].len() + p + phases - 1) / phases;
-    let mut acc = vec![0.0f64; 3 * n];
-    for side in 0..3 {
-        for (i, &v) in fine[side].iter().enumerate() {
-            if v != 0.0 {
-                acc[side * n + (i + p) / phases] += v;
-            }
+    let loss = |s: f64| levels.iter().zip(notes).map(|(l, n)| n * (1.0 - (-(l / s).powf(p)).exp())).sum::<f64>() / den;
+    let (mut lo, mut hi) = ((mean * 1e-3).ln(), (mean * 1e3).ln());
+    for _ in 0..60 {
+        let mid = 0.5 * (lo + hi);
+        if loss(mid.exp()) > k.ACC_TARGET {
+            lo = mid
+        } else {
+            hi = mid
         }
     }
-    (0..n).map(|b| ((acc[b] * acc[b] + acc[n + b] * acc[n + b]).sqrt() + acc[2 * n + b]) / k.BIN).collect()
+    (0.5 * (lo + hi)).exp()
+}
+
+#[cfg(test)]
+mod rating_tests {
+    use super::*;
+
+    #[test]
+    fn a_short_hard_burst_counts_by_its_notes_not_as_the_whole_chart() {
+        let k = Knobs::default();
+        let j = Judged { notes: vec![1.0; 400], fatigue: Vec::new() };
+        let easy = vec![1.0; 400];
+        let mut burst = easy.clone();
+        burst[200..216].iter_mut().for_each(|x| *x = 9.0);
+        let hard = vec![9.0; 400];
+        let r = |s: &[f64], k: &Knobs| rating(s, &j, 7, k);
+        let (e, b, h) = (r(&easy, &k), r(&burst, &k), r(&hard, &k));
+        // A peak model rates the burst chart near the hard one; on accuracy it sits much closer to the easy one.
+        assert!(e < b && b < h && (b / e).ln() < 0.5 * (h / e).ln(), "{e} {b} {h}");
+    }
+
+    #[test]
+    fn notes_weight_the_bins() {
+        let k = Knobs::default();
+        let series = [1.0, 1.0, 9.0, 9.0];
+        let (sparse_hard, dense_hard) = ([4.0, 4.0, 1.0, 1.0], [1.0, 1.0, 4.0, 4.0]);
+        let at = |notes: [f64; 4]| Judged { notes: notes.to_vec(), fatigue: Vec::new() };
+        assert!(rating(&series, &at(dense_hard), 7, &k) > rating(&series, &at(sparse_hard), 7, &k));
+        assert_eq!(Judged::new(&[10.0, 10.2, 11.0, 11.1], &[10.0, 10.2, 11.0, 12.6], 4, Vec::new(), &k).notes, vec![2.0, 0.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn tired_hands_make_the_same_notes_harder() {
+        let mut k = Knobs::default();
+        k.FATIGUE_W = 0.2;
+        let series = vec![4.0; 100];
+        let fresh = Judged { notes: vec![1.0; 100], fatigue: vec![0.0; 100] };
+        let tired = Judged { notes: vec![1.0; 100], fatigue: vec![1.0; 100] };
+        assert!(rating(&series, &tired, 7, &k) > 1.15 * rating(&series, &fresh, 7, &k));
+    }
 }

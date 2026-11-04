@@ -27,7 +27,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 pub const MODES: [&str; 3] = ["pp", "nps", "skills"];
-const CONVERT_WAIT: Duration = Duration::from_secs(2); // skipping through a list imports nothing
+const CONVERT_WAIT: Duration = Duration::from_secs(2); // skipping through a list imports nothing; a Next after a play waits for nothing
 const NOT_RUNNING: &str = "osu! isn't running";
 const NPS_CLOCK: f64 = 300.; // s: NPS/Skills predictions follow warm-up cooling without plays this often
 
@@ -1190,7 +1190,7 @@ impl Worker {
             "mods": mods.as_ref().map(|m| m.iter().map(|x| x["acronym"].clone()).collect::<Vec<_>>()).unwrap_or_default(), "mods_list": mods, "title": title, "predicted_at": now(),
             "predictor": forecast.as_ref().map_or(json!(PREDICTOR_ID), |f| f["predictor"].clone()), "calculator": forecast.as_ref().map_or(json!(CALC_ID), |f| f["calculator"].clone()),
             "snapshot": rec.map(|r| r.public.meta.snapshot.clone()), "features": exp.as_ref().map(|e| ms_data::codec::to_json(&ms_calc::val::Val::Dict((*e.1).clone()))),
-            "difficulty": exp.as_ref().map(|e| ms_calc::features::displayed_feature(&e.1, &rec.unwrap().prm)), "expected": exp.as_ref().map(|e| e.0.shown.acc_mid), "expected_lo": exp.as_ref().map(|e| e.0.shown.acc_lo),
+            "difficulty": exp.as_ref().map(|e| e.1.f("overall")), "expected": exp.as_ref().map(|e| e.0.shown.acc_mid), "expected_lo": exp.as_ref().map(|e| e.0.shown.acc_lo),
             "expected_hi": exp.as_ref().map(|e| e.0.shown.acc_hi), "accuracy_forecast": forecast, "accuracy_forecast_recorded_at": now(), "shown_mu": exp.as_ref().map(|e| e.0.pp.mu),
             "md5": identity_md5, "keys": keys, "length": length,
         });
@@ -1397,7 +1397,7 @@ impl Worker {
         match candidate.or_else(|| self.playlists[m].first().cloned().map(Box::new)) {
             Some(pick) => {
                 log_event(&self.db, "next", pick.identity().as_deref(), selected_at, &json!({"purpose": pick.purpose, "var": pick.var, "mode": mode}))?;
-                self.open(*pick, &mode, "next", result, selected_at, selection_id)?;
+                self.open(*pick, &mode, "next", result, selected_at, selection_id, skip)?;
             }
             None => (self.h.emit)(Out::Target { mode, revision: self.revision, selection_id: self.selection_id, c: None, msg: "Preparing the next playlist…".to_string(), copy: None }),
         }
@@ -1427,11 +1427,12 @@ impl Worker {
         if result.is_none() && (revision.is_some_and(|r| r != self.revision) || !self.keys[m].contains(&pick.keys) || (mode == "skills" && pick.practice_skills != self.practice_skills)) {
             return Ok(());
         }
-        self.open(*pick, &mode, "list", result, selected_at, selection_id)?;
+        self.open(*pick, &mode, "list", result, selected_at, selection_id, false)?;
         self.publish(None)
     }
 
-    fn open(&mut self, mut c: Pick, mode: &str, selection: &str, result: Option<Done>, selected_at: Option<f64>, selection_id: u64) -> Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    fn open(&mut self, mut c: Pick, mode: &str, selection: &str, result: Option<Done>, selected_at: Option<f64>, selection_id: u64, skipped: bool) -> Result<()> {
         c.mode = mode.to_string();
         c.selection = selection.to_string();
         let performed = result.is_some();
@@ -1472,7 +1473,7 @@ impl Worker {
         self.target = Some(boxed.clone());
         self.targets.insert(mode.to_string(), boxed.clone());
         if boxed.convert_of.is_some() && !boxed.installed {
-            self.deliver(boxed.clone(), mode.to_string());
+            self.deliver(boxed.clone(), mode.to_string(), skipped);
         }
         if done.sent {
             log_event(&self.db, "open", key.as_deref(), selected_at, &json!({"var": boxed.var, "mode": mode}))?;
@@ -1482,21 +1483,25 @@ impl Worker {
         Ok(())
     }
 
-    /// A convert's turn: written and imported once it stays the pick for a moment and no map is being played.
-    fn deliver(&mut self, pick: Box<Pick>, mode: String) {
+    /// A convert's turn: written and imported once no map is being played; after a skip, only if it stays the pick
+    /// for a moment (user 2026-11-03: waited seconds after a play for the import to start).
+    fn deliver(&mut self, pick: Box<Pick>, mode: String, skipped: bool) {
         let turn = self.convert_turn.fetch_add(1, Ordering::SeqCst) + 1;
         let (q, h, halt, turns, path, client) = (self.q.clone(), self.h.clone(), self.halt.clone(), self.convert_turn.clone(), self.db_path.clone(), self.shown.client.clone());
         let _ = std::thread::Builder::new().name("convert".into()).spawn(move || {
-            std::thread::sleep(CONVERT_WAIT);
+            let picked = Instant::now();
+            if skipped {
+                std::thread::sleep(CONVERT_WAIT);
+            }
             while (h.busy)() && !halt.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_secs(1));
+                std::thread::sleep(Duration::from_millis(250));
             }
             if turns.load(Ordering::SeqCst) != turn || halt.load(Ordering::Relaxed) {
                 return;
             }
             let root = crate::catalog::local_origin(&client).1;
             let error = if crate::navigation::game_running(&client) {
-                connect(&path).map_err(|e| e.to_string()).and_then(|db| converts::deliver(&pick, &db, &client, &root)).err()
+                connect(&path).map_err(|e| e.to_string()).and_then(|db| converts::deliver(&pick, &db, &client, &root, picked)).err()
             } else {
                 Some(NOT_RUNNING.to_string())
             };
@@ -1518,7 +1523,7 @@ impl Worker {
         let pick = Pick { sha: Some(sha), md5: Some(md5), title: text("Title").unwrap_or_default(), artist: text("Artist"), song: text("Title"), version: Some(out.version), creator: text("Creator"),
                           keys: target, set_id: text("BeatmapSetID").and_then(|s| s.parse().ok()), convert_of: Some(source), ..Pick::default() };
         self.status("Converting…");
-        self.deliver(Box::new(pick), SELECTED.to_string());
+        self.deliver(Box::new(pick), SELECTED.to_string(), false);
     }
 
     fn t_convert_done(&mut self, pick: Box<Pick>, mode: String, error: Option<String>) -> Result<()> {
