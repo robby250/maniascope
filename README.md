@@ -20,7 +20,7 @@ with [Torosu](https://github.com/Manolo-dl/Torosu) and imported into the game wh
 1. Download `ManiaScope.exe` from Releases and put it anywhere.
 2. Run it. On first start it downloads the population data for predictions (~200 MB).
 3. Optional: in ⋯ → **osu! profile…**, enter your username. Your public top-100 plays are then used as
-   bests (no password or API key).
+   bests.
 4. Optional: in the playlist window, NPS tab → ⚙ → **Website charts**, pick a ★ range and press Download. This
    runs in the background at low priority and fetches only chart text, never audio.
 
