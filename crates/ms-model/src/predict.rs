@@ -700,6 +700,14 @@ pub const MIN_RATE: f64 = 0.50;
 pub const MAX_RATE: f64 = 2.00;
 const MAX_TARGET: f64 = 0.985;
 const MAX_HIGH: f64 = 0.99;
+/// A rate further than this from the target gets the solved rate analysed (a 0.01× step moves the prediction ~0.15 pp).
+const ACC_TOL: f64 = 0.001;
+
+/// Whether (acc, value) beats `other` as a chart's offered rate: nearer the target in ACC_TOL steps, then the higher value.
+fn nearer(a: (f64, f64), other: (f64, f64), target: f64) -> bool {
+    let off = |acc: f64| ((acc - target).abs() / ACC_TOL).round();
+    off(a.0) < off(other.0) || (off(a.0) == off(other.0) && a.1 > other.1)
+}
 
 /// The request context of nps.candidates_from.
 struct Ctx {
@@ -972,19 +980,21 @@ impl PredModel {
             }
         }
         let mut prop = None;
-        if !has(proposal) && (!eligible_a || (e.acc_mid - target).abs() > 0.003 || anchor_missed.is_some()) {
+        if !has(proposal) && (!eligible_a || (e.acc_mid - target).abs() > ACC_TOL || anchor_missed.is_some()) {
             let nps = if ctx.skills { o.nps } else { o.nps * proposal / r };
             if let Some(q) = ctx.value(o, sa, nps, e, target, proposal, target) {
                 prop = Some((q, proposal, GROUPS[self.group(f)]));
             }
         }
+        // The band only says which rates may be offered; the one offered is the closest to the target (user 2026-11-05: 0.82×
+        // at 94.9 % for a 96 % target, because the denser rate scored higher anywhere in the band). Value breaks ties.
         let mut best: Option<(usize, f64)> = None;
         for (i, &(o, _, ref e, s)) in rated.iter().enumerate() {
             if missed(o.rate).is_some() || !ctx.eligible(e) || (o.vibro && !(ctx.skills && ctx.wants_vibro)) {
                 continue;
             }
             if let Some(v) = ctx.value(o, s, o.nps, e, e.acc_mid, o.rate, target) {
-                if best.is_none_or(|b| v > b.1) {
+                if best.is_none_or(|b| nearer((e.acc_mid, v), (rated[b.0].2.acc_mid, b.1), target)) {
                     best = Some((i, v));
                 }
             }
@@ -1693,6 +1703,14 @@ mod target_tests {
         let top = ctx(0.99, false);
         assert_eq!(top.central(), MAX_TARGET);
         assert!(top.band().1 <= MAX_HIGH);
+    }
+
+    /// User 2026-11-05: 0.82× at 94.9 % was offered for a 96 % target because the denser rate had the higher value.
+    #[test]
+    fn the_rate_nearest_the_target_is_offered_and_value_only_breaks_ties() {
+        assert!(nearer((0.9598, 1.), (0.949, 5.), 0.96));
+        assert!(!nearer((0.949, 5.), (0.9598, 1.), 0.96));
+        assert!(nearer((0.9601, 2.), (0.9599, 1.), 0.96));
     }
 
     #[test]
