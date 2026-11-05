@@ -135,6 +135,8 @@ fn stable_library_scores_replays_and_units() {
     let row: (String, i64, String, i64, i64) = db.query_row("SELECT sha256,beatmap_id,md5,status,keys FROM installed", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).unwrap();
     assert_eq!(row, (sha.clone(), 55, md5.clone(), 1, 7));
     assert_eq!(std::fs::read(local_file(&sha, &stable_store()).unwrap()).unwrap(), OSU, "every sha → file lookup reaches stable's chart");
+    // The calculator carry reads it too: before, a stable player's every chart kept the old calculator's analysis.
+    assert!(ms_rec::engine::Charts::new(&db).unwrap().chart(&sha).is_some(), "the carry finds stable's chart");
     let mut rows: Vec<(i64, f64, String, i64)> = db.prepare("SELECT total,rate,client,beatmap_id FROM scores").unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().map(Result::unwrap).collect();
     rows.sort_by_key(|r| r.0);
     assert_eq!(rows, [(700000, 1., "stable".to_string(), 55), (812345, 1.5, "stable".to_string(), 55)]);

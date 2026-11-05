@@ -16,6 +16,11 @@ fn month_name(m: i64) -> String {
 
 /// [(level, short name, full name)] of the keymode's main dan series inside lo..hi: the level matching each dan (its
 /// rating / the page's dan scale).
+
+/// Levels and ratings as the player reads them (osu!-anchored); dans and bars stay on the fitted scale.
+fn st(keys: i64, v: f64) -> f64 {
+    ms_rec::shown::stars(keys, v)
+}
 fn dan_ticks(keys: i64, lo: f64, hi: f64, factor: f64) -> Vec<(f64, String, String)> {
     let Some(series) = dans::series(keys, "rice") else { return Vec::new() };
     let prefix = dans::short(series).trim();
@@ -70,7 +75,7 @@ fn dan_axis(ui: &mut Ui, keys: i64, scale: Scale, width: f32) {
     }
     if let Some(at) = response.hover_pos() {
         if let Some((stars, _, full)) = ticks.iter().min_by(|a, b| (scale.x(a.0, r) - at.x).abs().total_cmp(&(scale.x(b.0, r) - at.x).abs())) {
-            response.on_hover_text_at_pointer(format!("{full} · level {stars:.2}"));
+            response.on_hover_text_at_pointer(format!("{full} · level {:.2}", st(keys, *stars)));
         }
     }
 }
@@ -209,7 +214,7 @@ fn history_chart(ui: &mut Ui, keys: i64, h: &[(i64, f64, f64)], peak: (i64, f64)
     if let Some((a, b)) = marked {
         let inside: Vec<&(i64, f64, f64)> = h.iter().filter(|e| (a..=b).contains(&x(e.0))).collect();
         if let (Some(f), Some(l)) = (inside.first(), inside.last()) {
-            mark(&plot, r, (a, b), format!("{:+.2} over these {} months", l.1 - f.1, l.0 - f.0 + 1));
+            mark(&plot, r, (a, b), format!("{:+.2} over these {} months", st(keys, l.1) - st(keys, f.1), l.0 - f.0 + 1));
         }
     }
     let hint = hint(ui, &response, hints);
@@ -222,10 +227,10 @@ fn history_chart(ui: &mut Ui, keys: i64, h: &[(i64, f64, f64)], peak: (i64, f64)
         let dan = dans::ability(keys, v, "overall", &page.dan_scale).map_or(String::new(), |d| format!(" · ≈ {d}"));
         let text = if near_peak {
             let ago = (page.now - m as f64).round() as i64;
-            format!("Peak {v:.1} · {} · {}{dan}", month_name(m), match ago { 0 => "this month".to_string(), 1 => "a month ago".to_string(), n => format!("{n} months ago") })
+            format!("Peak {:.1} · {} · {}{dan}", st(keys, v), month_name(m), match ago { 0 => "this month".to_string(), 1 => "a month ago".to_string(), n => format!("{n} months ago") })
         } else {
-            let before = h.iter().rev().find(|e| e.0 < m).map_or(String::new(), |e| format!(" ({:+.2} on {})", v - e.1, month_name(e.0)));
-            format!("{} · level {v:.2}{before} · {plays:.0} plays{dan}", month_name(m))
+            let before = h.iter().rev().find(|e| e.0 < m).map_or(String::new(), |e| format!(" ({:+.2} on {})", st(keys, v) - st(keys, e.1), month_name(e.0)));
+            format!("{} · level {:.2}{before} · {plays:.0} plays{dan}", month_name(m), st(keys, v))
         };
         response.on_hover_text_at_pointer(format!("{text}{hint}"));
     }
@@ -315,13 +320,13 @@ impl App {
             let bar = skill_bar(ui, keys, row, scale, page.session, l.bar, line);
             let at = bar.hover_pos().map(|p| scale.level(p.x, bar.rect));
             pointed = at;
-            let at = at.map_or(String::new(), |v| format!("\nAt the line: level {v:.2}{}", dans::ability(keys, v, &node.key, &page.dan_scale).map_or(String::new(), |d| format!(" ≈ {d}"))));
+            let at = at.map_or(String::new(), |v| format!("\nAt the line: level {:.2}{}", st(keys, v), dans::ability(keys, v, &node.key, &page.dan_scale).map_or(String::new(), |d| format!(" ≈ {d}"))));
             if let Some(g) = row {
                 if let Some(v) = g.value {
-                    let examples: Vec<String> = g.examples.iter().map(|(t, r, d)| format!("{t} · {r:.2}× · difficulty {d:.1}")).collect();
-                    bar.on_hover_text(format!("Level {v:.2}; likely between {:.2} and {:.2}. {} plays on {} charts.{}{at}", g.low, g.high, g.plays, g.maps, if examples.is_empty() { String::new() } else { format!("\n{}", examples.join("\n")) }));
+                    let examples: Vec<String> = g.examples.iter().map(|(t, r, d)| format!("{t} · {r:.2}× · difficulty {:.1}", st(keys, *d))).collect();
+                    bar.on_hover_text(format!("Level {:.2}; likely between {:.2} and {:.2}. {} plays on {} charts.{}{at}", st(keys, v), st(keys, g.low), st(keys, g.high), g.plays, g.maps, if examples.is_empty() { String::new() } else { format!("\n{}", examples.join("\n")) }));
                 } else if g.extrapolated {
-                    bar.on_hover_text(format!("Evidence reaches difficulty {:.1}; the fitted limit is not measured.{at}", g.tested_to));
+                    bar.on_hover_text(format!("Evidence reaches difficulty {:.1}; the fitted limit is not measured.{at}", st(keys, g.tested_to)));
                 } else if !at.is_empty() {
                     bar.on_hover_text(at.trim_start().to_string());
                 }
@@ -333,7 +338,7 @@ impl App {
                 ui.horizontal(|ui| {
                     match value {
                         Some(v) => {
-                            ui.label(RichText::new(format!("{v:.1}")).family(egui::FontFamily::Name("bold".into())));
+                            ui.label(RichText::new(format!("{:.1}", st(keys, v))).family(egui::FontFamily::Name("bold".into())));
                             if let Some(d) = &dan {
                                 theme::dim_small(ui, format!("≈ {d}"));
                             }
@@ -350,7 +355,7 @@ impl App {
         });
         let confidence = row.map_or("Not enough evidence", |g| g.confidence);
         let maps = row.map_or(0, |g| g.maps);
-        let session = row.filter(|g| page.session && g.value.is_some()).and_then(|g| g.current).map_or(String::new(), |c| format!(" · this session {c:.1}"));
+        let session = row.filter(|g| page.session && g.value.is_some()).and_then(|g| g.current).map_or(String::new(), |c| format!(" · this session {:.1}", st(keys, c)));
         ui.horizontal(|ui| {
             ui.add_space(l.name + 8.);
             theme::dim_small(ui, format!("{confidence} · {} charts{session}", ms_rec::engine::commas(maps)));
@@ -365,7 +370,7 @@ impl App {
         let dan_scale = &page.dan_scale;
         ui.horizontal(|ui| match value {
             Some(v) => {
-                ui.label(RichText::new(format!("{v:.1}")).size(theme::BODY * 2.2).family(egui::FontFamily::Name("bold".into())));
+                ui.label(RichText::new(format!("{:.1}", st(keys, v))).size(theme::BODY * 2.2).family(egui::FontFamily::Name("bold".into())));
                 ui.label(RichText::new(format!("your {keys}K level")).family(egui::FontFamily::Name("bold".into())));
                 if let Some(d) = dans::ability(keys, v, "overall", dan_scale) {
                     ui.label(format!("·  ≈ {d}"));
@@ -379,7 +384,7 @@ impl App {
         let mut lines = Vec::new();
         if let (Some(v), Some(p)) = (value, peak) {
             if p.1 > v + 0.05 {
-                lines.push(format!("Peak {:.1} in {}{}", p.1, month_name(p.0), dans::ability(keys, p.1, "overall", dan_scale).map_or(String::new(), |d| format!(" (≈ {d})"))));
+                lines.push(format!("Peak {:.1} in {}{}", st(keys, p.1), month_name(p.0), dans::ability(keys, p.1, "overall", dan_scale).map_or(String::new(), |d| format!(" (≈ {d})"))));
             } else if !stale {
                 lines.push("This is your peak so far.".to_string());
             }
@@ -388,7 +393,7 @@ impl App {
             lines.push(format!("Last measured in {}: too few {keys}K plays since to tell your form now.", month_name(last.0)));
         }
         match overall.and_then(|g| g.current).filter(|_| value.is_some() && page.session) {
-            Some(c) => lines.push(format!("This session: {c:.1} (○ on the bars)")),
+            Some(c) => lines.push(format!("This session: {:.1} (○ on the bars)", st(keys, c))),
             None if value.is_some() => lines.push("Not warmed up: the first maps of a session play lower than this, so no session number is shown until you have played a few.".to_string()),
             None => {}
         }
@@ -522,7 +527,7 @@ impl App {
                     theme::dim(ui, "Each rating uses its own keymode's difficulty scale. There is no cross-keymode average.");
                     for k in SUPPORTED_KEYS {
                         let page = data.pages.get(&k);
-                        let value = page.and_then(|p| p.groups.get("overall")).and_then(|g| g.value).map_or("—".to_string(), |v| format!("{v:.1}"));
+                        let value = page.and_then(|p| p.groups.get("overall")).and_then(|g| g.value).map_or("—".to_string(), |v| format!("{:.1}", st(k, v)));
                         let (maps, plays) = page.map_or((0, 0), |p| (p.maps, p.plays));
                         if ui.add(egui::Button::new(format!("{k}K     {value}    ·    {} charts / {} plays", ms_rec::engine::commas(maps), ms_rec::engine::commas(plays))).frame(false)).clicked() {
                             self.s.stats_keys = Some(k);

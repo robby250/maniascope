@@ -514,7 +514,7 @@ pub struct WebMap {
 }
 
 /// Stored website features moved to the calculator `to`, web.msp with them: a calculator change would else crawl everything again.
-pub fn carry(from: &str, to: &str, before: &Params, after: &Params, chart: &(dyn Fn(&str) -> Option<ms_calc::chart::Chart> + Sync)) -> Result<(), String> {
+pub fn carry(from: &str, to: &str, after: &Params, chart: &(dyn Fn(&str) -> Option<ms_calc::chart::Chart> + Sync)) -> Result<(), String> {
     let text = |e: rusqlite::Error| e.to_string();
     if !web_dir().join("state.db").is_file() {
         return Ok(());
@@ -522,9 +522,10 @@ pub fn carry(from: &str, to: &str, before: &Params, after: &Params, chart: &(dyn
     let db = state_db().map_err(text)?;
     let todo: Vec<String> = db.prepare("SELECT sha FROM feats WHERE calc=? AND sha NOT IN (SELECT sha FROM feats WHERE calc=?)").map_err(text)?
         .query_map([from, to], |r| r.get(0)).map_err(text)?.collect::<rusqlite::Result<_>>().map_err(text)?;
-    let rules = ms_calc::features::rules_differ(before, after);
     let threads = (std::thread::available_parallelism().map_or(2, |x| x.get()) / 2).max(1);
+    crate::store::CARRIED[1].fetch_add(todo.len(), std::sync::atomic::Ordering::Relaxed);
     for chunk in todo.chunks(500) {
+        crate::store::CARRIED[0].fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed);
         let mut stored: Vec<(&String, Vec<u8>)> = Vec::with_capacity(chunk.len());
         for sha in chunk {
             stored.push((sha, db.query_row("SELECT data FROM feats WHERE sha=? AND calc=?", [sha.as_str(), from], |r| r.get(0)).map_err(text)?));
@@ -533,7 +534,7 @@ pub fn carry(from: &str, to: &str, before: &Params, after: &Params, chart: &(dyn
             let file = std::cell::OnceCell::new();
             let chart = || file.get_or_init(|| chart(sha).map(std::rc::Rc::new)).clone();
             let fs = read_cell(data).unwrap_or_default();
-            let moved: Vec<Option<Dict>> = fs.iter().map(|(r, f)| ms_calc::features::carried(f, after, rules, *r, &chart)).collect();
+            let moved: Vec<Option<Dict>> = fs.iter().map(|(r, f)| ms_calc::features::carried(f, after, *r, &chart)).collect();
             Ok(if moved.iter().any(Option::is_some) {
                 write_cell(&fs.iter().zip(moved).map(|((r, f), m)| (*r, m.unwrap_or_else(|| f.clone()))).collect::<Vec<_>>())
             } else {

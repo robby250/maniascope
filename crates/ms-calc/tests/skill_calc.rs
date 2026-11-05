@@ -256,10 +256,12 @@ fn ln_interaction() {
     let taps = |hold: fn(i64, usize) -> Option<i64>| -> Vec<Note> { (0..300).flat_map(|i| [0, 1].map(|c| (1000 + 300 * i, c, hold(1000 + 300 * i, c)))).collect() };
     let (a, b, c) = (sc(&taps(|_, _| None), 7), sc(&taps(|t, _| Some(t + 250)), 7), sc(&taps(|t, c| Some(t + 250 - 70 * c as i64)), 7));
     assert!(a.f("ln") == 0. && a.f("overall") < b.f("overall") && b.f("overall") < c.f("overall"));
-    // a long simple hold is not harder than a shorter one
-    let holds = |len: i64| -> Vec<Note> { (0..40).map(|i| (1000 + 3000 * i, 3, Some(1000 + len + 3000 * i))).collect() };
+    // a long simple hold is not harder than a shorter one, each release 1.6 s before the next press (a fixed 3 s period put the
+    // long hold's release 0.6 s before the next head: closer notes, not a longer hold, made it harder)
+    let holds = |len: i64| -> Vec<Note> { (0..40).map(|i| (1000 + (len + 1600) * i, 3, Some(1000 + len + (len + 1600) * i))).collect() };
     let (long, short) = (sc(&holds(2400), 7).f("overall"), sc(&holds(1400), 7).f("overall"));
-    assert!((long - short).abs() < 0.12, "{long} {short}");
+    // 8abec714fac5: +2.4 % at 0.5★ from the fitted hold-share columns (no evidence under 3★); the old bound was ±0.12 stars
+    assert!(long <= short * 1.05, "{long} {short}");
     // tapping under a same-hand hold costs more than under an other-hand hold
     let under = |low: i64| -> Vec<Note> {
         let mut n: Vec<Note> = (0..30).map(|i| (1000 + 4000 * i, 0, Some(4900 + 4000 * i))).collect();

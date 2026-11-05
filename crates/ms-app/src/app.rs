@@ -603,8 +603,8 @@ impl App {
         if let Some(a) = self.analysis() {
             let step = (a.timeline.len() / 120).max(1);
             let dan = self.s.display.info.then(|| ms_rec::dans::label(a.keys, a.overall, a.ln_notes / a.notes.max(1) as f64, Some(&a.dan_vibro))).flatten();
-            state = json!({"title": a.title, "artist": a.artist, "version": format!("[{}]  {}", a.version, a.creator), "rating": a.overall, "context": fmt::context(a, dan.as_deref(), ""), "nps": a.nps,
-                           "ln": (100. * a.ln_notes / a.notes.max(1) as f64).round(), "skills": a.entries.iter().take(self.s.display.skills).map(|e| json!({"name": e.name, "rating": e.rating})).collect::<Vec<_>>(),
+            state = json!({"title": a.title, "artist": a.artist, "version": format!("[{}]  {}", a.version, a.creator), "rating": ms_rec::shown::stars(a.keys, a.overall), "context": fmt::context(a, dan.as_deref(), ""), "nps": a.nps,
+                           "ln": (100. * a.ln_notes / a.notes.max(1) as f64).round(), "skills": a.entries.iter().take(self.s.display.skills).map(|e| json!({"name": e.name, "rating": ms_rec::shown::stars(a.keys, e.rating)})).collect::<Vec<_>>(),
                            "timeline": a.timeline.chunks(step).map(|c| c.iter().copied().fold(f64::MIN, f64::max)).collect::<Vec<_>>()});
         }
         if let Some(c) = &self.card {

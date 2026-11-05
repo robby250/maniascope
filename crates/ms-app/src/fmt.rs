@@ -129,7 +129,7 @@ pub fn prediction_line(c: &Card, pp: bool, shown: &Shown) -> (Line, String) {
     }
     if let Some((stars, n)) = c.plays_like {
         // User 2026-10-02 could not tell whose stars or whose scores ("7.4* osu SR? or our SR?").
-        tip.push(format!("Top-1000 players score on it like a {stars:.1}★ map (ManiaScope ★, their best of {} scores at {:.2}×)", ms_rec::engine::commas(n as usize), c.rate));
+        tip.push(format!("Top-1000 players score on it like a {:.1}★ map (ManiaScope ★ on osu!'s scale, their best of {} scores at {:.2}×)", ms_rec::shown::stars(c.keys, stars), ms_rec::engine::commas(n as usize), c.rate));
     }
     (line, tip.join("\n"))
 }

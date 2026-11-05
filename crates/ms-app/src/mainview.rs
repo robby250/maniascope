@@ -71,8 +71,10 @@ fn your_skill(page: &Page, keys: i64, sk: &str) -> Option<f64> {
     out
 }
 
-fn versus(v: f64, you: Option<f64>) -> String {
-    you.map_or(String::new(), |y| format!(" · you {y:.1} ({:+.1})", v - y))
+/// A chart's rating against yours, both in fitted units, read on the shown (osu!) scale.
+fn versus(keys: i64, v: f64, you: Option<f64>) -> String {
+    let st = |x| ms_rec::shown::stars(keys, x);
+    you.map_or(String::new(), |y| format!(" · you {:.1} ({:+.1})", st(y), st(v) - st(y)))
 }
 
 /// Song time at this rate.
@@ -122,7 +124,7 @@ impl App {
             Some((x_at(w.t * 1000.)?, format!("Tech passage · {} · pattern {:.0}% / rhythm {:.0}%{why}", at_rate(w.t * 1000., a.rate), 100. * w.pattern, 100. * w.rhythm)))
         }).collect();
         let peak = (0..pts.len()).max_by(|&i, &j| pts[i].total_cmp(&pts[j])).unwrap_or(0);
-        marks.push((points[peak].0, format!("Peak · {}difficulty {:.1}", time(points[peak].0), pts[peak])));
+        marks.push((points[peak].0, format!("Peak · {}difficulty {:.1}", time(points[peak].0), ms_rec::shown::stars(a.keys, pts[peak]))));
         for (x, _) in &marks {
             p.vline(*x, (rect.bottom() - 6.)..=rect.bottom(), Stroke::new(2., ACCENT));
         }
@@ -131,7 +133,7 @@ impl App {
             Some((_, name)) => name,
             None => {
                 let i = (((hover.x - rect.left()) / rect.width()).clamp(0., 1.) * n).round() as usize;
-                format!("{}difficulty {:.1}", time(hover.x), pts[i.min(pts.len() - 1)])
+                format!("{}difficulty {:.1}", time(hover.x), ms_rec::shown::stars(a.keys, pts[i.min(pts.len() - 1)]))
             }
         };
         response.on_hover_text_at_pointer(text);
@@ -141,7 +143,7 @@ impl App {
     fn skill_tip(&self, a: &Analysis, i: usize) -> String {
         let e = &a.entries[i];
         let you = self.you(a.keys).and_then(|p| e.parts.first().and_then(|s| your_skill(p, a.keys, s)));
-        let mut lines = vec![format!("{} {:.1}{}", e.name, e.rating, versus(e.rating, you))];
+        let mut lines = vec![format!("{} {:.1}{}", e.name, ms_rec::shown::stars(a.keys, e.rating), versus(a.keys, e.rating, you))];
         if e.parts.len() > 1 {
             lines.push(e.parts.iter().map(|p| a.names.iter().find(|n| n.0 == *p).map_or(p.as_str(), |n| n.1.as_str())).collect::<Vec<_>>().join(" + "));
         }
@@ -160,10 +162,10 @@ impl App {
         area.context_menu(|ui| self.map_menu(ui, a));
         let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Center)));
         if d.rating {
-            let v = ms_calc::py::round_digits(a.overall, 2);
+            let v = ms_calc::py::round_digits(ms_rec::shown::stars(a.keys, a.overall), 2);
             let (text, pill) = fmt::rating_colours(v);
             let you = self.you(a.keys).and_then(|p| Some((p.groups.get("overall")?.value?, p)));
-            let versus = you.map_or(String::new(), |(y, p)| format!("\n{:+.1} vs your {}K {y:.1}{}", v - y, a.keys, ms_rec::dans::ability(a.keys, y, "overall", &p.dan_scale).map_or(String::new(), |d| format!(" · ≈ {d}"))));
+            let versus = you.map_or(String::new(), |(y, p)| format!("\n{:+.1} vs your {}K {:.1}{}", v - ms_rec::shown::stars(a.keys, y), a.keys, ms_rec::shown::stars(a.keys, y), ms_rec::dans::ability(a.keys, y, "overall", &p.dan_scale).map_or(String::new(), |d| format!(" · ≈ {d}"))));
             theme::gradient(&mut ui, &format!("{v:.2}"), BODY * 2.4, None, &text, Some(pill))
                 .on_hover_text(format!("Overall difficulty: level a well-rounded player needs for controlled, accurate play. Provisional calibration — one decimal is already generous.{versus}"));
             ui.add_space(4.);
@@ -180,7 +182,7 @@ impl App {
                 let family = if r >= 0.85 && i < 2 { egui::FontFamily::Name("bold".into()) } else { egui::FontFamily::Proportional };
                 TextFormat { font_id: FontId::new(BODY * (0.70 + 0.55 * f), family), color: TEXT.gamma_multiply(0.55 + 0.45 * f), ..TextFormat::default() }
             };
-            let text = |i: usize| format!("{} {:.1}", a.entries[i].name, a.entries[i].rating);
+            let text = |i: usize| format!("{} {:.1}", a.entries[i].name, ms_rec::shown::stars(a.keys, a.entries[i].rating));
             let width = ui.available_width();
             let row = |range: std::ops::Range<usize>| {
                 let mut j = LayoutJob::default();
@@ -245,7 +247,7 @@ impl App {
             let row = egui::Rect::from_min_size(area.min + Vec2::new(0., i as f32 * BAR_ROW), Vec2::new(area.width(), BAR_ROW));
             let hover = ui.interact(row, ui.scope_id().with(("bar", i)), Sense::hover());
             p.text(row.left_center(), egui::Align2::LEFT_CENTER, name, font.clone(), theme::TEXT);
-            p.text(row.right_center(), egui::Align2::RIGHT_CENTER, format!("{value:.2}"), font.clone(), theme::TEXT);
+            p.text(row.right_center(), egui::Align2::RIGHT_CENTER, format!("{:.2}", ms_rec::shown::stars(a.keys, *value)), font.clone(), theme::TEXT);
             let track = egui::Rect::from_min_max(egui::pos2(row.left() + BAR_LABEL, row.center().y - 3.), egui::pos2(row.right() - BAR_VALUE, row.center().y + 3.));
             p.rect_filled(track, 3., theme::BUTTON);
             let mut fill = track;
@@ -256,7 +258,7 @@ impl App {
                 let x = track.left() + track.width() * (y as f32 / BAR_FULL).clamp(0., 1.);
                 p.vline(x, (track.top() - 3.)..=(track.bottom() + 3.), Stroke::new(2., TEXT.gamma_multiply(0.6)));
             }
-            hover.on_hover_text(format!("{name} {value:.2}{}{}\n\n{BARS_TIP}", versus(*value, you), if you.is_some() { " — the tick is you" } else { "" }));
+            hover.on_hover_text(format!("{name} {:.2}{}{}\n\n{BARS_TIP}", ms_rec::shown::stars(a.keys, *value), versus(a.keys, *value, you), if you.is_some() { " — the tick is you" } else { "" }));
         }
     }
 

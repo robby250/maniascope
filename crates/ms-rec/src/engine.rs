@@ -24,10 +24,10 @@ use std::sync::{Arc, Mutex};
 /// recommend.predictor_id of the model the Rust port reproduces: forecasts stay comparable across the port. A change to
 /// the prediction model takes a new id, so old forecasts are not read as this model's.
 pub const PREDICTOR_ID: &str = "86660d70dccc";
-pub const CALC_ID: &str = "2f01eca5e738";
+pub const CALC_ID: &str = "8abec714fac5";
 /// Differ from CALC_ID in calibration only (calib/carry.json), newest first: a crawl still running holds the website rows back a whole
 /// calculator, so those can start older than the library's. Each carry keeps its source row.
-pub const CARRIED_CALCS: [&str; 9] = ["7cee1dfdba7f", "a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f"];
+pub const CARRIED_CALCS: [&str; 10] = ["2f01eca5e738", "7cee1dfdba7f", "a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f"];
 const SURE_PLAYS: usize = 50; // of the player's own, on a keymode: fewer and the model is mostly the population's guess
 pub const ACTIVE_KEYS: std::ops::RangeInclusive<i64> = 4..=10;
 
@@ -430,7 +430,7 @@ mod tests {
 pub fn carry_rows(db: &ms_data::store::Db) -> std::result::Result<(), String> {
     let charts = Charts::new(db).map_err(|e| e.to_string())?;
     for from in CARRIED_CALCS {
-        ms_data::store::carry_feats(db, from, CALC_ID, &ms_calc::features::params_of(from)?, &ms_calc::features::standard_params(), &|sha| charts.counted(sha)).map_err(|e| e.to_string())?;
+        ms_data::store::carry_feats(db, from, CALC_ID, &ms_calc::features::standard_params(), &|sha| charts.counted(sha)).map_err(|e| e.to_string())?;
     }
     let missing = charts.missing.load(std::sync::atomic::Ordering::Relaxed);
     if missing > 0 {
@@ -443,7 +443,7 @@ pub fn carry_rows(db: &ms_data::store::Db) -> std::result::Result<(), String> {
 pub fn carry_web(db: &ms_data::store::Db) -> std::result::Result<(), String> {
     ms_data::webmaps::forget_in_client()?;
     let charts = Charts::new(db).map_err(|e| e.to_string())?;
-    CARRIED_CALCS.iter().try_for_each(|from| ms_data::webmaps::carry(from, CALC_ID, &ms_calc::features::params_of(from)?, &ms_calc::features::standard_params(), &|sha| charts.counted(sha)))
+    CARRIED_CALCS.iter().try_for_each(|from| ms_data::webmaps::carry(from, CALC_ID, &ms_calc::features::standard_params(), &|sha| charts.counted(sha)))
 }
 
 /// A stored chart by its sha: lazer's store, the website cache, or a convert remade from its source.
@@ -461,7 +461,9 @@ impl Charts {
 
     pub fn chart(&self, sha: &str) -> Option<ms_calc::chart::Chart> {
         let web = ms_data::webmaps::web_dir().join("osu").join(format!("{sha}.osu"));
-        let data = ms_data::paths::local_file(sha, &self.root).and_then(|p| std::fs::read(p).ok()).or_else(|| std::fs::read(web).ok()).or_else(|| crate::converts::bytes(self.converts.get(sha)?, &self.root))?;
+        // Stable's store too: a stable player's charts all read as missing and kept the old calculator's analysis (Less
+        // 2026-11-05: every LN skill at 0 charts, v1.4.0).
+        let data = crate::pp::chart_path(Some(sha)).and_then(|p| std::fs::read(p).ok()).or_else(|| std::fs::read(web).ok()).or_else(|| crate::converts::bytes(self.converts.get(sha)?, &self.root))?;
         ms_calc::chart::parse(&data).ok()
     }
 

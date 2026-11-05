@@ -211,7 +211,7 @@ fn row_text(c: &Pick, mode: &str, shown: &ms_rec::history::Shown) -> (String, Ve
     let acc = 100. * shown.acc(c.pred.acc_mid);
     let (number, sub) = if pp_row(c, mode) {
         let n = format!("{}+{:.1}pp · {:.0}%", if mode != "pp" { "PP " } else { "" }, c.gain.unwrap_or(0.), 100. * c.p_up.unwrap_or(0.));
-        (n, vec![c.var.clone(), c.stars.map_or(String::new(), |s| format!("{s:.1}★")), c.best.filter(|b| *b != 0.).map_or("new".to_string(), |b| format!("best {b:.0}pp")), length])
+        (n, vec![c.var.clone(), c.stars.map_or(String::new(), |s| format!("{:.1}★", ms_rec::shown::stars(c.keys, s))), c.best.filter(|b| *b != 0.).map_or("new".to_string(), |b| format!("best {b:.0}pp")), length])
     } else if mode == "pp" {
         (format!("warm-up ~{acc:.1}%"), vec![length])
     } else {

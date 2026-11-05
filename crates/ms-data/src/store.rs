@@ -36,19 +36,23 @@ CREATE INDEX IF NOT EXISTS events_t ON events(t);
 
 pub type Db = Connection;
 
+/// Charts carried so far / to carry in this run (own rows and website rows), for the app's progress line.
+pub static CARRIED: [std::sync::atomic::AtomicUsize; 2] = [std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0)];
+
 /// Stored chart features moved to the calculator `to`, so a calibration change doesn't re-analyse the library. Charts it doesn't
 /// move keep their bytes. Rows are copied, as every older calculator's were left; a stopped run resumes.
-pub fn carry_feats(db: &Db, from: &str, to: &str, before: &ms_calc::params::Params, after: &ms_calc::params::Params, chart: &(dyn Fn(&str) -> Option<ms_calc::chart::Chart> + Sync)) -> Result<usize> {
+pub fn carry_feats(db: &Db, from: &str, to: &str, after: &ms_calc::params::Params, chart: &(dyn Fn(&str) -> Option<ms_calc::chart::Chart> + Sync)) -> Result<usize> {
     let there: std::collections::HashSet<String> = db.prepare("SELECT key FROM feats WHERE key LIKE ?")?.query_map([format!("%|{to}")], |r| r.get(0))?.collect::<Result<_>>()?;
     let all: Vec<String> = db.prepare("SELECT key FROM feats WHERE key LIKE ? ORDER BY key")?.query_map([format!("%|{from}")], |r| r.get(0))?.collect::<Result<_>>()?;
     // A launch during a crawl repeats the carry, and a second source calculator repeats most rows: only the missing cost anything.
     let keys: Vec<String> = all.into_iter().filter(|k| !there.contains(&format!("{}|{to}", k.rsplit_once('|').map_or("", |n| n.0)))).collect();
-    let rules = ms_calc::features::rules_differ(before, after);
     // A chart's rates sit together in key order, so its file is read and its convert remade once. Half the cores: the game may be up.
     let threads = (std::thread::available_parallelism().map_or(2, |x| x.get()) / 2).max(1);
     let sha_of = |k: &str| k.rsplit_once('|').map_or(k, |n| n.0).rsplit_once('@').map_or("", |n| n.0).to_string();
     let charts: Vec<&[String]> = keys.chunk_by(|a, b| sha_of(a) == sha_of(b)).collect();
+    CARRIED[1].fetch_add(charts.len(), std::sync::atomic::Ordering::Relaxed);
     for batch in charts.chunks(200) {
+        CARRIED[0].fetch_add(batch.len(), std::sync::atomic::Ordering::Relaxed);
         let mut stored: Vec<Vec<(String, Sql)>> = Vec::with_capacity(batch.len());
         for group in batch {
             stored.push(group.iter().map(|key| Ok((key.clone(), db.query_row("SELECT data FROM feats WHERE key=?", [key], |r| r.get(0))?))).collect::<Result<_>>()?);
@@ -66,7 +70,7 @@ pub fn carry_feats(db: &Db, from: &str, to: &str, before: &ms_calc::params::Para
                 let name = key.rsplit_once('|').map_or("", |k| k.0);
                 let rate = name.rsplit_once('@').map_or(1., |(_, r)| r.parse().unwrap_or(1.));
                 let moved = match f {
-                    Some(ms_calc::val::Val::Dict(f)) => ms_calc::features::carried(&f, after, rules, rate, &chart),
+                    Some(ms_calc::val::Val::Dict(f)) => ms_calc::features::carried(&f, after, rate, &chart),
                     _ => None,
                 };
                 (format!("{name}|{to}"), moved.map_or_else(|| data.clone(), |f| Sql::Blob(crate::codec::encode(&ms_calc::val::Val::Dict(f)))))
@@ -475,7 +479,6 @@ mod tests {
     fn carried_features_take_the_rating_the_new_calibration_gives() {
         use ms_calc::val::{Dict, Val};
         let after = ms_calc::features::standard_params();
-        let before = ms_calc::features::params_of("3c695ee7a23f").unwrap();
         let chart = |keys: i64, cj: f64| {
             let mut f = Dict::new();
             let mut cf = vec![0.; 12];
@@ -489,8 +492,8 @@ mod tests {
         for (key, data) in [("a@1.000", chart(10, 0.95)), ("c@1.000", chart(7, 0.95))] {
             db.execute("INSERT INTO feats VALUES (?,?)", params![format!("{key}|old"), data]).unwrap();
         }
-        assert_eq!(carry_feats(&db, "old", "new", &before, &after, &|_| None).unwrap(), 2);
-        assert_eq!(carry_feats(&db, "old", "new", &before, &after, &|_| None).unwrap(), 0, "a stopped run can repeat");
+        assert_eq!(carry_feats(&db, "old", "new", &after, &|_| None).unwrap(), 2);
+        assert_eq!(carry_feats(&db, "old", "new", &after, &|_| None).unwrap(), 0, "a stopped run can repeat");
         let at = |key: &str| db.query_row("SELECT data FROM feats WHERE key=?", [key], |r| r.get::<_, Vec<u8>>(0)).unwrap();
         for (key, keys) in [("a@1.000", 10), ("c@1.000", 7)] {
             let Val::Dict(moved) = crate::codec::decode(&at(&format!("{key}|new"))).unwrap() else { panic!() };
@@ -507,10 +510,17 @@ mod tests {
         let mut old = Dict::new();
         (old.set("keys", 7i64), old.set("overall", 5.), old.set("stars", 4.2));
         db.execute("INSERT INTO feats VALUES (?,?)", params!["b@1.000|old", crate::codec::encode(&Val::Dict(old))]).unwrap();
-        carry_feats(&db, "old", "new", &before, &after, &|_| Some(c.clone())).unwrap();
+        carry_feats(&db, "old", "new", &after, &|_| Some(c.clone())).unwrap();
         let Val::Dict(moved) = crate::codec::decode(&at("b@1.000|new")).unwrap() else { panic!() };
         let fresh = ms_calc::features::features_of(&ms_calc::compute::compute(&c, 1., true, &after).unwrap(), &after);
         assert_eq!((moved.f("overall"), moved.f("stam"), moved.f("stars")), (fresh.f("overall"), fresh.f("stam"), 4.2));
+        // A row analysed under today's rules isn't analysed again: only its calibration moves.
+        let mut current = fresh.clone();
+        (current.set("overall", 5.), current.set("stam", 0.123));
+        db.execute("INSERT INTO feats VALUES (?,?)", params!["d@1.000|old", crate::codec::encode(&Val::Dict(current))]).unwrap();
+        carry_feats(&db, "old", "new", &after, &|_| Some(c.clone())).unwrap();
+        let Val::Dict(moved) = crate::codec::decode(&at("d@1.000|new")).unwrap() else { panic!() };
+        assert_eq!(moved.f("stam"), 0.123, "same rules: the stored analysis stays");
     }
 
     #[test]

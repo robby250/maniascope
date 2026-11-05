@@ -84,9 +84,10 @@ pub fn remember_stable(game: &str) {
     }
 }
 
-/// The frozen September dump; only the calibration machine has one.
+/// The frozen September dump; only the calibration machine has one. `MS_DUMP` picks another bundle (the hard-play bundle,
+/// 2026-11-05) without touching this one.
 pub fn frozen() -> PathBuf {
-    home().join(".cache/maniascope/dump")
+    std::env::var_os("MS_DUMP").map_or_else(|| home().join(".cache/maniascope/dump"), PathBuf::from)
 }
 
 /// A chart's copy in a dump folder, when it is that revision (no md5: any). Beatmap ids keep their map across revisions.

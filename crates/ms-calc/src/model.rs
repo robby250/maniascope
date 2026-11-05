@@ -271,7 +271,7 @@ pub fn apply(prm: &Params, res: &mut Dict, od: f64, rate: f64) {
         let joint = &prm.model["joint"]["modes"][keys.to_string()];
         if present(joint) {
             let e = res.dict("execution").unwrap();
-            let f = crate::flow::Flow { broken: e.fget("flow_broken", 0.0), skip: e.fget("flow_skip", 0.0), change: e.fget("flow_change", 0.0), fast_ln: e.fget("fast_ln", 0.0), split: e.fget("flow_split", 0.0) };
+            let f = crate::flow::Flow::stored(e).unwrap_or_default();
             let factor = joint_shift(joint, &crate::flow::joint_row(&rv, res.fget("length", 0.0), raw, rate, f, &crate::flow::extra_inputs(&cf, e, od))).exp(); // `od`, not res["od"]: that is set below, so the window column read OD 8 (fixed 2026-11-04)
             res.dict_mut("execution").unwrap().set("joint_factor", factor);
         }

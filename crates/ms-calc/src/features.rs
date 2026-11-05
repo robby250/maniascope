@@ -151,10 +151,14 @@ pub fn rule_ratio(c: &crate::chart::Chart, rate: f64, before: &Params, after: &P
 }
 
 /// One stored row carried, with its chart when that can be found.
-/// The rules moved (`rules_differ`): the chart is analysed again, since a ratio would carry the old skill shares and
-/// stamina along (the rating's aggregation changed 2026-11-04). Without its file only the calibration moves.
-pub fn carried(f: &Dict, after: &Params, rules: bool, rate: f64, chart: &dyn Fn() -> Option<std::rc::Rc<crate::chart::Chart>>) -> Option<Dict> {
-    let found = if rules { chart() } else { None };
+/// A row analysed under other rules (its `rules` stamp; none before 2026-11-05) is analysed again when its chart is found,
+/// since a ratio would carry the old skill shares and stamina along. Without its file only the calibration moves and the
+/// old stamp stays, so a later carry that finds the file still analyses it. The stamp is per row, not per calculator pair:
+/// a row carried without its file once (stable charts until 2026-11-05) sat under each newer calculator's id with the
+/// old analysis, which a calculator-level check can't see.
+pub fn carried(f: &Dict, after: &Params, rate: f64, chart: &dyn Fn() -> Option<std::rc::Rc<crate::chart::Chart>>) -> Option<Dict> {
+    let stale = !matches!(f.get("rules"), Some(Val::Str(s)) if *s == rules_stamp(after));
+    let found = if stale { chart() } else { None };
     let Some(c) = found else {
         return recalibrated(f, after, rate, &|| chart().map(|c| crate::flow::flow(&c, rate)));
     };
@@ -168,9 +172,11 @@ pub fn carried(f: &Dict, after: &Params, rules: bool, rate: f64, chart: &dyn Fn(
     Some(fresh)
 }
 
-/// Whether two parameter sets rate a chart differently, not only calibrate it differently.
-pub fn rules_differ(before: &Params, after: &Params) -> bool {
-    before.k.dump() != after.k.dump()
+/// The rules a row was analysed under: the rule knobs' hash (calibration moves without a new analysis).
+pub fn rules_stamp(prm: &Params) -> String {
+    use sha2::Digest;
+    let knobs = serde_json::to_string(&prm.k.dump()).unwrap_or_default();
+    sha2::Sha256::digest(knobs.as_bytes()).iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
 
 fn with_joint(f: &mut Dict, after: &Params, rate: f64, raw: f64, flow: &dyn Fn() -> Option<crate::flow::Flow>) {
@@ -180,7 +186,7 @@ fn with_joint(f: &mut Dict, after: &Params, rate: f64, raw: f64, flow: &dyn Fn()
     let od = f.fget("od", 8.);
     let Some(e) = f.dict_mut("execution").filter(|_| joint.is_object()) else { return };
     let Some(vector) = e.get("residual_vector").map(Val::list_f).filter(|v| !v.is_empty()) else { return };
-    let stored = e.get("flow_broken").map(|_| crate::flow::Flow { broken: e.fget("flow_broken", 0.), skip: e.fget("flow_skip", 0.), change: e.fget("flow_change", 0.), fast_ln: e.fget("fast_ln", 0.), split: e.fget("flow_split", 0.) });
+    let stored = crate::flow::Flow::stored(e);
     // The chart's own flow first: a stored one is from the rules the row was analysed under (the middle key moved 2026-11-03).
     let Some(found) = flow().or(stored) else { return };
     found.store(e);
@@ -225,6 +231,7 @@ pub fn features_of(res: &Dict, prm: &Params) -> Dict {
     f.set("baseline_overall", demand.get("baseline_overall").cloned().unwrap_or_else(|| Val::F(overall)));
     f.set("tech_profile", or_empty("tech_profile"));
     f.set("archetype_profile", or_empty("archetype_profile"));
+    f.set("rules", rules_stamp(prm));
     f
 }
 

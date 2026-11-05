@@ -14,18 +14,31 @@ pub struct Flow {
     pub change: f64,  // share of rows making a pair the last MEMORY rows didn't have
     pub fast_ln: f64, // share of LN heads rolling onto a neighbour
     pub split: f64,   // speed-weighted share of a hand's rows that are a chord with a finger left out inside it (`1011`)
+    pub imbalance: f64, // density²-weighted |L − R| / (L + R) of 1 s bins: one hand carrying the load (MinaCalc HandBalance)
+    pub even: f64,      // speed-weighted share of notes whose neighbour finger repeats at the same interval (Sunny unevenness)
+    pub coupling: f64,  // jack load × cross-column share of 0.5 s bins, Sunny's √S·T^1.5 over √S
+    pub roll: f64,      // speed-weighted share of notes continuing a one-step roll at even timing (MinaCalc WideRangeRoll)
+    pub flam: f64,      // jack-speed-weighted share of notes 1–30 ms off another column's note (MinaCalc WideRangeJJ)
+    pub ohj: f64,       // speed-weighted share of a hand's jumps following a jump sharing a finger (MinaCalc OHJ, CJOHAnchor)
 }
 
 impl Flow {
     /// Kept with the chart's other execution numbers: the next calibration needn't read the file again.
     pub fn store(&self, execution: &mut crate::val::Dict) {
-        for (name, v) in [("flow_broken", self.broken), ("flow_skip", self.skip), ("flow_change", self.change), ("fast_ln", self.fast_ln), ("flow_split", self.split)] {
+        for (name, v) in [("flow_broken", self.broken), ("flow_skip", self.skip), ("flow_change", self.change), ("fast_ln", self.fast_ln), ("flow_split", self.split), ("imbalance", self.imbalance), ("even", self.even), ("coupling", self.coupling), ("roll", self.roll), ("flam", self.flam), ("ohj", self.ohj)] {
             execution.set(name, v);
         }
     }
+
+    /// The flow `store` kept, when it holds every descriptor (an older row lacks the newest: read the chart again).
+    pub fn stored(e: &crate::val::Dict) -> Option<Flow> {
+        e.get("ohj")?;
+        let g = |k: &str| e.fget(k, 0.);
+        Some(Flow { broken: g("flow_broken"), skip: g("flow_skip"), change: g("flow_change"), fast_ln: g("fast_ln"), split: g("flow_split"), imbalance: g("imbalance"), even: g("even"), coupling: g("coupling"), roll: g("roll"), flam: g("flam"), ohj: g("ohj") })
+    }
 }
 
-pub const NAMES: [&str; 5] = ["flow_broken", "flow_skip", "mental", "fast_ln", "flow_split"];
+pub const NAMES: [&str; 11] = ["flow_broken", "flow_skip", "mental", "fast_ln", "flow_split", "imbalance", "even", "coupling", "roll", "flam", "ohj"];
 pub const DIRECT: usize = crate::model::SR_NAMES_LEN + NAMES.len();
 
 /// Under about 5–7 stars processing is the limit, on physically hard maps the arms are (user 2026-11-01).
@@ -39,12 +52,13 @@ pub fn joint_row(residual: &[f64], length_ms: f64, raw: f64, rate: f64, f: Flow,
     let mut v = residual.to_vec();
     v.resize(crate::model::SR_NAMES_LEN, 0.);
     let stars = raw.max(0.05);
-    v.extend([f.broken, f.skip, f.change * (1. - (-length_ms / 1000. / rate / 120.).exp()) * mental_weight(stars), f.fast_ln, f.split]);
+    v.extend([f.broken, f.skip, f.change * (1. - (-length_ms / 1000. / rate / 120.).exp()) * mental_weight(stars), f.fast_ln, f.split, f.imbalance, f.even, f.coupling, f.roll, f.flam, f.ohj]);
     let (r, l) = (rate.ln(), stars.ln() - 1.8);
     v.extend((0..DIRECT).map(|i| v[i] * r).collect::<Vec<_>>());
     v.extend((0..DIRECT).map(|i| v[i] * l).collect::<Vec<_>>());
     v.push(l);
     v.extend(extra);
+    v.push(r); // log rate alone, after the extras: its curvature is a pair column (R11)
     v
 }
 
@@ -113,13 +127,18 @@ pub fn flow(chart: &Chart, rate: f64) -> Flow {
         rows.push((t * scale, mask));
     }
     let splits: &[bool] = if chart.keys % 2 == 1 { &[true, false] } else { &[true] };
-    let (mut broken, mut skip, mut split) = (0., 0., 0.);
+    let (mut broken, mut skip, mut split, mut imbalance, mut ohj) = (0., 0., 0., 0., 0.);
     for &centre_left in splits {
         let (b, s) = order(chart, scale, centre_left);
-        broken += b / splits.len() as f64;
-        skip += s / splits.len() as f64;
-        split += gapped(&rows, chart.keys, centre_left) / splits.len() as f64;
+        let part = splits.len() as f64;
+        broken += b / part;
+        skip += s / part;
+        split += gapped(&rows, chart.keys, centre_left) / part;
+        imbalance += hand_imbalance(&rows, chart.keys, centre_left) / part;
+        ohj += jump_chains(&rows, chart.keys, centre_left) / part;
     }
+    let even = evenness(chart, scale);
+    let (coupling, roll, flam) = (coupling(chart, scale), rolls(chart, scale), flams(chart, scale));
     let (mut changed, mut seen) = (0usize, Vec::with_capacity(MEMORY));
     for pair in rows.windows(2) {
         let p = (pair[0].1, pair[1].1);
@@ -131,7 +150,7 @@ pub fn flow(chart: &Chart, rate: f64) -> Flow {
     }
     let heads: Vec<(f64, u8)> = (0..chart.len()).filter(|&n| chart.end[n] > chart.t[n]).map(|n| (chart.t[n] * scale, chart.col[n])).collect();
     let rolled = heads.windows(2).filter(|w| w[1].0 - w[0].0 <= FAST_LN && w[1].0 > w[0].0 && w[1].1.abs_diff(w[0].1) == 1).count();
-    Flow { broken, skip, change: changed as f64 / rows.len().max(2).saturating_sub(1) as f64, fast_ln: rolled as f64 / heads.len().max(1) as f64, split }
+    Flow { broken, skip, change: changed as f64 / rows.len().max(2).saturating_sub(1) as f64, fast_ln: rolled as f64 / heads.len().max(1) as f64, split, imbalance, even, coupling, roll, flam, ohj }
 }
 
 /// Split hand chords: the hand must hold a finger up between two pressing ones (finger enslaving). Replays, 7K and 10K alike:
@@ -155,6 +174,152 @@ fn gapped(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
         }
     }
     if total > 0. { split / total } else { 0. }
+}
+
+/// One hand carrying a 1 s stretch: |L − R| / (L + R), weighted by the stretch's notes squared so dense parts decide.
+fn hand_imbalance(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
+    let mut bins: std::collections::BTreeMap<i64, [f64; 2]> = std::collections::BTreeMap::new();
+    let start = rows.first().map_or(0., |r| r.0); // bins from the first note: the chart's offset can't move them
+    for &(t, mask) in rows {
+        let bin = bins.entry((t - start).floor() as i64).or_default();
+        (0..keys).filter(|&c| mask >> c & 1 == 1).for_each(|c| bin[hand(c, keys, centre_left).0] += 1.);
+    }
+    let (mut num, mut den) = (0., 0.);
+    for [l, r] in bins.into_values() {
+        let n = l + r;
+        num += n * (l - r).abs();
+        den += n * n;
+    }
+    if den > 0. { num / den } else { 0. }
+}
+
+/// Sunny's unevenness, inverted: a note whose neighbouring finger on the same hand is repeating at the same interval
+/// (|Δ| < 20 ms, both under 0.5 s) moves with it as one motion. Speed-weighted share.
+fn evenness(chart: &Chart, scale: f64) -> f64 {
+    let keys = chart.keys;
+    let (mut last, mut gap) = (vec![f64::NEG_INFINITY; keys], vec![f64::INFINITY; keys]);
+    let (mut total, mut even) = (0., 0.);
+    for n in 0..chart.len() {
+        let (c, t) = (chart.col[n] as usize, chart.t[n] * scale);
+        let d = t - last[c];
+        if d <= 0.5 {
+            let weight = 1. / d.max(FLOOR);
+            total += weight;
+            let paired = [c.wrapping_sub(1), c + 1].into_iter().filter(|&o| o < keys && same_hand(o, c, keys)).any(|o| t - last[o] <= d && (gap[o] - d).abs() < 0.02);
+            if paired {
+                even += weight;
+            }
+        }
+        gap[c] = d;
+        last[c] = t;
+    }
+    if total > 0. { even / total } else { 0. }
+}
+
+fn same_hand(a: usize, b: usize, keys: usize) -> bool {
+    (a < keys / 2) == (b < keys / 2) || (keys % 2 == 1 && (a == keys / 2 || b == keys / 2))
+}
+
+/// Sunny's same-column × cross-column coupling: per 0.5 s bin S = Σ 1/jack gap, X = Σ 1/gap of notes off the previous
+/// note's column, T = X/(X+S+1); √S·T^1.5 summed over √S summed: jack-heavy stretches that also move across columns.
+fn coupling(chart: &Chart, scale: f64) -> f64 {
+    let mut bins: std::collections::BTreeMap<i64, [f64; 2]> = std::collections::BTreeMap::new();
+    let mut last = vec![f64::NEG_INFINITY; chart.keys];
+    let (mut prev_t, mut prev_c) = (f64::NEG_INFINITY, usize::MAX);
+    let start = chart.t.first().map_or(0., |t| t * scale);
+    for n in 0..chart.len() {
+        let (c, t) = (chart.col[n] as usize, chart.t[n] * scale);
+        let bin = bins.entry(((t - start) * 2.).floor() as i64).or_default();
+        if t - last[c] <= 0.5 {
+            bin[0] += 1. / (t - last[c]).max(FLOOR);
+        }
+        if c != prev_c && t > prev_t && t - prev_t <= LINK {
+            bin[1] += 1. / (t - prev_t).max(FLOOR);
+        }
+        last[c] = t;
+        (prev_t, prev_c) = (t, c);
+    }
+    let (mut num, mut den) = (0., 0.);
+    for [s, x] in bins.into_values() {
+        num += s.sqrt() * (x / (x + s + 1.)).powf(1.5);
+        den += s.sqrt();
+    }
+    if den > 0. { num / den } else { 0. }
+}
+
+/// MinaCalc's rolls: a single note one column on from the previous single, the same way as the step before, its gap within
+/// 20 % of that step's: a roll the hand sweeps, not a stream it reads.
+fn rolls(chart: &Chart, scale: f64) -> f64 {
+    let mut singles: Vec<(f64, i32)> = Vec::new();
+    let mut i = 0;
+    while i < chart.len() {
+        let j = (i..chart.len()).find(|&j| chart.t[j] != chart.t[i]).unwrap_or(chart.len());
+        if j - i == 1 {
+            singles.push((chart.t[i] * scale, chart.col[i] as i32));
+        }
+        i = j;
+    }
+    let (mut total, mut roll) = (0., 0.);
+    for w in singles.windows(3) {
+        let (g1, g2) = (w[1].0 - w[0].0, w[2].0 - w[1].0);
+        if g2 > LINK {
+            continue;
+        }
+        let weight = 1. / g2.max(FLOOR);
+        total += weight;
+        let (s1, s2) = (w[1].1 - w[0].1, w[2].1 - w[1].1);
+        if s1 == s2 && s1.abs() == 1 && (g2 - g1).abs() <= 0.2 * g1 {
+            roll += weight;
+        }
+    }
+    if total > 0. { roll / total } else { 0. }
+}
+
+/// MinaCalc's flammed jumpjacks: a note 1–30 ms off another column's note (a chord played as a flam), weighted by how fast
+/// its column jacks; share of the jack-weighted notes.
+fn flams(chart: &Chart, scale: f64) -> f64 {
+    let mut last = vec![f64::NEG_INFINITY; chart.keys];
+    let (mut total, mut flam) = (0., 0.);
+    for n in 0..chart.len() {
+        let (c, t) = (chart.col[n] as usize, chart.t[n] * scale);
+        let jd = t - last[c];
+        last[c] = t;
+        if jd > 0.5 {
+            continue;
+        }
+        let weight = 1. / jd.max(FLOOR);
+        total += weight;
+        let near = |m: usize| chart.col[m] as usize != c && (chart.t[m] * scale - t).abs() > 0.0005 && (chart.t[m] * scale - t).abs() <= 0.03;
+        let lo = (0..n).rev().take_while(|&m| t - chart.t[m] * scale <= 0.03).any(near);
+        let hi = (n + 1..chart.len()).take_while(|&m| chart.t[m] * scale - t <= 0.03).any(near);
+        if lo || hi {
+            flam += weight;
+        }
+    }
+    if total > 0. { flam / total } else { 0. }
+}
+
+/// One-hand jump chains: a hand's row of ≥ 2 notes right after (≤ LINK) another ≥ 2-note row of that hand sharing a column.
+fn jump_chains(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
+    let (mut last, mut prev) = ([f64::NEG_INFINITY; 2], [0u32; 2]);
+    let (mut total, mut chain) = (0., 0.);
+    for &(t, mask) in rows {
+        let mut hands = [0u32; 2];
+        (0..keys).filter(|&c| mask >> c & 1 == 1).for_each(|c| hands[hand(c, keys, centre_left).0] |= 1 << c);
+        for h in 0..2 {
+            if hands[h] == 0 {
+                continue;
+            }
+            let gap = t - last[h];
+            let weight = 1. / gap.max(FLOOR);
+            total += weight;
+            if gap <= LINK && hands[h].count_ones() > 1 && prev[h].count_ones() > 1 && hands[h] & prev[h] != 0 {
+                chain += weight;
+            }
+            (last[h], prev[h]) = (t, hands[h]);
+        }
+    }
+    if total > 0. { chain / total } else { 0. }
 }
 
 /// (broken, skip) of both hands' finger order, the middle key of an odd keymode with the left hand or not.
@@ -223,6 +388,58 @@ mod tests {
         let roll = flow(&chart(7, &repeated(&[1, 2, 3, 4, 5], 300), 100.), 1.);
         let broken = flow(&chart(7, &repeated(&[1, 3, 2, 5, 4], 300), 100.), 1.);
         assert!(broken.broken > roll.broken + 0.2, "{roll:?} {broken:?}");
+    }
+
+    #[test]
+    fn one_hand_alone_is_imbalanced_and_alternating_hands_are_not() {
+        assert!((flow(&chart(4, &repeated(&[0, 1], 400), 100.), 1.).imbalance - 1.).abs() < 1e-9);
+        assert!(flow(&chart(4, &repeated(&[0, 3], 400), 100.), 1.).imbalance < 0.05);
+    }
+
+    #[test]
+    fn neighbours_jacking_together_read_even() {
+        // [01] jumpjacks: both fingers repeat at one interval; a 0-2 split on 7K has no neighbour moving with it.
+        let rows = |pair: [u8; 2]| {
+            let cols: Vec<u8> = std::iter::repeat_n(pair, 200).flatten().collect();
+            let t: Vec<f64> = (0..cols.len()).map(|i| (i / 2) as f64 * 150.).collect();
+            Chart { keys: 7, end: t.clone(), t, col: cols, ..Chart::default() }
+        };
+        assert!(flow(&rows([0, 1]), 1.).even > 0.9);
+        assert_eq!(flow(&rows([0, 2]), 1.).even, 0.);
+    }
+
+    /// Notes from (ms, column) pairs, sorted.
+    fn notes(keys: usize, mut n: Vec<(f64, u8)>) -> Chart {
+        n.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let t: Vec<f64> = n.iter().map(|p| p.0).collect();
+        Chart { keys, end: t.clone(), col: n.iter().map(|p| p.1).collect(), t, ..Chart::default() }
+    }
+
+    #[test]
+    fn jacks_moving_across_columns_couple_and_a_lone_jack_does_not() {
+        assert_eq!(flow(&chart(4, &[0; 200], 100.), 1.).coupling, 0.);
+        assert!(flow(&chart(4, &repeated(&[0, 1], 100), 100.), 1.).coupling > 0.1);
+    }
+
+    #[test]
+    fn a_flammed_jumpjack_reads_flammed_and_a_chord_or_trill_does_not() {
+        let flammed = notes(4, (0..200).flat_map(|i| [(i as f64 * 120., 0), (i as f64 * 120. + 8., 1)]).collect());
+        let trill = flow(&chart(4, &repeated(&[0, 1], 100), 60.), 1.);
+        let (f, chord) = (flow(&flammed, 1.), flow(&notes(4, (0..200).flat_map(|i| [(i as f64 * 120., 0), (i as f64 * 120., 1)]).collect()), 1.));
+        assert!(f.flam > 0.9 && chord.flam == 0. && trill.flam == 0.);
+    }
+
+    #[test]
+    fn an_even_sweep_rolls_and_a_split_stream_does_not() {
+        assert!(flow(&chart(4, &repeated(&[0, 1, 2, 3], 50), 50.), 1.).roll > 0.4);
+        assert_eq!(flow(&chart(4, &repeated(&[0, 2, 1, 3], 50), 50.), 1.).roll, 0.);
+    }
+
+    #[test]
+    fn one_hand_jumps_in_a_row_chain_and_alternating_hands_do_not() {
+        let jumps = |hands: &[[u8; 2]]| notes(7, (0..200).flat_map(|i| hands[i % hands.len()].map(|c| (i as f64 * 150., c))).collect());
+        assert!(flow(&jumps(&[[0, 1]]), 1.).ohj > 0.9);
+        assert_eq!(flow(&jumps(&[[0, 1], [4, 5]]), 1.).ohj, 0.);
     }
 
     #[test]

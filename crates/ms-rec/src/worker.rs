@@ -463,16 +463,37 @@ impl Worker {
             return Ok(());
         }
         self.stage(Some("Updating stored ratings (once)…".into()), false);
-        crate::engine::carry_rows(&self.db)?;
-        // A crawl from before the update can still hold it; a failure here waits for the next launch, not for the player.
+        // A new analysis rule re-analyses every stored chart, which takes minutes: the line counts them so it doesn't look stuck.
+        let (stop, emit, db) = (AtomicBool::new(false), self.h.emit.clone(), &self.db);
+        std::thread::scope(|s| {
+            s.spawn(|| while !stop.load(Ordering::Relaxed) {
+                let [d, t] = ms_data::store::CARRIED.each_ref().map(|a| a.load(Ordering::Relaxed));
+                if t > 0 {
+                    let text = format!("Updating stored ratings (once) · {} / {} charts", crate::engine::commas(d.min(t)), crate::engine::commas(t));
+                    emit(Out::Status { text, progress: None, blocking: false, learning: None });
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            });
+            let carried = Self::carry_all(db);
+            stop.store(true, Ordering::Relaxed);
+            carried
+        })?
+        .then(|| kv_set(&self.db, &done, &json!(true)).map_err(|e| e.to_string()))
+        .unwrap_or(Ok(()))
+    }
+
+    /// Ok(true) once both stores carried. The own rows' error stops the launch; the website's waits for the next launch.
+    fn carry_all(db: &Db) -> std::result::Result<bool, String> {
+        crate::engine::carry_rows(db)?;
+        // A crawl from before the update can still hold it.
         if ms_data::webmaps::running() {
-            return Ok(());
+            return Ok(false);
         }
-        if let Err(e) = crate::engine::carry_web(&self.db) {
+        if let Err(e) = crate::engine::carry_web(db) {
             eprintln!("website features not carried: {e}");
-            return Ok(());
+            return Ok(false);
         }
-        kv_set(&self.db, &done, &json!(true)).map_err(|e| e.to_string())
+        Ok(true)
     }
 
     /// Once, after the carry: a player never needs the older calculators' rows again (user 2026-11-01).

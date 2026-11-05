@@ -1,8 +1,8 @@
 //! Background thread pool for batch analysis. Outside the calculator identity (native_backend.identity_files):
 //! scheduling never changes a result.
 
-/// Background work yields to the game and the UI: nice 10 on Unix, below-normal thread priority on Windows
-/// (what the spawned worker processes had before analysis moved in-process).
+/// Background work yields to the game and the UI: nice 10 on Unix, background mode on Windows (lowest CPU, I/O and memory
+/// priority; below-normal alone still cost osu!stable's frame rate, Less 2026-11-05: 960 → 348 fps while analysing).
 fn lower_priority() {
     #[cfg(unix)]
     unsafe {
@@ -14,9 +14,9 @@ fn lower_priority() {
             fn GetCurrentThread() -> isize;
             fn SetThreadPriority(thread: isize, priority: i32) -> i32;
         }
-        const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+        const THREAD_MODE_BACKGROUND_BEGIN: i32 = 0x0001_0000;
         unsafe {
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
         }
     }
 }

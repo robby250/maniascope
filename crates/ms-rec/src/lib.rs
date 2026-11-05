@@ -9,6 +9,7 @@ pub mod history;
 pub mod navigation;
 pub mod pp;
 pub mod recommender;
+pub mod shown;
 pub mod stats;
 pub mod worker;
 
