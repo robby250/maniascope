@@ -18,4 +18,8 @@ pub mod skills;
 pub mod structure;
 pub mod val;
 
-pub const CALC_ID: &str = "7cee1dfdba7f";
+// Every binary links the calculator: its many short-lived vectors made the system allocator ~9 % of a chart's analysis.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+pub const CALC_ID: &str = "2f01eca5e738";

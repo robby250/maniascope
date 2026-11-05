@@ -312,6 +312,7 @@ pub struct PredModel {
     pub tau2_c: f64,
     pub kap_c: f64,
     pub shown: (f64, f64),
+    pub judged_ln: f64, // added to log(1 − shown accuracy) per LN share: the client judges holds as stable does, 0 on lazer
     pub retry: f64,
     pub sd_att: HashMap<i64, f64>,
     // warmup.Model
@@ -337,13 +338,13 @@ impl PredModel {
     pub fn population(c: Arc<Consts>, pop: Arc<Pop>) -> PredModel {
         PredModel { c, pop, levels: HashMap::default(), level: HashMap::default(), glob: 0., sd_all: 0., shape: HashMap::default(),
                     recent: HashMap::default(), aff: HashMap::default(), rate_aff: HashMap::default(), rate_support: HashMap::default(),
-                    rate_bandwidth: [(0, 1.)].into_iter().collect(), tau2_c: 0., kap_c: 1., shown: (0., 1.), retry: 0.,
+                    rate_bandwidth: [(0, 1.)].into_iter().collect(), tau2_c: 0., kap_c: 1., shown: (0., 1.), judged_ln: 0., retry: 0.,
                     sd_att: HashMap::default(), slopes: Arc::new(Slopes::default()), modes: ByKeys::default(),
                     fallback: Mode { tau: 8., log_rate: false, amplitudes: Vec::new(), session: 0., fatigue: 0. } }
     }
 
     /// A fitted Personal and its warm-up model.
-    pub fn fitted(c: Arc<Consts>, pop: Arc<Pop>, levels: HashMap<i64, f64>, fit: &Fit, warmup: &Model, shown: (f64, f64)) -> PredModel {
+    pub fn fitted(c: Arc<Consts>, pop: Arc<Pop>, levels: HashMap<i64, f64>, fit: &Fit, warmup: &Model, shown: (f64, f64), judged_ln: f64) -> PredModel {
         let level = fit.level.iter().map(|(&k, &l)| (k, (l, fit.level_var[&k], fit.sd_att.get(&k).copied().unwrap_or(fit.sd_all)))).collect();
         let shape = fit.beta.iter().map(|(&k, b)| (k, (fit.zmean[&k].clone(), fit.zscale[&k].clone(), b.clone()))).collect();
         let rate_aff = fit.rate_aff.iter().map(|(c, a)| {
@@ -351,7 +352,7 @@ impl PredModel {
         }).collect();
         PredModel { c, pop, levels, level, glob: fit.glob, sd_all: fit.sd_all, shape, recent: fit.recent.clone(), aff: fit.aff.clone(), rate_aff,
                     rate_support: fit.rate_support.clone(), rate_bandwidth: fit.rate_bandwidth.iter().map(|(&k, &v)| (k, v)).collect(), tau2_c: fit.tau2_c,
-                    kap_c: fit.kap_c, shown, retry: fit.retry, sd_att: fit.sd_att.clone(), slopes: Arc::new(warmup.slopes.clone()),
+                    kap_c: fit.kap_c, shown, judged_ln, retry: fit.retry, sd_att: fit.sd_att.clone(), slopes: Arc::new(warmup.slopes.clone()),
                     modes: warmup.modes.iter().map(|(&k, v)| (k, v.clone())).collect(), fallback: warmup.fallback.clone() }
     }
 
@@ -890,6 +891,7 @@ pub struct Prediction {
     pub activation: f64,
     pub slope: f64,
     pub tau: f64,
+    pub ln: f64, // the chart's LN share: a stable result on it converts to lazer units by it (ms_rec::evidence)
 }
 
 pub const BAND_Z: f64 = 1.2816 * 0.75; // recommend.BAND_Z
@@ -1241,8 +1243,8 @@ impl PredModel {
         }
         let shift = correction + cold + self.played(f, chart, rate, st, s, sdm * sdm);
         mu += shift;
-        let (a, bb) = self.shown;
-        let shown = |y: f64| 0f64.max(1f64.min(1. - (20f64.min(a + bb * y)).exp()));
+        let (a, bb, judged) = (self.shown.0, self.shown.1, self.judged_ln * f.z_tail[0]);
+        let shown = |y: f64| 0f64.max(1f64.min(1. - (20f64.min(a + bb * y + judged)).exp()));
         let spread = sda.hypot(sdm);
         let opening = historical(0.);
         let activation = if s.warm {
@@ -1267,6 +1269,7 @@ impl PredModel {
             activation,
             slope,
             tau: mode.tau,
+            ln: f.z_tail[0],
         })
     }
 }
@@ -1308,7 +1311,7 @@ mod model_tests {
         PredModel { c, pop: Arc::new(Pop { tau2: 0.1, kappa: 3., knee: 4., ..pop }), levels: HashMap::default(), level: [(7, (-3., 0.01, 0.2))].into_iter().collect(), glob: -3., sd_all: 0.2,
                     shape: HashMap::default(), recent: HashMap::default(), aff: [("known".to_string(), (-0.6, 10.))].into_iter().collect(), rate_aff: HashMap::default(),
                     rate_support: [("known".to_string(), (1., 1.))].into_iter().collect(), rate_bandwidth: ByKeys { map: [(0, 0.18), (7, 0.12)].into_iter().collect() }, tau2_c: 0.12, kap_c: 2.,
-                    shown: (0.75f64.ln(), 1.), retry: 0., sd_att: [(7, 0.2)].into_iter().collect(), slopes: Arc::new(Slopes::default()), modes: ByKeys::default(), fallback: Mode::default() }
+                    shown: (0.75f64.ln(), 1.), judged_ln: 0., retry: 0., sd_att: [(7, 0.2)].into_iter().collect(), slopes: Arc::new(Slopes::default()), modes: ByKeys::default(), fallback: Mode::default() }
     }
 
     fn plain(m: &PredModel) -> Feats {
@@ -1397,6 +1400,22 @@ mod model_tests {
         let p = m.predict(&f, "m", None, 1., &s).unwrap();
         assert!((p.acc_mid - (1. - 0.75 * p.mu.exp())).abs() < 1e-12);
         assert!(p.acc_lo < p.acc_mid && p.acc_mid < p.acc_hi);
+    }
+
+    #[test]
+    fn a_stable_player_is_shown_what_stable_judges_on_holds() {
+        let mut m = model(Pop::default());
+        m.aff.clear();
+        let n = m.c.families.len();
+        let state = KeyState { form: vec![0.; n + 1], penalty: vec![0.; n], session: 0., session_tau: 8., fatigue: 0., activation: vec![0.; n] };
+        let s = PredSession { warm: true, by_keys: [(7, state)].into_iter().collect(), charts: HashMap::default() };
+        let (rice, mut holds) = (plain(&m), plain(&m));
+        holds.z_tail[0] = 1.;
+        let lost = |m: &PredModel, f: &Feats| 1. - m.predict(f, "m", None, 1., &s).unwrap().acc_mid;
+        let lazer = lost(&m, &holds);
+        m.judged_ln = 0.186;
+        assert!((lost(&m, &holds) / lazer - 0.186f64.exp()).abs() < 1e-9, "every note a hold: stable loses e^0.186 as much");
+        assert_eq!(lost(&m, &rice), { m.judged_ln = 0.; lost(&m, &rice) }, "no holds, no change");
     }
 
     #[test]
@@ -1553,7 +1572,7 @@ mod skill_tests {
         assert_eq!(crate::skills::state(&selected, "ln/inverse"), 1);
         assert_eq!(crate::skills::state(&selected, "ln/release"), -1);
         let choice: Vec<&str> = selected.iter().map(String::as_str).collect();
-        assert!(strength(&feature(7, &[("ln", 1.), ("inverse", 0.9)]), &choice) > 0.);
+        assert!(strength(&feature(7, &[("ln", 1.), ("ln_inverse", 0.9)]), &choice) > 0.);
         assert_eq!(normalize(&selected), selected);
     }
 
@@ -1607,7 +1626,7 @@ mod skill_tests {
 
     #[test]
     fn broad_membership_union_not_incidental_traces() {
-        let f = feature(7, &[("ln", 1.), ("release", 0.9), ("chordjack", 0.85), ("sv", 0.15)]);
+        let f = feature(7, &[("ln", 1.), ("ln_release", 0.9), ("chordjack", 0.85), ("sv", 0.15)]);
         assert!(strength(&f, &["ln", "sv"]) > 0.);
         assert_eq!(strength(&f, &["sv"]), 0.);
         assert!(strength(&f, &["chordjack"]) > 0.8);

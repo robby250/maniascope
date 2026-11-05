@@ -5,7 +5,6 @@ use ms_model::personal::WarmModels;
 use ms_model::predict::{Consts, HashMap, Slopes};
 use ms_model::session::{Session, SESSION_GAP};
 use ms_model::warmup::{FormPrior, Model};
-use ms_rec::evidence::{stable_evidence, Evidence};
 use ms_rec::history::{history_text, play_history, recover_results, Shown};
 use ms_rec::pp::Ledger;
 use ms_rec::recommender::family_transfer;
@@ -375,21 +374,6 @@ fn tracking_history_and_recovery() {
     let rows = realm_rows(&[raw(8, 777, 0, 2653437, &iso(t + 20.))], Some(2653437));
     assert_eq!(upsert_score(&db, rows[0].clone()).unwrap(), Some(old));
     assert_eq!(count(&db), 2);
-}
-
-fn evidence(key: String, client: &str, ln: f64) -> Evidence {
-    Evidence { y: 0., y_lazer: 0., keys: 7, t: 0., chart: String::new(), sha: None, f: 0, src: String::new(), client: Some(client.to_string()), ts: None, b: None, rate: 1.,
-               key, rd: false, completed: true, ln, overall: 5., family: String::new() }
-}
-
-#[test]
-fn stable_player_keeps_mostly_tap_charts_with_some_ln() {
-    // Less 2026-11-01: 85 of 100 stable bests were dropped because their charts held any LN.
-    let rows: Vec<Evidence> = [0., 0.1, 0.35, 0.6].iter().enumerate().map(|(i, ln)| evidence(format!("st|{i}"), "stable", *ln)).collect();
-    assert_eq!(stable_evidence(rows.iter()).iter().map(|r| r.ln).collect::<Vec<_>>(), [0., 0.1, 0.35]);
-    let mut both = rows;
-    both.extend((0..ms_rec::evidence::MIN_LAZER_LN).map(|i| evidence(format!("l|{i}"), "osu-lazer", 0.5)));
-    assert_eq!(stable_evidence(both.iter()).iter().filter(|r| r.client.as_deref() == Some("stable")).count(), 1);
 }
 
 // ---- session form ----

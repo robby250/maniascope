@@ -87,6 +87,7 @@ pub fn knobs_of(calc: &str) -> Value {
     use serde_json::json;
     // Newest first: (the last calculator before a rule change, the knobs it ran with). Older calculators take every later era's.
     let eras = [
+        ("7cee1dfdba7f", json!({"LN_TECH_FULL": 0})), // before the LN skills (Less 2026-11-04): the knob only marks the change
         ("a88aea03e865", json!({"ACC_POWER": 0})), // the peak model: its rules can't be recomputed, the knob only marks the change
         ("f9622a2b09c8", json!({"V_FINGER": 8})), // before the finger limit came from replays
         ("65c0a4cb63d6", json!({"W_JACK": 3.3, "W_JACK_KEYS": 0, "W_JACK_7K": 3.0, "MIRROR_ALL": 0, "CENTRE_SPLIT": 0, "V_FAST_KEYS": 2})), // before the revamp

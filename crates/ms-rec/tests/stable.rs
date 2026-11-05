@@ -85,10 +85,10 @@ fn replay_head(b: &mut Bytes, md5: &str, player: &str, stats: [i16; 6], score: i
     b.text("");
 }
 
-fn scores_db(md5: &str, player: &str, rows: &[([i16; 6], i32, i32, i64)]) -> Vec<u8> {
+fn scores_db(md5: &str, rows: &[(&str, [i16; 6], i32, i32, i64)]) -> Vec<u8> {
     let mut b = Bytes(Vec::new());
     b.i32(20250107).i32(1).text(md5).i32(rows.len() as i32);
-    for &(stats, score, mods, unix) in rows {
+    for &(player, stats, score, mods, unix) in rows {
         replay_head(&mut b, md5, player, stats, score, mods);
         b.i64(621_355_968_000_000_000 + unix * 10_000_000).i32(-1).i64(0);
     }
@@ -122,7 +122,7 @@ fn stable_library_scores_replays_and_units() {
         Listed { artist: "Art", title: "Song", version: "Hard", md5: &md5, file: "a.osu", folder: "123 set", bid: 55, mode: 3 },
         Listed { artist: "Art", title: "Std", version: "Hard", md5: &zero, file: "b.osu", folder: "123 set", bid: 56, mode: 0 }])).unwrap();
     let stats = [900, 80, 10, 5, 2, 3];
-    std::fs::write(root.join("scores.db"), scores_db(&md5, "me", &[(stats, 812345, 64, 1_700_000_000), (stats, 700000, 0, 1_700_000_100)])).unwrap();
+    std::fs::write(root.join("scores.db"), scores_db(&md5, &[("me", stats, 812345, 64, 1_700_000_000), ("me", stats, 700000, 0, 1_700_000_100)])).unwrap();
     std::env::set_var("HOME", tmp.join("home"));
     std::env::set_var("XDG_DATA_HOME", tmp.join("home/.local/share"));
     std::env::set_var("MANIASCOPE_DATA", tmp.join("data"));
@@ -181,5 +181,13 @@ fn stable_library_scores_replays_and_units() {
     assert_eq!(std::fs::read(tmp.join(&path)).unwrap(), own);
     assert_eq!(db.query_row("SELECT COUNT(*) FROM replay_evidence", [], |r| r.get::<_, i64>(0)).unwrap(), 1, "only observed attempts");
     assert_eq!(archive_stable(&db, Some(&root)).unwrap(), 0, "idempotent");
+
+    // offline plays saved under another name count once this app saw a play of that name live; a stranger's never do
+    add_live_score(&db, &live(&sha, 600000), false, None).unwrap();
+    std::fs::write(root.join("scores.db"), scores_db(&md5, &[("me", stats, 812345, 64, 1_700_000_000), ("me", stats, 700000, 0, 1_700_000_100),
+        ("Guest", stats, 600000, 64, 1_700_000_200), ("Guest", stats, 500000, 0, 1_700_000_300), ("friend", stats, 400000, 0, 1_700_000_400)])).unwrap();
+    import_library(&db, "stable").unwrap();
+    let totals: Vec<i64> = db.prepare("SELECT total FROM scores ORDER BY total").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(totals, [500000, 600000, 700000, 812345]);
     let _ = std::fs::remove_dir_all(tmp);
 }

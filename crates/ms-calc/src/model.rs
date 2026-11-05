@@ -78,6 +78,9 @@ pub fn endurance(fines: &[&[Vec<f64>; 3]], bin_seconds: f64, phases: usize) -> (
     ((py::sum(per.iter().copied()) / per.len() as f64, peak), timeline)
 }
 
+/// The skills `vector` reads from physical_sk (compute rates only these before execution::attribute).
+pub const VECTOR_SKILLS: [&str; 8] = ["ln", "chordjack", "jackspeed", "delay", "dump", "minijack", "technical", "sv"];
+
 /// difficulty_model.vector.
 pub fn vector(res: &Dict, od: f64) -> [f64; 12] {
     let mut sk: Vec<(String, f64)> = Vec::new();

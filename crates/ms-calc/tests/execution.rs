@@ -84,7 +84,7 @@ fn rice_has_no_ln_chordstream_profile() {
 fn ln_release_refinement_precedes_generic_tech_ln() {
     let mut result = Dict::new();
     result.set("keys", 7i64);
-    result.set("scores", scores(&[("overall", 10.), ("ln", 10.), ("release", 9.3), ("delay", 9.5), ("technical", 8.), ("hybrid", 6.3), ("chordstream", 7.2)]));
+    result.set("scores", scores(&[("overall", 10.), ("ln", 10.), ("ln_release", 9.3), ("delay", 9.5), ("technical", 8.), ("ln_general", 6.3), ("chordstream", 7.2)]));
     let mut archetype = Dict::new();
     archetype.set("ln_chordstream", 0.4);
     result.set("archetype_profile", archetype);
@@ -99,7 +99,7 @@ fn ln_release_refinement_precedes_generic_tech_ln() {
     if let Val::Dict(d) = &mut tech {
         d.set("of", "ln");
     }
-    result.set("archetypes", Val::List(vec![tech, entry("LN Release", 9.3, &["release", "ln"])]));
+    result.set("archetypes", Val::List(vec![tech, entry("LN Release", 9.3, &["ln_release", "ln"])]));
     let Val::Dict(first) = &card(&result)[0] else { panic!() };
     assert_eq!(first.get("name").and_then(|n| if let Val::Str(s) = n { Some(s.as_str()) } else { None }), Some("LN Release"));
 }

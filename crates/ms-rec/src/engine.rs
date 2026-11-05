@@ -24,10 +24,10 @@ use std::sync::{Arc, Mutex};
 /// recommend.predictor_id of the model the Rust port reproduces: forecasts stay comparable across the port. A change to
 /// the prediction model takes a new id, so old forecasts are not read as this model's.
 pub const PREDICTOR_ID: &str = "86660d70dccc";
-pub const CALC_ID: &str = "7cee1dfdba7f";
+pub const CALC_ID: &str = "2f01eca5e738";
 /// Differ from CALC_ID in calibration only (calib/carry.json), newest first: a crawl still running holds the website rows back a whole
 /// calculator, so those can start older than the library's. Each carry keeps its source row.
-pub const CARRIED_CALCS: [&str; 8] = ["a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f"];
+pub const CARRIED_CALCS: [&str; 9] = ["7cee1dfdba7f", "a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f"];
 const SURE_PLAYS: usize = 50; // of the player's own, on a keymode: fewer and the model is mostly the population's guess
 pub const ACTIVE_KEYS: std::ops::RangeInclusive<i64> = 4..=10;
 
@@ -92,7 +92,7 @@ impl Expected {
     pub fn fields(&self) -> Map<String, Value> {
         let (p, s) = (&self.pp, &self.shown);
         let mut out = Map::new();
-        for (k, v) in [("mu", p.mu), ("base_mu", p.base_mu), ("cold_penalty", p.cold), ("activation_minutes", s.activation), ("opening_acc", s.opening_acc), ("rate_slope", s.slope), ("sd", p.sd), ("sdm", p.sdm)] {
+        for (k, v) in [("mu", p.mu), ("base_mu", p.base_mu), ("cold_penalty", p.cold), ("activation_minutes", s.activation), ("opening_acc", s.opening_acc), ("rate_slope", s.slope), ("sd", p.sd), ("sdm", p.sdm), ("ln", p.ln)] {
             out.insert(k.to_string(), json!(v));
         }
         if self.direct {

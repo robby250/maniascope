@@ -164,7 +164,7 @@ knobs! {
     PHASES: usize = 8,
     RATE_G: f64 = 0.12,
     ACC_TARGET: f64 = 0.10, // the rating is the skill whose average note loses this much (skills::accuracy_rating)
-    FATIGUE_W: f64 = 0.2,   // a note's level × (1 + this·fatigue), fatigue from model::endurance (skills::note_levels)
+    FATIGUE_W: f64 = 0.2,   // a note's level × (1 + this·fatigue), fatigue from model::endurance (skills::powered)
     FATIGUE_W_KEYS: f64 = 3.0, // that weight as (keys/7)^this: wide keymodes are finger-limited, so fatigue weighs more
     ACC_POWER: f64 = 3.0,   // a note's loss grows as (local level / skill)^this (skills::rating)
     TECH_FULL: f64 = 0.09,
@@ -192,6 +192,13 @@ knobs! {
     INV_FULL: f64 = 1.5,
     HYB_FULL: f64 = 0.8,
     REL_FULL: f64 = 0.6,
+    // The LN skills' shares (skills::attribute), set on the four 7K LN Dan practice packs (Less 2026-11-04) so each pack's maps
+    // rate their own skill top: held share of column-time where Inverse starts and is full, staggered releases per release
+    // where Release is full, technical share where Tech is full.
+    LN_INV_LO: f64 = 0.5,
+    LN_INV_HI: f64 = 0.6,
+    LN_REL_FULL: f64 = 1.0,
+    LN_TECH_FULL: f64 = 1.0,
     STAMINA_WINDOW: f64 = 60.0, // seconds of demand the stamina rating averages (skills::local_levels)
     SV_KIND_SHARE: f64 = 0.5,
     REFINE_Q: f64 = 0.9,

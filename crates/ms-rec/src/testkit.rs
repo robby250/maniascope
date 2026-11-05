@@ -32,6 +32,18 @@ pub fn osu(keys: usize, gap: f64, seed: usize) -> Vec<u8> {
     text.into_bytes()
 }
 
+/// `osu` with every note a hold of three gaps.
+pub fn osu_ln(keys: usize, gap: f64, seed: usize) -> Vec<u8> {
+    let text = String::from_utf8(osu(keys, gap, seed)).unwrap();
+    let (head, notes) = text.split_once("[HitObjects]\n").unwrap();
+    let held: String = notes.lines().map(|l| {
+        let f: Vec<&str> = l.split(',').collect();
+        let t: i64 = f[2].parse().unwrap();
+        format!("{},{},{},128,0,{}:0:0:0:0:\n", f[0], f[1], t, t + (3. * gap) as i64)
+    }).collect();
+    format!("{head}[HitObjects]\n{held}").into_bytes()
+}
+
 pub fn population() -> Population {
     Population { slope: vec![(7, 2.)], window: vec![(7, 1.5)], curve: vec![(7, 0.)], curve_knee: 4., sig2: 0.1, tau2: 0.05, kappa: 5., rows: 1000, players: 50, ..Population::default() }
 }
@@ -71,6 +83,11 @@ pub fn world(tag: &str, acc: impl Fn(f64) -> f64, plays: usize) -> World {
 
 /// `plays` over the last `days`; `acc(overall, age in days)`.
 pub fn dated(tag: &str, plays: usize, days: f64, acc: impl Fn(f64, f64) -> f64) -> World {
+    played_on(tag, plays, days, acc, chart_bytes, "realm")
+}
+
+/// `dated` on charts `chart(i)`, the plays from `client`: "realm" (lazer) or "stable".
+pub fn played_on(tag: &str, plays: usize, days: f64, acc: impl Fn(f64, f64) -> f64, chart: fn(usize) -> Vec<u8>, client: &str) -> World {
     let dir = std::env::temp_dir().join(format!("ms-world-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -78,7 +95,7 @@ pub fn dated(tag: &str, plays: usize, days: f64, acc: impl Fn(f64, f64) -> f64) 
     let prm = standard_params();
     let (mut maps, mut records, mut charts, mut analysed) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for i in 0..24usize {
-        let data = chart_bytes(i);
+        let data = chart(i);
         let (sha, md5) = hashes(&data);
         let (rate, f) = chart_features(&data, &[1.], &prm).unwrap().remove(0);
         let bid = 1000 + i as i64;
@@ -98,8 +115,9 @@ pub fn dated(tag: &str, plays: usize, days: f64, acc: impl Fn(f64, f64) -> f64) 
         let at = now - 86400. - (plays - i) as f64 * spacing;
         let s = stats(acc(*overall, (now - at) / 86400.));
         let (accuracy, n) = ms_data::store::acc320(&s);
-        upsert_score(&db, Score { key: format!("s{i}"), src: "realm".into(), online_id: 5000 + i as i64, player_id: Some(1), sha256: Some(sha.clone()), md5: Some(md5.clone()),
-            beatmap_id: Some(1000 + (i % charts.len()) as i64), status: Some(1), played: Some(iso(at)), imported: "2026-11-01T00:00:00+00:00".into(), client: Some("2026.921.0-lazer".into()),
+        let stable = client == "stable";
+        upsert_score(&db, Score { key: format!("{}{i}", if stable { "st|" } else { "s" }), src: client.into(), online_id: 5000 + i as i64, player_id: Some(1), sha256: Some(sha.clone()), md5: Some(md5.clone()),
+            beatmap_id: Some(1000 + (i % charts.len()) as i64), status: Some(1), played: Some(iso(at)), imported: "2026-11-01T00:00:00+00:00".into(), client: Some(if stable { "stable".into() } else { "2026.921.0-lazer".into() }),
             mods: "[]".into(), rate: Some(1.), ranked: true, stats: s, acc: accuracy, n, total: 900000, pp: Some(1.), fresh: false, local_id: None }).unwrap();
     }
     World { dir, db, public, charts }

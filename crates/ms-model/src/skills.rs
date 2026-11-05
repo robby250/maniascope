@@ -16,16 +16,30 @@ pub struct Skill {
 fn family(key: &str, name: &'static str, members: &[&'static str], children: &[(&'static str, &'static str, &'static str)], tip: &'static str) -> Skill {
     Skill {
         key: key.to_string(), name, members: members.to_vec(), tip,
-        children: children.iter().map(|(child, label, about)| Skill { key: format!("{key}/{child}"), name: label, members: vec![child], children: Vec::new(), tip: about }).collect(),
+        children: children.iter().map(|(child, label, about)| Skill { key: format!("{key}/{child}"), name: label, members: vec![member(key, child)], children: Vec::new(), tip: about }).collect(),
+    }
+}
+
+/// The calculator skill a child reads: its own name, but the LN children's skills carry an `ln_` prefix.
+fn member(key: &str, child: &'static str) -> &'static str {
+    match (key, child) {
+        ("ln", "general") => "ln_general",
+        ("ln", "tech") => "ln_tech",
+        ("ln", "inverse") => "ln_inverse",
+        ("ln", "release") => "ln_release",
+        _ => child,
     }
 }
 
 fn shared() -> [Skill; 7] {
     [
-        family("ln", "LN", &["ln", "release", "inverse", "hybrid", "shield"], &[
-            ("release", "LN Release", "Timing and coordinating hold endings."),
-            ("inverse", "Inverse", "Release followed by a re-press of the held column."),
-            ("hybrid", "Hybrid LN", "Independent taps while other fingers hold."),
+        // Less 2026-11-04: Hybrid deleted; General/Tech/Inverse/Release each rate their own 7K LN Dan practice pack top
+        // (ms_calc::skills::attribute). The tree keys stay; a child's member is its own LN skill (`member`).
+        family("ln", "LN", &["ln", "ln_general", "ln_tech", "ln_inverse", "ln_release", "shield"], &[
+            ("general", "LN General", "Holds and taps without one dominant LN specialty."),
+            ("tech", "LN Tech", "Irregular hold rhythms and awkward transitions inside LN."),
+            ("inverse", "Inverse", "Most columns held most of the time: the gaps are the notes."),
+            ("release", "LN Release", "Releasing one finger while others of the hand keep holding."),
             ("shield", "Shields", "A tap immediately followed by a hold in the same column.")], ""),
         family("technical", "Technical", &["technical", "patterntech", "rhythmtech"], &[
             ("patterntech", "Pattern Tech", "Awkward finger control and genuinely difficult transitions."),
@@ -118,11 +132,10 @@ pub fn name(key: &str) -> &'static str {
     node(key).map_or("", |n| n.name)
 }
 
-/// The strongest of a dimension's members, Hybrid LN only as far as the map mixes LN and rice (card::hybrid_mix).
+/// The strongest of a dimension's members.
 pub fn member_value<S: AsRef<str>>(f: &ms_calc::val::Dict, members: &[S]) -> f64 {
-    let (sk, mix) = (f.dict("sk"), ms_calc::card::hybrid_mix(f.fget("ln", 0.)));
-    members.iter().filter_map(|m| Some((m.as_ref(), sk?.get(m.as_ref())?.f().max(0.))))
-        .fold(0f64, |a, (m, v)| a.max(if m == "hybrid" { v * mix } else { v }))
+    let sk = f.dict("sk");
+    members.iter().filter_map(|m| Some(sk?.get(m.as_ref())?.f().max(0.))).fold(0f64, f64::max)
 }
 
 /// skill_practice.strengths and practice_strengths of one chart-rate: (key, raw, practice) per dimension.
@@ -166,7 +179,7 @@ pub fn feat_trees() -> Vec<Vec<(String, Vec<String>)>> {
 }
 
 /// Saved keys of older trees → their place now. Exclusions keep their "!".
-const LEGACY: [(&str, &[&str]); 15] = [
+const LEGACY: [(&str, &[&str]); 16] = [
     ("rice", &["stream", "jumpstream", "handstream"]),
     ("chords", &["jumpstream", "handstream", "chordstream"]),
     ("jack", &["jackspeed"]),
@@ -183,6 +196,8 @@ const LEGACY: [(&str, &[&str]); 15] = [
     ("bracket", &["chordstream/bracket"]),
     ("jumptrill", &["trills/jumptrill"]),
     ("splittrill", &["trills/splittrill"]),
+    // 2026-11-04 (Less): Hybrid LN deleted; its closest skill is LN Tech.
+    ("ln/hybrid", &["ln/tech"]),
 ];
 
 /// A saved key's current keys (settings keep weights and avoid levels under these too).
@@ -361,7 +376,7 @@ mod tests {
         assert_eq!(cycle(&one, "ln"), v(&["!ln"]));
         assert!(cycle(&v(&["!ln"]), "ln").is_empty());
         // Python's result: a child cycled out of an included parent expands the parent, the child neutral.
-        assert_eq!(cycle(&cycle(&one, "ln/release"), "ln/release"), v(&["ln/inverse", "ln/hybrid", "ln/shield"]));
+        assert_eq!(cycle(&cycle(&one, "ln/release"), "ln/release"), v(&["ln/general", "ln/tech", "ln/inverse", "ln/shield"]));
     }
 
     #[test]
@@ -389,18 +404,12 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_counts_only_where_the_map_mixes_ln_and_rice() {
-        let f = |ln: f64| {
-            let mut sk = ms_calc::val::Dict::new();
-            sk.set("hybrid", 1.0);
-            let mut f = ms_calc::val::Dict::new();
-            f.set("keys", 7i64);
-            f.set("ln", ln);
-            f.set("sk", sk);
-            strengths(&f).into_iter().find(|s| s.0 == "ln/hybrid").unwrap().1
-        };
-        assert_eq!((f(0.01), f(0.30), f(0.95)), (0., 1., 0.));
-        assert!(f(0.17) > 0. && f(0.17) < 1.);
+    fn ln_children_read_their_own_ln_skill_and_hybrid_moves_to_tech() {
+        let ln = node("ln").unwrap();
+        assert_eq!(ln.children.iter().map(|c| (c.key.as_str(), c.members[0])).collect::<Vec<_>>(),
+                   [("ln/general", "ln_general"), ("ln/tech", "ln_tech"), ("ln/inverse", "ln_inverse"), ("ln/release", "ln_release"), ("ln/shield", "shield")]);
+        assert_eq!(normalize(&v(&["ln/hybrid"])), v(&["ln/tech"]));
+        assert_eq!(normalize(&v(&["!ln/hybrid"])), v(&["!ln/tech"]));
     }
 
     #[test]

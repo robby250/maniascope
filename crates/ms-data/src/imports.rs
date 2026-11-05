@@ -8,7 +8,7 @@ use crate::store::{acc320, kv_get, kv_set, local_stamp, now, score_key, stable_k
 use chrono::DateTime;
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 type R<T> = Result<T, String>;
@@ -267,10 +267,16 @@ pub fn import_stable(db: &Db, root: Option<&Path>) -> R<Imported> {
     let imported = local_stamp();
     // no plays yet: stable writes scores.db on the first one
     let raw = std::fs::read(root.join("scores.db")).map_err(|e| e.to_string()).and_then(|b| stable::scores(&b)).unwrap_or_default();
+    // The account's name, and any name that owns a play this app saw live (offline plays may carry another name).
+    let live = |s: &stable::Score| md5_sha.get(&s.md5).is_some_and(|sha| {
+        let key = stable_key(sha, s.score as i64, &s.stats.map(i64::from));
+        db.query_row("SELECT 1 FROM scores WHERE key=? AND client='stable-live'", [&key], |_| Ok(())).is_ok()
+    });
+    let names: HashSet<String> = raw.iter().filter(|s| s.mode == 3 && s.player != player && live(s)).map(|s| s.player.clone()).chain([player.clone()]).collect();
     let mut scores = Vec::new();
     for s in raw {
         let Some(sha) = md5_sha.get(&s.md5) else { continue };
-        if s.mode != 3 || s.player != player {
+        if s.mode != 3 || !names.contains(&s.player) {
             continue;
         }
         let st: Stats = s.stats.map(i64::from);

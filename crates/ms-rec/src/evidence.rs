@@ -14,8 +14,14 @@ use std::sync::Arc;
 
 const EVIDENCE_MODS: [&str; 13] = ["NF", "HD", "FI", "FL", "MR", "SD", "PF", "DT", "NC", "HT", "DC", "CL", "RD"];
 const STABLE_MODS: i64 = 1 | 8 | 64 | 256 | 512 | 1024 | 1048576 | 1073741824 | 16384 | 32; // stage1 rules drop the rest
-pub const MIN_LAZER_LN: usize = 30;   // lazer LN plays of a keymode from which stable ones stop being evidence
-const STABLE_LN: f64 = 0.35;      // LN share up to which a stable result stands in for a lazer one
+/// Stable judges a hold once from its head and head + release error, harsher than lazer's separate head and tail. The
+/// same 1,224 own lazer replays re-judged by stable's rule (`calib replay_review` stable_stats, 2026-11-05) had log(1 − acc)
+/// higher by these × the chart's LN share; held-out MAE on charts over 30 % LN .20 pp (display) and .27 (acc320), against
+/// .59 and 1.13 unconverted. A stable result is evidence in lazer units after this, on any LN share. It replaced a filter
+/// that dropped stable plays above 35 % LN, which kept a stable LN player's level on rice (Less 2026-11-04: target 90 %,
+/// "tot pot face 95", level never moved).
+pub const STABLE_LN_Y: f64 = 0.186; // lazer's displayed accuracy
+pub const STABLE_LN_Y320: f64 = 0.281; // acc320
 
 pub fn months(iso: &str) -> Option<f64> {
     let part = |r: std::ops::Range<usize>| iso.get(r)?.parse::<f64>().ok();
@@ -194,9 +200,11 @@ pub fn evidence_rows(db: &Db, source: &mut FeatureSource, c: &Consts) -> Result<
         });
         let notes = f.fget("notes", 0.);
         let stats = r.stats.as_deref().and_then(parse_stats);
+        let stable = stable_judged(&r.key, r.client.as_deref(), &mods);
+        let shift = if stable { ln } else { 0. };
         out.rows.push(Evidence {
-            y: y_of(acc),
-            y_lazer: y_of(stats.as_ref().map_or(0., acc_lazer)),
+            y: y_of(acc) - STABLE_LN_Y320 * shift,
+            y_lazer: y_of(stats.as_ref().map_or(0., acc_lazer)) - STABLE_LN_Y * shift,
             keys: out.feats[at].keys,
             t,
             chart,
@@ -209,7 +217,7 @@ pub fn evidence_rows(db: &Db, source: &mut FeatureSource, c: &Consts) -> Result<
             rate: r.rate.unwrap_or(1.),
             key: r.key.clone(),
             rd,
-            completed: completed(r.n.unwrap_or(0), notes, ln, lazer_judged(&r.key, r.client.as_deref())),
+            completed: completed(r.n.unwrap_or(0), notes, ln, !stable),
             ln,
             overall: out.feats[at].overall,
             family,
@@ -218,27 +226,16 @@ pub fn evidence_rows(db: &Db, source: &mut FeatureSource, c: &Consts) -> Result<
     Ok(out)
 }
 
-fn lazer_judged(key: &str, client: Option<&str>) -> bool {
-    !key.starts_with("legacy|") && client.is_some_and(|c| c.ends_with("-lazer") || c == "lazer-live")
+/// A result judged by stable's rules: stable's own scores, and website scores marked Classic (legacy scores carry CL).
+fn stable_judged(key: &str, client: Option<&str>, mods: &Value) -> bool {
+    let classic = || mods.as_array().is_some_and(|m| m.iter().any(|x| x["acronym"].as_str().is_some_and(|a| a.eq_ignore_ascii_case("CL"))));
+    key.starts_with("legacy|") || matches!(client, Some("stable" | "stable-live")) || client == Some("website") && classic()
 }
 
 /// lazer judges a hold's head and tail apart; stable merges them into one judgement. Asking stable for both left 348 of
 /// iess's 441 plays out of the Stats line, most of their hard ones.
 fn completed(judged: i64, notes: f64, ln: f64, lazer: bool) -> bool {
     judged as f64 >= 0.95 * notes * if lazer { 1. + ln } else { 1. }
-}
-
-/// Rows the personal fit reads. Both forecasts target lazer plays. Stable merges a hold's head and tail into one
-/// judgement; neither 305 nor 320 reweighting reconstructs the two separate judgements. Stable tap scores remain
-/// transfer evidence. A keymode without lazer LN plays keeps charts up to STABLE_LN: most 7K charts hold some LN, so
-/// the rule left a stable player's hardest plays out and their level on easy rice (Less 2026-11-01: 85 of 100 bests
-/// dropped). G533QR's stable plays predicting its lazer LN plays: 7K RMSE .374 → .343, 4K .843 → .560; all of them
-/// .434, 1.046.
-pub fn stable_evidence<'a>(rows: impl Iterator<Item = &'a Evidence> + Clone) -> Vec<&'a Evidence> {
-    let lazer = |r: &Evidence| lazer_judged(&r.key, r.client.as_deref());
-    let mut lazer_ln: HashMap<i64, usize> = HashMap::default();
-    rows.clone().filter(|r| r.ln != 0. && lazer(r)).for_each(|r| *lazer_ln.entry(r.keys).or_insert(0) += 1);
-    rows.filter(|r| r.ln == 0. || lazer(r) || (lazer_ln.get(&r.keys).copied().unwrap_or(0) < MIN_LAZER_LN && r.ln <= STABLE_LN)).collect()
 }
 
 fn percentile(sorted: &[f64], q: f64) -> f64 {
@@ -287,6 +284,21 @@ mod tests {
         assert!(!completed(1000, 1000., 0.3, true));
         assert!(completed(1300, 1000., 0.3, true));
         assert!(!completed(900, 1000., 0.3, false));
-        assert!(!lazer_judged("legacy|1", Some("osu-lazer")) && lazer_judged("x", Some("g835lx-lazer")) && !lazer_judged("st|x", Some("stable")));
+        let (none, cl) = (serde_json::json!([]), serde_json::json!([{"acronym": "CL"}]));
+        assert!(stable_judged("legacy|1", Some("osu-lazer"), &none) && !stable_judged("x", Some("g835lx-lazer"), &none) && stable_judged("st|x", Some("stable"), &none));
+        assert!(stable_judged("web|1", Some("website"), &cl) && !stable_judged("web|2", Some("website"), &none));
+    }
+
+    #[test]
+    fn a_stable_ln_player_is_rated_on_their_ln_plays_in_lazer_units() {
+        // Less 2026-11-04: stable plays on charts over 35 % LN were dropped, so a stable LN player's level never moved. Every
+        // stable LN play now counts, converted to lazer units (stable judges each hold once from head + release, harsher).
+        use crate::testkit::{engine, osu_ln, played_on, spread, World};
+        let ln = |i: usize| osu_ln(7, 150. - 4. * i as f64, i);
+        let (stable, lazer) = (played_on("ln-stable", 120, 30., |o, _| spread(o), ln, "stable"), played_on("ln-lazer", 120, 30., |o, _| spread(o), ln, "realm"));
+        let level = |w: &World| engine(w).model().level.get(&7).expect("a 7K level from the LN plays").0;
+        let gap = level(&lazer) - level(&stable);
+        // the same accuracies judged by stable are the better play: STABLE_LN_Y × the LN share (every note a hold; the shown model)
+        assert!((0.15..0.25).contains(&gap), "level gap {gap}");
     }
 }

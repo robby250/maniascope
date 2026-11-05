@@ -71,8 +71,9 @@ pub fn recover_results(db: &Db) -> Result<usize> {
         if !tracking_allowed(db, Some(played), Some(*t))? || info["predicted_at"].as_f64().unwrap_or(*t) > played {
             continue;
         }
-        let y_lazer = r.5.as_deref().and_then(parse_stats).map_or(0., |s| y_of(acc_lazer(&s)));
-        log_event(db, "finish", beatmap.as_deref(), Some(played), &json!({"key": r.0, "start_id": id, "recovered": true, "y": y_of(r.4), "y_lazer": y_lazer}))?;
+        let held = if r.0.starts_with("st|") { info["ln"].as_f64().unwrap_or(0.) } else { 0. }; // stable: lazer units (evidence::STABLE_LN_Y)
+        let y_lazer = r.5.as_deref().and_then(parse_stats).map_or(0., |s| y_of(acc_lazer(&s))) - crate::evidence::STABLE_LN_Y * held;
+        log_event(db, "finish", beatmap.as_deref(), Some(played), &json!({"key": r.0, "start_id": id, "recovered": true, "y": y_of(r.4) - crate::evidence::STABLE_LN_Y320 * held, "y_lazer": y_lazer}))?;
         db.execute("UPDATE scores SET fresh=1 WHERE key=?", [&r.0])?;
         finished.insert(r.0.clone());
         added += 1;

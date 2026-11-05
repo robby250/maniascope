@@ -12,24 +12,25 @@ pub enum P {
     stream, jumpstream, handstream, jumptrill, splittrill, jackspeed, chordjack, ln, sv, delay,
     chordstream, jack, technical, bracket, dump, odd, rodd, pins, psw, oht, anc, rows, sv_raw,
     ln_rel, mj, sus, lj, shield, inv, hyb, vib, sv_fast, sv_slow, sv_accel, sv_stutter, sv_brake,
+    cover, stag, lnend, used,
 }
-pub const NP: usize = 36;
+pub const NP: usize = 40;
 pub const P_NAMES: [&str; NP] = [
     "stream", "jumpstream", "handstream", "jumptrill", "splittrill", "jackspeed", "chordjack", "ln", "sv", "delay",
     "chordstream", "jack", "technical", "bracket", "dump", "odd", "rodd", "pins", "psw", "oht", "anc", "rows",
     "sv_raw", "ln_rel", "mj", "sus", "lj", "shield", "inv", "hyb", "vib", "sv_fast", "sv_slow", "sv_accel",
-    "sv_stutter", "sv_brake",
+    "sv_stutter", "sv_brake", "cover", "stag", "lnend", "used",
 ];
 pub const PARTS_4K: [P; 9] = [P::stream, P::jumpstream, P::handstream, P::jumptrill, P::splittrill, P::jackspeed, P::chordjack, P::ln, P::sv];
 pub const PARTS_5K: [P; 8] = [P::delay, P::stream, P::chordstream, P::jumptrill, P::jack, P::chordjack, P::ln, P::sv];
 pub const SV_KINDS: [P; 5] = [P::sv_fast, P::sv_slow, P::sv_accel, P::sv_stutter, P::sv_brake];
-const TAIL: [P; 26] = [
+const TAIL: [P; 30] = [
     P::technical, P::bracket, P::dump, P::odd, P::rodd, P::pins, P::psw, P::oht, P::anc, P::rows, P::sv_raw, P::ln_rel, P::mj, P::sus, P::lj, P::shield, P::inv, P::hyb,
-    P::vib, P::sv_fast, P::sv_slow, P::sv_accel, P::sv_stutter, P::sv_brake,
+    P::vib, P::sv_fast, P::sv_slow, P::sv_accel, P::sv_stutter, P::sv_brake, P::cover, P::stag, P::lnend, P::used,
     // padding never read (TAIL_LEN)
     P::stream, P::stream,
 ];
-const TAIL_LEN: usize = 24;
+const TAIL_LEN: usize = 28;
 
 /// Output order of the parts dict for a keymode.
 pub fn part_keys(wide: bool) -> Vec<P> {
@@ -40,7 +41,7 @@ pub fn part_keys(wide: bool) -> Vec<P> {
 
 #[inline]
 fn non_demand(p: P) -> bool {
-    matches!(p, P::odd | P::rodd | P::pins | P::psw | P::oht | P::anc | P::rows | P::sv_raw | P::mj | P::sus | P::lj | P::shield | P::inv | P::hyb | P::vib)
+    matches!(p, P::odd | P::rodd | P::pins | P::psw | P::oht | P::anc | P::rows | P::sv_raw | P::mj | P::sus | P::lj | P::shield | P::inv | P::hyb | P::vib | P::cover | P::stag | P::lnend | P::used)
 }
 
 /// Part series, keyed like the Python dict (`keys` = its order).
@@ -817,6 +818,19 @@ pub fn demand(
         a.sort_by(|x, y| x.partial_cmp(y).unwrap());
     }
     let ats: [Vec<f64>; 2] = [acts[0].iter().map(|x| x.0).collect(), acts[1].iter().map(|x| x.0).collect()];
+    let mut holds: Vec<Vec<(f64, f64)>> = vec![Vec::new(); keys]; // per column, in time order (a column's holds don't overlap)
+    let mut used = vec![0u32; nbins]; // columns pressed or held in each bin: what the held share is a share of
+    for ni in 0..n {
+        let bin_of = |x: f64| (nbins - 1).min(((x - t0) / bin).max(0.0) as usize);
+        let (first, last) = (bin_of(times[ni]), bin_of(ends[ni].max(times[ni])));
+        used[first..=last].iter_mut().for_each(|m| *m |= 1 << columns[ni]);
+        if ends[ni] - times[ni] > 0.003 {
+            holds[columns[ni] as usize].push((times[ni], ends[ni]));
+        }
+    }
+    for (b, m) in used.iter().enumerate() {
+        comp[o(P::used) + b] = f64::from(m.count_ones()) * bin;
+    }
     for ni in 0..n {
         let (t, e, c) = (times[ni], ends[ni], columns[ni]);
         let ln_len = e - t;
@@ -853,6 +867,21 @@ pub fn demand(
         fine[h * nfine + fb] += eff;
         comp[o(P::ln) + b] += eff;
         comp[o(P::ln_rel) + b] += eff;
+        // skills::attribute's LN shares: releases, the staggered ones (another finger of the hand holds on), held time
+        comp[o(P::lnend) + b] += 1.0;
+        let staggered = (0..keys).filter(|&oc| oc != c as usize && hand_of[oc] as usize == h).any(|oc| {
+            let v = &holds[oc];
+            let i = v.partition_point(|x| x.0 < e - 0.02);
+            i > 0 && v[i - 1].1 > e + 0.02
+        });
+        if staggered {
+            comp[o(P::stag) + b] += 1.0;
+        }
+        let first = (nbins - 1).min(((t - t0) / bin).max(0.0) as usize);
+        for hb in first..=b {
+            let (lo, hi) = (t0 + hb as f64 * bin, if hb == nbins - 1 { f64::INFINITY } else { t0 + (hb + 1) as f64 * bin });
+            comp[o(P::cover) + hb] += 0f64.max(e.min(hi) - t.max(lo));
+        }
     }
     for c in 0..keys {
         if runs[c].len() >= 3 {

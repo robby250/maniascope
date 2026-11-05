@@ -40,6 +40,12 @@ pub fn int(s: &str) -> Option<i64> {
 
 /// `int(float(s))`: NaN is a ValueError (Err(false)), ±inf an OverflowError (Err(true)).
 pub fn int_float(s: &str) -> Result<i64, bool> {
+    // nearly every field is a plain integer: below 2^53 the float round trip is exact
+    if let Ok(v) = s.trim().parse::<i64>() {
+        if v.unsigned_abs() < 1 << 53 {
+            return Ok(v);
+        }
+    }
     match float(s) {
         None => Err(false),
         Some(v) if v.is_nan() => Err(false),

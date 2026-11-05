@@ -4,36 +4,37 @@ use crate::demand::{Parts, P};
 use crate::params::Knobs;
 use crate::pattern::technical_title;
 use crate::py;
-use crate::skills::{rating, skills, stamina_rating, Judged, Series, Sk, LN_KINDS, SV_KINDS, TECH_KEYS};
+use crate::skills::{rating, skills, stamina_rating, Judged, Series, Sk, FIT_ONLY, LN_SKILLS, SV_KINDS, TECH_KEYS};
 use crate::val::{Dict, Key, Val};
 
-const TECH_NAMES: [(Sk, &str); 19] = [
+const TECH_NAMES: [(Sk, &str); 18] = [
     (Sk::stream, "Tech Stream"), (Sk::delay, "Tech Stream"), (Sk::chordstream, "Tech Chordstream"),
     (Sk::dump, "Tech Dump"), (Sk::jumptrill, "Tech Jumptrill"), (Sk::splittrill, "Tech Split Trill"),
     (Sk::jumpstream, "Tech Jumpstream"), (Sk::handstream, "Tech Handstream"), (Sk::jack, "Tech Jacks"),
     (Sk::jackspeed, "Tech Jacks"), (Sk::chordjack, "Tech Chordjack"), (Sk::minijack, "Tech Minijack"),
-    (Sk::longjack, "Tech Longjack"), (Sk::bracket, "Tech Bracket"), (Sk::hybrid, "Tech Hybrid LN"),
-    (Sk::inverse, "Tech Inverse"), (Sk::release, "Tech LN Release"), (Sk::ln, "Tech LN"),
+    (Sk::longjack, "Tech Longjack"), (Sk::bracket, "Tech Bracket"),
+    (Sk::ln_inverse, "Tech Inverse"), (Sk::ln_release, "Tech LN Release"), (Sk::ln, "Tech LN"),
     (Sk::trill1h, "Tech 1H Trill"),
 ];
 const TECH_ANCHOR: (Sk, &str) = (Sk::anchor, "Tech Anchor");
-const STAMINA_NAMES: [(Sk, &str); 17] = [
+const STAMINA_NAMES: [(Sk, &str); 18] = [
     (Sk::stream, "Stream Stamina"), (Sk::delay, "Stream Stamina"), (Sk::chordstream, "Chordstream Stam"),
     (Sk::dump, "Dump Stamina"), (Sk::jumptrill, "JT Stamina"), (Sk::splittrill, "Split Stamina"),
     (Sk::jumpstream, "JS Stamina"), (Sk::handstream, "HS Stamina"), (Sk::jack, "Jack Stamina"),
     (Sk::jackspeed, "Jack Stamina"), (Sk::longjack, "Jack Stamina"), (Sk::chordjack, "CJ Stamina"),
-    (Sk::bracket, "Bracket Stamina"), (Sk::release, "LN Stamina"), (Sk::inverse, "LN Stamina"),
-    (Sk::hybrid, "LN Stamina"), (Sk::ln, "LN Stamina"),
+    (Sk::bracket, "Bracket Stamina"), (Sk::ln_release, "LN Stamina"), (Sk::ln_inverse, "LN Stamina"),
+    (Sk::ln_tech, "LN Stamina"), (Sk::ln_general, "LN Stamina"), (Sk::ln, "LN Stamina"),
 ];
 const TECH_CONTROL: &str = "Tech Control";
-const REFINES: [(Sk, &[Sk]); 8] = [
+const REFINES: [(Sk, &[Sk]); 9] = [
     (Sk::bracket, &[Sk::chordstream]),
     (Sk::quadstream, &[Sk::handstream, Sk::minijack]),
     (Sk::longjack, &[Sk::jack, Sk::jackspeed, Sk::chordjack]),
     (Sk::vibro, &[Sk::jack, Sk::jackspeed, Sk::chordjack, Sk::longjack]),
-    (Sk::release, &[Sk::ln]),
-    (Sk::inverse, &[Sk::ln]),
-    (Sk::hybrid, &[Sk::ln]),
+    (Sk::ln_general, &[Sk::ln]),
+    (Sk::ln_tech, &[Sk::ln]),
+    (Sk::ln_inverse, &[Sk::ln]),
+    (Sk::ln_release, &[Sk::ln]),
     (Sk::shield, &[Sk::ln]),
 ];
 fn describes(s: &str) -> &'static [&'static str] {
@@ -47,18 +48,6 @@ fn describes(s: &str) -> &'static [&'static str] {
     }
 }
 
-/// How much a map counts as Hybrid LN for display and Skills: LN and rice must both be a real share of it (user
-/// 2026-11-02: "a map with like 30% LN is usually considered hybrid", not one held LN under rice). Ramps 10→25% on
-/// each side. The calculator's hybrid strain and the difficulty number are untouched.
-pub fn hybrid_mix(ln_share: f64) -> f64 {
-    let ramp = |x: f64| ((x - 0.10) / 0.15).clamp(0., 1.);
-    ramp(ln_share) * ramp(1. - ln_share)
-}
-
-fn ln_share(res: &Dict) -> f64 {
-    res.fget("ln_notes", 0.) / res.fget("notes", 0.).max(1.)
-}
-
 pub fn display_name(s: Sk) -> &'static str {
     match s {
         Sk::stream => "Stream", Sk::jumpstream => "Jumpstream", Sk::handstream => "Handstream",
@@ -69,8 +58,8 @@ pub fn display_name(s: Sk) -> &'static str {
         Sk::jumptrill => "Jumptrill", Sk::splittrill => "Split Trill", Sk::technical => "Technical",
         Sk::patterntech => "Pattern Tech", Sk::rhythmtech => "Rhythm Tech", Sk::trill1h => "1H Trill",
         Sk::anchor => "Anchor", Sk::ln => "LN", Sk::sv => "SV", Sk::stamina => "Stamina", Sk::minijack => "Minijack",
-        Sk::longjack => "Longjack", Sk::release => "LN Release", Sk::inverse => "Inverse", Sk::hybrid => "Hybrid LN",
-        Sk::shield => "Shield", Sk::vibro => "Vibro", Sk::mash => "Mash", Sk::overall | Sk::switch => "",
+        Sk::longjack => "Longjack", Sk::ln_release => "LN Release", Sk::ln_inverse => "Inverse", Sk::ln_general => "LN General",
+        Sk::ln_tech => "LN Tech", Sk::shield => "Shield", Sk::release | Sk::inverse | Sk::hybrid => "", Sk::vibro => "Vibro", Sk::mash => "Mash", Sk::overall | Sk::switch => "",
     }
 }
 
@@ -117,11 +106,12 @@ pub fn archetypes(series: &Series, sc: &Dict, judged: &Judged, keys: usize, swit
     let tech = series.get(Sk::technical);
     let mut best = 0.0f64;
     for (key, name) in TECH_NAMES.iter().chain(std::iter::once(&TECH_ANCHOR)) {
-        if !series.has(*key) || s(sc, *key) < k.ARCH_MATERIAL * top {
+        let sk = s(sc, *key);
+        // min(skill, technical) rates no higher than either (rating rises with the series): below the bar, no search
+        if !series.has(*key) || sk < k.ARCH_MATERIAL * top || sk.min(s(sc, Sk::technical)) < (k.ARCH_TECH * sk).max(0.80 * s(sc, Sk::overall)) {
             continue;
         }
         let r = local(&min_series(series.get(*key), tech));
-        let sk = s(sc, *key);
         if r >= k.ARCH_TECH * sk && r >= 0.80 * s(sc, Sk::overall) {
             let whole = r >= k.TECH_WHOLE * sk;
             let rating = if whole { sk } else { r };
@@ -133,7 +123,7 @@ pub fn archetypes(series: &Series, sc: &Dict, judged: &Judged, keys: usize, swit
             best = best.max(rating);
         }
     }
-    if !switch.is_empty() {
+    if !switch.is_empty() && s(sc, Sk::technical) >= k.ARCH_MATERIAL * top {
         let r = local(&min_series(switch, tech));
         if r >= k.ARCH_MATERIAL * top && best < k.REFINE_Q * r {
             out.push(arch(TECH_CONTROL, r, &["technical", "patterntech"], None));
@@ -168,9 +158,9 @@ pub fn archetypes(series: &Series, sc: &Dict, judged: &Judged, keys: usize, swit
         if !series.has(key) || s(sc, key) < k.ARCH_MATERIAL * top || teched.iter().any(|t| t == key.name()) {
             continue;
         }
-        let (sk, short) = (s(sc, key), local(series.get(key)));
+        let sk = s(sc, key); // already rating(series.get(key)) (compute::series_dict_scores)
         // Sustained: the skill keeps its rating when its demand is averaged over minutes.
-        if short > 0.0 && stamina_rating(series.get(key), judged, keys, k) >= k.STAMINA_SUSTAIN * short {
+        if sk > 0.0 && stamina_rating(series.get(key), judged, keys, k) >= k.STAMINA_SUSTAIN * sk {
             out.push(arch(name, sk, &[key.name(), "stamina"], None));
         }
     }
@@ -263,6 +253,7 @@ fn names_for(res: &Dict) -> impl Fn(&str) -> String + '_ {
 pub fn ranked(res: &Dict) -> Vec<Sk> {
     let sc = res.dict("scores").unwrap();
     let mut v = skills(res.f("keys") as usize);
+    v.retain(|s| !FIT_ONLY.contains(s));
     v.sort_by(|a, b| (-py::round_digits(s(sc, *a), 2)).partial_cmp(&-py::round_digits(s(sc, *b), 2)).unwrap());
     v
 }
@@ -293,8 +284,6 @@ pub fn card_top(res: &Dict, n: usize) -> Vec<Val> {
     let profile = tech_profile_of(res);
     let names = names_for(res);
     let scf = |p: &str| sc.f(p);
-    let mix = hybrid_mix(ln_share(res));
-    let gate = |p: &str| if p == "hybrid" { mix } else { 1. };
     // (score, order, entry)
     let mut cands: Vec<(f64, u8, Dict)> = Vec::new();
     if let Some(Val::List(archs)) = res.get("archetypes") {
@@ -305,10 +294,6 @@ pub fn card_top(res: &Dict, n: usize) -> Vec<Val> {
                 continue;
             }
             let parts = parts_of(a);
-            let g = parts.iter().map(|p| gate(p)).fold(1., f64::min);
-            if g <= 0. {
-                continue;
-            }
             let mut mx = a.f("rating");
             for p in &parts {
                 if !TECH_KEYS.iter().any(|t| t.name() == p) {
@@ -320,14 +305,12 @@ pub fn card_top(res: &Dict, n: usize) -> Vec<Val> {
             }
             let of = str_of(a, "of");
             let first = of.as_deref().is_some_and(|o| matches!(o, "dump" | "trill1h" | "anchor"))
-                || parts.iter().any(|p| p == "ln") && parts.iter().any(|p| LN_KINDS.iter().any(|l| l.name() == p));
-            let mut a = a.clone();
-            a.set("rating", a.f("rating") * g);
-            cands.push((mx * g, if first { 0 } else { 1 }, a));
+                || parts.iter().any(|p| p == "ln") && parts.iter().any(|p| LN_SKILLS.iter().chain([&Sk::shield]).any(|l| l.name() == p));
+            cands.push((mx, if first { 0 } else { 1 }, a.clone()));
         }
     }
     for kk in ranked(res) {
-        let v = s(sc, kk) * gate(kk.name());
+        let v = s(sc, kk);
         if TECH_KEYS.contains(&kk) || SV_KINDS.contains(&kk) || v <= 0.0 {
             continue;
         }
@@ -368,7 +351,7 @@ pub fn card_top(res: &Dict, n: usize) -> Vec<Val> {
     let lnv = sc.f("ln");
     let key = |e: &Dict| {
         let parts = parts_of(e);
-        let lnk = parts.iter().any(|p| p == "ln") && parts.iter().any(|p| LN_KINDS.iter().any(|l| l.name() == p));
+        let lnk = parts.iter().any(|p| p == "ln") && parts.iter().any(|p| LN_SKILLS.iter().chain([&Sk::shield]).any(|l| l.name() == p));
         -e.f("rating").max(if lnk { lnv } else { 0.0 })
     };
     picked.sort_by(|a, b| key(a).partial_cmp(&key(b)).unwrap());
@@ -386,7 +369,7 @@ pub fn card_top(res: &Dict, n: usize) -> Vec<Val> {
     }
     let ln_cs = res.dict("archetype_profile").map(|p| p.f("ln_chordstream"));
     let sk_wo: Vec<(String, f64)> = sc.0.iter().filter_map(|(k, v)| match k {
-        Key::S(k) if k != "overall" => Some((k.clone(), v.f() * gate(k))),
+        Key::S(k) if k != "overall" => Some((k.clone(), v.f())),
         _ => None,
     }).collect();
     names_card(picked, &sk_wo, ln_cs, res.f("keys") as usize).into_iter().map(Val::Dict).collect()
@@ -462,8 +445,8 @@ fn descriptor(sk: &[(String, f64)], ln_cs: Option<f64>, keys: usize) -> Option<(
     if top <= 0.0 || g(primary) < 0.6 * top {
         return None;
     }
-    if ln_cs >= 0.25 && g("hybrid") >= 0.6 * top && g("ln") >= 0.65 * top && g("chordstream").max(g("handstream")) >= 0.65 * top {
-        return Some(("LN Chordstream", ["ln", "hybrid", if keys == 4 { "handstream" } else { "chordstream" }]));
+    if ln_cs >= 0.25 && g("ln") >= 0.65 * top && g("chordstream").max(g("handstream")) >= 0.65 * top {
+        return Some(("LN Chordstream", ["ln", "ln_general", if keys == 4 { "handstream" } else { "chordstream" }]));
     }
     None
 }
@@ -472,7 +455,7 @@ fn an_name(k: &str) -> &str {
     match k {
         "stream" => "Stream", "dump" => "Dump", "jumpstream" => "Jumpstream", "handstream" => "Handstream",
         "delay" => "Stream", "chordstream" => "Chordstream", "bracket" => "Bracket", "minijack" => "Minijack",
-        "anchor" => "Anchor", "ln" => "LN", "hybrid" => "Hybrid LN", "release" => "LN Release", _ => k,
+        "anchor" => "Anchor", "ln" => "LN", "ln_general" => "LN General", "ln_release" => "LN Release", _ => k,
     }
 }
 
@@ -544,12 +527,11 @@ pub fn describe(res: &Dict, k: &Knobs) -> (String, Vec<String>) {
     }
     let shown: Vec<String> = entries.iter().flat_map(|e| if let Val::Dict(d) = e { parts_of(d) } else { Vec::new() }).collect();
     let names = names_for(res);
-    let mix = hybrid_mix(ln_share(res));
-    let val = |g: &str| sc.f(g) * if g == "hybrid" { mix } else { 1. };
+    let val = |g: &str| sc.f(g);
     let mut extra = Vec::new();
     let groups: [(&[&str], f64); 4] = [
         (&["sv"], k.ALSO_SPECIAL),
-        (&["release", "inverse", "hybrid", "shield", "ln"], k.ALSO_SHARE),
+        (&["ln_general", "ln_tech", "ln_inverse", "ln_release", "shield", "ln"], k.ALSO_SHARE),
         (&["vibro"], k.ALSO_SPECIAL),
         (&["mash"], 0.25),
     ];
@@ -600,10 +582,10 @@ mod tests {
 
     #[test]
     fn ln_chordstream_names_the_texture_with_valid_parts() {
-        let s = sk(&[("chordstream", 1.0), ("ln", 0.9), ("hybrid", 0.85)]);
+        let s = sk(&[("chordstream", 1.0), ("ln", 0.9), ("ln_general", 0.85)]);
         assert_eq!(rename("Chordstream", descriptor(&s, Some(0.95), 7)), "LN Chordstream");
         for (keys, texture) in [(4, "handstream"), (7, "chordstream")] {
-            let s = sk(&[(texture, 1.0), ("ln", 0.9), ("hybrid", 0.85)]);
+            let s = sk(&[(texture, 1.0), ("ln", 0.9), ("ln_general", 0.85)]);
             let (_, parts) = descriptor(&s, Some(0.8), keys).unwrap();
             let names: Vec<&str> = skills(keys).iter().map(|k| k.name()).collect();
             assert!(parts.iter().all(|p| names.contains(p)), "{keys}K {parts:?}");

@@ -36,28 +36,20 @@ impl Chart {
     }
 }
 
-/// Python text mode: utf-8 with errors="ignore", universal newlines.
-fn lines(data: &[u8]) -> Vec<String> {
-    let text = String::from_utf8_lossy(data).replace('\u{FFFD}', "");
+/// Python text mode: utf-8 with errors="ignore", universal newlines. Slices of `text`: no copy per line. A lone \r also
+/// ends a line; the empty pieces this split leaves are blank lines, which the parser skips.
+fn lines(text: &str) -> Vec<&str> {
     let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut it = text.chars().peekable();
-    while let Some(ch) = it.next() {
-        match ch {
-            '\n' => {
-                out.push(std::mem::take(&mut cur));
-            }
-            '\r' => {
-                if it.peek() == Some(&'\n') {
-                    it.next();
-                }
-                out.push(std::mem::take(&mut cur));
-            }
-            _ => cur.push(ch),
+    for l in text.split('\n') {
+        let l = l.strip_suffix('\r').unwrap_or(l);
+        if l.contains('\r') {
+            out.extend(l.split('\r'));
+        } else {
+            out.push(l);
         }
     }
-    if !cur.is_empty() {
-        out.push(cur);
+    if text.ends_with('\n') {
+        out.pop(); // "a\n" is one line, as before
     }
     out
 }
@@ -68,7 +60,12 @@ fn strip(s: &str) -> &str {
 }
 
 pub fn parse(data: &[u8]) -> Result<Chart, ChartError> {
-    let lines = lines(data);
+    // Valid UTF-8 without U+FFFD (nearly every chart) is read in place; the copy only drops bad bytes.
+    let text: std::borrow::Cow<str> = match std::str::from_utf8(data) {
+        Ok(t) if !t.contains('\u{FFFD}') => t.into(),
+        _ => String::from_utf8_lossy(data).replace('\u{FFFD}', "").into(),
+    };
+    let lines = lines(&text);
     let first = lines.first().map(|l| l.trim_start_matches('\u{FEFF}')).unwrap_or("");
     if !first.starts_with("osu file format") {
         return Err(ChartError::Chart("not an .osu file".into()));
@@ -90,8 +87,14 @@ pub fn parse(data: &[u8]) -> Result<Chart, ChartError> {
             continue;
         }
         if section == "[HitObjects]" {
-            let p: Vec<&str> = line.split(',').collect();
-            if p.len() < 4 {
+            let (mut p, mut len) = ([""; 6], 0); // fields 0–5 without a Vec per note
+            for (i, f) in line.split(',').enumerate() {
+                if i < 6 {
+                    p[i] = f;
+                }
+                len = i + 1;
+            }
+            if len < 4 {
                 continue;
             }
             let x = match py::int_float(p[0]) {
@@ -109,7 +112,7 @@ pub fn parse(data: &[u8]) -> Result<Chart, ChartError> {
                 None => continue,
             };
             let end = if typ & 128 != 0 {
-                if p.len() < 6 {
+                if len < 6 {
                     continue;
                 }
                 match py::int_float(p[5].split(':').next().unwrap()) {
@@ -162,7 +165,7 @@ pub fn parse(data: &[u8]) -> Result<Chart, ChartError> {
         .into_iter()
         .map(|(t, e, x)| (t, e, (keys - 1).min(0i64.max(py::floordiv(x.saturating_mul(keys), 512)))))
         .collect();
-    notes.sort_by_key(|&(t, e, c)| (t, c, e));
+    notes.sort_unstable_by_key(|&(t, e, c)| (t, c, e)); // equal keys are equal notes: order among them is moot
     notes.dedup();
     let mut ch = Chart { keys: keys as usize, ..Default::default() };
     let mut last: Vec<Option<usize>> = vec![None; keys as usize];

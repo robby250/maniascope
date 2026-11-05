@@ -1268,11 +1268,13 @@ impl Worker {
             self.replay_retries = 0;
             let (acc, stats): (f64, String) = self.db.query_row("SELECT acc,stats FROM scores WHERE key=?", [&key], |r| Ok((r.get(0)?, r.get(1)?)))?;
             let display = parse_stats(&stats).map_or(0., |s| acc_lazer(&s));
+            // form compares this play with base_mu in lazer units (evidence::STABLE_LN_Y)
+            let held = if score["client"] == "stable" { info["ln"].as_f64().unwrap_or(0.) } else { 0. };
             if self.db.query_row("SELECT 1 FROM events WHERE kind='finish' AND json_extract(info,'$.key')=?", [&key], |_| Ok(())).optional()?.is_some() {
                 return Ok(());
             }
-            log_event(&self.db, "finish", start.as_ref().and_then(|s| s.1.as_deref()), None, &json!({"key": key, "start_id": start.as_ref().map(|s| s.0), "prediction_valid": info["mu"].is_number(), "y": y_of(acc),
-                                                                                                  "y_lazer": y_of(display), "pauses": play.and_then(|p| p.get("pauses")).filter(|p| !p.is_null()).cloned().unwrap_or(json!([]))}))?;
+            log_event(&self.db, "finish", start.as_ref().and_then(|s| s.1.as_deref()), None, &json!({"key": key, "start_id": start.as_ref().map(|s| s.0), "prediction_valid": info["mu"].is_number(), "y": y_of(acc) - crate::evidence::STABLE_LN_Y320 * held,
+                                                                                                  "y_lazer": y_of(display) - crate::evidence::STABLE_LN_Y * held, "pauses": play.and_then(|p| p.get("pauses")).filter(|p| !p.is_null()).cloned().unwrap_or(json!([]))}))?;
             // Show the saved play even if subsequent feature calculation/refitting fails.
             let mut v = self.verdict(&key, bid, None, &info, &title)?;
             v.targets = self.targets.iter().filter(|(_, c)| same_map(c, Some(&sha), md5.as_deref(), bid)).map(|x| x.0.clone()).collect();

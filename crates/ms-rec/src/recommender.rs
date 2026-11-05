@@ -1,8 +1,8 @@
 //! recommend.Recommender's fit: both accuracy targets on the historical rows.
-use crate::evidence::{evidence_rows, now_months, personal_row, play_levels, stable_evidence, Evidence, FeatureSource, Rows};
+use crate::evidence::{evidence_rows, now_months, personal_row, play_levels, Evidence, FeatureSource, Rows};
 use ms_data::events::load_events;
 use ms_data::public::Public;
-use ms_data::store::{acc320, acc_lazer, now, parse_stats, Db, Result};
+use ms_data::store::{acc320, acc_lazer, kv_get, now, parse_stats, Db, Result};
 use ms_model::personal::{personal_fit, transfer, Fit, Knobs, WarmupArgs};
 use ms_model::predict::{Consts, HashMap, PredModel};
 use ms_model::public::{population, slopes};
@@ -60,11 +60,10 @@ pub fn fit_shown(db: &Db, until: f64) -> Result<(f64, f64)> {
 }
 
 pub fn fit_target(c: &Arc<Consts>, public: &Public, pop: &ms_data::public::Population, rows: &[&Evidence], feats: &[ms_model::predict::Feats],
-              levels: &HashMap<i64, f64>, display: bool, month: f64, shown: (f64, f64)) -> Target {
+              levels: &HashMap<i64, f64>, display: bool, month: f64, shown: (f64, f64), judged_ln: f64) -> Target {
     let native = Arc::new(population(pop, c));
     let base_model = PredModel::population(c.clone(), native.clone());
-    let kept = stable_evidence(rows.iter().copied());
-    let personal: Vec<_> = kept.iter().map(|r| {
+    let personal: Vec<_> = rows.iter().map(|r| {
         let (base, _) = base_model.base_of(&feats[r.f], r.b, ms_calc::py::round_digits(r.rate, 3), levels.get(&r.keys).copied());
         personal_row(r, if display { r.y_lazer } else { r.y }, base)
     }).collect();
@@ -78,7 +77,7 @@ pub fn fit_target(c: &Arc<Consts>, public: &Public, pop: &ms_data::public::Popul
         noise_variance: (fit.sd_all * fit.sd_all).max(1e-4),
     };
     let warmup = Arc::new(Model::new(&fit.warmup, args.slopes, prior, c.families.len()));
-    let model = Arc::new(PredModel::fitted(c.clone(), native, levels.clone(), &fit, &warmup, shown));
+    let model = Arc::new(PredModel::fitted(c.clone(), native, levels.clone(), &fit, &warmup, shown, judged_ln));
     Target { fit, warmup, model }
 }
 
@@ -93,7 +92,10 @@ pub fn fit(db: &Db, public: &Arc<Public>, calc: &str, c: &Arc<Consts>) -> Result
     let historical: Vec<&Evidence> = rows.rows.iter().filter(|r| r.ts.is_none_or(|t| t == 0. || t < begin)).collect();
     let levels = play_levels(&historical, month);
     let shown = fit_shown(db, begin)?;
-    let pp = fit_target(c, public, &public.meta.pop, &historical, &rows.feats, &levels, false, month, shown);
-    let display = public.meta.pop_lazer.as_ref().map(|pop| fit_target(c, public, pop, &historical, &rows.feats, &levels, true, month, (0., 1.)));
+    // Evidence is in lazer units; a stable player's forecasts are what stable judges (more lost per hold).
+    let stable = kv_get(db, "client").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| crate::history::default_client().to_string()) == "stable";
+    let judged = if stable { crate::evidence::STABLE_LN_Y } else { 0. };
+    let pp = fit_target(c, public, &public.meta.pop, &historical, &rows.feats, &levels, false, month, shown, judged);
+    let display = public.meta.pop_lazer.as_ref().map(|pop| fit_target(c, public, pop, &historical, &rows.feats, &levels, true, month, (0., 1.), judged));
     Ok(Fitted { rows, levels, pp, display, shown })
 }

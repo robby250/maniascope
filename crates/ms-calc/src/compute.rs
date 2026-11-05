@@ -37,11 +37,23 @@ pub struct Shared {
     pub structure: Option<Dict>,
 }
 
-fn series_dict_scores(sc: &mut Dict, series: &Series, judged: &skills::Judged, keys: usize, prm: &Params) {
+/// Rates every skill series. A series `rated` already holds unchanged keeps its rating: the pass after
+/// execution::attribute changes few series, and rating them all again cost a fifth of a chart's analysis.
+fn series_dict_scores(sc: &mut Dict, series: &Series, judged: &skills::Judged, keys: usize, prm: &Params, rated: &mut Vec<(Vec<f64>, f64)>, only: Option<&[&str]>) {
     for &key in &series.keys {
-        if key != Sk::switch {
-            sc.set(key.name(), skills::rating(series.get(key), judged, keys, &prm.k));
+        if key == Sk::switch || only.is_some_and(|o| !o.contains(&key.name())) {
+            continue;
         }
+        let s = series.get(key);
+        let r = match rated.iter().find(|(v, _)| v.as_slice() == s) { // the rating reads only the series: equal series share it
+            Some(hit) => hit.1,
+            None => {
+                let r = skills::rating(s, judged, keys, &prm.k);
+                rated.push((s.to_vec(), r));
+                r
+            }
+        };
+        sc.set(key.name(), r);
     }
 }
 
@@ -73,7 +85,7 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     let read = if sv && !prm.off("sv_reading") { Some(scroll::reading(chart, rate, prm)?) } else { None };
     let any_strain = read.as_ref().is_some_and(|r| r.0.iter().any(|&x| x != 0.0));
     let runs: Vec<Run> = if !sv && shared.plain_runs.is_some() {
-        shared.plain_runs.clone().unwrap()
+        shared.plain_runs.take().unwrap() // the one plain pass (compute) reads it once
     } else {
         let want_plain = sv && !chart.sv.is_empty() && any_strain;
         let g = demand::geometry(chart, rate, k);
@@ -94,8 +106,15 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
         }
         rs
     };
-    let m = runs.len();
-    let (total, mut parts): (Vec<f64>, Parts) = if m == 2 {
+    if shared.endurance.is_none() {
+        let fines: Vec<&[Vec<f64>; 3]> = runs.iter().map(|r| &r.fine).collect();
+        shared.endurance = Some(if prm.off("endurance") {
+            ((0.0, 0.0), vec![0.0; runs[0].totals.len()])
+        } else {
+            model::endurance(&fines, k.BIN, k.PHASES)
+        });
+    }
+    let (total, mut parts): (Vec<f64>, Parts) = if runs.len() == 2 {
         let t: Vec<f64> = runs[0].totals.iter().zip(&runs[1].totals).map(|(l, r)| (l + r) / 2.0).collect();
         let mut p = runs[0].parts.clone();
         for (x, y) in p.data.iter_mut().zip(&runs[1].parts.data) {
@@ -103,17 +122,10 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
         }
         (t, p)
     } else {
-        (runs[0].totals.clone(), runs[0].parts.clone())
+        let r = runs.into_iter().next().unwrap();
+        (r.totals, r.parts)
     };
     let tracing = shared.trace.is_some();
-    if shared.endurance.is_none() {
-        let fines: Vec<&[Vec<f64>; 3]> = runs.iter().map(|r| &r.fine).collect();
-        shared.endurance = Some(if prm.off("endurance") {
-            ((0.0, 0.0), vec![0.0; total.len()])
-        } else {
-            model::endurance(&fines, k.BIN, k.PHASES)
-        });
-    }
     let g = shared.geometry.as_ref().unwrap();
     let judged = skills::Judged::new(&g.times, &g.ends, total.len(), shared.endurance.as_ref().unwrap().1.clone(), k);
     let overall = skills::rating(&total, &judged, keys, k);
@@ -121,11 +133,15 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     // Sustained demand: the same rating on minutes-long windows, so a uniformly hard chart keeps it near the overall.
     sc.set("stamina", skills::stamina_rating(&total, &judged, keys, k));
     let mut series = skills::attribute(&parts, &total, keys, false, k);
-    series_dict_scores(&mut sc, &series, &judged, keys, prm);
+    let mut rated = Vec::new();
+    // Before execution::attribute only model::vector's skills are read (physical_sk); the rest are rated once, after it.
+    series_dict_scores(&mut sc, &series, &judged, keys, prm, &mut rated, Some(&model::VECTOR_SKILLS));
     let mut psk = Dict::new();
     for (key, v) in &sc.0 {
         if let Key::S(s) = key {
-            psk.set(s, v.f() / 0.05f64.max(overall));
+            if model::VECTOR_SKILLS.contains(&s.as_str()) {
+                psk.set(s, v.f() / 0.05f64.max(overall));
+            }
         }
     }
     res.set("physical_sk", psk);
@@ -171,7 +187,7 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
         res.set("tech_profile", tpd);
     }
     let switch = series.remove(Sk::switch);
-    series_dict_scores(&mut sc, &series, &judged, keys, prm);
+    series_dict_scores(&mut sc, &series, &judged, keys, prm, &mut rated, None);
     res.set("archetypes", Val::List(card::archetypes(&series, &sc, &judged, keys, &switch, k)));
     res.set("tech_where", Val::List(card::tech_where(&series, &parts, chart.t[0] / 1000.0, rate, k)));
     let sv_tot = py::sum(parts.get(P::sv).iter().copied());

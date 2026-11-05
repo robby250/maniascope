@@ -21,8 +21,8 @@ pub const STRUCTURE_VERSION: i64 = 2; // = ms_calc::structure::STRUCTURE_VERSION
 pub const DEFAULT_TARGET: f64 = 0.95;
 const LEAD: usize = 300; // charts re-predicted first after a play or refit (the shown 20 come from the top ~60)
 const STABLE_RATES: [f64; 3] = [0.75, 1., 1.5]; // stable has HT/NM/DT only (user 2026-10-31)
-pub const PROFILE: [&str; 21] = ["stream", "delay", "jumpstream", "handstream", "chordstream", "chordjack", "jack", "jackspeed", "minijack", "longjack", "jumptrill",
-    "splittrill", "bracket", "ln", "release", "inverse", "hybrid", "shield", "patterntech", "rhythmtech", "sv"];
+pub const PROFILE: [&str; 22] = ["stream", "delay", "jumpstream", "handstream", "chordstream", "chordjack", "jack", "jackspeed", "minijack", "longjack", "jumptrill",
+    "splittrill", "bracket", "ln", "ln_general", "ln_tech", "ln_inverse", "ln_release", "shield", "patterntech", "rhythmtech", "sv"];
 
 pub fn offerable(rate: f64, client: &str) -> bool {
     client != "stable" || STABLE_RATES.contains(&rate)
