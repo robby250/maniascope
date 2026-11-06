@@ -52,6 +52,85 @@ pub fn solve(a: &[f64], b: &[f64]) -> Vec<f64> {
     x
 }
 
+/// a·x = b for a symmetric positive definite a (n×n row-major), by Cholesky in blocks of 64 rows: each pass over the factor
+/// serves a whole block from cache. `solve`'s row-by-row elimination streams the whole matrix per column, so a 2,900-column
+/// joint solve was memory-bound (four at once ran no faster than one, 2026-11-06). A non-positive pivot falls back to `solve`.
+pub fn solve_spd(a: &[f64], b: &[f64]) -> Vec<f64> {
+    let Some(l) = cholesky(a, b.len()) else { return solve(a, b) };
+    let n = b.len();
+    let mut x = b.to_vec();
+    for i in 0..n {
+        x[i] = (x[i] - dot4(&l[i * n..i * n + i], &x[..i])) / l[i * n + i];
+    }
+    for i in (0..n).rev() {
+        x[i] /= l[i * n + i];
+        let xi = x[i];
+        l[i * n..i * n + i].iter().zip(&mut x[..i]).for_each(|(v, y)| *y -= v * xi);
+    }
+    x
+}
+
+/// Four running sums, so the compiler vectorises it.
+fn dot4(x: &[f64], y: &[f64]) -> f64 {
+    let (cx, cy) = (x.chunks_exact(4), y.chunks_exact(4));
+    let tail: f64 = cx.remainder().iter().zip(cy.remainder()).map(|(p, q)| p * q).sum();
+    let mut s = [0.; 4];
+    for (p, q) in cx.zip(cy) {
+        for t in 0..4 {
+            s[t] += p[t] * q[t];
+        }
+    }
+    s[0] + s[1] + s[2] + s[3] + tail
+}
+
+/// Lower factor L (row-major, L·Lᵀ = a), None at a non-positive pivot.
+fn cholesky(a: &[f64], n: usize) -> Option<Vec<f64>> {
+    const BLOCK: usize = 64;
+    let mut l = vec![0.; n * n];
+    for i0 in (0..n).step_by(BLOCK) {
+        let i1 = (i0 + BLOCK).min(n);
+        for j in 0..i1 {
+            for i in i0.max(j)..i1 {
+                let (done, rest) = l.split_at_mut(i * n);
+                let row = &mut rest[..n];
+                if i == j {
+                    let d = a[i * n + i] - dot4(&row[..i], &row[..i]);
+                    if d <= 0. || !d.is_finite() {
+                        return None;
+                    }
+                    row[i] = d.sqrt();
+                } else {
+                    let rj = &done[j * n..j * n + j + 1];
+                    row[j] = (a[i * n + j] - dot4(&row[..j], &rj[..j])) / rj[j];
+                }
+            }
+        }
+    }
+    Some(l)
+}
+
+#[cfg(test)]
+mod spd_tests {
+    use super::*;
+
+    #[test]
+    fn the_blocked_cholesky_matches_elimination_on_a_positive_definite_system() {
+        let n = 150; // over two blocks, with a ragged last one
+        let mut seed = 7u64;
+        let mut r = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5 };
+        let m: Vec<f64> = (0..n * n).map(|_| r()).collect();
+        let a: Vec<f64> = (0..n * n).map(|ij| { let (i, j) = (ij / n, ij % n); (0..n).map(|k| m[i * n + k] * m[j * n + k]).sum::<f64>() + if i == j { 0.1 } else { 0. } }).collect();
+        let b: Vec<f64> = (0..n).map(|_| r()).collect();
+        assert!(cholesky(&a, n).is_some(), "the fast path, not the fallback");
+        let (x, y) = (solve_spd(&a, &b), solve(&a, &b));
+        for i in 0..n {
+            assert!((x[i] - y[i]).abs() < 1e-8 * (1. + y[i].abs()), "{i}: {} {}", x[i], y[i]);
+        }
+        let neg: Vec<f64> = a.iter().enumerate().map(|(ij, v)| if ij == 0 { -1. } else { *v }).collect();
+        assert_eq!(solve_spd(&neg, &b), solve(&neg, &b));
+    }
+}
+
 /// warmup._fit's alternation: box-constrained ridge coefficients (A·coeff = Xᵀ·w·(y − effects) + prior, by
 /// box_cd from the unconstrained solve), then each random effect group in turn as the ridge-shrunk weighted
 /// mean of what the rest leaves. X is n×p row-major f64 bytes, y and weights f64 bytes; groups are

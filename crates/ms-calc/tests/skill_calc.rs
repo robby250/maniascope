@@ -260,7 +260,7 @@ fn ln_interaction() {
     // long hold's release 0.6 s before the next head: closer notes, not a longer hold, made it harder)
     let holds = |len: i64| -> Vec<Note> { (0..40).map(|i| (1000 + (len + 1600) * i, 3, Some(1000 + len + (len + 1600) * i))).collect() };
     let (long, short) = (sc(&holds(2400), 7).f("overall"), sc(&holds(1400), 7).f("overall"));
-    // 8abec714fac5: +2.4 % at 0.5★ from the fitted hold-share columns (no evidence under 3★); the old bound was ±0.12 stars
+    // 4ccede2d49cf: +2.4 % at 0.5★ from the fitted hold-share columns (no evidence under 3★); the old bound was ±0.12 stars
     assert!(long <= short * 1.05, "{long} {short}");
     // tapping under a same-hand hold costs more than under an other-hand hold
     let under = |low: i64| -> Vec<Note> {
@@ -296,7 +296,7 @@ fn card_taxonomy() {
     let shield: Vec<Note> = (0..300i64).flat_map(|i| [(1000 + 400 * i, (i % 7) as usize, None), (1100 + 400 * i, (i % 7) as usize, Some(1350 + 400 * i))]).collect();
     assert!(names(&shield, 7).iter().any(|x| x == "Shield"));
     let inverse: Vec<Note> = (0..300).flat_map(|i| [1, 5].map(|c| (1000 + 300 * i, c, Some(1250 + 300 * i)))).collect();
-    assert!(names(&inverse, 7).iter().any(|x| x == "Inverse"));
+    assert!(names(&inverse, 7).iter().any(|x| x.ends_with("Inverse")));
     // broken rhythm reads as Tech <pattern>, never a bare Technical; a component never repeats
     let swing: Vec<Note> = (0..600).map(|i| (1000 + 100 * i + if i % 3 == 1 { 37 } else { 0 }, (i % 7) as usize, None)).collect();
     let entries = card(&res(&swing, 7));
@@ -560,4 +560,33 @@ fn delay_keeps_its_stream_name_without_ln_tech_prevalence() {
     p.set("technical", 0.43);
     res.set("tech_profile", p);
     assert_eq!(name_of(&card(&res)[0]), "Stream");
+}
+
+#[test]
+fn a_one_note_chart_carries_the_structure_stamp() {
+    // The library counts a chart analysed when its nps.version is current; a 1-note chart had none and was analysed forever.
+    let data = osu(&[(1000, 0, None)], 7, 3, false, &[DEFAULT_TIMING.to_string()]);
+    let out = ms_calc::features::chart_features(&data, &[1.], &standard_params()).unwrap();
+    let nps = out[0].1.dict("nps").expect("nps");
+    assert_eq!(nps.get("version").map(Val::f), Some(ms_calc::structure::STRUCTURE_VERSION as f64));
+}
+
+#[test]
+fn an_ln_type_names_the_ln_entry_instead_of_a_second_rating() {
+    // Rolling holds read "LN 4.8 · LN General 4.1" before: LN leads, its strongest type rides on its name.
+    let holds: Vec<Note> = (0..400i64).map(|i| (1000 + 200 * i, (i % 7) as usize, Some(1000 + 200 * i + 150 + 40 * (i % 3)))).collect();
+    let n = names(&holds, 7);
+    assert!(n.contains(&"LN · General".to_string()), "{n:?}");
+    let ln: Vec<&String> = n.iter().filter(|x| x.starts_with("LN") || *x == "Inverse").collect();
+    assert_eq!(ln.len(), 1, "{n:?}");
+}
+
+#[test]
+fn a_chart_row_stores_the_ln_types() {
+    // Stats and skill picks read a chart's LN types from its row's `sk`; without them every LN type counted 0 charts.
+    let holds: Vec<Note> = (0..400i64).map(|i| (1000 + 200 * i, (i % 7) as usize, Some(1000 + 200 * i + 150 + 40 * (i % 3)))).collect();
+    let data = osu(&holds, 7, 3, false, &[DEFAULT_TIMING.to_string()]);
+    let out = ms_calc::features::chart_features(&data, &[1.], &standard_params()).unwrap();
+    let sk = out[0].1.dict("sk").expect("sk");
+    assert!(sk.get("ln_general").is_some_and(|v| v.f() > 0.), "{:?}", sk.get("ln"));
 }

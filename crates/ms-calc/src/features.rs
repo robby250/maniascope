@@ -53,15 +53,20 @@ pub fn compute_selected(data: &[u8], parsed: &chart::Chart, rate: f64, sv: bool,
     SELECTED.get(hash.finish(), || compute::compute(parsed, rate, sv, prm).map(Arc::new))
 }
 
-pub const SKILLS: [&str; 34] = ["stream", "jumpstream", "handstream", "jackspeed", "chordjack", "minijack", "chordstream", "delay",
+/// Skills whose share of the overall a chart row stores (`sk`): what Stats, skill picks and the card read.
+pub const SKILLS: [&str; 38] = ["stream", "jumpstream", "handstream", "jackspeed", "chordjack", "minijack", "chordstream", "delay",
     "bracket", "jack", "ln", "release", "inverse", "hybrid", "shield", "sv", "technical", "vibro", "stamina",
     "dump", "jumptrill", "splittrill", "longjack", "patterntech", "rhythmtech", "trill1h", "anchor", "mash",
-    "quadstream", "sv_fast", "sv_slow", "sv_accel", "sv_stutter", "sv_brake"];
+    "quadstream", "sv_fast", "sv_slow", "sv_accel", "sv_stutter", "sv_brake",
+    "ln_general", "ln_tech", "ln_inverse", "ln_release"]; // missing until 2026-11-06: every LN type read 0 charts (Less)
 
 /// calib/difficulty.json: the frozen chart-only calibration.
 pub fn standard_params() -> Params {
     let model: Value = serde_json::from_str(include_str!("../../../calib/difficulty.json")).expect("difficulty.json");
-    Params::new(model, &Value::Null).expect("difficulty.json parameters")
+    // MS_KNOBS (JSON): rule knobs for a calibration screen (open loop: the old constants re-tuned with each new system). The app
+    // never sets it; a screened pack goes to its own MANIASCOPE_REC.
+    let knobs = std::env::var("MS_KNOBS").ok().and_then(|k| serde_json::from_str(&k).ok()).unwrap_or(Value::Null);
+    Params::new(model, &knobs).expect("difficulty.json parameters")
 }
 
 /// The calibration a past calculator used: calib/carry.json holds what differs from today's, null for a key it lacked.

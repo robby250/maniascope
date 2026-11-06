@@ -701,7 +701,7 @@ pub const MAX_RATE: f64 = 2.00;
 const MAX_TARGET: f64 = 0.985;
 const MAX_HIGH: f64 = 0.99;
 /// A rate further than this from the target gets the solved rate analysed (a 0.01× step moves the prediction ~0.15 pp).
-const ACC_TOL: f64 = 0.001;
+pub const ACC_TOL: f64 = 0.001;
 
 /// Whether (acc, value) beats `other` as a chart's offered rate: nearer the target in ACC_TOL steps, then the higher value.
 fn nearer(a: (f64, f64), other: (f64, f64), target: f64) -> bool {

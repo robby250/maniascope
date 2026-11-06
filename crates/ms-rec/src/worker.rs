@@ -900,6 +900,10 @@ impl Worker {
                 shown = fresh[..1].to_vec();
             }
         }
+        // Next plays the head from this snapshot without asking the worker: it gets its target rate here.
+        if let Some(head) = shown.first_mut() {
+            self.aim(head, mode)?;
+        }
         self.playlists.insert(mode, shown.clone());
         Ok(shown)
     }
@@ -1454,9 +1458,70 @@ impl Worker {
         self.publish(None)
     }
 
+    /// The picked chart moved to the rate whose prediction is the accuracy target (user 2026-11-06: "at least make it so
+    /// that the selected map in the playlist gets the correct rate"; the list itself keeps its analysed rates). Secant on
+    /// ln(1 − acc) over ln rate from the prediction's own slope: ≤ 4 analyses of one chart, ~5 ms each.
+    fn aim(&mut self, c: &mut Pick, mode: &str) -> Result<()> {
+        let tol = ms_model::predict::ACC_TOL;
+        let (Some(sha), Some(inst)) = (c.sha.clone(), c.sha.as_ref().and_then(|s| self.states.get(mode)?.catalog.get(s).cloned())) else { return Ok(()) };
+        if self.shown.client == "stable" || c.purpose == "nps_mix" || c.purpose == "warmup" || c.f.is_none() {
+            return Ok(()); // stable has HT/NM/DT only; PP and warm-up picks aren't aimed at the target
+        }
+        let n = self.session()?;
+        let rec = self.rec.as_ref().unwrap();
+        let target = rec.model().central_target(n.target, n.view.warm_flag);
+        let (lo, hi) = self.rate_range(mode);
+        let root = crate::catalog::local_origin(&self.shown.client).1;
+        let mut data = None;
+        let gap = |acc: f64| (1. - acc).max(1e-6).ln() - (1. - target).ln();
+        let (mut tried, mut slope) = (vec![(c.rate, gap(c.pred.acc_mid))], c.pred.slope.clamp(0.5, 8.));
+        for _ in 0..4 {
+            if (c.pred.acc_mid - target).abs() <= tol {
+                break;
+            }
+            let (r, g) = *tried.last().unwrap();
+            if let [.., (r0, g0), _] = tried[..] {
+                let s = (g - g0) / (r / r0).ln();
+                if s.is_finite() && s > 0.2 {
+                    slope = s.min(8.);
+                }
+            }
+            let next = ms_calc::py::round_digits((r * (-g / slope).exp()).clamp(lo, hi), 2);
+            if tried.iter().any(|t| t.0 == next) {
+                break;
+            }
+            if !self.store.read().unwrap().has_rate(&sha, next) {
+                let bytes = data.get_or_insert_with(|| if inst.convert_of.is_some() && !inst.installed { crate::converts::bytes(&inst, &root) } else {
+                    inst.path.clone().or_else(|| ms_data::paths::local_file(&sha, &root)).and_then(|p| std::fs::read(p).ok())
+                });
+                let Some(bytes) = bytes.as_ref() else { break };
+                let Ok(fs) = ms_calc::features::chart_features(bytes, &[next], &rec.prm) else { break };
+                let mut store = self.store.write().unwrap();
+                for (rate, f) in &fs {
+                    self.db.execute("INSERT OR REPLACE INTO feats VALUES (?,?)", rusqlite::params![format!("{sha}@{rate:.3}|{CALC_ID}"), ms_data::codec::encode(&ms_calc::val::Val::Dict(f.clone()))])?;
+                    store.put(&sha, *rate, f);
+                }
+            }
+            let Some(f) = self.store.read().unwrap().feats(&sha, next).cloned() else { break };
+            let chart = c.md5.clone().unwrap_or_else(|| sha.clone());
+            let Some(e) = rec.predict(&f, &chart, c.bid, next, &n) else { break };
+            tried.push((next, gap(e.shown.acc_mid)));
+            if (e.shown.acc_mid - target).abs() < (c.pred.acc_mid - target).abs() {
+                let old = c.rate;
+                (c.rate, c.var, c.f, c.pred, c.pp_pred) = (next, crate::catalog::rate_label(next), Some(Arc::new(f)), e.shown, Some(e.pp));
+                c.nps = c.nps.map(|v| v * next / old);
+                c.length *= old / next;
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn open(&mut self, mut c: Pick, mode: &str, selection: &str, result: Option<Done>, selected_at: Option<f64>, selection_id: u64, skipped: bool) -> Result<()> {
         c.mode = mode.to_string();
+        if result.is_none() && mode != "pp" {
+            self.aim(&mut c, mode)?;
+        }
         c.selection = selection.to_string();
         let performed = result.is_some();
         let done = result.unwrap_or_else(|| {
@@ -1789,7 +1854,9 @@ impl Worker {
                 source.prefetch(&db, rows.iter().filter_map(|r| Some(format!("{}@{:.3}|{CALC_ID}", r.0.as_ref()?, ms_calc::py::round_digits(r.3.filter(|&x| x != 0.).unwrap_or(1.), 3)))))?;
                 let mut need: std::collections::BTreeMap<String, Vec<f64>> = Default::default();
                 let mut want = |source: &mut crate::evidence::FeatureSource, sha: &str, md5: Option<&str>, bid: Option<i64>, rate: f64| -> Result<()> {
-                    if source.of(&db, Some(sha), md5, bid, Some(rate))?.0.is_none() && pp::chart_path(Some(sha)).is_some() {
+                    // An analysis of another structure version is redone too (2026-11-06: rows without the LN types).
+                    let stale = source.of(&db, Some(sha), md5, bid, Some(rate))?.0.is_none_or(|f| f.dict("nps").and_then(|n| n.get("version")).map(ms_calc::val::Val::f) != Some(STRUCTURE_VERSION as f64));
+                    if stale && pp::chart_path(Some(sha)).is_some() {
                         let rate = ms_calc::py::round_digits(rate, 3);
                         let list = need.entry(sha.to_string()).or_default();
                         if !list.contains(&rate) {

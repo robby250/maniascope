@@ -193,11 +193,7 @@ fn archive_files(path: &Path, charts: bool) -> std::result::Result<Vec<(String, 
 /// A set's files in lazer, by content hash.
 fn local_set(source: &str) -> std::result::Result<Vec<(String, PathBuf)>, String> {
     let root = paths::lazer_data();
-    let copy = paths::cache().join(format!("sets-{}.realm", std::process::id()));
-    std::fs::create_dir_all(paths::cache()).map_err(|e| e.to_string())?;
-    std::fs::copy(root.join("client.realm"), &copy).map_err(|e| e.to_string())?;
-    let files = ms_data::realm::set_files(&copy, source);
-    let _ = std::fs::remove_file(&copy);
+    let files = ms_data::imports::with_copy(&root.join("client.realm"), |copy| ms_data::realm::set_files(copy, source));
     Ok(files?.into_iter().filter(|(name, _)| !is_chart(name)).filter_map(|(name, hash)| Some((name, paths::local_file(&hash, &root)?))).collect())
 }
 

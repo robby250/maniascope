@@ -122,6 +122,7 @@ knobs! {
     W_HAND: f64 = 1.0,
     V_FAST_KEYS: f64 = 1.0, // above 7K the fast-hand onset grows with the hand's fingers; ^2 put 10K's past v()'s 22.2/s cap, so it never fired
     V_FAST: f64 = 12.0,
+    V_FAST_LOW: f64 = 0.0,  // below 7K the onset × (keys/7)^V_FAST_LOW (round 4 knob screen: V_FAST 10 helped 4K, 14 helped 7K)
     SPEED_P: f64 = 1.5,
     W_JACK: f64 = 3.0,      // on 7K; other keymodes as (7/keys)^W_JACK_KEYS: 3.3 on 4K as before, 2.82 on 10K (was 3.3 everywhere but 7K)
     W_JACK_KEYS: f64 = 0.17,

@@ -5,7 +5,8 @@ use crate::py;
 use crate::val::{Dict, Val};
 use sha2::{Digest, Sha256};
 
-pub const STRUCTURE_VERSION: i64 = 2;
+/// A stored analysis of another version is redone: 3 = rows carry the LN types in `sk` (2026-11-06).
+pub const STRUCTURE_VERSION: i64 = 3;
 
 /// numpy pairwise summation (np.add.reduce on a contiguous float64 array).
 pub fn np_sum(a: &[f64]) -> f64 {

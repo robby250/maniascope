@@ -80,15 +80,23 @@ pub fn realm_rows(raw: &[Value], user_id: Option<i64>) -> Vec<Score> {
     out
 }
 
-/// A dump of the live file through a private copy: lazer rewrites freed pages under a reader.
-pub fn snapshot(realm: Option<&Path>, maps: bool, recent: Option<(i64, i64)>) -> R<Vec<Value>> {
-    let source = realm.map_or_else(|| paths::lazer_data().join("client.realm"), Path::to_path_buf);
+/// `read` over a private copy of a Realm file: lazer rewrites freed pages under a reader. Each call gets its own name:
+/// a shared one let a second thread's copy truncate the file under the first one's map (SIGBUS, 2026-11-05).
+pub fn with_copy<T>(source: &Path, read: impl FnOnce(&Path) -> R<T>) -> R<T> {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     std::fs::create_dir_all(paths::cache()).map_err(|e| e.to_string())?;
-    let copy = paths::cache().join(format!("client-{}.realm", std::process::id()));
-    std::fs::copy(&source, &copy).map_err(|e| format!("{}: {e}", source.display()))?;
-    let out = dump(&copy, maps, recent);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let copy = paths::cache().join(format!("client-{}-{n}.realm", std::process::id()));
+    std::fs::copy(source, &copy).map_err(|e| format!("{}: {e}", source.display()))?;
+    let out = read(&copy);
     let _ = std::fs::remove_file(&copy);
     out
+}
+
+/// A dump of the live file through a private copy.
+pub fn snapshot(realm: Option<&Path>, maps: bool, recent: Option<(i64, i64)>) -> R<Vec<Value>> {
+    let source = realm.map_or_else(|| paths::lazer_data().join("client.realm"), Path::to_path_buf);
+    with_copy(&source, |copy| dump(copy, maps, recent))
 }
 
 fn set_origin(db: &Db, host: &str, root: &Path) -> rusqlite::Result<()> {
@@ -267,12 +275,14 @@ pub fn import_stable(db: &Db, root: Option<&Path>) -> R<Imported> {
     let imported = local_stamp();
     // no plays yet: stable writes scores.db on the first one
     let raw = std::fs::read(root.join("scores.db")).map_err(|e| e.to_string()).and_then(|b| stable::scores(&b)).unwrap_or_default();
-    // The account's name, and any name that owns a play this app saw live (offline plays may carry another name).
+    // The player's names: the account's, any name that owns a play this app saw live, and any name with a play never
+    // submitted (offline plays carry whatever name was typed; Less, offline: 133 of his plays came in, 2026-11-06). A watched
+    // replay of someone else is a submitted score under a name that never played here unsubmitted, so it stays out.
     let live = |s: &stable::Score| md5_sha.get(&s.md5).is_some_and(|sha| {
         let key = stable_key(sha, s.score as i64, &s.stats.map(i64::from));
         db.query_row("SELECT 1 FROM scores WHERE key=? AND client='stable-live'", [&key], |_| Ok(())).is_ok()
     });
-    let names: HashSet<String> = raw.iter().filter(|s| s.mode == 3 && s.player != player && live(s)).map(|s| s.player.clone()).chain([player.clone()]).collect();
+    let names: HashSet<String> = raw.iter().filter(|s| s.mode == 3 && s.player != player && (s.online_id <= 0 || live(s))).map(|s| s.player.clone()).chain([player.clone()]).collect();
     let mut scores = Vec::new();
     for s in raw {
         let Some(sha) = md5_sha.get(&s.md5) else { continue };
@@ -429,6 +439,20 @@ pub fn add_live_score(db: &Db, score: &Value, fresh: bool, play: Option<&Value>)
 #[cfg(test)]
 mod website_tests {
     use super::*;
+
+    #[test]
+    fn concurrent_realm_copies_never_share_a_file() {
+        let src = std::env::temp_dir().join(format!("ms-realm-src-{}", std::process::id()));
+        std::fs::write(&src, b"realm bytes").unwrap();
+        let outer = with_copy(&src, |a| {
+            let inner = with_copy(&src, |b| Ok(b.to_path_buf())).unwrap();
+            assert_ne!(a, inner.as_path());
+            Ok((a.to_path_buf(), std::fs::read(a).map_err(|e| e.to_string())?))
+        }).unwrap();
+        assert_eq!(outer.1, b"realm bytes", "the inner copy truncated or removed the outer one");
+        assert!(!outer.0.exists());
+        let _ = std::fs::remove_file(&src);
+    }
 
     #[test]
     fn website_top_plays_become_ledger_bests() {

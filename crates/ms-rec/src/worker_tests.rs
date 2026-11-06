@@ -559,3 +559,19 @@ fn a_newer_request_ends_the_running_build_and_gameplay_pauses_it() {
     let (_, whole) = built(&mut l, "nps", |_| {});
     assert!(!last_ready(&whole).candidates.restart_refs().is_empty(), "the next request still completes");
 }
+
+#[test]
+fn the_next_pick_is_offered_at_its_target_rate() {
+    let mut l = live("aim", 240, busy(false));
+    let list = fresh_list(&mut l);
+    let before = list[0].clone();
+    let shown = l.w.prepared_playlist("nps", list).unwrap();
+    let n = l.w.session().unwrap();
+    let target = l.w.rec.as_ref().unwrap().model().central_target(n.target, n.view.warm_flag);
+    let head = &shown[0];
+    assert_eq!(head.sha, l.w.playlists["nps"][0].sha);
+    let (off, was) = ((head.pred.acc_mid - target).abs(), (before.pred.acc_mid - target).abs());
+    assert!(was > ms_model::predict::ACC_TOL, "the fixture's head was already on target: {was}");
+    assert!(off <= ms_model::predict::ACC_TOL, "head at {:.2}× predicts {:.4}, target {target:.4} (was {:.2}×)", head.rate, head.pred.acc_mid, before.rate);
+    assert_eq!(head.var, crate::catalog::rate_label(head.rate));
+}

@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 fn release_url() -> String {
     let repo = std::env::var("MANIASCOPE_RELEASE_REPO").unwrap_or_else(|_| "robby250/maniascope".into());
-    std::env::var("MANIASCOPE_RELEASE_URL").unwrap_or_else(|_| format!("https://github.com/{repo}/releases/latest/download"))
+    // This version's own release: `latest` made every release carry each older calculator's pack (user 2026-11-06).
+    std::env::var("MANIASCOPE_RELEASE_URL").unwrap_or_else(|_| format!("https://github.com/{repo}/releases/download/v{}", env!("CARGO_PKG_VERSION")))
 }
 
 fn candidates(dir: &Path) -> [PathBuf; 2] {

@@ -22,4 +22,4 @@ pub mod val;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-pub const CALC_ID: &str = "8abec714fac5";
+pub const CALC_ID: &str = "4ccede2d49cf";

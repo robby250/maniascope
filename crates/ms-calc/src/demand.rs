@@ -311,7 +311,7 @@ pub fn demand(
 ) -> (Run, Option<Run>) {
     let keys = chart.keys;
     let wide = keys >= 5;
-    let v_fast = k.V_FAST * ((keys.max(7) as f64) / 7.0).powf(k.V_FAST_KEYS);
+    let v_fast = k.V_FAST * (keys as f64 / 7.0).powf(if keys >= 7 { k.V_FAST_KEYS } else { k.V_FAST_LOW });
     // One curve over keymodes (user 2026-11-03: "gradients over the 4k-10k spectrum").
     let w_jack = if keys == 7 && k.W_JACK_7K > 0.0 { k.W_JACK_7K } else { k.W_JACK * (7.0 / keys as f64).powf(k.W_JACK_KEYS) };
     let w_group = k.W_GROUP * (keys.min(7) as f64 / 7.0).powf(k.GROUP_KEYS);

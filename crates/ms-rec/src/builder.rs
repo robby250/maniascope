@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
-pub const STRUCTURE_VERSION: i64 = 2; // = ms_calc::structure::STRUCTURE_VERSION: offers of another version are skipped
+pub use ms_calc::structure::STRUCTURE_VERSION; // offers of another version are skipped
 pub const DEFAULT_TARGET: f64 = 0.95;
 const LEAD: usize = 300; // charts re-predicted first after a play or refit (the shown 20 come from the top ~60)
 const STABLE_RATES: [f64; 3] = [0.75, 1., 1.5]; // stable has HT/NM/DT only (user 2026-10-31)
