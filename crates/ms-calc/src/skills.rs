@@ -235,13 +235,14 @@ pub fn attribute(parts: &Parts, total: &[f64], keys: usize, technical_only: bool
         // notes). Release: releases while another finger of the hand keeps holding (finger independence on the release).
         // Tech: the technical share (irregular rhythm or awkward transitions) where LN is. General: LN without one of them.
         let (cover, used, stag, ends) = (win(parts.get(P::cover), k.RT_WIN), win(parts.get(P::used), k.RT_WIN), win(parts.get(P::stag), k.RT_WIN), win(parts.get(P::lnend), k.RT_WIN));
+        let rel_full = k.LN_REL_FULL * (keys as f64 / 7.0).powf(k.LN_REL_KEYS);
         for b in 0..nb {
             let ln = se.data[at(Sk::ln, b)];
             if ln == 0.0 {
                 continue;
             }
             let inverse = ((cover[b] / used[b].max(1e-9) - k.LN_INV_LO) / (k.LN_INV_HI - k.LN_INV_LO)).clamp(0.0, 1.0);
-            let release = if ends[b] > 0.0 { 1f64.min(stag[b] / (k.LN_REL_FULL * ends[b])) } else { 0.0 };
+            let release = if ends[b] > 0.0 { 1f64.min(stag[b] / (rel_full * ends[b])) } else { 0.0 };
             let tech = 1f64.min(tech_share[b] / k.LN_TECH_FULL);
             se.data[at(Sk::ln_inverse, b)] = ln * inverse;
             se.data[at(Sk::ln_release, b)] = ln * release;

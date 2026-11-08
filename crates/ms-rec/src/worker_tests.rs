@@ -575,3 +575,32 @@ fn the_next_pick_is_offered_at_its_target_rate() {
     assert!(off <= ms_model::predict::ACC_TOL, "head at {:.2}× predicts {:.4}, target {target:.4} (was {:.2}×)", head.rate, head.pred.acc_mid, before.rate);
     assert_eq!(head.var, crate::catalog::rate_label(head.rate));
 }
+
+#[test]
+fn after_a_play_only_the_current_pick_re_aims_its_rate_at_the_target() {
+    let mut l = live("reaim", 240, busy(false));
+    let list = fresh_list(&mut l);
+    let mut pick = list.iter().find(|c| c.rate + 0.15 <= builder::DEFAULT_RATES.1).cloned().expect("a pick with room to speed up");
+    pick.rate = ((pick.rate + 0.15) * 100.).round() / 100.; // an offer the newest results no longer support
+    pick.var = crate::catalog::rate_label(pick.rate);
+    l.w.target = Some(Box::new(pick.clone()));
+    l.w.targets.insert("nps".into(), Box::new(pick.clone()));
+    let rest = l.w.playlists["nps"].iter().map(|c| (c.identity(), c.rate)).collect::<Vec<_>>();
+    l.w.retarget(Some((pick.sha.as_deref().unwrap(), pick.md5.as_deref(), pick.bid))).unwrap();
+    assert_eq!(l.w.target.as_ref().unwrap().rate, pick.rate, "the map just played keeps its pick");
+    l.w.retarget(None).unwrap();
+    let n = l.w.session().unwrap();
+    let target = l.w.rec.as_ref().unwrap().model().central_target(n.target, n.view.warm_flag);
+    let now = l.w.target.clone().unwrap();
+    assert_ne!(now.rate, pick.rate);
+    assert!((now.pred.acc_mid - target).abs() <= 0.002, "{:.2}× predicts {:.4}, target {target:.4}", now.rate, now.pred.acc_mid);
+    let (sha, md5) = (now.sha.clone().unwrap(), now.md5.clone().unwrap_or_default());
+    for r in [now.rate - 0.01, now.rate + 0.01].map(|r| (r * 100.).round() / 100.) {
+        let e = l.w.rec.as_mut().unwrap().expectation(&l.world.db, &sha, &md5, r, &n).unwrap().expect("the neighbours were analysed");
+        assert!((e.0.shown.acc_mid - target).abs() >= (now.pred.acc_mid - target).abs(), "{r:.2}× is nearer the target than the pick's {:.2}×", now.rate);
+    }
+    assert_eq!(now.var, crate::catalog::rate_label(now.rate));
+    assert_eq!(l.w.targets["nps"].rate, now.rate);
+    assert!(l.rx.try_iter().any(|m| matches!(m, Out::Target { c: Some(c), .. } if c.rate == now.rate)));
+    assert_eq!(l.w.playlists["nps"].iter().map(|c| (c.identity(), c.rate)).collect::<Vec<_>>(), rest, "the rest of the list keeps its offers");
+}

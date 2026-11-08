@@ -316,6 +316,15 @@ pub fn demand(
     let w_jack = if keys == 7 && k.W_JACK_7K > 0.0 { k.W_JACK_7K } else { k.W_JACK * (7.0 / keys as f64).powf(k.W_JACK_KEYS) };
     let w_group = k.W_GROUP * (keys.min(7) as f64 / 7.0).powf(k.GROUP_KEYS);
     let jack_share = k.JACK_SHARE * (7.0 / keys.max(7) as f64).powf(k.JACK_SHARE_KEYS);
+    let jack_p = k.JACK_P * (keys as f64 / 4.0).powf(k.JACK_P_KEYS);
+    // Per-row and per-note powers with few distinct inputs, computed once (same calls, same values).
+    let by_count = |e: f64| -> Vec<f64> { (0..=keys).map(|c| (c as f64).powf(e)).collect() };
+    let (row_share, jack_split) = (by_count(-k.ROW_SHARE), by_count(-jack_share));
+    let shapes_t = k.SHAPES_T * (10.0 / keys as f64).powf(k.SHAPES_KEYS);
+    let mix_edge = k.MIX_V * (7.0 / keys as f64).powf(k.MIX_KEYS);
+    let vf_jacked = 1.0 - k.VF_JACK * (4.0 / keys as f64).powf(k.VF_JACK_KEYS);
+    // max(1, x)^p is exactly 1 for x ≤ 1: no pow call.
+    let above_one = |x: f64, p: f64| if x > 1.0 { x.powf(p) } else { 1.0 };
     let hand_of = hand_of(keys, centre_left);
     let n = g.times.len();
     let times = &g.times;
@@ -407,7 +416,7 @@ pub fn demand(
         let (i, j) = (row.start, row.end);
         let t = times[i];
         let size = j - i;
-        let share = (size as f64).powf(-k.ROW_SHARE);
+        let share = row_share.get(size).copied().unwrap_or_else(|| (size as f64).powf(-k.ROW_SHARE));
         let b = ((t - t0) / bin) as usize;
         let fb = (nfine - 1).min(((t - t0) * phases as f64 / bin) as usize);
         let tr: Option<usize> = match trill[ri] {
@@ -554,7 +563,7 @@ pub fn demand(
             if n_jack[h] != 0 {
                 let vj = v(t - previous_hand[h], 0.07, 0.5);
                 jack_effort[h] =
-                    w_jack * vj * (vj / 12.0).powf(k.JACK_P) * (n_jack[h] as f64).powf(-jack_share) * mirror[h];
+                    w_jack * vj * (vj / 12.0).powf(jack_p) * jack_split.get(n_jack[h]).copied().unwrap_or_else(|| (n_jack[h] as f64).powf(-jack_share)) * mirror[h];
                 inserted[h] = k.W_IJACK + (1.0 - k.W_IJACK) * smooth(vj, 7.0, 11.0);
             }
         }
@@ -576,15 +585,14 @@ pub fn demand(
                             count += 1.0;
                         }
                     }
-                    many[h] = k.W_SHAPES * (count / (k.SHAPES_T * (10.0 / keys as f64).powf(k.SHAPES_KEYS))).max(1.0).log2();
+                    many[h] = k.W_SHAPES * (count / shapes_t).max(1.0).log2();
                 }
             }
         }
         let mut mix = [0.0f64; 2];
         for h in 0..2 {
             if k.W_MIX != 0.0 && row_hand[h] & previous_mask[h] != 0 && row_hand[h] & !previous_mask[h] != 0 {
-                let edge = k.MIX_V * (7.0 / keys as f64).powf(k.MIX_KEYS);
-                mix[h] = k.W_MIX * smooth(v(t - previous_hand[h], 0.07, 0.5), edge, edge * 1.3);
+                mix[h] = k.W_MIX * smooth(v(t - previous_hand[h], 0.07, 0.5), mix_edge, mix_edge * 1.3);
             }
         }
         pending.clear();
@@ -611,7 +619,7 @@ pub fn demand(
             let vdj = v(dj, flam, 2.0);
             let vdh = if dh != 0.0 { v(dh, flam, 2.0) } else { 0.0 };
             let e_hand = if dh != 0.0 {
-                k.W_HAND * (vdh * vdj).sqrt() * share * 1f64.max(vdh / v_fast).powf(k.SPEED_P)
+                k.W_HAND * (vdh * vdj).sqrt() * share * above_one(vdh / v_fast, k.SPEED_P)
             } else {
                 0.0
             };
@@ -624,7 +632,8 @@ pub fn demand(
             // neighbour left up (W_ISO, overlaps the groups), fast jack premium, reviving V_FAST on 10K.
             let groups = (row_hand[h] & !(row_hand[h] << 1)).count_ones() as f64;
             let cost = 1. + mix[h] + many[h] + if size as f64 >= k.GROUP_SIZE { w_group * (groups - 1.) } else { 0. };
-            let rice = (e_hand + e_jack) * 1f64.max(vdj / k.V_FINGER) * cost;
+            // V_FINGER over keymodes (·(keys/7)^x) rejected 2026-11-07 (r6c): DevSelect better, DevConfirm 4K and 10K worse.
+            let rice = (e_hand + e_jack) * above_one(vdj / k.V_FINGER, if jacked { vf_jacked } else { 1.0 }) * cost;
             let mut held_same = 0.0f64;
             let mut held_other = 0.0f64;
             for &oc in &order[..nseen] {
@@ -637,7 +646,7 @@ pub fn demand(
                 }
             }
             let mut e_ln = (rice + k.LN_BASE * share)
-                * (k.W_HOLD_SAME * held_same.powf(0.7) + k.W_HOLD_OTHER * held_other.min(1.0));
+                * (k.W_HOLD_SAME * if held_same > 0.0 { held_same.powf(0.7) } else { 0.0 } + k.W_HOLD_OTHER * held_other.min(1.0));
             if e - t <= 0.003 && held_same + held_other >= 0.5 && gap != 0.0 && gap < 0.15 {
                 comp[o(P::hyb) + b] += 1.0;
             }

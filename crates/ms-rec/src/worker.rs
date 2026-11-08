@@ -29,6 +29,8 @@ use std::time::{Duration, Instant};
 pub const MODES: [&str; 3] = ["pp", "nps", "skills"];
 const CONVERT_WAIT: Duration = Duration::from_secs(2); // skipping through a list imports nothing; a Next after a play waits for nothing
 const NOT_RUNNING: &str = "osu! isn't running";
+/// kv: Next downloads maps you don't have (default) or opens them in osu! to look at first.
+pub const AUTO_DOWNLOAD: &str = "auto_download";
 const NPS_CLOCK: f64 = 300.; // s: NPS/Skills predictions follow warm-up cooling without plays this often
 
 #[derive(Clone, Debug, PartialEq)]
@@ -54,6 +56,8 @@ pub struct Config {
     pub revision: u64,
     pub practice_skills: Option<Vec<String>>,
     pub nps_focus: Option<f64>,
+    pub skills_focus: Option<f64>, // the open custom playlist's slider; below 0: off
+    pub skills_mix: Option<PpMix>,
     pub acc_targets: std::collections::HashMap<String, f64>,
     pub rates: std::collections::HashMap<String, (f64, f64)>, // NPS and Skills HT/DT ranges
     pub web_bias: std::collections::HashMap<String, f64>,
@@ -238,6 +242,8 @@ pub struct Worker {
     playlists: std::collections::HashMap<&'static str, Vec<Pick>>,
     consumed: VecDeque<String>,
     nps_focus: f64,
+    skills_focus: f64,
+    skills_mix: PpMix,
     web_bias: std::collections::HashMap<&'static str, f64>,
     web_weighted: std::collections::HashMap<&'static str, bool>,
     converts: std::collections::HashMap<&'static str, BTreeMap<i64, Setting>>,
@@ -358,7 +364,7 @@ impl Worker {
             q, h, halt, db, db_path, c, rec: None, public: None, store: Arc::new(RwLock::new(store)), slot: Arc::new(BuildSlot { request: Mutex::new(None), wake: Condvar::new() }), generation: 0, local_request: 0,
             mode: "pp".into(), action: "auto".into(), revision: 0, selection_id: 0,
             keys: [("pp", SUPPORTED_KEYS.collect()), ("nps", vec![7]), ("skills", vec![7])].into_iter().collect(),
-            target: None, targets: Default::default(), playlists: empty(), consumed: VecDeque::new(), nps_focus: 0.5, web_bias: [("nps", 0.5), ("skills", 0.5)].into_iter().collect(), skill_weights: Default::default(), skill_tuning: Default::default(), web_weighted: [("nps", true), ("skills", true)].into_iter().collect(),
+            target: None, targets: Default::default(), playlists: empty(), consumed: VecDeque::new(), nps_focus: 0.5, skills_focus: 0., skills_mix: PpMix { on: false, ..PpMix::default() }, web_bias: [("nps", 0.5), ("skills", 0.5)].into_iter().collect(), skill_weights: Default::default(), skill_tuning: Default::default(), web_weighted: [("nps", true), ("skills", true)].into_iter().collect(),
             converts: [("nps", BTreeMap::new()), ("skills", BTreeMap::new())].into_iter().collect(), odds: [("nps", [1., 1., 0.]), ("skills", [1., 1., 0.])].into_iter().collect(), convert_turn: Arc::new(AtomicU64::new(0)),
             acc_targets: [("nps", DEFAULT_TARGET), ("skills", DEFAULT_TARGET)].into_iter().collect(), rates: [("nps", builder::DEFAULT_RATES), ("skills", builder::DEFAULT_RATES)].into_iter().collect(), pp_mix: PpMix::default(), settings: PpSettings::default(), practice_skills: Vec::new(),
             states: [("nps", ListState::default()), ("skills", ListState::default())].into_iter().collect(), credible: Default::default(), restored: HashSet::new(),
@@ -641,8 +647,8 @@ impl Worker {
         let kept = st.as_ref().filter(|s| s.partial).map(|_| (self.playlists[mode].clone(), self.credible.get(mode).cloned()));
         let (phase, shown, note) = self.pool(mode)?;
         let mut shown = self.prepared_playlist(mode, shown)?;
-        if mode == "nps" && self.pp_mix.on {
-            shown = self.mix_pp(shown)?;
+        if mode != "pp" && self.mix_of(mode).on {
+            shown = self.mix_pp(mode, shown)?;
             self.playlists.insert(mode, shown.clone());
         }
         if let Some((list, credible)) = kept {
@@ -741,7 +747,7 @@ impl Worker {
         let (recent_sets, recent_convert_sets) = if active.is_empty() { Default::default() } else { self.recent_sets(&n)? };
         let store = self.store.read().unwrap();
         let (ranked, odds) = rank(&prepared, &st.catalog, &n.session, &store, RankInputs {
-            keys: self.keys[mode].clone(), mode, web: web_factor(self.web_bias[mode]), convert, weighted: [self.web_weighted[mode], active.iter().any(|s| s.weighted)], recent_sets: &recent_sets, recent_convert_sets: &recent_convert_sets, taste: if mode == "nps" { &self.taste_cache.1 } else { &none }, consumed: &consumed, seed, focus: self.nps_focus, count: 60,
+            keys: self.keys[mode].clone(), mode, web: web_factor(self.web_bias[mode]), convert, weighted: [self.web_weighted[mode], active.iter().any(|s| s.weighted)], recent_sets: &recent_sets, recent_convert_sets: &recent_convert_sets, taste: if mode == "nps" { &self.taste_cache.1 } else { &none }, consumed: &consumed, seed, focus: if mode == "nps" { self.nps_focus } else { self.skills_focus }, count: 60,
             recent: Self::recent(&n, mode), skill_weights: shares, selected_skills: &self.practice_skills, miss_ratio: (self.shown.client == "stable").then_some(self.shown.miss_ratio),
         });
         drop(store);
@@ -782,12 +788,16 @@ impl Worker {
         Ok((n.session.phase().to_string(), shown, note))
     }
 
-    /// PP maps past the mix bars at every N-th place of the NPS list (user 2026-10-30).
-    fn mix_pp(&mut self, shown: Vec<Pick>) -> Result<Vec<Pick>> {
+    fn mix_of(&self, mode: &str) -> &PpMix {
+        if mode == "nps" { &self.pp_mix } else { &self.skills_mix }
+    }
+
+    /// PP maps past the mix bars at every N-th place of the NPS list or a custom playlist (user 2026-10-30, 2026-11-06).
+    fn mix_pp(&mut self, mode: &'static str, shown: Vec<Pick>) -> Result<Vec<Pick>> {
         let n = self.session()?;
-        let keys = self.keys["nps"].clone();
+        let keys = self.keys[mode].clone();
         let cands = self.rec.as_mut().unwrap().scored(&self.db, &keys, &n)?;
-        let m = self.pp_mix.clone();
+        let m = self.mix_of(mode).clone();
         let listed: HashSet<String> = shown.iter().filter_map(Pick::identity).collect();
         // Time-based freshness (no pool): an offered PP map stays back ~half an hour, a played one ~6 plays.
         let mut picks: Vec<Pick> = cands.into_iter().filter(|c| {
@@ -795,7 +805,7 @@ impl Worker {
             c.ranked && c.gain.unwrap_or(0.) >= m.min_gain && c.p_up.unwrap_or(0.) >= (if c.rate < 1. { m.ht_chance } else { m.chance }) && !listed.contains(&id)
                 && n.session.freshness(&id, c.length, Some("pp"), None, ms_model::session::EXPOSURE_S) >= 0.5
         }).map(|mut c| {
-            c.why = format!("{} · PP map in the NPS list", reason(&c));
+            c.why = format!("{} · PP map in this list", reason(&c));
             c.purpose = "nps_mix".into();
             c
         }).collect();
@@ -933,7 +943,8 @@ impl Worker {
         let view = n.view.clone();
         Ok(Request { model: rec.r.fitted.display.as_ref().map_or_else(|| rec.r.fitted.pp.model.clone(), |d| d.model.clone()), tables_for: Arc::new(move |k| view.tables(k)), session: n.session.clone(),
                      public: rec.public.clone(), calc: CALC_ID.to_string(), predictor: PREDICTOR_ID.to_string(), client: self.shown.client.clone(), target: n.target, rates: self.rate_range(mode), keys: self.keys["nps"].clone(),
-                     skills_keys: self.keys["skills"].clone(), selected_skills: self.practice_skills.clone(), tuning: self.skill_tuning.clone(), converts: self.converts.get(key_mode(mode)).map_or_else(Vec::new, |s| converts::pairs(s, &self.keys[key_mode(mode)])), mode: mode.to_string(), revision: self.local_request, generation: self.generation })
+                     skills_keys: self.keys["skills"].clone(), selected_skills: self.practice_skills.clone(), tuning: self.skill_tuning.clone(), converts: self.converts.get(key_mode(mode)).map_or_else(Vec::new, |s| converts::pairs(s, &self.keys[key_mode(mode)])), mode: mode.to_string(),
+                     nps_weight: if key_mode(mode) == "skills" { self.skills_focus.max(0.) } else { 0. }, revision: self.local_request, generation: self.generation })
     }
 
     fn restore_local(&mut self, mode: &str) -> Result<()> {
@@ -1085,6 +1096,15 @@ impl Worker {
             }
         }
         let mut rebuild = false;
+        if let Some(focus) = c.skills_focus.filter(|f| f.is_finite() && *f != self.skills_focus) {
+            self.skills_focus = focus.min(1.);
+            self.playlists.insert("skills", Vec::new());
+            rebuild = true; // the slider's NPS share is part of each map's value
+        }
+        if let Some(m) = c.skills_mix.filter(|m| *m != self.skills_mix) {
+            self.skills_mix = m;
+            self.playlists.insert("skills", Vec::new());
+        }
         for (m, on) in &c.web_weighted {
             let m = key_mode(m);
             if self.web_weighted.get(m).is_some_and(|v| v != on) {
@@ -1318,6 +1338,9 @@ impl Worker {
                 self.t_refit(); // a newly viewed old score is historical evidence, unlike a live result handled by form
             }
             self.card();
+            if fresh {
+                self.retarget(Some((&sha, md5.as_deref(), bid)))?;
+            }
             self.refresh_later();
             if self.stats_visible {
                 self.t_stats(true)?;
@@ -1409,6 +1432,27 @@ impl Worker {
         (self.h.emit)(Out::Card { c: c.map(Box::new), note, path: Some(path), rate });
     }
 
+    /// After a play the current pick is aimed again with the newest results (`aim`); only the current pick, the rest of
+    /// the list keeps its offer. A pick that was just played keeps its result.
+    fn retarget(&mut self, played: Option<(&str, Option<&str>, Option<i64>)>) -> Result<()> {
+        let Some(c) = self.target.clone() else { return Ok(()) };
+        let Some(mode) = self.targets.iter().find(|(_, t)| t.identity() == c.identity()).map(|(m, _)| m.clone()) else { return Ok(()) };
+        if !MODES.contains(&mode.as_str()) || mode == "pp" || self.rec.is_none() || played.is_some_and(|(sha, md5, bid)| same_map(&c, Some(sha), md5, bid)) {
+            return Ok(());
+        }
+        let mut aimed = (*c).clone();
+        self.aim(&mut aimed, &mode)?;
+        if aimed.rate == c.rate && (aimed.pred.acc_mid - c.pred.acc_mid).abs() < 1e-4 {
+            return Ok(());
+        }
+        let msg = if aimed.rate == c.rate { "Expected accuracy updated with your latest results".to_string() } else { format!("Rate {:.2}× → {:.2}× for your target with your latest results", c.rate, aimed.rate) };
+        let aimed = Box::new(aimed);
+        self.target = Some(aimed.clone());
+        self.targets.insert(mode.clone(), aimed.clone());
+        (self.h.emit)(Out::Target { mode, revision: self.revision, selection_id: self.selection_id, c: Some(aimed), msg, copy: None });
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn t_next(&mut self, skip: bool, mode: Option<String>, revision: Option<u64>, candidate: Option<Box<Pick>>, result: Option<Done>, selected_at: Option<f64>, selection_id: u64) -> Result<()> {
         let mode = mode.unwrap_or_else(|| self.mode.clone());
@@ -1459,8 +1503,10 @@ impl Worker {
     }
 
     /// The picked chart moved to the rate whose prediction is the accuracy target (user 2026-11-06: "at least make it so
-    /// that the selected map in the playlist gets the correct rate"; the list itself keeps its analysed rates). Secant on
-    /// ln(1 − acc) over ln rate from the prediction's own slope: ≤ 4 analyses of one chart, ~5 ms each.
+    /// that the selected map in the playlist gets the correct rate"; the list itself keeps its analysed rates). Each rate is
+    /// predicted now, with the newest results, as the card does (user 2026-11-08: "SET 1.00× ~96.0 %" while the card showed
+    /// 96.3 %, and 0.82× ~95.9 % when 0.81× gave 96.0 %): a secant on ln(1 − acc) over ln rate from the prediction's own
+    /// slope, then the 0.01× neighbours of the best, ≤ 7 analyses of one chart, ~5 ms each.
     fn aim(&mut self, c: &mut Pick, mode: &str) -> Result<()> {
         let tol = ms_model::predict::ACC_TOL;
         let (Some(sha), Some(inst)) = (c.sha.clone(), c.sha.as_ref().and_then(|s| self.states.get(mode)?.catalog.get(s).cloned())) else { return Ok(()) };
@@ -1468,20 +1514,43 @@ impl Worker {
             return Ok(()); // stable has HT/NM/DT only; PP and warm-up picks aren't aimed at the target
         }
         let n = self.session()?;
-        let rec = self.rec.as_ref().unwrap();
-        let target = rec.model().central_target(n.target, n.view.warm_flag);
+        let target = self.rec.as_ref().unwrap().model().central_target(n.target, n.view.warm_flag);
         let (lo, hi) = self.rate_range(mode);
         let root = crate::catalog::local_origin(&self.shown.client).1;
+        let chart = c.md5.clone().unwrap_or_else(|| sha.clone());
         let mut data = None;
+        // The prediction at `rate` with its features, analysing the chart there first if needed.
+        let mut at = |w: &mut Self, rate: f64| -> Result<Option<(Arc<ms_model::predict::Feats>, crate::engine::Expected)>> {
+            if !w.store.read().unwrap().has_rate(&sha, rate) {
+                let bytes = data.get_or_insert_with(|| if inst.convert_of.is_some() && !inst.installed { crate::converts::bytes(&inst, &root) } else {
+                    inst.path.clone().or_else(|| ms_data::paths::local_file(&sha, &root)).and_then(|p| std::fs::read(p).ok())
+                });
+                let Some(bytes) = bytes.as_ref() else { return Ok(None) };
+                let Ok(fs) = ms_calc::features::chart_features(bytes, &[rate], &w.rec.as_ref().unwrap().prm) else { return Ok(None) };
+                let mut store = w.store.write().unwrap();
+                for (r, f) in &fs {
+                    w.db.execute("INSERT OR REPLACE INTO feats VALUES (?,?)", rusqlite::params![format!("{sha}@{r:.3}|{CALC_ID}"), ms_data::codec::encode(&ms_calc::val::Val::Dict(f.clone()))])?;
+                    store.put(&sha, *r, f);
+                }
+            }
+            let Some(f) = w.store.read().unwrap().feats(&sha, rate).cloned() else { return Ok(None) };
+            Ok(w.rec.as_ref().unwrap().predict(&f, &chart, c.bid, rate, &n).map(|e| (Arc::new(f), e)))
+        };
         let gap = |acc: f64| (1. - acc).max(1e-6).ln() - (1. - target).ln();
-        let (mut tried, mut slope) = (vec![(c.rate, gap(c.pred.acc_mid))], c.pred.slope.clamp(0.5, 8.));
+        let off = |e: &crate::engine::Expected| (e.shown.acc_mid - target).abs();
+        let mut tried: Vec<(f64, Arc<ms_model::predict::Feats>, crate::engine::Expected)> = Vec::new();
+        if let Some((f, e)) = at(self, c.rate)? {
+            tried.push((c.rate, f, e));
+        }
+        let mut slope = tried.first().map_or(c.pred.slope, |t| t.2.shown.slope).clamp(0.5, 8.);
         for _ in 0..4 {
-            if (c.pred.acc_mid - target).abs() <= tol {
+            let Some((r, _, e)) = tried.last() else { break };
+            if off(e) <= tol / 2. {
                 break;
             }
-            let (r, g) = *tried.last().unwrap();
-            if let [.., (r0, g0), _] = tried[..] {
-                let s = (g - g0) / (r / r0).ln();
+            let (r, g) = (*r, gap(e.shown.acc_mid));
+            if let [.., (r0, _, e0), _] = &tried[..] {
+                let s = (g - gap(e0.shown.acc_mid)) / (r / r0).ln();
                 if s.is_finite() && s > 0.2 {
                     slope = s.min(8.);
                 }
@@ -1490,28 +1559,23 @@ impl Worker {
             if tried.iter().any(|t| t.0 == next) {
                 break;
             }
-            if !self.store.read().unwrap().has_rate(&sha, next) {
-                let bytes = data.get_or_insert_with(|| if inst.convert_of.is_some() && !inst.installed { crate::converts::bytes(&inst, &root) } else {
-                    inst.path.clone().or_else(|| ms_data::paths::local_file(&sha, &root)).and_then(|p| std::fs::read(p).ok())
-                });
-                let Some(bytes) = bytes.as_ref() else { break };
-                let Ok(fs) = ms_calc::features::chart_features(bytes, &[next], &rec.prm) else { break };
-                let mut store = self.store.write().unwrap();
-                for (rate, f) in &fs {
-                    self.db.execute("INSERT OR REPLACE INTO feats VALUES (?,?)", rusqlite::params![format!("{sha}@{rate:.3}|{CALC_ID}"), ms_data::codec::encode(&ms_calc::val::Val::Dict(f.clone()))])?;
-                    store.put(&sha, *rate, f);
+            let Some((f, e)) = at(self, next)? else { break };
+            tried.push((next, f, e));
+        }
+        if let Some(best) = tried.iter().min_by(|a, b| off(&a.2).total_cmp(&off(&b.2))).map(|t| t.0) {
+            for next in [best - 0.01, best + 0.01].map(|r| ms_calc::py::round_digits(r, 2)) {
+                if (lo - 1e-9..=hi + 1e-9).contains(&next) && !tried.iter().any(|t| t.0 == next) {
+                    if let Some((f, e)) = at(self, next)? {
+                        tried.push((next, f, e));
+                    }
                 }
             }
-            let Some(f) = self.store.read().unwrap().feats(&sha, next).cloned() else { break };
-            let chart = c.md5.clone().unwrap_or_else(|| sha.clone());
-            let Some(e) = rec.predict(&f, &chart, c.bid, next, &n) else { break };
-            tried.push((next, gap(e.shown.acc_mid)));
-            if (e.shown.acc_mid - target).abs() < (c.pred.acc_mid - target).abs() {
-                let old = c.rate;
-                (c.rate, c.var, c.f, c.pred, c.pp_pred) = (next, crate::catalog::rate_label(next), Some(Arc::new(f)), e.shown, Some(e.pp));
-                c.nps = c.nps.map(|v| v * next / old);
-                c.length *= old / next;
-            }
+        }
+        if let Some((rate, f, e)) = tried.into_iter().min_by(|a, b| off(&a.2).total_cmp(&off(&b.2))) {
+            let old = c.rate;
+            (c.rate, c.var, c.f, c.pred, c.pp_pred) = (rate, crate::catalog::rate_label(rate), Some(f), e.shown, Some(e.pp));
+            c.nps = c.nps.map(|v| v * rate / old);
+            c.length *= old / rate;
         }
         Ok(())
     }
@@ -1524,9 +1588,10 @@ impl Worker {
         }
         c.selection = selection.to_string();
         let performed = result.is_some();
+        let auto = kv_get(&self.db, AUTO_DOWNLOAD).and_then(|v| v.as_bool()).unwrap_or(true);
         let done = result.unwrap_or_else(|| {
             let action = if (self.h.busy)() { "copy" } else { self.action.as_str() };
-            let p = perform(&mut c, action, &self.shown.client);
+            let p = perform(&mut c, action, &self.shown.client, auto);
             Done { copy: p.copy, msg: p.msg, sent: p.sent, unavailable: p.unavailable }
         });
         self.selection_id = self.selection_id.max(selection_id);
@@ -1560,7 +1625,7 @@ impl Worker {
         let boxed = Box::new(c);
         self.target = Some(boxed.clone());
         self.targets.insert(mode.to_string(), boxed.clone());
-        if boxed.convert_of.is_some() && !boxed.installed {
+        if crate::navigation::delivers(&boxed, auto) {
             self.deliver(boxed.clone(), mode.to_string(), skipped);
         }
         if done.sent {
@@ -1634,8 +1699,8 @@ impl Worker {
             None => {}
             Some(e) if e == NOT_RUNNING => self.status(format!("{e} — start it, then press Next")),
             Some(e) => {
-                eprintln!("convert failed: {} {e}", pick.title);
-                self.status(format!("Couldn't convert that map: {e}"));
+                eprintln!("delivery failed: {} {e}", pick.title);
+                self.status(format!("Couldn't {} that map: {e}", if pick.convert_of.is_some() { "convert" } else { "download" }));
                 if current {
                     self.q.put(Task::Next { skip: false, mode: Some(mode), revision: None, candidate: None, result: None, selected_at: None, selection_id: self.selection_id });
                 }
@@ -1773,6 +1838,13 @@ impl Worker {
                 let result = import_library(&db, &client)?;
                 let recovered = recover_results(&db).map_err(|e| e.to_string())?;
                 let mut changed = signature(&db)? != before;
+                // A website chart now in the client drops its stored .osu right away, not at the next launch (user 2026-11-06).
+                // A running crawl does the same at its start and owns state.db meanwhile.
+                if changed && !ms_data::webmaps::running() {
+                    if let Err(e) = ms_data::webmaps::forget_in_client() {
+                        eprintln!("website charts not forgotten: {e}");
+                    }
+                }
                 // Website top 100 for a named profile: bests from stable/other PCs (user 2026-10-01).
                 let name = kv_get(&db, "website_username").and_then(|v| v.as_str().map(str::to_string));
                 let last = kv_get(&db, "website_user").and_then(|v| v["t"].as_f64()).unwrap_or(0.);

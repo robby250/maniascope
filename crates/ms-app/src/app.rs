@@ -91,6 +91,9 @@ pub struct Open {
     pub history_only: bool,
     pub history_text: String,
     pub web: bool,
+    pub rename: Option<(usize, String)>, // a playlist being renamed: (index, text)
+    pub delete: Option<usize>,           // a playlist whose Delete waits for a second click
+    pub drag: Option<(usize, f32)>,      // a tab being dragged: its strip place and where the pointer holds it
 }
 
 pub struct App {
@@ -248,7 +251,7 @@ impl App {
         let s = &self.s;
         self.q.put(Task::Configure(Box::new(Config {
             mode: s.mode.clone(), keys: s.keys.clone(), action: s.next_action.clone(), revision: self.revision, practice_skills: Some(s.practice.clone()), nps_focus: Some(s.nps_focus),
-            acc_targets: s.targets.clone(), rates: s.rates.clone(), web_bias: s.web_bias.clone(), web_weighted: s.web_weighted.clone(), converts: s.converts.clone(), pp_settings: Some(s.pp.clone()), pp_mix: Some(s.mix.clone()), skill_weights: Some(s.skill_weights.clone()), skill_tuning: Some(s.skill_tuning()),
+            acc_targets: s.targets.clone(), rates: s.rates.clone(), web_bias: s.web_bias.clone(), web_weighted: s.web_weighted.clone(), converts: s.converts.clone(), pp_settings: Some(s.pp.clone()), pp_mix: Some(s.mix.clone()), skills_focus: Some(s.skills_focus), skills_mix: Some(s.skills_mix.clone()), skill_weights: Some(s.skill_weights.clone()), skill_tuning: Some(s.skill_tuning()),
         })));
         self.request_save();
     }
@@ -284,15 +287,26 @@ impl App {
             return;
         }
         self.s.practice = selected;
+        self.clear_custom(format!("Finding {} maps at your current level…", ms_model::skills::label(&self.s.practice)));
+        self.sync_rec();
+    }
+
+    /// The custom playlist slot's list starts over: other skills or another playlist.
+    pub fn clear_custom(&mut self, note: String) {
         let v = self.views.get_mut("skills").expect("a tab");
         v.shown.clear();
         (v.ready, v.pending, v.target) = (false, None, None);
         v.target_msg.clear();
-        v.note = format!("Finding {} maps at your current level…", ms_model::skills::label(&self.s.practice));
-        self.sync_rec();
+        v.note = note;
     }
 
     pub fn practice_from_stats(&mut self, keys: i64, group: &str) {
+        // Its own playlist, so a Stats link never overwrites one of yours (user 2026-11-06: custom playlists).
+        let name = format!("{} {keys}K", ms_model::skills::label(&[group.to_string()]));
+        match self.s.playlists.iter().position(|p| p.0 == name) {
+            Some(i) => self.s.open_playlist(i),
+            None => self.s.add_playlist(name),
+        }
         self.set_keys("skills", vec![keys]);
         self.s.skill_other = 0.; // the Stats link means this skill only
         self.set_skills(vec![group.to_string()]);
@@ -336,7 +350,8 @@ impl App {
         c.selection = if skip.is_none() { "list" } else { "next" }.to_string();
         let selected_at = now();
         let action = if self.live.is_some() { "copy" } else { self.s.next_action.as_str() };
-        let done = perform(&mut c, action, &self.units.client);
+        let auto = ms_data::store::kv_get(&self.db, ms_rec::worker::AUTO_DOWNLOAD).and_then(|v| v.as_bool()).unwrap_or(true);
+        let done = perform(&mut c, action, &self.units.client, auto);
         self.selection_id += 1;
         let (sel, rev) = (self.selection_id, self.revision);
         let result = Some(Sent { copy: done.copy.clone(), msg: done.msg.clone(), sent: done.sent, unavailable: done.unavailable });

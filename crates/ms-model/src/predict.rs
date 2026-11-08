@@ -360,8 +360,8 @@ impl PredModel {
     /// across calls; its owner drops a chart whenever the chart's analyses change.
     #[allow(clippy::too_many_arguments)]
     pub fn score_into(&self, choices: &mut Choices, session: &PredSession, store: &FeatStore, jobs: &[ScoreJob],
-                      selected: &[String], tuning: &crate::skills::Tuning, target: f64, rates: (f64, f64), skills: bool, wants_vibro: bool, preference: bool, now: f64) -> Res<()> {
-        let ctx = Ctx { target, rates, warm: session.warm, skills, wants_vibro, preference, version: store.version };
+                      selected: &[String], tuning: &crate::skills::Tuning, target: f64, rates: (f64, f64), skills: bool, wants_vibro: bool, preference: bool, nps_weight: f64, now: f64) -> Res<()> {
+        let ctx = Ctx { target, rates, warm: session.warm, skills, wants_vibro, preference, version: store.version, nps_weight };
         let sel: Vec<Selection> = store.trees.iter().map(|t| t.select(selected, tuning)).collect();
         let included: Vec<&String> = selected.iter().filter(|k| !k.starts_with('!')).collect();
         static EMPTY: Vec<Entry> = Vec::new();
@@ -406,20 +406,20 @@ impl PredModel {
 
     /// nps.central_target.
     pub fn central_target(&self, target: f64, warm: bool) -> f64 {
-        let ctx = Ctx { target, rates: (MIN_RATE, MAX_RATE), warm, skills: false, wants_vibro: false, preference: false, version: 0 };
+        let ctx = Ctx { target, rates: (MIN_RATE, MAX_RATE), warm, skills: false, wants_vibro: false, preference: false, version: 0, nps_weight: 0. };
         ctx.central()
     }
 
     /// nps.eligible: a prediction inside the tab's accuracy band.
     pub fn eligible(&self, p: &Prediction, target: f64, warm: bool) -> bool {
-        let ctx = Ctx { target, rates: (MIN_RATE, MAX_RATE), warm, skills: false, wants_vibro: false, preference: false, version: 0 };
+        let ctx = Ctx { target, rates: (MIN_RATE, MAX_RATE), warm, skills: false, wants_vibro: false, preference: false, version: 0, nps_weight: 0. };
         ctx.eligible(p)
     }
 
     /// nps.Builder.initial_value: a known chart's density at the rate that meets the target, for analysis order.
     pub fn initial_value(&self, store: &FeatStore, job: &ScoreJob, rate: f64, session: &PredSession, target: f64) -> Res<f64> {
         let (Some(f), Some((notes, length))) = (store.feats(&job.sha, rate), store.size(&job.sha, rate)) else { return Ok(0.) };
-        let ctx = Ctx { target, rates: (MIN_RATE, MAX_RATE), warm: session.warm, skills: false, wants_vibro: false, preference: false, version: store.version };
+        let ctx = Ctx { target, rates: (MIN_RATE, MAX_RATE), warm: session.warm, skills: false, wants_vibro: false, preference: false, version: store.version, nps_weight: 0. };
         let p = self.predict(f, &job.key, job.bid, rate, session)?;
         let need = rate * (ctx.rate_shift(&p, ctx.central()) / p.slope).exp();
         Ok(notes / length.max(1000.) * need.min(MAX_RATE) * if need < MIN_RATE * 0.85 { 0.05 } else { 1. })
@@ -718,6 +718,7 @@ struct Ctx {
     wants_vibro: bool,
     preference: bool,
     version: i64,
+    nps_weight: f64, // a custom playlist's variety ↔ NPS slider: how much a map's NPS adds to its skill value
 }
 
 impl Ctx {
@@ -767,7 +768,7 @@ impl Ctx {
             let strength = strength.filter(|s| *s != 0.)?;
             let preference = if self.preference { 2.2 * strength.min(1.).max(0.01).ln() } else { 0. };
             return Some(1.1 * strength.max(0.01).ln() + preference - 14. * (acc - target).abs() - 0.40 * p.sdm - quality
-                        - 0.15 * rate.ln().abs());
+                        - 0.15 * rate.ln().abs() + self.nps_weight * self.ready(p) * nps.max(1.).ln());
         }
         let ready = self.ready(p);
         Some(ready * nps.max(1.).ln() - 12. * (acc - target).abs() - (0.35 + 1. - ready) * p.sdm - quality)
@@ -904,6 +905,18 @@ pub struct Prediction {
 
 pub const BAND_Z: f64 = 1.2816 * 0.75; // recommend.BAND_Z
 
+// Mashing a map far above you still scores ~60–70 % (user 2026-11-06: "it's very hard to get below 50% acc"; own lowest
+// completed lazer accuracy 68 % over 12,387 plays; the dumps hold top scores only, so this is not fitted). A soft minimum
+// of miss rates: 90 % moves < 0.1 pp, 80 % ~0.3 pp, a model 30 % reads ~61 %.
+const MASH_MISS: f64 = 0.4;
+const MASH_P: f64 = 4.;
+
+/// An accuracy with the mash floor applied.
+pub fn mash_floor(acc: f64) -> f64 {
+    let miss = 1. - acc;
+    1. - miss / (1. + (miss / MASH_MISS).powf(MASH_P)).powf(1. / MASH_P)
+}
+
 impl PredModel {
 
     /// score_into for one chart: None (nothing rateable) or (best (rate, value), proposal (quality, rate, group),
@@ -1036,14 +1049,19 @@ impl PredModel {
     }
 
     fn gap_term(&self, f: &Feats, level: Option<f64>) -> f64 {
+        self.gap_parts(f, level).iter().map(|x| x.1).sum()
+    }
+
+    /// The population's pattern-type corrections: (part index into `gap_part_names`, log term) per fitted part.
+    pub fn gap_parts(&self, f: &Feats, level: Option<f64>) -> Vec<(usize, f64)> {
         let k = if self.pop.gap.get(f.keys).is_some() {
             f.keys
         } else if self.c.gap_borrow.contains(&f.keys) {
             self.c.gap_shared
         } else {
-            return 0.;
+            return Vec::new();
         };
-        let (Some(parts), Some(level)) = (self.pop.gap.get(k), level) else { return 0. };
+        let (Some(parts), Some(level)) = (self.pop.gap.get(k), level) else { return Vec::new() };
         let means = self.pop.share_mean.get(k);
         let knots = &self.c.gap_knots;
         let g = ((f.overall.max(0.05)).ln() - level).clamp(knots[0], knots[knots.len() - 1]);
@@ -1053,7 +1071,7 @@ impl PredModel {
             let hi = if i + 1 < knots.len() { knots[i + 1] } else { kk + 1. };
             1f64.min(0f64.max(((g - lo) / (kk - lo)).min((hi - g) / (hi - kk))))
         }).collect();
-        let mut total = 0.;
+        let mut out = Vec::new();
         for (p, cs) in parts {
             let members = &self.c.gap_idx[*p];
             let share = if members.is_empty() { 1. } else { members.iter().map(|&x| f.sk[x]).fold(0., f64::max).min(1.) };
@@ -1062,9 +1080,9 @@ impl PredModel {
             for (c, h) in cs.iter().zip(&hats) {
                 s += c * h;
             }
-            total += (share - mean) * s;
+            out.push((*p, (share - mean) * s));
         }
-        total
+        out
     }
 
     /// recommend.base_of → (value, n public rows)
@@ -1254,7 +1272,7 @@ impl PredModel {
         let shift = correction + cold + self.played(f, chart, rate, st, s, sdm * sdm);
         mu += shift;
         let (a, bb, judged) = (self.shown.0, self.shown.1, self.judged_ln * f.z_tail[0]);
-        let shown = |y: f64| 0f64.max(1f64.min(1. - (20f64.min(a + bb * y + judged)).exp()));
+        let shown = |y: f64| mash_floor(0f64.max(1f64.min(1. - (20f64.min(a + bb * y + judged)).exp())));
         let spread = sda.hypot(sdm);
         let opening = historical(0.);
         let activation = if s.warm {
@@ -1439,6 +1457,13 @@ mod model_tests {
         let base = m.personal(&plain(&m), "x", None, 1.).0;
         assert!((m.personal(&f(7, 0.9), "x", None, 1.).0 - base - 0.3 * 0.2).abs() < 1e-12);
         assert_eq!(m.personal(&f(7, 0.6), "x", None, 1.).0, base);
+    }
+
+    #[test]
+    fn the_mash_floor_lifts_hopeless_maps_and_leaves_normal_ones() {
+        assert!((mash_floor(0.95) - 0.95).abs() < 1e-4 && (mash_floor(0.9) - 0.9).abs() < 1e-3);
+        assert!((0.58..0.65).contains(&mash_floor(0.3)) && mash_floor(0.) > 0.55);
+        assert!(mash_floor(0.3) < mash_floor(0.5) && mash_floor(0.5) < mash_floor(0.8), "still ordered");
     }
 
     #[test]
@@ -1687,7 +1712,7 @@ mod target_tests {
     use super::*;
 
     fn ctx(target: f64, warm: bool) -> Ctx {
-        Ctx { target, rates: (MIN_RATE, MAX_RATE), warm, skills: false, wants_vibro: false, preference: false, version: 1 }
+        Ctx { target, rates: (MIN_RATE, MAX_RATE), warm, skills: false, wants_vibro: false, preference: false, version: 1, nps_weight: 0. }
     }
 
     fn prediction(acc: f64, opening: f64) -> Prediction {

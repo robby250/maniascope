@@ -106,8 +106,10 @@ fn webmaps(args: &[String]) -> i32 {
     let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1));
     let keys = value("--keys").map_or_else(Default::default, |k| k.split(',').filter_map(|x| x.parse().ok()).collect());
     let stars = value("--stars").and_then(|s| { let (a, b) = s.split_once('-')?; Some((a.parse().ok()?, b.parse().ok()?)) });
+    // No --status: a paused batch from before the choice, which listed every status.
+    let groups: Vec<&str> = value("--status").map_or_else(|| vec!["ranked", "unranked"], |s| s.split(',').collect());
     let prm = ms_calc::features::standard_params();
-    match ms_data::webmaps::crawl(&keys, stars, command == "check", false, None, ms_rec::engine::CALC_ID, &prm) {
+    match ms_data::webmaps::crawl(&keys, &ms_data::webmaps::statuses(&groups), stars, command == "check", false, None, ms_rec::engine::CALC_ID, &prm) {
         Ok(()) => 0,
         Err(ms_data::webmaps::CrawlError::Stopped) => 0,
         Err(ms_data::webmaps::CrawlError::Failed(e)) => {

@@ -25,7 +25,26 @@ const SEARCH: &str = "https://osu.direct/api/v2/search?mode=3&amount=100&sort=la
 // so a throttled IP at ppy would hurt play (user concern 2026-09-30).
 pub const FILES: [(&str, f64); 2] = [("https://osu.direct/api/osu/", 0.6), ("https://osu.ppy.sh/osu/", 3.)];
 const UA: &str = "maniascope/1.0 (personal osu!mania practice recommender)";
-const STATUSES: [i64; 7] = [-2, -1, 0, 1, 2, 3, 4]; // graveyard, wip, pending, ranked, approved, qualified, loved
+// Listing order: ranked, approved, qualified, loved, then pending, wip, graveyard. Ranked first: the graveyard is most of
+// the ~100k mania sets (user 2026-11-06: "the search currently goes through like 100k maps … it searches non-ranked too").
+const STATUSES: [i64; 7] = [1, 2, 3, 4, 0, -1, -2];
+/// The window's status choices: (name the app and `--status` use, osu! statuses).
+pub const GROUPS: [(&str, &[i64]); 2] = [("ranked", &[1, 2, 3, 4]), ("unranked", &[0, -1, -2])];
+
+/// osu! statuses of the named groups.
+pub fn statuses(groups: &[&str]) -> Vec<i64> {
+    GROUPS.iter().filter(|g| groups.contains(&g.0)).flat_map(|g| g.1.iter().copied()).collect()
+}
+
+/// The statuses the last crawl was asked for; every status for crawls from before the choice.
+pub fn wanted_statuses(db: &Connection) -> Vec<i64> {
+    kv_get(db, "want_status").and_then(|v| v.as_array().map(|a| a.iter().filter_map(Value::as_i64).collect())).unwrap_or_else(|| STATUSES.to_vec())
+}
+
+/// A row's status is chosen; rows listed before the status column count as unranked.
+fn chosen(statuses: &[i64], status: Option<i64>) -> bool {
+    statuses.contains(&status.unwrap_or(-2))
+}
 // HT/NM/DT only (user 2026-10-02: ~3x faster crawl, ~3x smaller file). NPS/Skills compute the exact rate a candidate
 // needs on demand, as for installed maps.
 pub const RATES: [f64; 3] = [0.75, 1., 1.5];
@@ -153,11 +172,14 @@ fn reachable(notes: i64, length: f64, keys: i64) -> bool {
     notes >= 100 && length >= 30. && notes as f64 / length * 1.5 >= 0.6 * 20. * keys as f64 / 7.
 }
 
-fn listed_keys(db: &Connection) -> rusqlite::Result<HashSet<i64>> {
-    if let Some(saved) = kv_get(db, "keys").and_then(|v| v.as_array().cloned()) {
-        return Ok(saved.iter().filter_map(Value::as_i64).collect());
+/// Keymodes whose listing of `status` is complete. `keys` (no status) is from crawls that listed every status at once.
+fn listed_keys(db: &Connection, status: i64) -> rusqlite::Result<HashSet<i64>> {
+    let saved = |k: &str| kv_get(db, k).and_then(|v| v.as_array().cloned()).map(|a| a.iter().filter_map(Value::as_i64).collect::<HashSet<i64>>());
+    match (saved(&format!("keys{status}")), saved("keys")) {
+        // Crawls before either listed every status together: their rows' keymodes.
+        (None, None) => db.prepare("SELECT DISTINCT keys FROM diffs")?.query_map([], |r| r.get(0))?.collect(),
+        (own, all) => Ok(own.unwrap_or_default().union(&all.unwrap_or_default()).copied().collect()),
     }
-    db.prepare("SELECT DISTINCT keys FROM diffs")?.query_map([], |r| r.get(0))?.collect()
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -230,15 +252,15 @@ fn forget(db: &Connection, client: &InClient, osu: &Path) -> rusqlite::Result<us
 }
 
 /// What a crawl for these keymodes and ★ range still has to do.
-pub fn estimate(db: &Connection, keys: &HashSet<i64>, stars: Option<(f64, f64)>, calc: &str) -> rusqlite::Result<Estimate> {
+pub fn estimate(db: &Connection, keys: &HashSet<i64>, statuses: &[i64], stars: Option<(f64, f64)>, calc: &str) -> rusqlite::Result<Estimate> {
     let (mut fetch, mut analyse, mut ready) = (0, 0, 0);
-    let mut q = db.prepare("SELECT d.keys,d.notes,d.length,d.stars,d.sha,d.fetched,d.md5,f.sha IS NOT NULL,d.bid FROM diffs d LEFT JOIN feats f ON f.sha=d.sha AND f.calc=? WHERE d.error IS NULL")?;
+    let mut q = db.prepare("SELECT d.keys,d.notes,d.length,d.stars,d.sha,d.fetched,d.md5,f.sha IS NOT NULL,d.bid,d.status FROM diffs d LEFT JOIN feats f ON f.sha=d.sha AND f.calc=? WHERE d.error IS NULL")?;
     let rows = q.query_map([calc], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?, r.get::<_, Option<f64>>(3)?, r.get::<_, Option<String>>(4)?,
-                                           r.get::<_, Option<String>>(5)?, r.get::<_, Option<String>>(6)?, r.get::<_, bool>(7)?, r.get::<_, i64>(8)?)))?;
+                                           r.get::<_, Option<String>>(5)?, r.get::<_, Option<String>>(6)?, r.get::<_, bool>(7)?, r.get::<_, i64>(8)?, r.get::<_, Option<i64>>(9)?)))?;
     let client = InClient::read();
     for row in rows {
-        let (k, notes, length, s, sha, fetched, md5, done, bid) = row?;
-        if !keys.contains(&k) || !reachable(notes, length, k) || !in_stars(s, stars) || client.holds(bid, md5.as_deref().unwrap_or("")) {
+        let (k, notes, length, s, sha, fetched, md5, done, bid, status) = row?;
+        if !keys.contains(&k) || !chosen(statuses, status) || !reachable(notes, length, k) || !in_stars(s, stars) || client.holds(bid, md5.as_deref().unwrap_or("")) {
             continue;
         }
         if sha.is_none() || fetched != md5 {
@@ -249,9 +271,13 @@ pub fn estimate(db: &Connection, keys: &HashSet<i64>, stars: Option<(f64, f64)>,
             ready += 1;
         }
     }
-    let listed = listed_keys(db)?;
-    let mut unlisted: Vec<i64> = keys.difference(&listed).copied().collect();
+    let mut unlisted = Vec::new();
+    for &status in statuses {
+        let listed = listed_keys(db, status)?;
+        unlisted.extend(keys.iter().filter(|k| !listed.contains(k)));
+    }
     unlisted.sort_unstable();
+    unlisted.dedup();
     Ok(Estimate { fetch, analyse: fetch + analyse, ready, new_bytes: fetch * CHART_BYTES, seconds: seconds(db, fetch, fetch + analyse), disk: disk_bytes(),
                   checked: kv_get(db, "checked").and_then(|v| v.as_f64()), unlisted })
 }
@@ -259,31 +285,33 @@ pub fn estimate(db: &Connection, keys: &HashSet<i64>, stars: Option<(f64, f64)>,
 /// Newest-first per status; an incremental crawl stops a day past the last watermark.
 /// Where a listing for these keymodes stopped: (status index, offset, sets, newest). A pause or a closed app lost a full pass
 /// before this, so a keymode that needs one never got listed (user 2026-11-01: "it always checks the whole listing").
-fn listing_at(db: &Connection, keys: &HashSet<i64>) -> Option<(usize, i64, i64, String)> {
+fn listing_at(db: &Connection, keys: &HashSet<i64>, order: &[i64]) -> Option<(usize, i64, i64, String)> {
     let mut wanted: Vec<i64> = keys.iter().copied().collect();
     wanted.sort_unstable();
-    let l = kv_get(db, "listing").filter(|l| l["keys"] == json!(wanted))?;
+    let l = kv_get(db, "listing").filter(|l| l["keys"] == json!(wanted) && l["statuses"] == json!(order))?;
     Some((l["status"].as_u64()? as usize, l["offset"].as_i64()?, l["sets"].as_i64()?, l["newest"].as_str()?.to_string()))
 }
 
-fn save_listing(db: &Connection, keys: &HashSet<i64>, at: (usize, i64, i64, &str)) -> rusqlite::Result<()> {
+fn save_listing(db: &Connection, keys: &HashSet<i64>, order: &[i64], at: (usize, i64, i64, &str)) -> rusqlite::Result<()> {
     let mut wanted: Vec<i64> = keys.iter().copied().collect();
     wanted.sort_unstable();
-    kv_set(db, "listing", &json!({"keys": wanted, "status": at.0, "offset": at.1, "sets": at.2, "newest": at.3}))
+    kv_set(db, "listing", &json!({"keys": wanted, "statuses": order, "status": at.0, "offset": at.1, "sets": at.2, "newest": at.3}))
 }
 
-fn crawl_meta(db: &Connection, keys: &HashSet<i64>, full: bool) -> Result<(), CrawlError> {
+fn crawl_meta(db: &Connection, keys: &HashSet<i64>, statuses: &[i64], full: bool) -> Result<(), CrawlError> {
+    let order: Vec<i64> = STATUSES.into_iter().filter(|s| statuses.contains(s)).collect();
     // Rows crawled before the stars column need one full pass to learn their rating.
     let backfill = kv_get(db, "stars_backfilled").is_none_or(|v| !v.as_bool().unwrap_or(false));
-    let listed = listed_keys(db)?;
-    let stopped = listing_at(db, keys);
-    let full = full || backfill || !keys.is_subset(&listed) || stopped.is_some();
+    let stopped = listing_at(db, keys, &order);
+    let whole = |status: i64| -> rusqlite::Result<bool> { Ok(full || backfill || stopped.is_some() || !keys.is_subset(&listed_keys(db, status)?)) };
     let mut sets = stopped.as_ref().map_or(0, |s| s.2 as usize);
-    progress(db, json!({"phase": "check", "sets": sets, "full": full}))?;
-    for (index, status) in STATUSES.into_iter().enumerate() {
+    let any_whole = order.iter().map(|&s| whole(s)).collect::<rusqlite::Result<Vec<bool>>>()?.contains(&true);
+    progress(db, json!({"phase": "check", "sets": sets, "full": any_whole}))?;
+    for (index, &status) in order.iter().enumerate() {
         if stopped.as_ref().is_some_and(|s| s.0 > index) {
             continue;
         }
+        let full = whole(status)?;
         let mark: String = db.query_row("SELECT v FROM kv WHERE k=?", [format!("mark{status}")], |r| r.get(0)).optional()?.unwrap_or_default();
         let stop = if full || mark.is_empty() { None } else {
             chrono::DateTime::parse_from_rfc3339(&mark.replace('Z', "+00:00")).ok().map(|t| (t - chrono::Duration::days(1)).format("%Y-%m-%dT%H:%M:%SZ").to_string())
@@ -341,31 +369,31 @@ fn crawl_meta(db: &Connection, keys: &HashSet<i64>, full: bool) -> Result<(), Cr
             }
             offset += 100 * PAGES;
             if full {
-                save_listing(db, keys, (index, offset, sets as i64, &newest))?;
+                save_listing(db, keys, &order, (index, offset, sets as i64, &newest))?;
             }
         }
         db.execute("INSERT OR REPLACE INTO kv VALUES(?,?)", params![format!("mark{status}"), newest])?;
         if full {
-            save_listing(db, keys, (index + 1, 0, sets as i64, ""))?;
+            save_listing(db, keys, &order, (index + 1, 0, sets as i64, ""))?;
         }
+        let mut done: Vec<i64> = keys.union(&listed_keys(db, status)?).copied().collect();
+        done.sort_unstable();
+        kv_set(db, &format!("keys{status}"), &json!(done))?;
     }
     db.execute("DELETE FROM kv WHERE k='listing'", [])?;
     if backfill {
         kv_set(db, "stars_backfilled", &json!(true))?;
     }
-    let mut all: Vec<i64> = keys.union(&listed).copied().collect();
-    all.sort_unstable();
-    kv_set(db, "keys", &json!(all))?;
     kv_set(db, "checked", &json!(now()))?;
     Ok(())
 }
 
 /// Chart text once per revision, most-played first; empty body = unavailable.
-fn fetch(db: &Connection, keys: &HashSet<i64>, limit: usize, stars: Option<(f64, f64)>) -> Result<usize, CrawlError> {
+fn fetch(db: &Connection, keys: &HashSet<i64>, statuses: &[i64], limit: usize, stars: Option<(f64, f64)>) -> Result<usize, CrawlError> {
     let client = InClient::read();
-    let mut q = db.prepare("SELECT bid,md5,keys,notes,length,stars FROM diffs WHERE error IS NULL AND (sha IS NULL OR fetched IS NOT md5) ORDER BY playcount DESC")?;
-    let rows: Vec<(i64, String)> = q.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, f64>(4)?, r.get::<_, Option<f64>>(5)?)))?
-        .filter_map(Result::ok).filter(|r| keys.contains(&r.2) && reachable(r.3, r.4, r.2) && in_stars(r.5, stars) && !client.holds(r.0, &r.1)).take(limit).map(|r| (r.0, r.1)).collect();
+    let mut q = db.prepare("SELECT bid,md5,keys,notes,length,stars,status FROM diffs WHERE error IS NULL AND (sha IS NULL OR fetched IS NOT md5) ORDER BY playcount DESC")?;
+    let rows: Vec<(i64, String)> = q.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, f64>(4)?, r.get::<_, Option<f64>>(5)?, r.get::<_, Option<i64>>(6)?)))?
+        .filter_map(Result::ok).filter(|r| keys.contains(&r.2) && chosen(statuses, r.6) && reachable(r.3, r.4, r.2) && in_stars(r.5, stars) && !client.holds(r.0, &r.1)).take(limit).map(|r| (r.0, r.1)).collect();
     let (t0, done) = (std::time::Instant::now(), kv_get(db, "progress").and_then(|p| p["fetched"].as_u64()).unwrap_or(0) as usize);
     let total = rows.len();
     let (send, receive) = std::sync::mpsc::sync_channel::<(i64, Vec<u8>)>(1); // one ahead of the store loop, ~60/min
@@ -549,7 +577,7 @@ pub fn carry(from: &str, to: &str, after: &Params, chart: &(dyn Fn(&str) -> Opti
     }
     if !todo.is_empty() {
         let stars = kv_get(&db, "stars").and_then(|v| Some((v[0].as_f64()?, v[1].as_f64()?)));
-        publish(&db, to, stars).map_err(|e| format!("{e:?}"))?;
+        publish(&db, to, &wanted_statuses(&db), stars).map_err(|e| format!("{e:?}"))?;
     }
     Ok(())
 }
@@ -561,7 +589,7 @@ struct WebMeta {
     maps: Vec<WebMap>,
 }
 
-fn publish(db: &Connection, calc: &str, stars: Option<(f64, f64)>) -> Result<(), CrawlError> {
+fn publish(db: &Connection, calc: &str, statuses: &[i64], stars: Option<(f64, f64)>) -> Result<(), CrawlError> {
     let mut q = db.prepare("SELECT d.sha,d.bid,d.set_id,d.status,d.keys,d.file_md5,d.playcount,d.artist,d.title,d.version,d.creator,d.stars,f.data \
                             FROM diffs d JOIN feats f ON f.sha=d.sha AND f.calc=? WHERE d.error IS NULL")?;
     let mut rows = q.query([calc])?;
@@ -569,7 +597,7 @@ fn publish(db: &Connection, calc: &str, stars: Option<(f64, f64)>) -> Result<(),
     let (mut maps, mut records, mut seen) = (Vec::new(), Vec::new(), HashSet::new());
     while let Some(r) = rows.next()? {
         let sha = text(r, 0)?;
-        if !in_stars(r.get(11)?, stars) || !seen.insert(sha.clone()) {
+        if !chosen(statuses, r.get(3)?) || !in_stars(r.get(11)?, stars) || !seen.insert(sha.clone()) {
             continue;
         }
         let Ok(fs) = read_cell(&r.get::<_, Vec<u8>>(12)?) else { continue };
@@ -663,13 +691,14 @@ fn window_rates(ov: &[(f64, f64)], reach: Option<(f64, f64)>) -> Option<Vec<f64>
 
 /// Everything a crawl does: listing, chart text, analysis, publication. `check` stops after the listing, so the app
 /// can show counts, size and time before Start.
-pub fn crawl(keys: &HashSet<i64>, stars: Option<(f64, f64)>, check: bool, full: bool, threads: Option<usize>, calc: &str, prm: &Params) -> Result<(), CrawlError> {
+pub fn crawl(keys: &HashSet<i64>, statuses: &[i64], stars: Option<(f64, f64)>, check: bool, full: bool, threads: Option<usize>, calc: &str, prm: &Params) -> Result<(), CrawlError> {
     let db = state_db()?;
     let Some(_held) = lock() else { return Err(CrawlError::Failed("another crawl is running".into())) };
     let _ = std::fs::remove_file(web_dir().join("stop"));
     let mut wanted: Vec<i64> = keys.iter().copied().collect();
     wanted.sort_unstable();
     kv_set(&db, "want_keys", &json!(wanted))?; // the app's window reopens with these
+    kv_set(&db, "want_status", &json!(statuses))?;
     kv_set(&db, "command", &json!(if check { "check" } else { "crawl" }))?;
     db.execute("DELETE FROM kv WHERE k='reopen'", [])?;
     if let Some((lo, hi)) = stars {
@@ -677,20 +706,20 @@ pub fn crawl(keys: &HashSet<i64>, stars: Option<(f64, f64)>, check: bool, full: 
     }
     let stars = kv_get(&db, "stars").and_then(|v| Some((v[0].as_f64()?, v[1].as_f64()?)));
     let run = || -> Result<(), CrawlError> {
-        crawl_meta(&db, keys, full)?;
+        crawl_meta(&db, keys, statuses, full)?;
         forget(&db, &InClient::read(), &web_dir().join("osu"))?;
         if check {
             progress(&db, json!({"phase": "checked"}))?;
             return Ok(());
         }
-        let plan = estimate(&db, keys, stars, calc)?;
+        let plan = estimate(&db, keys, statuses, stars, calc)?;
         progress(&db, json!({"phase": "download", "fetched": 0, "fetch_total": plan.fetch, "analysed": 0, "analyse_total": plan.analyse, "error": null}))?;
         // Publish every chunk; small first chunks so a new player sees website maps within minutes, not after 5,000
         // downloads (fresh-install run 2026-10-02).
         for size in [300, 1500].into_iter().chain(std::iter::repeat(5000)) {
-            let more = fetch(&db, keys, size, stars)?;
+            let more = fetch(&db, keys, statuses, size, stars)?;
             analyse(&db, calc, prm, threads)?;
-            publish(&db, calc, stars)?;
+            publish(&db, calc, statuses, stars)?;
             if more == 0 {
                 break;
             }
@@ -768,10 +797,12 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT);").unwrap();
         let (ten, seven): (HashSet<i64>, HashSet<i64>) = ([10].into(), [7, 10].into());
-        assert_eq!(listing_at(&db, &ten), None);
-        save_listing(&db, &ten, (3, 4800, 52800, "2026-11-01T08:37:21Z")).unwrap();
-        assert_eq!(listing_at(&db, &ten), Some((3, 4800, 52800, "2026-11-01T08:37:21Z".to_string())));
-        assert_eq!(listing_at(&db, &seven), None, "other keymodes read the listing for themselves");
+        let (ranked, all) = (statuses(&["ranked"]), statuses(&["ranked", "unranked"]));
+        assert_eq!(listing_at(&db, &ten, &ranked), None);
+        save_listing(&db, &ten, &ranked, (3, 4800, 52800, "2026-11-01T08:37:21Z")).unwrap();
+        assert_eq!(listing_at(&db, &ten, &ranked), Some((3, 4800, 52800, "2026-11-01T08:37:21Z".to_string())));
+        assert_eq!(listing_at(&db, &seven, &ranked), None, "other keymodes read the listing for themselves");
+        assert_eq!(listing_at(&db, &ten, &all), None, "and other statuses");
     }
 
     #[test]
@@ -785,21 +816,27 @@ mod tests {
     fn the_estimate_counts_what_a_crawl_still_has_to_do() {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT); CREATE TABLE feats(sha TEXT, calc TEXT);
-                          CREATE TABLE diffs(bid INTEGER PRIMARY KEY, keys INTEGER, md5 TEXT, notes INTEGER, length REAL, playcount INTEGER, stars REAL, sha TEXT, fetched TEXT, error TEXT);").unwrap();
+                          CREATE TABLE diffs(bid INTEGER PRIMARY KEY, status INTEGER, keys INTEGER, md5 TEXT, notes INTEGER, length REAL, playcount INTEGER, stars REAL, sha TEXT, fetched TEXT, error TEXT);").unwrap();
         for bid in 1..5 {
-            db.execute("INSERT INTO diffs(bid,keys,md5,notes,length,playcount,stars) VALUES(?,7,?,2000,120,?,?)", rusqlite::params![bid, format!("m{bid}"), bid, if bid < 4 { 8. } else { 3. }]).unwrap();
+            db.execute("INSERT INTO diffs(bid,status,keys,md5,notes,length,playcount,stars) VALUES(?,1,7,?,2000,120,?,?)", rusqlite::params![bid, format!("m{bid}"), bid, if bid < 4 { 8. } else { 3. }]).unwrap();
         }
+        db.execute("INSERT INTO diffs(bid,status,keys,md5,notes,length,playcount,stars) VALUES(9,-2,7,'m9',2000,120,9,8)", []).unwrap();
         let keys = |k: &[i64]| k.iter().copied().collect::<HashSet<i64>>();
-        assert!(estimate(&db, &keys(&[7]), Some((6., 12.)), "c").unwrap().unlisted.is_empty(), "older crawls: their rows' keymodes");
+        let all = statuses(&["ranked", "unranked"]);
+        let estimate = |k: &[i64], s: &[i64]| estimate(&db, &keys(k), s, Some((6., 12.)), "c").unwrap();
+        assert_eq!(estimate(&[7], &statuses(&["ranked"])).unlisted, Vec::<i64>::new(), "older crawls: their rows' keymodes");
+        assert_eq!(estimate(&[7], &statuses(&["unranked"])).fetch, 1, "a graveyard chart only when unranked is ticked");
+        assert_eq!(estimate(&[7], &all).fetch, 4);
         kv_set(&db, "keys", &json!([7])).unwrap();
-        let e = estimate(&db, &keys(&[4, 7]), Some((6., 12.)), "c").unwrap();
+        let e = estimate(&[4, 7], &statuses(&["ranked"]));
         assert_eq!((e.fetch, e.analyse, e.ready, e.unlisted.clone()), (3, 3, 0, vec![4]));
         assert_eq!(e.new_bytes, 3 * CHART_BYTES);
         assert!(e.seconds > 0.);
-        assert_eq!(estimate(&db, &keys(&[4]), Some((6., 12.)), "c").unwrap().fetch, 0);
+        let ranked = statuses(&["ranked"]);
+        assert_eq!(estimate(&[4], &ranked).fetch, 0);
         db.execute("UPDATE diffs SET sha='s1', fetched='m1' WHERE bid=1", []).unwrap();
-        assert_eq!(estimate(&db, &keys(&[7]), Some((6., 12.)), "c").unwrap().fetch, 2, "a resume fetches only the rest");
+        assert_eq!(estimate(&[7], &ranked).fetch, 2, "a resume fetches only the rest");
         db.execute("INSERT INTO feats VALUES('s1','c')", []).unwrap();
-        assert_eq!(estimate(&db, &keys(&[7]), Some((6., 12.)), "c").unwrap().ready, 1);
+        assert_eq!(estimate(&[7], &ranked).ready, 1);
     }
 }

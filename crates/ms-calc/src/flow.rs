@@ -137,6 +137,11 @@ pub fn hand(col: usize, keys: usize, centre_left: bool) -> (usize, f64) {
     (if col < keys / 2 || (centre_left && keys % 2 == 1 && col == keys / 2) { 0 } else { 1 }, col as f64)
 }
 
+/// Each hand's columns as a bit mask: a row's hands are `mask & m[h]` (once per chart, not a column loop per row).
+fn hand_masks(keys: usize, centre_left: bool) -> [u32; 2] {
+    (0..keys).fold([0u32; 2], |mut m, c| { m[hand(c, keys, centre_left).0] |= 1 << c; m })
+}
+
 /// The chart's rows: (seconds at `rate`, column mask).
 pub fn rows(chart: &Chart, rate: f64) -> Vec<(f64, u32)> {
     let scale = 0.001 / rate;
@@ -219,7 +224,8 @@ pub fn held(chart: &Chart) -> Vec<u32> {
 /// hand presses, [gap ≥ 180 ms, faster].
 fn hold_taps(rows: &[(f64, u32)], held: &[u32], keys: usize, centre_left: bool) -> [f64; 2] {
     let (mut out, mut n, mut last) = ([0.; 2], 0., [f64::NEG_INFINITY; 2]);
-    let side = |m: u32| (0..keys).filter(|&c| m >> c & 1 == 1).fold([0u32; 2], |mut h, c| { h[hand(c, keys, centre_left).0] |= 1 << c; h });
+    let hm = hand_masks(keys, centre_left);
+    let side = |m: u32| [m & hm[0], m & hm[1]];
     for (&(t, mask), &hold) in rows.iter().zip(held) {
         let (hands, holding) = (side(mask), side(hold));
         for h in (0..2).filter(|&h| hands[h] != 0) {
@@ -241,23 +247,23 @@ fn hold_taps(rows: &[(f64, u32)], held: &[u32], keys: usize, centre_left: bool) 
 fn shape_loads(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
     let (mut total, mut n) = (0., 0.);
     for h in 0..2 {
-        let mine: u32 = (0..keys).filter(|&c| hand(c, keys, centre_left).0 == h).fold(0, |m, c| m | 1 << c);
+        let mine = hand_masks(keys, centre_left)[h];
         let hr: Vec<(f64, u32)> = rows.iter().filter(|r| r.1 & mine != 0).map(|r| (r.0, r.1 & mine)).collect();
-        let (mut lo2, mut lo30, mut seen) = (0, 0, std::collections::HashMap::<u32, u32>::new());
+        // shape counts over the last 2 s, dense by mask (≤ 2^keys): no hashing per press
+        let (mut lo2, mut lo30, mut seen, mut distinct) = (0, 0, vec![0u32; 1 << keys], 0usize);
         for (i, &(t, m)) in hr.iter().enumerate() {
-            *seen.entry(m).or_default() += 1;
+            distinct += usize::from(seen[m as usize] == 0);
+            seen[m as usize] += 1;
             while hr[lo2].0 < t - 2. {
-                let k = hr[lo2].1;
-                let left = seen.get_mut(&k).map_or(0, |c| { *c -= 1; *c });
-                if left == 0 {
-                    seen.remove(&k);
-                }
+                let k = hr[lo2].1 as usize;
+                seen[k] -= 1;
+                distinct -= usize::from(seen[k] == 0);
                 lo2 += 1;
             }
             while hr[lo30].0 < t - 30. {
                 lo30 += 1;
             }
-            total += seen.len() as f64 * (i - lo30) as f64 / 30.;
+            total += distinct as f64 * (i - lo30) as f64 / 30.;
             n += 1.;
         }
     }
@@ -266,11 +272,9 @@ fn shape_loads(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
 
 /// Each hand's presses by the gap since that hand's last press; shares of all presses.
 fn gap_profile(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> [f64; 4] {
-    let (mut out, mut n, mut last) = ([0.; 4], 0., [f64::NEG_INFINITY; 2]);
+    let (mut out, mut n, mut last, hm) = ([0.; 4], 0., [f64::NEG_INFINITY; 2], hand_masks(keys, centre_left));
     for &(t, mask) in rows {
-        let mut hands = [false; 2];
-        (0..keys).filter(|&c| mask >> c & 1 == 1).for_each(|c| hands[hand(c, keys, centre_left).0] = true);
-        for h in (0..2).filter(|&h| hands[h]) {
+        for h in (0..2).filter(|&h| mask & hm[h] != 0) {
             n += 1.;
             let mut below = 0.;
             for (b, &e) in GAP_EDGES.iter().enumerate() {
@@ -288,10 +292,9 @@ fn gap_profile(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> [f64; 4] 
 /// about +1 pp of accuracy lost on each such note against an adjacent chord at the same speed and size (2026-11-04).
 /// A chart-level hand-shape entropy (2 s, Hick–Hyman) was tried beside it and didn't help the fit (2026-11-04).
 fn gapped(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
-    let (mut total, mut split, mut last) = (0., 0., [f64::NEG_INFINITY; 2]);
+    let (mut total, mut split, mut last, hm) = (0., 0., [f64::NEG_INFINITY; 2], hand_masks(keys, centre_left));
     for &(t, mask) in rows {
-        let mut hands = [0u32; 2];
-        (0..keys).filter(|&c| mask >> c & 1 == 1).for_each(|c| hands[hand(c, keys, centre_left).0] |= 1 << c);
+        let hands = [mask & hm[0], mask & hm[1]];
         for h in 0..2 {
             if hands[h] == 0 {
                 continue;
@@ -307,16 +310,22 @@ fn gapped(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
     if total > 0. { split / total } else { 0. }
 }
 
+/// One `[f64; 2]` bin per `width` seconds from 0 up to the last offset (empty bins add exact zeros where a map skipped them).
+fn dense_bins(offsets: impl Iterator<Item = f64>, width: f64) -> Vec<[f64; 2]> {
+    vec![[0.; 2]; offsets.fold(0., f64::max).div_euclid(width) as usize + 1]
+}
+
 /// One hand carrying a 1 s stretch: |L − R| / (L + R), weighted by the stretch's notes squared so dense parts decide.
 fn hand_imbalance(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
-    let mut bins: std::collections::BTreeMap<i64, [f64; 2]> = std::collections::BTreeMap::new();
     let start = rows.first().map_or(0., |r| r.0); // bins from the first note: the chart's offset can't move them
+    let hm = hand_masks(keys, centre_left);
+    let mut bins = dense_bins(rows.iter().map(|r| r.0 - start), 1.);
     for &(t, mask) in rows {
-        let bin = bins.entry((t - start).floor() as i64).or_default();
-        (0..keys).filter(|&c| mask >> c & 1 == 1).for_each(|c| bin[hand(c, keys, centre_left).0] += 1.);
+        let bin = &mut bins[(t - start).floor() as usize];
+        (0..2).for_each(|h| bin[h] += (mask & hm[h]).count_ones() as f64);
     }
     let (mut num, mut den) = (0., 0.);
-    for [l, r] in bins.into_values() {
+    for [l, r] in bins {
         let n = l + r;
         num += n * (l - r).abs();
         den += n * n;
@@ -354,13 +363,13 @@ fn same_hand(a: usize, b: usize, keys: usize) -> bool {
 /// Sunny's same-column × cross-column coupling: per 0.5 s bin S = Σ 1/jack gap, X = Σ 1/gap of notes off the previous
 /// note's column, T = X/(X+S+1); √S·T^1.5 summed over √S summed: jack-heavy stretches that also move across columns.
 fn coupling(chart: &Chart, scale: f64) -> f64 {
-    let mut bins: std::collections::BTreeMap<i64, [f64; 2]> = std::collections::BTreeMap::new();
     let mut last = vec![f64::NEG_INFINITY; chart.keys];
     let (mut prev_t, mut prev_c) = (f64::NEG_INFINITY, usize::MAX);
     let start = chart.t.first().map_or(0., |t| t * scale);
+    let mut bins = dense_bins(chart.t.iter().map(|t| t * scale - start), 0.5);
     for n in 0..chart.len() {
         let (c, t) = (chart.col[n] as usize, chart.t[n] * scale);
-        let bin = bins.entry(((t - start) * 2.).floor() as i64).or_default();
+        let bin = &mut bins[((t - start) * 2.).floor() as usize];
         if t - last[c] <= 0.5 {
             bin[0] += 1. / (t - last[c]).max(FLOOR);
         }
@@ -371,7 +380,7 @@ fn coupling(chart: &Chart, scale: f64) -> f64 {
         (prev_t, prev_c) = (t, c);
     }
     let (mut num, mut den) = (0., 0.);
-    for [s, x] in bins.into_values() {
+    for [s, x] in bins {
         num += s.sqrt() * (x / (x + s + 1.)).powf(1.5);
         den += s.sqrt();
     }
@@ -382,10 +391,10 @@ fn coupling(chart: &Chart, scale: f64) -> f64 {
 /// (hand, bucket) pairs within ±0.75 s, averaged, /10.
 fn rhythm_variety(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
     let mut marks: Vec<(f64, i32)> = Vec::new();
-    let mut last = [f64::NEG_INFINITY; 2];
+    let (mut last, hm) = ([f64::NEG_INFINITY; 2], hand_masks(keys, centre_left));
     for &(t, mask) in rows {
         for h in 0..2 {
-            if (0..keys).any(|c| mask >> c & 1 == 1 && hand(c, keys, centre_left).0 == h) {
+            if mask & hm[h] != 0 {
                 let gap = t - last[h];
                 let bucket = if gap > LINK { -1 } else { ((gap.max(FLOOR) * 1000.).log2() * 4.).round() as i32 };
                 marks.push((t, bucket * 2 + h as i32));
@@ -393,21 +402,24 @@ fn rhythm_variety(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
             }
         }
     }
-    let (mut count, mut lo, mut hi, mut total) = (std::collections::HashMap::<i32, usize>::new(), 0, 0, 0.);
+    // (hand, bucket) counts in the ±0.75 s window, dense from the smallest key: no hashing per mark
+    let base = marks.iter().map(|m| m.1).min().unwrap_or(0);
+    let mut count = vec![0usize; marks.iter().map(|m| (m.1 - base) as usize + 1).max().unwrap_or(0)];
+    let (mut distinct, mut lo, mut hi, mut total) = (0usize, 0, 0, 0.);
     for i in 0..marks.len() {
         while hi < marks.len() && marks[hi].0 <= marks[i].0 + 0.75 {
-            *count.entry(marks[hi].1).or_default() += 1;
+            let e = &mut count[(marks[hi].1 - base) as usize];
+            distinct += usize::from(*e == 0);
+            *e += 1;
             hi += 1;
         }
         while marks[lo].0 < marks[i].0 - 0.75 {
-            let e = count.get_mut(&marks[lo].1).expect("counted");
+            let e = &mut count[(marks[lo].1 - base) as usize];
             *e -= 1;
-            if *e == 0 {
-                count.remove(&marks[lo].1);
-            }
+            distinct -= usize::from(*e == 0);
             lo += 1;
         }
-        total += count.len() as f64;
+        total += distinct as f64;
     }
     total / marks.len().max(1) as f64 / 10.
 }
@@ -415,11 +427,11 @@ fn rhythm_variety(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
 /// MinaCalc's Chaos: on each hand, the longer of two consecutive gaps over the shorter; how far it sits from a whole number
 /// (1:1, 2:1 read clean, 3:2 or 4:3 poly-ish), speed-weighted.
 fn gap_chaos(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
-    let (mut last, mut gap) = ([f64::NEG_INFINITY; 2], [f64::INFINITY; 2]);
+    let (mut last, mut gap, hm) = ([f64::NEG_INFINITY; 2], [f64::INFINITY; 2], hand_masks(keys, centre_left));
     let (mut total, mut chaos) = (0., 0.);
     for &(t, mask) in rows {
         for h in 0..2 {
-            if !(0..keys).any(|c| mask >> c & 1 == 1 && hand(c, keys, centre_left).0 == h) {
+            if mask & hm[h] == 0 {
                 continue;
             }
             let g = t - last[h];
@@ -440,6 +452,7 @@ fn gap_chaos(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
 /// gap, log2, √, ≤ 1, is how far the stream (not the jack) sets it. Here the jack's share, 1 − that, speed-weighted.
 fn jack_compensation(chart: &Chart, scale: f64) -> f64 {
     let keys = chart.keys;
+    let mates: Vec<Vec<usize>> = (0..keys).map(|c| (0..keys).filter(|&o| o != c && same_hand(o, c, keys)).collect()).collect();
     let mut last = vec![f64::NEG_INFINITY; keys];
     let (mut total, mut jack) = (0., 0.);
     for n in 0..chart.len() {
@@ -448,7 +461,7 @@ fn jack_compensation(chart: &Chart, scale: f64) -> f64 {
         if jd <= 0.5 {
             let weight = 1. / jd.max(FLOOR);
             total += weight;
-            let between = (0..keys).filter(|&o| o != c && same_hand(o, c, keys) && last[o] > last[c] && last[o] < t).map(|o| t - last[o]).fold(f64::INFINITY, f64::min);
+            let between = mates[c].iter().filter(|&&o| last[o] > last[c] && last[o] < t).map(|&o| t - last[o]).fold(f64::INFINITY, f64::min);
             if between.is_finite() {
                 jack += weight * (1. - (jd / between).log2().max(0.).sqrt().min(1.));
             }
@@ -512,11 +525,10 @@ fn flams(chart: &Chart, scale: f64) -> f64 {
 
 /// One-hand jump chains: a hand's row of ≥ 2 notes right after (≤ LINK) another ≥ 2-note row of that hand sharing a column.
 fn jump_chains(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
-    let (mut last, mut prev) = ([f64::NEG_INFINITY; 2], [0u32; 2]);
+    let (mut last, mut prev, hm) = ([f64::NEG_INFINITY; 2], [0u32; 2], hand_masks(keys, centre_left));
     let (mut total, mut chain) = (0., 0.);
     for &(t, mask) in rows {
-        let mut hands = [0u32; 2];
-        (0..keys).filter(|&c| mask >> c & 1 == 1).for_each(|c| hands[hand(c, keys, centre_left).0] |= 1 << c);
+        let hands = [mask & hm[0], mask & hm[1]];
         for h in 0..2 {
             if hands[h] == 0 {
                 continue;
@@ -565,17 +577,18 @@ fn ring_conflicts(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
 /// (Panzer 2021).
 fn hand_rates(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
     let start = rows.first().map_or(0., |r| r.0);
-    let mut bins: std::collections::BTreeMap<i64, [f64; 2]> = std::collections::BTreeMap::new();
+    let hm = hand_masks(keys, centre_left);
+    let mut bins = dense_bins(rows.iter().map(|r| r.0 - start), 1.);
     for &(t, mask) in rows {
-        let bin = bins.entry((t - start).floor() as i64).or_default();
+        let bin = &mut bins[(t - start).floor() as usize];
         for h in 0..2 {
-            if (0..keys).any(|c| mask >> c & 1 == 1 && hand(c, keys, centre_left).0 == h) {
+            if mask & hm[h] != 0 {
                 bin[h] += 1.;
             }
         }
     }
     let (mut total, mut slow) = (0., 0.);
-    for [l, r] in bins.into_values() {
+    for [l, r] in bins {
         total += l + r;
         if l >= 2. && r >= 2. {
             slow += l.min(r) * (1. - l.min(r) / l.max(r));

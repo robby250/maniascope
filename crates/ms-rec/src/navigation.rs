@@ -174,11 +174,20 @@ pub struct Performed {
     pub unavailable: bool,
 }
 
+/// The worker writes or downloads this pick into the client. `auto` off (Website charts: "look first", user 2026-11-06):
+/// nothing is downloaded; a website map and a website convert's original open in osu! instead. A convert of a map you
+/// have still arrives by itself: nothing to download.
+pub fn delivers(p: &Pick, auto: bool) -> bool {
+    !p.installed && if p.convert_of.is_some() { auto || !p.source_web } else { auto && p.set_id.is_some_and(|s| s > 0) }
+}
+
 /// copy/msg/sent; never starts the game or automatically changes mods.
-pub fn perform(p: &mut Pick, action: &str, client: &str) -> Performed {
-    if p.convert_of.is_some() && !p.installed {
-        return Performed { msg: format!("Converting to {}K…", p.keys), ..Performed::default() }; // the worker delivers it
+pub fn perform(p: &mut Pick, action: &str, client: &str, auto: bool) -> Performed {
+    if delivers(p, auto) {
+        // the worker delivers it
+        return Performed { msg: if p.convert_of.is_some() { format!("Converting to {}K…", p.keys) } else { "Downloading the map…".to_string() }, ..Performed::default() };
     }
+    let original = p.convert_of.is_some() && !p.installed; // a website convert, looked at first: its original opens
     if p.installed {
         let path = p.sha.as_deref().and_then(|s| crate::pp::chart_path(Some(s)));
         if path.is_none() {
@@ -191,7 +200,7 @@ pub fn perform(p: &mut Pick, action: &str, client: &str) -> Performed {
     let action = if ACTIONS.contains(&action) { action } else { "auto" };
     let bid = p.bid.filter(|&b| b > 0);
     // A known edited revision must never open the online original instead.
-    let trusted = bid.is_some() && p.online_match;
+    let trusted = bid.is_some() && (p.online_match || original);
     if action == "copy" || (action == "auto" && p.installed) || !trusted {
         let query = song_search(p, client);
         if query.is_empty() {
@@ -215,7 +224,11 @@ pub fn perform(p: &mut Pick, action: &str, client: &str) -> Performed {
     }
     // Auto still copies the search, so after downloading it can be pasted in song select (user 2026-10-09).
     let query = (action == "auto").then(|| song_search(p, client)).filter(|q| !q.is_empty());
-    let msg = format!("Sent beatmap link to osu! — choose Go to beatmap; mods unchanged{}", if query.is_some() { " · search copied, Ctrl+V in song select" } else { "" });
+    let msg = if original {
+        format!("Opened the original in osu! — download it, then ⋯ → Convert this map to {}K", p.keys)
+    } else {
+        format!("Sent beatmap link to osu! — choose Go to beatmap; mods unchanged{}", if query.is_some() { " · search copied, Ctrl+V in song select" } else { "" })
+    };
     Performed { copy: query, msg, sent: true, unavailable: false }
 }
 
@@ -240,6 +253,16 @@ mod tests {
         assert_eq!(field("title", "plain"), "title=\"plain\"!");
         assert_eq!(field("title", "a \"long part\" b"), "title=\"long part\"");
         assert_eq!(field("title", "  "), "");
+    }
+
+    #[test]
+    fn look_first_downloads_nothing_but_a_convert_of_a_map_you_have_still_arrives() {
+        let web = Pick { set_id: Some(5), ..Pick::default() };
+        let web_convert = Pick { convert_of: Some("s".into()), source_web: true, ..web.clone() };
+        let own_convert = Pick { convert_of: Some("s".into()), ..Pick::default() };
+        assert!(delivers(&web, true) && delivers(&web_convert, true) && delivers(&own_convert, true));
+        assert!(!delivers(&web, false) && !delivers(&web_convert, false) && delivers(&own_convert, false));
+        assert!(!delivers(&Pick { installed: true, ..web }, true));
     }
 
     #[test]

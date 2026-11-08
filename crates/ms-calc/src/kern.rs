@@ -7,7 +7,9 @@ pub fn v(d: f64, knee: f64, taper: f64) -> f64 {
     if d >= knee {
         return 1.0 / d;
     }
-    (d.max(0.0) / knee).powf(taper) / knee
+    let x = d.max(0.0) / knee;
+    // The tapers in use: a square and a root without a pow call.
+    (if taper == 2.0 { x * x } else if taper == 0.5 { x.sqrt() } else { x.powf(taper) }) / knee
 }
 
 #[inline]

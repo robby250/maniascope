@@ -191,8 +191,9 @@ fn hand_patterns() {
     // single-column jack is Jack (7K) / Jackspeed (4K); repeated chords are chordjack
     assert_eq!(top(&col(2, 150, 400), 7, 1), ["jack"]);
     assert_eq!(top(&col(2, 150, 400), 4, 1), ["jackspeed"]);
-    // an anchor with the other hand in between is still a jack in 7K (the hand repeats)
-    let anchor: Vec<Note> = (0..800i64).map(|i| (1000 + 120 * i, if i % 2 == 1 { 1 } else { (5 + (i / 2) % 2) as usize }, None)).collect();
+    // an anchor with the other hand in between is still a jack in 7K (the hand repeats); 200 ms repeats: since 21660e31a4f6
+    // slower 7K jacks cost less (JACK_P curve), and at 240 ms stamina of the 800-note run ranks above it
+    let anchor: Vec<Note> = (0..800i64).map(|i| (1000 + 100 * i, if i % 2 == 1 { 1 } else { (5 + (i / 2) % 2) as usize }, None)).collect();
     assert!(top(&anchor, 7, 2).contains(&"jack"));
     let cj = rows(&[&[0, 3, 4, 5], &[0, 2, 4, 6]], 160, 400);
     assert_eq!(top(&cj, 7, 1), ["chordjack"]);
@@ -260,7 +261,7 @@ fn ln_interaction() {
     // long hold's release 0.6 s before the next head: closer notes, not a longer hold, made it harder)
     let holds = |len: i64| -> Vec<Note> { (0..40).map(|i| (1000 + (len + 1600) * i, 3, Some(1000 + len + (len + 1600) * i))).collect() };
     let (long, short) = (sc(&holds(2400), 7).f("overall"), sc(&holds(1400), 7).f("overall"));
-    // 4ccede2d49cf: +2.4 % at 0.5★ from the fitted hold-share columns (no evidence under 3★); the old bound was ±0.12 stars
+    // 21660e31a4f6: +2.4 % at 0.5★ from the fitted hold-share columns (no evidence under 3★); the old bound was ±0.12 stars
     assert!(long <= short * 1.05, "{long} {short}");
     // tapping under a same-hand hold costs more than under an other-hand hold
     let under = |low: i64| -> Vec<Note> {

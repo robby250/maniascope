@@ -22,4 +22,5 @@ pub mod val;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-pub const CALC_ID: &str = "4ccede2d49cf";
+// A refit takes the sha256 of calib/difficulty.json; a rules-only change (labels, same stars) that of it plus the rule commit.
+pub const CALC_ID: &str = "09639faa6673";

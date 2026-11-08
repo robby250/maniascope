@@ -23,6 +23,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(include_str!("../../../calib/anchor.json")).unwrap();
         assert_eq!(v["calc"], crate::engine::CALC_ID, "rerun calib anchor for the new calculator");
         assert!(super::stars(7, 6.) < super::stars(7, 9.), "monotone");
-        assert!((super::stars(7, 6.7) - 5.16).abs() < 0.2, "{}", super::stars(7, 6.7));
+        // moves with each calc's fitted scale (21660e31a4f6: LN_BASE 30 raised 7K units, 5.16 → 4.92)
+        assert!((super::stars(7, 6.7) - 4.92).abs() < 0.2, "{}", super::stars(7, 6.7));
     }
 }

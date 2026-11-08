@@ -646,3 +646,58 @@ fn rows_carry_website_and_convert_badges() {
         assert!(b.rect().left() > 400., "badge at {:?}", b.rect());
     }
 }
+
+#[test]
+fn playlist_tabs_open_their_own_presets_and_the_wheel_only_scrolls_the_strip() {
+    let ctx = egui::Context::default();
+    let mut a = app(json!({"recommendation_mode": "skills", "skills_keys": [7], "practice_skills": ["ln"]}), &ctx);
+    a.s.playlists[0].0 = "Holds".into();
+    for n in 0..6 {
+        a.s.add_playlist(format!("Jacks {n}"));
+    }
+    a.set_skills(vec!["chordjack".into()]);
+    let mut h = Harness::builder().with_size(egui::vec2(300., 400.)).allow_missing_glyphs().build_ui_state(|ui, a: &mut App| a.playlist_ui(ui), a);
+    h.run();
+    h.get_by_label("Holds").click();
+    h.run();
+    assert_eq!((h.state().s.playlist, h.state().s.practice.clone()), (0, vec!["ln".to_string()]));
+    let before = h.get_by_label("PP").rect().left();
+    h.get_by_label("NPS").hover();
+    h.run();
+    for _ in 0..10 {
+        h.event(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0., -40.), phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel, modifiers: Default::default() });
+        h.step();
+    }
+    h.run();
+    assert!(h.get_by_label("PP").rect().left() < before, "the strip scrolled sideways");
+    assert_eq!((h.state().s.playlist, h.state().mode()), (0, "skills"), "the open tab stayed");
+}
+
+#[test]
+fn tabs_drag_like_browser_tabs_and_pp_moves_too() {
+    let ctx = egui::Context::default();
+    let mut a = app(json!({"recommendation_mode": "nps", "nps_keys": [7]}), &ctx);
+    a.s.playlists[0].0 = "Holds".into();
+    a.s.add_playlist("Jacks".into());
+    let mut h = Harness::builder().with_size(egui::vec2(600., 400.)).allow_missing_glyphs().build_ui_state(|ui, a: &mut App| a.playlist_ui(ui), a);
+    h.run();
+    let (pp, nps, jacks) = (h.get_by_label("PP").rect(), h.get_by_label("NPS").rect().left(), h.get_by_label("Jacks").rect().right());
+    let pointer = |h: &mut Harness<'_, App>, pos: egui::Pos2, pressed: Option<bool>| {
+        h.event(egui::Event::PointerMoved(pos));
+        if let Some(pressed) = pressed {
+            h.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+        }
+        h.step();
+    };
+    pointer(&mut h, pp.center(), Some(true));
+    for i in 1..=12 {
+        pointer(&mut h, pp.center() + egui::vec2((jacks - pp.center().x) * i as f32 / 12., 0.), None);
+    }
+    h.run_steps(20); // held: it keeps repainting
+    assert!(h.get_by_label("NPS").rect().left() < nps - 1., "the others slid aside while PP was held");
+    let end = pp.center() + egui::vec2(jacks - pp.center().x, 0.);
+    pointer(&mut h, end, Some(false));
+    h.run();
+    assert_eq!(h.state().s.tabs().last(), Some(&crate::settings::Tab::Mode("pp")), "PP dropped at the end");
+    assert!(h.get_by_label("PP").rect().left() > h.get_by_label("Jacks").rect().left());
+}

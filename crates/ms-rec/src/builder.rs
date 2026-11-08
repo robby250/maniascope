@@ -149,6 +149,7 @@ pub struct Request {
     pub tuning: skills::Tuning,
     pub converts: Vec<(i64, Vec<i64>)>, // this tab's enabled (target, source keymodes)
     pub mode: String,                  // nps, skills, or a tab that never waits for this
+    pub nps_weight: f64,               // the custom playlist's slider (≥ 0), 0 elsewhere
     pub revision: u64,
     pub generation: u64,
 }
@@ -236,7 +237,7 @@ impl Builder {
         let selected = skills::normalize(&r.selected_skills);
         let mut memo = Choices::new(order.clone(), Forecast { calc: r.calc.clone(), predictor: r.predictor.clone(), band_z: ms_model::predict::BAND_Z });
         let jobs: Vec<ScoreJob> = order.iter().map(|s| publish_job(s, &catalog[s], &r.public)).collect();
-        r.model.score_into(&mut memo, &tables, &store, &jobs, &selected, &r.tuning, r.target, r.rates, r.mode == "skills", skills::wants_vibro(&selected), !selected.is_empty(), ms_data::store::now())
+        r.model.score_into(&mut memo, &tables, &store, &jobs, &selected, &r.tuning, r.target, r.rates, r.mode == "skills", skills::wants_vibro(&selected), !selected.is_empty(), r.nps_weight, ms_data::store::now())
             .map_err(rusqlite::Error::InvalidParameterName)?;
         *self.store.write().unwrap() = store;
         Ok((Arc::new(memo.snapshot()), Arc::new(catalog)))
@@ -491,7 +492,7 @@ impl Builder {
         let forecast = Forecast { calc: r.calc.clone(), predictor: r.predictor.clone(), band_z: ms_model::predict::BAND_Z };
         let score = |choices: &mut Choices, shas: &[String], catalog: &HashMap<String, Arc<Inst>>, store: &FeatStore, now: f64| -> std::result::Result<(), String> {
             let jobs: Vec<ScoreJob> = shas.iter().filter_map(|s| catalog.get(s).map(|i| publish_job(s, i, &r.public))).collect();
-            r.model.score_into(choices, &tables, store, &jobs, &selected, &r.tuning, r.target, r.rates, skills_mode, skills::wants_vibro(&selected), !selected.is_empty(), now)
+            r.model.score_into(choices, &tables, store, &jobs, &selected, &r.tuning, r.target, r.rates, skills_mode, skills::wants_vibro(&selected), !selected.is_empty(), r.nps_weight, now)
         };
         let now = ms_data::store::now();
         // A play or refit re-predicts the whole library. The previous request's leading charts go first, so the shown
@@ -726,7 +727,8 @@ pub fn rank(prepared: &ms_model::choices::Prepared, catalog: &HashMap<String, Ar
         recent_families: recent.iter().rev().take(4).rev().filter_map(|a| a.text("family").map(str::to_string)).collect(),
         recent_profiles: recent.iter().filter_map(|a| a.a.get("profile")?.as_array().map(|p| p.iter().filter_map(Value::as_f64).collect())).collect(),
         current_keys: session.current_keys(), consumed: &consumed,
-        shuffle: inputs.seed.map(|s| (s, if mode == "nps" { inputs.focus } else { 0. })), count: Some(inputs.count), recent: inputs.recent, skill_weights: inputs.skill_weights,
+        // A custom playlist's slider at "off" (< 0): no shuffle, the best skill match first.
+        shuffle: inputs.seed.filter(|_| inputs.focus >= 0.).map(|s| (s, inputs.focus)), count: Some(inputs.count), recent: inputs.recent, skill_weights: inputs.skill_weights,
     });
     let picks = rows.into_iter().filter_map(|(i, value, weight, share)| {
         let mut p = prepared_pick(prepared, i, catalog, mode, inputs.selected_skills, store)?;

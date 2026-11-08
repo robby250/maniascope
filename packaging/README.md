@@ -11,5 +11,5 @@ Everything lands in `dist/` (gitignored). Nothing here uploads.
 
 Attach the two exes and `public-<calc>.msp` to a release of `robby250/maniascope`. Every calculator change needs a new
 `public-<calc>.msp`. The release tag must be `v<Cargo version>`: each app downloads its pack from its own tag. Releases
-after v1.6.0 carry only their own pack; v1.5.0 and older read `latest`, so v1.6.0 still carries 2f01, 65c0, 7cee, 8abe, 9148
-and v0.5.8's `.pkl`/`.so`, and later releases drop them.
+after v1.6.0 carry only their two exes and their own pack, never older packs (user 2026-11-06). v1.5.0 and older read
+`latest`, so from v1.6.1 on they find no pack until they update.

@@ -1,7 +1,7 @@
 //! The playlist window, its own so the main one can stay an OBS source: selected map, last play, the tabs and their settings.
 use crate::app::App;
 use crate::fmt::{self, keys_label};
-use crate::settings::{mode_name, MODES};
+use crate::settings::{mode_name, Tab};
 use crate::theme::{self, ACCENT, BORDER, CHIP_OFF, CHIP_ON, DIM};
 use eframe::egui::{self, containers::menu::{MenuButton, MenuConfig}, Color32, PopupCloseBehavior, RichText, ScrollArea, Sense, Stroke, Ui, UiBuilder};
 use ms_data::webmaps::web_dir;
@@ -502,14 +502,50 @@ impl App {
                     }
                 }
                 "skills" => {
+                    let i = self.s.playlist;
+                    ui.horizontal(|ui| {
+                        let label = ui.add_sized(egui::vec2(NAME, 16.), egui::Label::new("Name"));
+                        let mut name = self.s.playlists[i].0.clone();
+                        if ui.text_edit_singleline(&mut name).labelled_by(label.id).changed() && !name.trim().is_empty() {
+                            self.s.playlists[i].0 = name;
+                            self.request_save();
+                        }
+                    });
                     theme::section(ui, "SKILLS");
                     self.skill_picker(ui);
                     theme::section(ui, "MAPS");
                     self.key_picker(ui, mode);
                     self.acc_target(ui, mode);
                     self.rate_range(ui, mode);
+                    theme::section(ui, "MIX");
+                    let mut focus = self.s.skills_focus;
+                    let show = |v: f64| if v < 0. { "off".to_string() } else { focus_label(v) };
+                    if slider(ui, "Variety to high NPS", &mut focus, (crate::settings::FOCUS_OFF, 1., 0.05), 0., show, Some("Leftmost: off, the best skill match at your accuracy target first (with any skill: accuracy alone). Then from an even share of pattern types to the highest NPS maps.")) {
+                        self.s.skills_focus = if focus < 0. { crate::settings::FOCUS_OFF } else { focus.min(1.) };
+                        self.sync_rec();
+                    }
                     self.web_bias(ui, mode);
+                    self.web_button(ui);
                     self.converts(ui, mode);
+                    theme::section(ui, "PP MAPS IN THIS LIST");
+                    let mut changed = false;
+                    let m = &mut self.s.skills_mix;
+                    changed |= switch(ui, "Mix in likely PP gains", &mut m.on, Some("PP maps you are likely to beat now, between this playlist's maps."));
+                    if m.on {
+                        let mut every = m.every as f64;
+                        if slider(ui, "One PP map every", &mut every, (2., 8., 1.), d.mix.every as f64, |v| format!("{v:.0} picks"), None) {
+                            m.every = every as usize;
+                            changed = true;
+                        }
+                        changed |= stepped(ui, "Min gain", &mut m.min_gain, &[1., 2., 3., 5., 8., 10., 15.], d.mix.min_gain, pp_text, None);
+                        changed |= slider(ui, "Min chance", &mut m.chance, (0.2, 0.9, 0.05), d.mix.chance, pct, Some("Chance to beat your best, NM and DT. It already includes this session's form."));
+                        changed |= slider(ui, "Min chance (HT)", &mut m.ht_chance, (0.4, 0.95, 0.05), d.mix.ht_chance, pct, None);
+                    }
+                    if changed {
+                        self.sync_rec();
+                    }
+                    theme::section(ui, "PLAYLIST");
+                    self.delete_button(ui, i);
                 }
                 _ => {
                     theme::section(ui, "CHOICE");
@@ -580,7 +616,7 @@ impl App {
             if shown.is_empty() {
                 ui.vertical_centered(|ui| {
                     ui.add_space(24.);
-                    let head = if loaded { "Nothing to suggest yet.".to_string() } else { format!("Loading {} suggestions…", mode_name(mode)) };
+                    let head = if loaded { "Nothing to suggest yet.".to_string() } else { format!("Loading {} suggestions…", if mode == "skills" { self.s.playlists[self.s.playlist].0.as_str() } else { mode_name(mode) }) };
                     theme::dim(ui, if status.is_empty() { head } else { format!("{head}\n\n{status}") });
                 });
             }
@@ -675,12 +711,212 @@ impl App {
     }
 
     /// A tab's hover: what it draws from.
-    fn tab_tip(&self, m: &str) -> String {
+    fn tab_tip(&self, m: &str, playlist: Option<usize>) -> String {
+        if playlist.is_some_and(|i| i != self.s.playlist) {
+            return "Right-click: rename, duplicate, delete · drag to move".to_string(); // its settings are stored, not live
+        }
         let keys = keys_label(&self.s.keys[m]);
         if m == "pp" {
-            return format!("{keys} · maps likely to raise your pp");
+            return format!("{keys} · maps likely to raise your pp\nDrag to move");
         }
-        format!("{keys} · target {:.1}% · {} · {} shown", 100. * self.s.targets[m], rate_text(self.s.rates[m]), self.views[m].shown.len())
+        let more = if playlist.is_some() { "\nRight-click: rename, duplicate, delete · drag to move" } else { "\nDrag to move" };
+        format!("{keys} · target {:.1}% · {} · {} shown{more}", 100. * self.s.targets[m], rate_text(self.s.rates[m]), self.views[m].shown.len())
+    }
+
+    /// One tab; its cog when open. `playlist`: a custom playlist's index.
+    fn tab(&mut self, ui: &mut Ui, m: &'static str, name: &str, playlist: Option<usize>, mode: &str) -> egui::Response {
+        let active = !self.stats_open && m == mode && playlist.is_none_or(|i| i == self.s.playlist);
+        let tab = ui.add(egui::Button::selectable(active, name).sense(egui::Sense::click_and_drag())).on_hover_text(self.tab_tip(m, playlist));
+        if tab.clicked() {
+            self.set_stats(false);
+            if let Some(i) = playlist.filter(|i| *i != self.s.playlist) {
+                self.s.open_playlist(i);
+                self.clear_custom(format!("Loading {name}…"));
+                self.views.get_mut(m).expect("a tab").settings = false;
+                self.s.mode = m.to_string();
+                self.sync_rec();
+            } else {
+                self.set_mode(m);
+            }
+            if active {
+                self.views.get_mut(m).expect("a tab").settings = false; // back to the list, like the cog
+            }
+        }
+        if active {
+            let view = self.views.get_mut(m).expect("a tab");
+            // Painted, not laid out: a glyph this big as a button would make the row taller (user 2026-11-01).
+            let (rect, gear) = ui.allocate_exact_size(egui::vec2(GEAR + 4., tab.rect.height()), egui::Sense::click());
+            gear.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "⚙"));
+            let color = ui.style().interact_selectable(&gear, view.settings).text_color();
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "⚙", egui::FontId::proportional(GEAR), color);
+            if gear.on_hover_text("Settings for this tab").clicked() {
+                view.settings = !view.settings;
+            }
+        }
+        tab
+    }
+
+    /// PP, NPS and the custom playlists (in place of Skills, user 2026-11-06) in their saved order, then "+" and Stats. Every
+    /// tab drags like a browser tab (user 2026-11-08: "feel exactly like chrome tabs", PP and NPS too): the held tab follows
+    /// the pointer, the others slide aside to show where it lands, and on release it settles there.
+    fn tab_strip(&mut self, ui: &mut Ui, mode: &str) {
+        const SLIDE: f32 = 0.12; // seconds a tab takes to slide into its place
+        let tabs = self.s.tabs();
+        let names: Vec<String> = tabs.iter().map(|t| match t { Tab::Mode(m) => mode_name(m).to_string(), Tab::List(i) => self.s.playlists[*i].0.clone() }).collect();
+        // Stable across moves: kind and name, numbered among equal names.
+        let ids: Vec<egui::Id> = (0..tabs.len()).map(|k| {
+            let same = names[..k].iter().filter(|n| **n == names[k]).count();
+            ui.scope_id().with(("strip-tab", matches!(tabs[k], Tab::Mode(_)), names[k].as_str(), same))
+        }).collect();
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let pad = 2. * ui.spacing().button_padding.x;
+        let widths: Vec<f32> = ids.iter().zip(&names).map(|(id, name)| ui.ctx().data(|d| d.get_temp::<f32>(*id))
+            .unwrap_or_else(|| ui.painter().layout_no_wrap(name.clone(), font.clone(), Color32::WHITE).size().x + pad)).collect();
+        let gap = ui.spacing().item_spacing.x;
+        let total = widths.iter().sum::<f32>() + gap * tabs.len().saturating_sub(1) as f32;
+        let (strip, _) = ui.allocate_exact_size(egui::vec2(total, ui.spacing().interact_size.y), Sense::hover());
+        if self.open.drag.is_some_and(|d| d.0 >= tabs.len()) {
+            self.open.drag = None;
+        }
+        // Where each tab goes: with one held, the order it would drop into.
+        let mut order: Vec<usize> = (0..tabs.len()).collect();
+        let pointer = ui.input(|i| i.pointer.interact_pos());
+        let mut held = None;
+        if let (Some((from, grab)), Some(p)) = (self.open.drag, pointer) {
+            let x = (p.x - grab).clamp(strip.left(), strip.right() - widths[from]);
+            held = Some((from, x));
+            order.remove(from);
+            let (centre, mut cursor) = (x + widths[from] / 2., strip.left());
+            let at = order.iter().position(|&t| {
+                let before = centre < cursor + widths[t] / 2.;
+                cursor += widths[t] + gap;
+                before
+            }).unwrap_or(order.len());
+            order.insert(at, from);
+        }
+        let mut place = vec![0f32; tabs.len()];
+        let mut cursor = strip.left();
+        for &t in &order {
+            place[t] = cursor;
+            cursor += widths[t] + gap;
+        }
+        let mut sliding = false;
+        let mut drawn = order.clone();
+        if let Some((from, _)) = held {
+            drawn.retain(|&t| t != from);
+            drawn.push(from); // the held tab over the others
+        }
+        for k in drawn {
+            let x_id = ids[k].with("x");
+            let x = match held {
+                Some((from, x)) if from == k => ui.ctx().animate_value_with_time(x_id, x, 0.),
+                _ => ui.ctx().animate_value_with_time(x_id, place[k], SLIDE),
+            };
+            sliding |= (x - place[k]).abs() > 0.5;
+            let rect = egui::Rect::from_min_size(egui::pos2(x, strip.top()), egui::vec2(widths[k], strip.height()));
+            let mut child = ui.new_child(UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+            let (m, playlist) = match tabs[k] { Tab::Mode(m) => (m, None), Tab::List(i) => ("skills", Some(i)) };
+            let tab = self.tab(&mut child, m, &names[k], playlist, mode);
+            let width = child.min_rect().width();
+            if (width - widths[k]).abs() > 0.5 {
+                ui.ctx().data_mut(|d| d.insert_temp(ids[k], width));
+                ui.ctx().request_repaint();
+            }
+            if tab.drag_started() {
+                if let Some(p) = pointer {
+                    self.open.drag = Some((k, p.x - x));
+                }
+            }
+            if let Some(i) = playlist {
+                let name = names[k].clone();
+                tab.context_menu(|ui| {
+                    if ui.button("Rename").clicked() {
+                        self.open.rename = Some((i, name.clone()));
+                        ui.close();
+                    }
+                    if ui.button("Duplicate").clicked() {
+                        if i != self.s.playlist {
+                            self.s.open_playlist(i);
+                            self.clear_custom(String::new());
+                        }
+                        self.s.add_playlist(format!("{name} copy"));
+                        self.s.mode = "skills".into();
+                        self.sync_rec();
+                        ui.close();
+                    }
+                    self.delete_button(ui, i);
+                });
+            }
+        }
+        if let Some((from, _)) = self.open.drag {
+            if ui.input(|i| i.pointer.any_released()) {
+                self.open.drag = None;
+                let to = order.iter().position(|&t| t == from).unwrap_or(from);
+                if to != from {
+                    self.s.move_tab(from, to);
+                    self.request_save();
+                }
+            } else {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+        }
+        if sliding || self.open.drag.is_some() {
+            ui.ctx().request_repaint();
+        }
+        if ui.button("+").on_hover_text("A new playlist with the open playlist's settings").clicked() {
+            if self.mode() != "skills" {
+                let i = self.s.playlist;
+                self.s.open_playlist(i);
+            }
+            self.s.add_playlist(format!("Playlist {}", self.s.playlists.len() + 1));
+            self.s.mode = "skills".into();
+            self.set_stats(false);
+            self.views.get_mut("skills").expect("a tab").settings = true; // a new one starts at its settings
+            self.sync_rec();
+        }
+        if ui.selectable_label(self.stats_open, "Stats").clicked() {
+            self.set_stats(true);
+        }
+        if let Some((i, mut text)) = self.open.rename.take() {
+            let mut keep = true;
+            egui::Window::new("Rename playlist").collapsible(false).resizable(false).show(ui.ctx(), |ui| {
+                let label = ui.label("Name");
+                let edit = ui.text_edit_singleline(&mut text).labelled_by(label.id);
+                edit.request_focus();
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                        if let Some(p) = self.s.playlists.get_mut(i).filter(|_| !text.trim().is_empty()) {
+                            p.0 = text.trim().to_string();
+                            self.request_save();
+                        }
+                        keep = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        keep = false;
+                    }
+                });
+            });
+            if keep {
+                self.open.rename = Some((i, text));
+            }
+        }
+    }
+
+    /// Delete, asking once; the last playlist stays.
+    fn delete_button(&mut self, ui: &mut Ui, i: usize) {
+        let last = self.s.playlists.len() == 1;
+        let asked = self.open.delete == Some(i);
+        let label = if asked { "Click again to delete" } else { "Delete" };
+        if ui.add_enabled(!last, egui::Button::new(label)).on_disabled_hover_text("Keep at least one playlist").clicked() {
+            if asked {
+                self.open.delete = None;
+                self.s.remove_playlist(i);
+                self.clear_custom(String::new());
+                self.sync_rec();
+            } else {
+                self.open.delete = Some(i);
+            }
+        }
     }
 
     pub fn playlist_ui(&mut self, ui: &mut Ui) {
@@ -720,33 +956,12 @@ impl App {
             theme::block(ui, &lines.iter().cloned().zip([1, 1, 2]).collect::<Vec<_>>(), Some(tip));
         }
         ui.add_space(6.);
-        ui.horizontal(|ui| {
-            for m in MODES {
-                let active = !self.stats_open && m == mode;
-                let tab = ui.selectable_label(active, mode_name(m)).on_hover_text(self.tab_tip(m));
-                if tab.clicked() {
-                    self.set_stats(false);
-                    self.set_mode(m);
-                    if active {
-                        self.views.get_mut(m).expect("a tab").settings = false; // back to the list, like the cog
-                    }
-                }
-                if active {
-                    let view = self.views.get_mut(m).expect("a tab");
-                    // Painted, not laid out: a glyph this big as a button would make the row taller (user 2026-11-01).
-                    let (rect, gear) = ui.allocate_exact_size(egui::vec2(GEAR + 4., tab.rect.height()), egui::Sense::click());
-                    gear.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "⚙"));
-                    let color = ui.style().interact_selectable(&gear, view.settings).text_color();
-                    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "⚙", egui::FontId::proportional(GEAR), color);
-                    if gear.on_hover_text("Settings for this tab").clicked() {
-                        view.settings = !view.settings;
-                    }
-                }
-            }
-            if ui.selectable_label(self.stats_open, "Stats").clicked() {
-                self.set_stats(true);
-            }
+        // More tabs than room: the strip scrolls sideways under the mouse wheel; the open tab stays (user 2026-11-06).
+        ui.style_mut().always_scroll_the_only_direction = true;
+        egui::ScrollArea::horizontal().id_salt("tab-strip").scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
+            ui.horizontal(|ui| self.tab_strip(ui, mode));
         });
+        ui.style_mut().always_scroll_the_only_direction = false;
         ui.separator();
         // The one status line and bar for the whole window, at the bottom (user 2026-10-30: "Analysing" three times).
         let analysing = if self.stats_open || self.bg_progress.is_some() { None } else { self.views[mode].analysing.clone() };

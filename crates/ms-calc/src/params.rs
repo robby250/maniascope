@@ -129,7 +129,8 @@ knobs! {
     W_JACK_7K: f64 = 0.0,   // > 0: 7K alone takes this and the rest W_JACK (calculators before the revamp: 3.0 and 3.3)
     MIRROR_ALL: f64 = 1.0,  // 1: the partial-mirror jack rule on every keymode; 0: 7K only (before the revamp)
     CENTRE_SPLIT: f64 = 1.0, // 1: an odd keymode's middle key with each hand in turn, averaged; 0: execution gave it to the right hand, the bracket gate to neither
-    JACK_P: f64 = 0.5,
+    JACK_P: f64 = 0.5,      // on 4K; wider keymodes as (keys/4)^JACK_P_KEYS (open loop p8/p12: wide keys want a steeper jack speed curve)
+    JACK_P_KEYS: f64 = 1.0,
     W_IJACK: f64 = 0.4,
     JACK_SHARE: f64 = 0.7,
     MIRROR: f64 = 0.25,
@@ -140,13 +141,15 @@ knobs! {
     W_TECH: f64 = 0.3,
     W_SV: f64 = 2.8,
     W_REL: f64 = 0.50,
-    W_STAG: f64 = 0.30,
+    W_STAG: f64 = 0.0,
     W_HOLD_SAME: f64 = 0.30,
     W_HOLD_OTHER: f64 = 0.08,
     W_REPRESS: f64 = 0.30,
-    LN_BASE: f64 = 10.0,
+    LN_BASE: f64 = 30.0,    // own replays: LN sections played harder than charged on every keymode (open loop p9/p13; 10 before)
     ROW_SHARE: f64 = 0.3,
     FLAM: f64 = 0.045,
+    VF_JACK: f64 = 0.5,     // 0 → 1: a jacked note's finger-repeat factor fades out (its jack effort already scales with that speed); 4K value
+    VF_JACK_KEYS: f64 = 2.0, // VF_JACK scales as (4/keys)^this: the 4K gain, flat it cost 7K/10K (open loop p7/p11)
     V_FINGER: f64 = 6.0,    // a finger's own sustainable tap rate (finger-tapping studies: 5–7/s); replays: cost starts at 120–160 ms a column
     // Chord switching, measured on 5.2M notes of own replays at equal speed, width and play (docs/REPORT_2026-11-01_CHORD_SWITCH.md).
     W_GROUP: f64 = 0.5,     // each extra separate group of fingers in a hand's chord: `10110`, not `11100`
@@ -158,7 +161,7 @@ knobs! {
     W_SHAPES: f64 = 1.0,    // per doubling of the chord shapes a hand plays in 2 s past SHAPES_T
     SHAPES_T: f64 = 4.0,    // on 10K; narrower keymodes start later, as (10/keys)^SHAPES_KEYS
     SHAPES_KEYS: f64 = 2.0,
-    JACK_SHARE_KEYS: f64 = 2.0, // above 7K the chordjack discount falls as (7/keys)^this
+    JACK_SHARE_KEYS: f64 = -3.0, // above 7K the chordjack discount scales as (7/keys)^this; −3 grows it (own 10K replays: chordjacks overcharged, open loop p6/p10; 2 before)
     LOCAL_WINDOW: f64 = 2.0, // seconds of demand a note's local level reads (skills::local_levels)
     LOCAL_TOL: f64 = 1.75,   // the star scale of that level (it was the 2 s horizon's tolerance)
     BIN: f64 = 0.5,
@@ -196,9 +199,12 @@ knobs! {
     // The LN skills' shares (skills::attribute), set on the four 7K LN Dan practice packs (Less 2026-11-04) so each pack's maps
     // rate their own skill top: held share of column-time where Inverse starts and is full, staggered releases per release
     // where Release is full, technical share where Tech is full.
-    LN_INV_LO: f64 = 0.5,
-    LN_INV_HI: f64 = 0.6,
-    LN_REL_FULL: f64 = 1.0,
+    // 2026-11-07 (Less's Release sets 2102220/2435797/2501331, 25 7K + 17 4K diffs): Release 11/25 → 17/25 (7K), 3/17 → 14/17
+    // (4K), packs 34 → 35/48; ordinary 4K LN charts 0 → 13/150 Release (it was out of reach at 4K).
+    LN_INV_LO: f64 = 0.55,
+    LN_INV_HI: f64 = 0.65,
+    LN_REL_FULL: f64 = 0.9,
+    LN_REL_KEYS: f64 = 1.0, // Release full at LN_REL_FULL·(keys/7)^this: fewer fingers per hand hold fewer releases apart
     LN_TECH_FULL: f64 = 1.0,
     STAMINA_WINDOW: f64 = 60.0, // seconds of demand the stamina rating averages (skills::local_levels)
     SV_KIND_SHARE: f64 = 0.5,

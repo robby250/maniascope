@@ -227,7 +227,8 @@ fn needs_original(p: &Pick, db: &Db, stable: bool) -> bool {
 pub fn deliver(p: &Pick, db: &Db, client: &str, root: &Path, picked: Instant) -> std::result::Result<(), String> {
     let stage = |what: &str| eprintln!("convert {}: {what} at {} ms", p.title, picked.elapsed().as_millis()); // where the wait after Next goes
     stage("start");
-    let (source, set) = (p.convert_of.as_deref().ok_or("not a convert")?, p.set_id.unwrap_or(0));
+    let Some(source) = p.convert_of.as_deref() else { return deliver_website(p, client) };
+    let set = p.set_id.unwrap_or(0);
     let data = std::fs::read(source_path(source, p.source_web, root).ok_or("the source chart is gone")?).map_err(|e| e.to_string())?;
     let out = ms_convert::convert(&data, p.keys as usize).map_err(|e| e.to_string())?;
     if p.sha.as_deref() != Some(&hashes(&out.osu).0) {
@@ -282,6 +283,28 @@ pub fn deliver(p: &Pick, db: &Db, client: &str, root: &Path, picked: Instant) ->
         std::thread::sleep(Duration::from_millis(250));
     }
     stage("in osu!'s store");
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+/// A website chart that isn't a convert: its set from the mirror into the client, as a convert's original arrives
+/// (user 2026-11-06: natives opened osu://b for the in-game download while converts arrived by themselves).
+fn deliver_website(p: &Pick, client: &str) -> std::result::Result<(), String> {
+    let set = p.set_id.filter(|s| *s > 0).ok_or("no beatmap set id")?;
+    let path = import_dir(client)?.join(format!("{set}.osz"));
+    download(set, &path)?;
+    crate::navigation::hand_over(&path, client)?;
+    if client == "stable" {
+        return Ok(()); // stable imports the .osz from Songs on entering song select
+    }
+    // The website chart's sha is its .osu's: the set landed when lazer stores that file (an updated map never does).
+    let (wanted, start) = (paths::local_file(p.sha.as_deref().unwrap_or(""), &paths::lazer_data()).ok_or("no sha")?, Instant::now());
+    while !wanted.is_file() {
+        if start.elapsed() > CONFIRM {
+            return Err("osu! didn't import the map (is it running, or was it updated on the website?)".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
     let _ = std::fs::remove_file(&path);
     Ok(())
 }

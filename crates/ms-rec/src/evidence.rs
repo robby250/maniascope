@@ -268,7 +268,7 @@ pub fn play_levels(rows: &[&Evidence], now: f64) -> HashMap<i64, f64> {
 /// Row of the Personal fit: `y` and `base` chosen by the caller.
 pub fn personal_row(r: &Evidence, y: f64, base: f64) -> Row {
     Row {
-        keys: r.keys, y, base, t: r.t, ts: r.ts.unwrap_or(0.), public: r.src == "public", local: r.src == "realm" || r.src == "live", rd: r.rd,
+        keys: r.keys, y, base, t: r.t, ts: r.ts.unwrap_or(0.), public: r.src == "public", local: matches!(r.src.as_str(), "realm" | "live" | "stable"), rd: r.rd,
         completed: r.completed, chart: r.chart.clone(), rate: r.rate, rate3: round_digits(r.rate, 3), best: Best::Key(r.key.clone()),
         family: r.family.clone(), f: r.f,
     }
@@ -300,5 +300,15 @@ mod tests {
         let gap = level(&lazer) - level(&stable);
         // the same accuracies judged by stable are the better play: STABLE_LN_Y × the LN share (every note a hold; the shown model)
         assert!((0.15..0.25).contains(&gap), "level gap {gap}");
+    }
+
+    #[test]
+    fn stable_scores_are_the_players_own_plays() {
+        // Less 2026-11-08: stable scores weren't the player's own plays to the warm-up fit and session context, so a stable
+        // player never got a warm-up curve and every map paid the generic cold penalty (+0.26 in ln(1 − acc) over his 11
+        // tracked finishes; with his own curve +0.03).
+        let row = |src: &str| personal_row(&Evidence { y: 0., y_lazer: 0., keys: 7, t: 0., chart: "c".into(), sha: None, f: 0, src: src.into(), client: None, ts: Some(1.), b: None,
+                                                       rate: 1., key: "k".into(), rd: false, completed: true, ln: 0., overall: 1., family: "c".into() }, 0., 0.).local;
+        assert!(row("stable") && row("realm") && row("live") && !row("public"));
     }
 }

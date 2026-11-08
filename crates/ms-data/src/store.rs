@@ -47,7 +47,9 @@ pub fn carry_feats(db: &Db, from: &str, to: &str, after: &ms_calc::params::Param
     // A launch during a crawl repeats the carry, and a second source calculator repeats most rows: only the missing cost anything.
     let keys: Vec<String> = all.into_iter().filter(|k| !there.contains(&format!("{}|{to}", k.rsplit_once('|').map_or("", |n| n.0)))).collect();
     // A chart's rates sit together in key order, so its file is read and its convert remade once. Half the cores: the game may be up.
-    let threads = (std::thread::available_parallelism().map_or(2, |x| x.get()) / 2).max(1);
+    // MS_CARRY_THREADS: calibration boxes with no game use every core (the knob screens spend ~85 % of each run here).
+    let threads = std::env::var("MS_CARRY_THREADS").ok().and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| (std::thread::available_parallelism().map_or(2, |x| x.get()) / 2).max(1));
     let sha_of = |k: &str| k.rsplit_once('|').map_or(k, |n| n.0).rsplit_once('@').map_or("", |n| n.0).to_string();
     let charts: Vec<&[String]> = keys.chunk_by(|a, b| sha_of(a) == sha_of(b)).collect();
     CARRIED[1].fetch_add(charts.len(), std::sync::atomic::Ordering::Relaxed);

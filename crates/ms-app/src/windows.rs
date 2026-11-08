@@ -38,7 +38,7 @@ pub struct WebInfo {
     pub left: f64,
     pub done: f64,
     pub error: Option<String>,
-    pub reopen: Option<(String, Vec<i64>, Option<(f64, f64)>)>, // the batch closing the app paused: command, keymodes, ★
+    pub reopen: Option<(String, Vec<i64>, Option<(f64, f64)>, Vec<i64>)>, // the batch closing the app paused: command, keymodes, ★, statuses
 }
 
 #[derive(Default)]
@@ -51,10 +51,11 @@ pub struct WebView {
     ready: Option<i64>,
     keys: Option<HashSet<i64>>,
     stars: Option<(f64, f64)>,
+    statuses: Vec<i64>,
     saved: bool,
 }
 
-fn poll(mail: Mail, view: Option<(HashSet<i64>, Option<(f64, f64)>)>) {
+fn poll(mail: Mail, view: Option<(HashSet<i64>, Option<(f64, f64)>, Vec<i64>)>) {
     std::thread::spawn(move || {
         let read = || -> rusqlite::Result<WebInfo> {
             let db = webmaps::state_db()?;
@@ -62,7 +63,7 @@ fn poll(mail: Mail, view: Option<(HashSet<i64>, Option<(f64, f64)>)>) {
             let state = webmaps::state(&db);
             let p = state.get("progress").cloned().unwrap_or(Value::Null);
             let estimate = match view.as_ref().filter(|_| !running) {
-                Some((keys, stars)) => Some(webmaps::estimate(&db, keys, *stars, ms_rec::engine::CALC_ID)?),
+                Some((keys, stars, statuses)) => Some(webmaps::estimate(&db, keys, statuses, *stars, ms_rec::engine::CALC_ID)?),
                 None => None,
             };
             let num = |k: &str| p[k].as_i64().unwrap_or(0);
@@ -73,7 +74,7 @@ fn poll(mail: Mail, view: Option<(HashSet<i64>, Option<(f64, f64)>)>) {
             }
             let reopen = state.get("reopen").map(|_| {
                 let keys = state.get("want_keys").and_then(|v| v.as_array()).map_or_else(Vec::new, |a| a.iter().filter_map(Value::as_i64).collect());
-                (state.get("command").and_then(Value::as_str).unwrap_or("crawl").to_string(), keys, state.get("stars").and_then(|v| Some((v[0].as_f64()?, v[1].as_f64()?))))
+                (state.get("command").and_then(Value::as_str).unwrap_or("crawl").to_string(), keys, state.get("stars").and_then(|v| Some((v[0].as_f64()?, v[1].as_f64()?))), webmaps::wanted_statuses(&db))
             });
             Ok(WebInfo { disk: webmaps::disk_bytes() as f64, running, estimate, left, done, progress: p, error: None, reopen })
         };
@@ -99,7 +100,7 @@ impl App {
             return;
         }
         self.web.polling = true;
-        let view = self.open.web.then(|| (self.web.keys.clone().unwrap_or_default(), self.web.stars));
+        let view = self.open.web.then(|| (self.web.keys.clone().unwrap_or_default(), self.web.stars, self.web.statuses.clone()));
         poll(self.mail.clone(), view);
     }
 
@@ -110,8 +111,8 @@ impl App {
             self.q.put(Task::WebUpdated); // new website charts join the open playlist without a restart
         }
         self.web.ready = Some(ready);
-        if let Some((command, keys, stars)) = info.reopen.as_ref().filter(|_| !info.running && self.web.child.is_none()) { // the child clears the flag a moment after it starts
-            self.web_run(command, keys, *stars);
+        if let Some((command, keys, stars, statuses)) = info.reopen.as_ref().filter(|_| !info.running && self.web.child.is_none()) { // the child clears the flag a moment after it starts
+            self.web_run(command, keys, *stars, statuses);
             self.web.continued = true;
         }
         let child = self.web.child.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None)));
@@ -134,13 +135,14 @@ impl App {
         }
     }
 
-    fn web_run(&mut self, command: &str, keys: &[i64], stars: Option<(f64, f64)>) {
+    fn web_run(&mut self, command: &str, keys: &[i64], stars: Option<(f64, f64)>, statuses: &[i64]) {
         let Ok(exe) = std::env::current_exe() else { return };
         let _ = std::fs::create_dir_all(cache());
         let Ok(log) = std::fs::File::create(cache().join("webmaps.log")) else { return };
         let list = keys.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
         let mut c = Command::new(exe);
-        c.args(["--webmaps", command, "--keys", &list]);
+        let groups: Vec<&str> = webmaps::GROUPS.iter().filter(|g| g.1.iter().all(|s| statuses.contains(s))).map(|g| g.0).collect();
+        c.args(["--webmaps", command, "--keys", &list, "--status", &groups.join(",")]);
         if let Some((lo, hi)) = stars {
             c.args(["--stars", &format!("{lo}-{hi}")]);
         }
@@ -201,6 +203,11 @@ impl App {
                 let state = webmaps::state(&db);
                 self.web.keys = state.get("want_keys").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(Value::as_i64).collect());
                 self.web.stars = state.get("stars").and_then(|v| Some((v[0].as_f64()?, v[1].as_f64()?)));
+                // Ranked + loved unless a crawl chose otherwise: crawls from before the choice listed everything.
+                self.web.statuses = state.get("want_status").and_then(|v| v.as_array().map(|a| a.iter().filter_map(Value::as_i64).collect())).unwrap_or_default();
+            }
+            if self.web.statuses.is_empty() {
+                self.web.statuses = webmaps::statuses(&["ranked"]);
             }
             let chosen: HashSet<i64> = self.s.keys["nps"].iter().chain(&self.s.keys["skills"]).copied().collect();
             let keys = self.web.keys.get_or_insert(chosen).clone();
@@ -208,6 +215,10 @@ impl App {
             self.web_poll();
         }
         ui.label("Downloads the chart text (no audio) of maps you don't have from osu.direct, analyses it and adds those maps to the NPS and Skills playlists; Next then offers the download in osu!. Runs at low priority. Pause any time; closing ManiaScope pauses it too, and it continues where it stopped the next time you open the app.");
+        let mut auto = kv_get(&self.db, ms_rec::worker::AUTO_DOWNLOAD).and_then(|v| v.as_bool()).unwrap_or(true);
+        if ui.checkbox(&mut auto, "Next downloads maps I don't have").on_hover_text("On: a picked website map or website convert is downloaded and imported into osu! by itself.\nOff: Next opens the map in osu! so you can look at it first; a website convert opens its original, then ⋯ → Convert this map adds the convert.").changed() {
+            let _ = ms_data::store::kv_set(&self.db, ms_rec::worker::AUTO_DOWNLOAD, &Value::Bool(auto));
+        }
         let (running, phase) = self.web.info.as_ref().map_or((false, String::new()), |i| (i.running, i.progress["phase"].as_str().unwrap_or("").to_string()));
         let mut changed = false;
         let keys = self.web.keys.clone().unwrap_or_default();
@@ -219,6 +230,21 @@ impl App {
                     if ui.checkbox(&mut on, format!("{k}K")).changed() {
                         let set = self.web.keys.get_or_insert_default();
                         if on { set.insert(k); } else { set.remove(&k); }
+                        changed = true;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Status");
+                for (name, label, tip) in [("ranked", "Ranked + loved", "Ranked, approved, qualified and loved maps: a few minutes to list"),
+                                           ("unranked", "Unranked", "Pending, WIP and graveyard maps: most of the ~100k mania sets, about 15–30 min to list the first time")] {
+                    let group = webmaps::statuses(&[name]);
+                    let mut on = group.iter().all(|s| self.web.statuses.contains(s));
+                    if ui.checkbox(&mut on, label).on_hover_text(tip).changed() {
+                        self.web.statuses.retain(|s| !group.contains(s));
+                        if on {
+                            self.web.statuses.extend(&group);
+                        }
                         changed = true;
                     }
                 }
@@ -251,7 +277,7 @@ impl App {
                 if let Some(e) = &info.error {
                     ui.label(format!("Could not read the website chart state: {e}"));
                 } else if running && phase == "check" {
-                    let what = if p["full"].as_bool().unwrap_or(false) { "A keymode not listed yet needs the whole mania listing, once: about 15–30 min, and it continues from here if you pause or close." } else { "Only what changed since the last check." };
+                    let what = if p["full"].as_bool().unwrap_or(false) { "A keymode not listed yet needs the whole listing of the chosen statuses, once (unranked maps: about 15–30 min), and it continues from here if you pause or close." } else { "Only what changed since the last check." };
                     ui.label(format!("Checking osu.direct: {} map sets listed so far. {what}", i64n(num("sets"))));
                 } else if running {
                     if self.web.continued {
@@ -268,10 +294,11 @@ impl App {
                         lines.push("Paused.".to_string());
                     }
                     if !est.unlisted.is_empty() {
-                        lines.push(format!("{} not listed yet. Start first reads osu.direct's mania listing (about 15–30 min the first time, seconds after that), then downloads; Check only reads the listing, to see the size first.", keys_label(&est.unlisted)));
+                        let time = if self.web.statuses.contains(&-2) { "about 15–30 min the first time with unranked maps" } else { "a few minutes for ranked + loved" };
+                        lines.push(format!("{} not listed yet. Start first reads osu.direct's mania listing ({time}, seconds after that), then downloads; Check only reads the listing, to see the size first.", keys_label(&est.unlisted)));
                     }
-                    if selected.is_empty() {
-                        lines.push("Pick at least one keymode.".to_string());
+                    if selected.is_empty() || self.web.statuses.is_empty() {
+                        lines.push("Pick at least one keymode and one status.".to_string());
                     } else if est.fetch > 0 || est.analyse > 0 {
                         lines.push(format!("To do: {} charts to download (about {}) and {} to analyse, about {} on this PC.", i64n(est.fetch), fmt::size(est.new_bytes as f64), i64n(est.analyse), fmt::duration(est.seconds)));
                         lines.push(format!("On disk now {}, afterwards about {}. {} charts in this range are in the playlist already.", fmt::size(est.disk as f64), fmt::size(est.disk as f64 + est.new_bytes as f64), i64n(est.ready)));
@@ -283,7 +310,7 @@ impl App {
                     }
                     ui.label(lines.join("\n"));
                     // Start lists unchecked keymodes itself: a first run needs no separate Check (fresh install).
-                    go_ok = est.fetch > 0 || est.analyse > 0 || !est.unlisted.is_empty() || phase == "paused";
+                    go_ok = !self.web.statuses.is_empty() && (est.fetch > 0 || est.analyse > 0 || !est.unlisted.is_empty() || phase == "paused");
                 }
             }
         }
@@ -293,11 +320,11 @@ impl App {
                 if running {
                     let _ = std::fs::write(webmaps::web_dir().join("stop"), ""); // pauses after the current chart
                 } else {
-                    self.web_run("crawl", &selected, stars);
+                    self.web_run("crawl", &selected, stars, &self.web.statuses.clone());
                 }
             }
-            if ui.add_enabled(!running && !selected.is_empty(), egui::Button::new("Check for new charts")).clicked() {
-                self.web_run("check", &selected, None);
+            if ui.add_enabled(!running && !selected.is_empty() && !self.web.statuses.is_empty(), egui::Button::new("Check for new charts")).clicked() {
+                self.web_run("check", &selected, None, &self.web.statuses.clone());
             }
         });
     }
@@ -331,10 +358,15 @@ impl App {
                 self.toggle_overlay(on);
             }
         }
-        if ui.button("osu! profile…").on_hover_text("Your username: your public top 100 plays fill in bests that lazer doesn't have locally").clicked() {
-            self.open.profile = if self.open.profile.is_some() { None } else { Some(false) };
-            self.open.profile_text = kv_get(&self.db, "website_username").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
-        }
+        ui.horizontal(|ui| {
+            if ui.button("osu! profile…").on_hover_text("Your username: your public top 100 plays fill in bests that lazer doesn't have locally").clicked() {
+                self.open.profile = if self.open.profile.is_some() { None } else { Some(false) };
+                self.open.profile_text = kv_get(&self.db, "website_username").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+            }
+            if ui.button(self.web_label()).on_hover_text("Maps you don't have, from the osu! website, for the NPS and Skills playlists").clicked() {
+                self.open.web = true;
+            }
+        });
         if self.open.profile == Some(false) {
             self.profile_ui(ui);
         }
