@@ -233,7 +233,7 @@ fn stable_judged(key: &str, client: Option<&str>, mods: &Value) -> bool {
 }
 
 /// lazer judges a hold's head and tail apart; stable merges them into one judgement. Asking stable for both left 348 of
-/// iess's 441 plays out of the Stats line, most of their hard ones.
+/// a player's 441 plays out of the Stats line, most of their hard ones.
 fn completed(judged: i64, notes: f64, ln: f64, lazer: bool) -> bool {
     judged as f64 >= 0.95 * notes * if lazer { 1. + ln } else { 1. }
 }

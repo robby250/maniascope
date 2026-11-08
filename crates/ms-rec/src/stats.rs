@@ -25,7 +25,7 @@ const CALIBRATION_MIN: f64 = 20.;      // effective recent plays for a skill's o
 const PEAK_SHARE: f64 = 0.5;           // of a player's plays, measured against expectation; a raw accuracy cut would keep only the easy charts
 const GRIND: f64 = -0.15;              // log(1 − acc) a ground course gains on those plays: the user's 7K history lands on Gamma, their stated level
 const THIN_LINE: f64 = 5.;              // effective recent plays that can still carry the main keymode's slope
-const CARRY_LOSS: f64 = 0.25;           // Level lost per keymode going down: the user's and iess's pairs give no gap, so the smallest step
+const CARRY_LOSS: f64 = 0.25;           // Level lost per keymode going down: the user's and a player's pairs give no gap, so the smallest step
 const MIN_RECENT: f64 = 3.;             // charts, halved per year: below it and without a line of its own a keymode has no Level
 const MIN_CHARTS: usize = 10;          // charts before a skill gets a number (4K LN from 3 charts read "Yume+", user 2026-10-30)
 const HISTORY_BW: f64 = 1.;            // months: Gaussian smoothing of the monthly history (a peak month stays visible)
@@ -182,7 +182,7 @@ fn peak_line(points: &[(f64, f64, f64)], slope: Option<f64>) -> Option<(f64, f64
     let cut = quantile(&left, &points.iter().map(|p| p.2).collect::<Vec<_>>(), PEAK_SHARE);
     let best: Vec<(f64, f64)> = points.iter().zip(&left).filter(|x| *x.1 <= cut).map(|x| (x.0.2, *x.1)).collect();
     let kept: Vec<(f64, f64, f64)> = points.iter().zip(&left).filter(|x| *x.1 <= cut).map(|x| *x.0).collect();
-    // Too few plays to set a slope (iess's 4K read 15.9 on five): keep the line's, moved up to them.
+    // Too few plays to set a slope (a player's 4K read 15.9 on five): keep the line's, moved up to them.
     let (c, d) = steepened(&kept, fit_line(&kept), slope).unwrap_or((c + best.iter().map(|b| b.0 * b.1).sum::<f64>() / best.iter().map(|b| b.0).sum::<f64>(), d));
     Some((c + GRIND, d))
 }
