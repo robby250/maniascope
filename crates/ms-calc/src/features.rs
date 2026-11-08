@@ -58,7 +58,7 @@ pub const SKILLS: [&str; 38] = ["stream", "jumpstream", "handstream", "jackspeed
     "bracket", "jack", "ln", "release", "inverse", "hybrid", "shield", "sv", "technical", "vibro", "stamina",
     "dump", "jumptrill", "splittrill", "longjack", "patterntech", "rhythmtech", "trill1h", "anchor", "mash",
     "quadstream", "sv_fast", "sv_slow", "sv_accel", "sv_stutter", "sv_brake",
-    "ln_general", "ln_tech", "ln_inverse", "ln_release"]; // missing until 2026-11-06: every LN type read 0 charts (Less)
+    "ln_general", "ln_tech", "ln_inverse", "ln_release"]; // missing until 2026-11-06: every LN type read 0 charts (a player)
 
 /// calib/difficulty.json: the frozen chart-only calibration.
 pub fn standard_params() -> Params {
@@ -93,9 +93,9 @@ pub fn knobs_of(calc: &str) -> Value {
     // Newest first: (the last calculator before a rule change, the knobs it ran with). Older calculators take every later era's.
     let eras = [
         ("882ee20657e4", json!({"W_STAG": 0.3})), // before staggered releases stopped costing extra
-        ("21660e31a4f6", json!({"LN_INV_LO": 0.5, "LN_INV_HI": 0.6, "LN_REL_FULL": 1.0, "LN_REL_KEYS": 0})), // before Less's Release sets
+        ("21660e31a4f6", json!({"LN_INV_LO": 0.5, "LN_INV_HI": 0.6, "LN_REL_FULL": 1.0, "LN_REL_KEYS": 0})), // before a player's Release sets
         ("4ccede2d49cf", json!({"LN_BASE": 10, "JACK_SHARE_KEYS": 2, "JACK_P_KEYS": 0, "VF_JACK": 0, "VF_JACK_KEYS": 0})), // before the replay-found jack/LN constants
-        ("7cee1dfdba7f", json!({"LN_TECH_FULL": 0})), // before the LN skills (Less 2026-11-04): the knob only marks the change
+        ("7cee1dfdba7f", json!({"LN_TECH_FULL": 0})), // before the LN skills (a player 2026-11-04): the knob only marks the change
         ("a88aea03e865", json!({"ACC_POWER": 0})), // the peak model: its rules can't be recomputed, the knob only marks the change
         ("f9622a2b09c8", json!({"V_FINGER": 8})), // before the finger limit came from replays
         ("65c0a4cb63d6", json!({"W_JACK": 3.3, "W_JACK_KEYS": 0, "W_JACK_7K": 3.0, "MIRROR_ALL": 0, "CENTRE_SPLIT": 0, "V_FAST_KEYS": 2})), // before the revamp

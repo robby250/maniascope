@@ -397,7 +397,7 @@ fn slot<'a>(c: &'a Choice, skills: Option<&std::collections::HashMap<String, f64
 
 /// Weights with each slot's total mass divided out as focus falls, then its share applied. At focus 0 every slot has
 /// its share of the sampled list; at 1 the weights are untouched. Library proportions alone made low variety
-/// "doar chordstreams si brackets" (Less, 2026-10-31): those own the top of NPS, so a harder shuffle changed nothing.
+/// "doar chordstreams si brackets" (a player, 2026-10-31): those own the top of NPS, so a harder shuffle changed nothing.
 fn balanced(weights: &[f64], slots: &[((i64, &str), f64)], focus: f64) -> Vec<f64> {
     let mut mass: HashMap<(i64, &str), f64> = HashMap::default();
     for (w, s) in weights.iter().zip(slots) {

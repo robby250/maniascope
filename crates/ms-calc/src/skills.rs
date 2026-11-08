@@ -45,10 +45,10 @@ pub fn sk_of(p: P) -> Option<Sk> {
 
 pub const JACK_PARTS: [Sk; 3] = [Sk::chordjack, Sk::jack, Sk::jackspeed];
 pub const LN_KINDS: [Sk; 4] = [Sk::release, Sk::inverse, Sk::hybrid, Sk::shield];
-/// The LN skills a player sees, each defined so its own KomeijiDove 7K LN Dan practice pack (Less 2026-11-04) rates it top:
+/// The LN skills a player sees, each defined so its own KomeijiDove 7K LN Dan practice pack (a player 2026-11-04) rates it top:
 /// General (LN without a specialty), Tech, Inverse, Release. Shields stay as they were.
 pub const LN_SKILLS: [Sk; 4] = [Sk::ln_general, Sk::ln_tech, Sk::ln_inverse, Sk::ln_release];
-/// Rated for the families fit's LN columns (model::sr_vector), never shown: Hybrid was deleted (Less 2026-11-04), Release and
+/// Rated for the families fit's LN columns (model::sr_vector), never shown: Hybrid was deleted (a player 2026-11-04), Release and
 /// Inverse became ln_release/ln_inverse. Redefining these would move every chart's stars.
 pub const FIT_ONLY: [Sk; 3] = [Sk::release, Sk::inverse, Sk::hybrid];
 pub const SV_KINDS: [Sk; 5] = [Sk::sv_fast, Sk::sv_slow, Sk::sv_accel, Sk::sv_stutter, Sk::sv_brake];

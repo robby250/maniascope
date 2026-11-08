@@ -81,7 +81,7 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     res.set("sv", if chart.sv.is_empty() { "constant" } else if sv { "included" } else { "ignored" });
     if n < 2 {
         // The structure stamp marks the analysis current: without it a 0/1-note chart was analysed again forever and the
-        // library bar stopped short (Less 2026-11-06: "10,099 / 10,126" in every version).
+        // library bar stopped short (a player 2026-11-06: "10,099 / 10,126" in every version).
         res.set("structure", structure::structure(chart, rate, k));
         return Ok(res);
     }

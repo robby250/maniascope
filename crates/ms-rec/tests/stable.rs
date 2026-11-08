@@ -185,7 +185,7 @@ fn stable_library_scores_replays_and_units() {
     assert_eq!(db.query_row("SELECT COUNT(*) FROM replay_evidence", [], |r| r.get::<_, i64>(0)).unwrap(), 1, "only observed attempts");
     assert_eq!(archive_stable(&db, Some(&root)).unwrap(), 0, "idempotent");
 
-    // Offline plays count whatever name they were saved under (Less plays offline: 133 of his plays came in, 2026-11-06). A
+    // Offline plays count whatever name they were saved under (a player plays offline: 133 of their plays came in, 2026-11-06). A
     // watched replay of someone else is a submitted score (online id), under a name that never played here unsubmitted.
     add_live_score(&db, &live(&sha, 600000), false, None).unwrap();
     std::fs::write(root.join("scores.db"), scores_db(&md5, &[("me", stats, 812345, 64, 1_700_000_000, 0), ("me", stats, 700000, 0, 1_700_000_100, 0),

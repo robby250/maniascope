@@ -240,7 +240,7 @@ impl App {
 
     pub fn sync_rec(&mut self) {
         self.revision += 1;
-        // Settings apply at once; this answers "how do I refresh?" (Less, 2026-10-31).
+        // Settings apply at once; this answers "how do I refresh?" (a player, 2026-10-31).
         let mode = self.mode();
         if !self.s.keys[mode].is_empty() {
             self.views.get_mut(mode).expect("a tab").note = "Applied · updating the list…".into();

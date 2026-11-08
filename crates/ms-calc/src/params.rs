@@ -196,10 +196,10 @@ knobs! {
     INV_FULL: f64 = 1.5,
     HYB_FULL: f64 = 0.8,
     REL_FULL: f64 = 0.6,
-    // The LN skills' shares (skills::attribute), set on the four 7K LN Dan practice packs (Less 2026-11-04) so each pack's maps
+    // The LN skills' shares (skills::attribute), set on the four 7K LN Dan practice packs (a player 2026-11-04) so each pack's maps
     // rate their own skill top: held share of column-time where Inverse starts and is full, staggered releases per release
     // where Release is full, technical share where Tech is full.
-    // 2026-11-07 (Less's Release sets 2102220/2435797/2501331, 25 7K + 17 4K diffs): Release 11/25 → 17/25 (7K), 3/17 → 14/17
+    // 2026-11-07 (a player's Release sets 2102220/2435797/2501331, 25 7K + 17 4K diffs): Release 11/25 → 17/25 (7K), 3/17 → 14/17
     // (4K), packs 34 → 35/48; ordinary 4K LN charts 0 → 13/150 Release (it was out of reach at 4K).
     LN_INV_LO: f64 = 0.55,
     LN_INV_HI: f64 = 0.65,

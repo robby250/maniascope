@@ -461,7 +461,7 @@ impl Charts {
 
     pub fn chart(&self, sha: &str) -> Option<ms_calc::chart::Chart> {
         let web = ms_data::webmaps::web_dir().join("osu").join(format!("{sha}.osu"));
-        // Stable's store too: a stable player's charts all read as missing and kept the old calculator's analysis (Less
+        // Stable's store too: a stable player's charts all read as missing and kept the old calculator's analysis (a player
         // 2026-11-05: every LN skill at 0 charts, v1.4.0).
         let data = crate::pp::chart_path(Some(sha)).and_then(|p| std::fs::read(p).ok()).or_else(|| std::fs::read(web).ok()).or_else(|| crate::converts::bytes(self.converts.get(sha)?, &self.root))?;
         ms_calc::chart::parse(&data).ok()

@@ -332,7 +332,7 @@ pub fn card_top(res: &Dict, n: usize) -> Vec<Val> {
         if parts.iter().any(|p| used.contains(p)) || of.as_ref().is_some_and(|o| used.contains(o)) {
             continue;
         }
-        // An LN type is a slice of the LN rating, not a second skill (Less 2026-11-06: "LN 6.1 · LN General 4.6" read as two
+        // An LN type is a slice of the LN rating, not a second skill (a player 2026-11-06: "LN 6.1 · LN General 4.6" read as two
         // skills): the strongest type names the LN entry ("LN · General 6.1"), the rest stay off the card.
         if let [p] = parts.as_slice() {
             if LN_SKILLS.iter().any(|l| l.name() == p) {

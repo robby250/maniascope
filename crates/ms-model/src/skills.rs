@@ -33,7 +33,7 @@ fn member(key: &str, child: &'static str) -> &'static str {
 
 fn shared() -> [Skill; 7] {
     [
-        // Less 2026-11-04: Hybrid deleted; General/Tech/Inverse/Release each rate their own 7K LN Dan practice pack top
+        // A player, 2026-11-04: Hybrid deleted; General/Tech/Inverse/Release each rate their own 7K LN Dan practice pack top
         // (ms_calc::skills::attribute). The tree keys stay; a child's member is its own LN skill (`member`).
         family("ln", "LN", &["ln", "ln_general", "ln_tech", "ln_inverse", "ln_release", "shield"], &[
             ("general", "LN General", "Holds and taps without one dominant LN specialty."),
@@ -196,7 +196,7 @@ const LEGACY: [(&str, &[&str]); 16] = [
     ("bracket", &["chordstream/bracket"]),
     ("jumptrill", &["trills/jumptrill"]),
     ("splittrill", &["trills/splittrill"]),
-    // 2026-11-04 (Less): Hybrid LN deleted; its closest skill is LN Tech.
+    // 2026-11-04 (a player): Hybrid LN deleted; its closest skill is LN Tech.
     ("ln/hybrid", &["ln/tech"]),
 ];
 

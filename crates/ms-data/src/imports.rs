@@ -276,7 +276,7 @@ pub fn import_stable(db: &Db, root: Option<&Path>) -> R<Imported> {
     // no plays yet: stable writes scores.db on the first one
     let raw = std::fs::read(root.join("scores.db")).map_err(|e| e.to_string()).and_then(|b| stable::scores(&b)).unwrap_or_default();
     // The player's names: the account's, any name that owns a play this app saw live, and any name with a play never
-    // submitted (offline plays carry whatever name was typed; Less, offline: 133 of his plays came in, 2026-11-06). A watched
+    // submitted (offline plays carry whatever name was typed; a player, offline: 133 of their plays came in, 2026-11-06). A watched
     // replay of someone else is a submitted score under a name that never played here unsubmitted, so it stays out.
     let live = |s: &stable::Score| md5_sha.get(&s.md5).is_some_and(|sha| {
         let key = stable_key(sha, s.score as i64, &s.stats.map(i64::from));

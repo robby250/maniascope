@@ -18,7 +18,7 @@ const STABLE_MODS: i64 = 1 | 8 | 64 | 256 | 512 | 1024 | 1048576 | 1073741824 | 
 /// same 1,224 own lazer replays re-judged by stable's rule (`calib replay_review` stable_stats, 2026-11-05) had log(1 − acc)
 /// higher by these × the chart's LN share; held-out MAE on charts over 30 % LN .20 pp (display) and .27 (acc320), against
 /// .59 and 1.13 unconverted. A stable result is evidence in lazer units after this, on any LN share. It replaced a filter
-/// that dropped stable plays above 35 % LN, which kept a stable LN player's level on rice (Less 2026-11-04: target 90 %,
+/// that dropped stable plays above 35 % LN, which kept a stable LN player's level on rice (a player 2026-11-04: target 90 %,
 /// "tot pot face 95", level never moved).
 pub const STABLE_LN_Y: f64 = 0.186; // lazer's displayed accuracy
 pub const STABLE_LN_Y320: f64 = 0.281; // acc320
@@ -291,7 +291,7 @@ mod tests {
 
     #[test]
     fn a_stable_ln_player_is_rated_on_their_ln_plays_in_lazer_units() {
-        // Less 2026-11-04: stable plays on charts over 35 % LN were dropped, so a stable LN player's level never moved. Every
+        // A player, 2026-11-04: stable plays on charts over 35 % LN were dropped, so a stable LN player's level never moved. Every
         // stable LN play now counts, converted to lazer units (stable judges each hold once from head + release, harsher).
         use crate::testkit::{engine, osu_ln, played_on, spread, World};
         let ln = |i: usize| osu_ln(7, 150. - 4. * i as f64, i);
@@ -304,9 +304,9 @@ mod tests {
 
     #[test]
     fn stable_scores_are_the_players_own_plays() {
-        // Less 2026-11-08: stable scores weren't the player's own plays to the warm-up fit and session context, so a stable
-        // player never got a warm-up curve and every map paid the generic cold penalty (+0.26 in ln(1 − acc) over his 11
-        // tracked finishes; with his own curve +0.03).
+        // A player, 2026-11-08: stable scores weren't the player's own plays to the warm-up fit and session context, so a stable
+        // player never got a warm-up curve and every map paid the generic cold penalty (+0.26 in ln(1 − acc) over their 11
+        // tracked finishes; with their own curve +0.03).
         let row = |src: &str| personal_row(&Evidence { y: 0., y_lazer: 0., keys: 7, t: 0., chart: "c".into(), sha: None, f: 0, src: src.into(), client: None, ts: Some(1.), b: None,
                                                        rate: 1., key: "k".into(), rd: false, completed: true, ln: 0., overall: 1., family: "c".into() }, 0., 0.).local;
         assert!(row("stable") && row("realm") && row("live") && !row("public"));

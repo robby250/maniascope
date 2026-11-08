@@ -279,7 +279,7 @@ impl App {
 
     /// How often this tab suggests website charts (maps you don't have) next to your own.
     fn web_bias(&mut self, ui: &mut Ui, mode: &str) {
-        // Without website charts it can change nothing (Less, 2026-10-31: set "Never", saw no difference).
+        // Without website charts it can change nothing (a player, 2026-10-31: set "Never", saw no difference).
         let have = web_dir().join("web.msp").is_file() || web_dir().join("web.pkl").is_file();
         let tip = if have { "Website charts (Website charts…): their share of your picks. Middle: half. Right end: 80 %. Left end: never, only maps you own." } else { "Nothing to mix yet: add charts with Website charts… on the NPS tab. Until then every pick is a map you own." };
         let mut v = self.s.web_bias[mode];

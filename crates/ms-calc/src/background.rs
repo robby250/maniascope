@@ -2,7 +2,7 @@
 //! scheduling never changes a result.
 
 /// Background work yields to the game and the UI: nice 10 on Unix, background mode on Windows (lowest CPU, I/O and memory
-/// priority; below-normal alone still cost osu!stable's frame rate, Less 2026-11-05: 960 → 348 fps while analysing).
+/// priority; below-normal alone still cost osu!stable's frame rate, a player 2026-11-05: 960 → 348 fps while analysing).
 fn lower_priority() {
     #[cfg(unix)]
     unsafe {
