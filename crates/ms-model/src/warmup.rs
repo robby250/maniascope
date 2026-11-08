@@ -27,10 +27,17 @@ fn median(mut v: Vec<f64>) -> f64 {
     if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2. }
 }
 
+/// The user's fitted 7K warm-up amplitudes per family (Consts::families order).
+const DEFAULT_AMPLITUDES: [f64; 8] = [0.07382986184278191, 0.12960057492617003, 0.1713297402405536, 0.11931279925705524, 0.11691373965623665,
+    0.11193472522823102, 0.11193472522823102, 0.1132153120098264];
+
 /// The pooled curve of a keymode too sparse to identify its own, from the constant-response control (warmup.models).
 fn pooled(modes: &HashMap<i64, Mode>, families: usize) -> Mode {
     if modes.is_empty() {
-        return Mode { tau: 8., log_rate: true, amplitudes: vec![CAPACITY_PRIOR; families], session: 0., fatigue: 0. };
+        // A player without a fit of their own gets the user's own 7K curve (user 2026-11-08: "make the default warmup curve be
+        // the same as my custom warmup curve"; fitted on 422 sessions, 898 cold rows, G835LX 2026-11-08).
+        let amplitudes = if families == DEFAULT_AMPLITUDES.len() { DEFAULT_AMPLITUDES.to_vec() } else { vec![CAPACITY_PRIOR; families] };
+        return Mode { tau: 1., log_rate: true, amplitudes, session: 0.09097194700514105, fatigue: 0.020472369594539724 };
     }
     let all: Vec<&Mode> = modes.values().collect();
     Mode {

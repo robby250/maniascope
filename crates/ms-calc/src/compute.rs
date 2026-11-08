@@ -192,6 +192,7 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     let switch = series.remove(Sk::switch);
     series_dict_scores(&mut sc, &series, &judged, keys, prm, &mut rated, None);
     res.set("archetypes", Val::List(card::archetypes(&series, &sc, &judged, keys, &switch, k)));
+    res.set("type_share", card::type_shares(&series));
     res.set("tech_where", Val::List(card::tech_where(&series, &parts, chart.t[0] / 1000.0, rate, k)));
     let sv_tot = py::sum(parts.get(P::sv).iter().copied());
     if sv_tot != 0.0 {
@@ -315,7 +316,6 @@ pub fn compute(chart: &Chart, rate: f64, sv: bool, prm: &Params) -> Result<Dict,
     let mut result = compute_inner(chart, rate, sv, &mut Shared::default(), prm)?;
     let mut ap = Dict::new();
     ap.set("version", 3i64);
-    ap.set("ln_chordstream", if prm.off("archetype_profile") { 0.0 } else { card::profile(chart, rate) });
     result.set("archetype_profile", ap);
     Ok(result)
 }

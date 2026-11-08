@@ -95,7 +95,7 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(rolling().join("active.json"), serde_json::json!({"name": "fixture"}).to_string()).unwrap();
         let save = |calc: &str, version| write(&folder.join("public.msp"), &Meta { calc: calc.into(), pop: Population { version, ..Population::default() }, ..Meta::default() }, &[]).unwrap();
-        let h = Hooks { emit: Arc::new(|_| {}), busy: Arc::new(|| false), game: Arc::new(|| false) };
+        let h = Hooks { emit: Arc::new(|_| {}), busy: Arc::new(|| false), game: Arc::new(|| false), list_open: Arc::new(|| true) };
         save("not-this", ms_data::public::POP_VERSION);
         let refused = load(&h).err().unwrap_or_default();
         assert!(refused.contains("could not download"), "{refused}");

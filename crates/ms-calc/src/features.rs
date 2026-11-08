@@ -92,6 +92,7 @@ pub fn knobs_of(calc: &str) -> Value {
     use serde_json::json;
     // Newest first: (the last calculator before a rule change, the knobs it ran with). Older calculators take every later era's.
     let eras = [
+        ("09639faa6673", json!({"RATE_G": 0.12})), // before the extra rate factor on the ratings was dropped
         ("882ee20657e4", json!({"W_STAG": 0.3})), // before staggered releases stopped costing extra
         ("21660e31a4f6", json!({"LN_INV_LO": 0.5, "LN_INV_HI": 0.6, "LN_REL_FULL": 1.0, "LN_REL_KEYS": 0})), // before a player's Release sets
         ("4ccede2d49cf", json!({"LN_BASE": 10, "JACK_SHARE_KEYS": 2, "JACK_P_KEYS": 0, "VF_JACK": 0, "VF_JACK_KEYS": 0})), // before the replay-found jack/LN constants
@@ -245,11 +246,17 @@ pub fn features_of(res: &Dict, prm: &Params) -> Dict {
 
 /// (lazer stars, judgement count) at a ranked rate; None for a chart rosu-pp cannot read.
 fn lazer_stars(map: &rosu_pp::Beatmap, rate: f64) -> Option<(f64, u32)> {
-    let mods = if rate == 0.75 { 256 } else if rate == 1.5 { 64 } else if rate == 1. { 0 } else { return None };
-    match rosu_pp::Difficulty::new().mods(mods).lazer(true).calculate(map) {
+    let mods = if rate == 0.75 { 256 } else if rate == 1.5 { 64 } else { 0 };
+    let d = rosu_pp::Difficulty::new().mods(mods).lazer(true);
+    match if [0.75, 1., 1.5].contains(&rate) { d } else { d.clock_rate(rate) }.calculate(map) {
         rosu_pp::any::DifficultyAttributes::Mania(a) => Some((a.stars, a.n_objects + a.n_hold_notes)),
         _ => None,
     }
+}
+
+/// lazer's star rating and hit count of a chart at any rate (the card's pp at a rate the analysis didn't star).
+pub fn stars_at(data: &[u8], rate: f64) -> Option<(f64, u32)> {
+    lazer_stars(&rosu_pp::Beatmap::from_bytes(data).ok()?, rate)
 }
 
 /// {rate: features} of one chart's bytes.
@@ -324,6 +331,17 @@ mod shared_tests {
         model["joint"]["limit"] = serde_json::json!(0.1);
         assert_ne!(Params::new(model, &Value::Null).unwrap().id(), prm.id());
         assert_eq!(standard_params().id(), prm.id());
+        // Stars at any rate (the card's pp), between the rated rates and equal to them on them.
+        let (s1, s15, s11) = (stars_at(text.as_bytes(), 1.).unwrap().0, stars_at(text.as_bytes(), 1.5).unwrap().0, stars_at(text.as_bytes(), 1.1).unwrap().0);
+        assert!(s1 < s11 && s11 < s15, "{s1} {s11} {s15}");
+        assert_eq!(stars_at(text.as_bytes(), 1.5).unwrap().0, rosu_stars_dt(text.as_bytes()));
+    }
+
+    fn rosu_stars_dt(data: &[u8]) -> f64 {
+        match rosu_pp::Difficulty::new().mods(64).lazer(true).calculate(&rosu_pp::Beatmap::from_bytes(data).unwrap()) {
+            rosu_pp::any::DifficultyAttributes::Mania(a) => a.stars,
+            _ => unreachable!(),
+        }
     }
 }
 

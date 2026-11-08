@@ -182,7 +182,8 @@ impl App {
                 let family = if r >= 0.85 && i < 2 { egui::FontFamily::Name("bold".into()) } else { egui::FontFamily::Proportional };
                 TextFormat { font_id: FontId::new(BODY * (0.70 + 0.55 * f), family), color: TEXT.gamma_multiply(0.55 + 0.45 * f), ..TextFormat::default() }
             };
-            let text = |i: usize| format!("{} {:.1}", a.entries[i].name, ms_rec::shown::stars(a.keys, a.entries[i].rating));
+            // Names only, sized by rating: the overall is the card's one number, skill stars are in Details (user 2026-11-09).
+            let text = |i: usize| a.entries[i].name.clone();
             let width = ui.available_width();
             let row = |range: std::ops::Range<usize>| {
                 let mut j = LayoutJob::default();

@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 /// recommend.predictor_id of the model the Rust port reproduces: forecasts stay comparable across the port. A change to
 /// the prediction model takes a new id, so old forecasts are not read as this model's.
 pub const PREDICTOR_ID: &str = "6d720089aed6"; // mash floor (2026-11-06); was 86660d70dccc
-pub const CALC_ID: &str = "09639faa6673";
+pub const CALC_ID: &str = "d3a86f7b014f";
 /// Differ from CALC_ID in calibration only (calib/carry.json), newest first: a crawl still running holds the website rows back a whole
 /// calculator, so those can start older than the library's. Each carry keeps its source row.
 pub const CARRIED_CALCS: [&str; 10] = ["2f01eca5e738", "7cee1dfdba7f", "a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f"];
@@ -138,6 +138,7 @@ pub struct Card {
     pub skill: Option<String>,
     pub nps: Option<f64>,
     pub pp: Option<(f64, f64, Option<f64>, f64, f64)>, // pp_lo, pp_hi, best, gain, p_up
+    pub pp_expected: Option<f64>, // shown on every map with stars, unranked too
     pub plays_like: Option<(f64, i64)>,
 }
 
@@ -327,7 +328,10 @@ impl Engine {
         let approved = b.and_then(|b| self.public.map_info(b)).is_some_and(|m| RANKED_STATUS.contains(&m.approved));
         let stars = f.get("stars").map(Val::f).or_else(|| b.and_then(|b| self.public.feature(b, round_digits(rate, 3)))
             .and_then(|v| if let Val::Dict(d) = v { d.get("stars").map(Val::f) } else { None }));
-        let hits = f.get("hits").map(Val::f).unwrap_or_else(|| f.fget("notes", 0.));
+        // Off 0.75×/1×/1.5× the analysis has no stars: computed here for the card's pp (user 2026-11-08: 1.10× showed none).
+        let at = if stars.is_none() { ms_calc::features::stars_at(&data, rate) } else { None };
+        let stars = stars.or(at.map(|a| a.0));
+        let hits = f.get("hits").map(Val::f).or(at.map(|a| f64::from(a.1))).unwrap_or_else(|| f.fget("notes", 0.));
         let ranked = (approved || inst.as_ref().is_some_and(|i| i.status.is_some_and(|s| RANKED_STATUS.contains(&s)))) && [0.75, 1., 1.5].contains(&round_digits(rate, 2)) && stars.is_some();
         let meta = if inst.is_none() { ms_data::lazer_index::metadata(path) } else { None };
         let get = |k: &str| meta.as_ref().and_then(|m| m.get(k).cloned());
@@ -341,7 +345,7 @@ impl Engine {
         let plays_like = self.plays_like(&f, b, rate);
         let nps = f.dict("nps").map(|d| d.f("nps"));
         Ok(Some(Card { bid, md5, keys: feats.keys, title, var: rate_label_pp(rate), rate, ranked, artist, song, version, acc_mid: e.shown.acc_mid, acc_lo: e.shown.acc_lo, acc_hi: e.shown.acc_hi, sure: self.own_plays(feats.keys) >= SURE_PLAYS,
-                       form: n.session.form_state(feats.keys), length: f.f("length") / 1000. / rate, skill: top_skill(&f), nps, pp, plays_like }))
+                       form: n.session.form_state(feats.keys), length: f.f("length") / 1000. / rate, skill: top_skill(&f), nps, pp, pp_expected: stars.map(|s| crate::pp::expected(&e.pp, s, hits)), plays_like }))
     }
 
     /// (stars, scores) the public scores say a chart plays like at this rate, its stars moved by its map effect; None

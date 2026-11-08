@@ -212,6 +212,7 @@ pub struct Hooks {
     pub emit: Arc<dyn Fn(Out) + Send + Sync>,
     pub busy: Check, // a map is being played
     pub game: Check, // the game is running
+    pub list_open: Check, // the playlist window is open: lists are built and published only then (user 2026-11-08)
 }
 
 struct BuildSlot {
@@ -523,7 +524,7 @@ impl Worker {
             let mut builder = Builder::new(store, prm);
             let (s, stop) = (slot.clone(), halt.clone());
             builder.wanted = Arc::new(move || stop.load(Ordering::Relaxed) || s.request.lock().unwrap().is_some());
-            builder.busy = h.busy.clone();
+            builder.busy = { let (b, o) = (h.busy.clone(), h.list_open.clone()); Arc::new(move || b() || !o()) }; // a closed window pauses a running build
             builder.game = h.game.clone();
             let out = q.clone();
             builder.emit = Arc::new(move |u| out.put(Task::NpsUpdate(u)));
@@ -635,7 +636,7 @@ impl Worker {
 
     fn publish(&mut self, mode: Option<String>) -> Result<()> {
         let Some(rec) = self.rec.as_ref() else { return Ok(()) };
-        if self.stats_visible {
+        if self.stats_visible || !(self.h.list_open)() {
             return Ok(());
         }
         // The player's level is still unknown: an empty list says why, not beginner maps.
@@ -964,7 +965,7 @@ impl Worker {
     }
 
     fn request_nps(&mut self) {
-        if self.rec.is_none() {
+        if self.rec.is_none() || !(self.h.list_open)() {
             return;
         }
         self.local_request += 1;

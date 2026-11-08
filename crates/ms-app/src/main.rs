@@ -17,6 +17,7 @@ use eframe::egui::{self, ViewportBuilder};
 use ms_data::paths::cache;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::Ordering;
 
 const INSTANCE_PORT: u16 = 24051; // a second launch raises the first instance's window
 
@@ -153,6 +154,9 @@ impl eframe::App for Shell {
         };
         egui::CentralPanel::default().frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 2 })).show(ui, |ui| app.main_ui(ui));
         app.track_window(&ctx);
+        if app.list_open.swap(app.s.recs_open, Ordering::Relaxed) != app.s.recs_open && app.s.recs_open {
+            app.q.put(ms_rec::worker::Task::Refresh); // closed, nothing was built: catch up now
+        }
         if !app.s.recs_open {
             app.recs_opened = None;
         } else {

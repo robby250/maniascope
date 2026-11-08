@@ -1,5 +1,4 @@
 //! Archetypes, Technical passages, card entries and descriptions (skill_calc + archetype_names).
-use crate::chart::Chart;
 use crate::demand::{Parts, P};
 use crate::params::Knobs;
 use crate::pattern::technical_title;
@@ -26,6 +25,42 @@ const STAMINA_NAMES: [(Sk, &str); 18] = [
     (Sk::ln_tech, "LN Stamina"), (Sk::ln_general, "LN Stamina"), (Sk::ln, "LN Stamina"),
 ];
 const TECH_CONTROL: &str = "Tech Control";
+/// Skills with types: (type skill, family, type). Every family reads "Family · Type" on the card, the family's number when
+/// the family entry leads, the type's own when the type does (user 2026-11-09: one naming for LN, Jacks, Trills and SV).
+const TYPES: [(&str, &str, &str); 11] = [
+    ("ln_general", "LN", "General"), ("ln_tech", "LN", "Tech"), ("ln_inverse", "LN", "Inverse"), ("ln_release", "LN", "Release"),
+    ("shield", "LN", "Shields"), ("minijack", "Jacks", "Minijack"), ("longjack", "Jacks", "Longjack"), ("vibro", "Jacks", "Vibro"),
+    ("jumptrill", "Trills", "Jumptrill"), ("trill1h", "Trills", "1H"), ("splittrill", "Trills", "Split"),
+];
+/// A type names its family only when it carries at least this share of the family's load; below it the family reads
+/// "LN · Mix" (user 2026-11-09: "if it doesnt cross a threshold it shouldnt show a type", "when there's no dominant we can
+/// write Mix").
+const TYPE_SHOWN: f64 = 0.5;
+const SV_TYPES: [(&str, &str); 5] = [("Fast SV", "Fast"), ("Slowjam SV", "Slowjam"), ("Accel SV", "Accel"), ("Stutter SV", "Stutters"), ("Brakes", "Brakes")];
+
+/// Each type's share of its family's load (summed attributed demand), for the card's "LN · Release 62%" (user 2026-11-09:
+/// "put a percentage at the type to show how much of the total family score it is"). Ratings can't give it: they aren't
+/// linear in load (Azimuth 0.75×: Release 10.5 of LN 11.9 reads 88 % for a smaller share of the holds) and don't add to 100 %.
+pub fn type_shares(series: &Series) -> Val {
+    let load = |key: &str| Sk::from_name(key).filter(|s| series.has(*s)).map_or(0., |s| py::sum(series.get(s).iter().copied()));
+    let mut d = Dict::new();
+    for (key, family, _) in TYPES {
+        let all: f64 = TYPES.iter().filter(|t| t.1 == family).map(|t| load(t.0)).sum();
+        if all > 0. {
+            d.set(key, load(key) / all);
+        }
+    }
+    Val::Dict(d)
+}
+
+/// The family entries a type joins: the family's own skills.
+fn family_parts(family: &str) -> &'static [&'static str] {
+    match family {
+        "LN" => &["ln"],
+        "Jacks" => &["jackspeed", "jack"],
+        _ => &[],
+    }
+}
 const REFINES: [(Sk, &[Sk]); 9] = [
     (Sk::bracket, &[Sk::chordstream]),
     (Sk::quadstream, &[Sk::handstream, Sk::minijack]),
@@ -159,7 +194,9 @@ pub fn archetypes(series: &Series, sc: &Dict, judged: &Judged, keys: usize, swit
             continue;
         }
         let sk = s(sc, key); // already rating(series.get(key)) (compute::series_dict_scores)
-        // Sustained: the skill keeps its rating when its demand is averaged over minutes.
+        // Sustained: the skill keeps its rating when its demand is averaged over minutes. Stamina is named after the skill it
+        // sustains, never shown alone when one does (user 2026-11-08: "if the stamina is in the same section where there are
+        // brackets then its bracket stamina").
         if sk > 0.0 && stamina_rating(series.get(key), judged, keys, k) >= k.STAMINA_SUSTAIN * sk {
             out.push(arch(name, sk, &[key.name(), "stamina"], None));
         }
@@ -323,6 +360,15 @@ pub fn card_top(res: &Dict, n: usize) -> Vec<Val> {
     cands.sort_by(|a, b| (-py::round_digits(a.0, 6), a.1).partial_cmp(&(-py::round_digits(b.0, 6), b.1)).unwrap());
     let mut picked: Vec<Dict> = Vec::new();
     let mut used: Vec<String> = Vec::new();
+    // A family entry is named after its strongest type, even when another entry ("LN Stamina") already took it (a player
+    // 2026-11-08: Azimuth, Release pack, read "LN · Tech" at 0.75× with Release 10.6 > Tech 7.1).
+    let shares = res.dict("type_share");
+    // The type's share of its family's load; none for a chart analysed before shares were stored. Not printed: the card
+    // already has enough numbers (user 2026-11-09).
+    let share = |key: &str| shares.and_then(|d| d.get(key)).map(Val::f);
+    // The strongest type by rating, "Mix" when it carries too little of the family (no shares stored: as before).
+    let strongest = |family: &str| TYPES.iter().filter(|t| t.1 == family && scf(t.0) > 0.).max_by(|a, b| scf(a.0).total_cmp(&scf(b.0)))
+        .map(|t| if share(t.0).is_none_or(|v| v >= TYPE_SHOWN) { t.2 } else { "Mix" });
     for (_, _, e) in cands {
         if picked.len() == n || (!picked.is_empty() && e.f("rating") < 0.3 * picked[0].f("rating")) {
             break;
@@ -332,15 +378,14 @@ pub fn card_top(res: &Dict, n: usize) -> Vec<Val> {
         if parts.iter().any(|p| used.contains(p)) || of.as_ref().is_some_and(|o| used.contains(o)) {
             continue;
         }
-        // An LN type is a slice of the LN rating, not a second skill (a player 2026-11-06: "LN 6.1 · LN General 4.6" read as two
-        // skills): the strongest type names the LN entry ("LN · General 6.1"), the rest stay off the card.
+        // A type is a slice of its family's rating, not a second skill (a player 2026-11-06: "LN 6.1 · LN General 4.6" read as two
+        // skills): with the family entry on the card, the strongest type names it ("LN · General 6.1") and the rest stay off.
         if let [p] = parts.as_slice() {
-            if LN_SKILLS.iter().any(|l| l.name() == p) {
-                if let Some(ln) = picked.iter_mut().find(|d| parts_of(d) == ["ln"]) {
-                    let name = str_of(ln, "name").unwrap();
-                    if !name.contains(" · ") {
-                        let child = str_of(&e, "name").unwrap();
-                        ln.set("name", format!("{name} · {}", child.strip_prefix("LN ").unwrap_or(&child)));
+            if let Some(&(_, family, _)) = TYPES.iter().find(|t| t.0 == p) {
+                if let Some(head) = picked.iter_mut().find(|d| matches!(parts_of(d).as_slice(), [q] if family_parts(family).contains(&q.as_str()))) {
+                    let name = str_of(head, "name").unwrap();
+                    if let (false, Some(t)) = (name.contains(" · "), strongest(family)) {
+                        head.set("name", format!("{family} · {t}"));
                     }
                     continue;
                 }
@@ -381,138 +426,26 @@ pub fn card_top(res: &Dict, n: usize) -> Vec<Val> {
             first.set("parts", Val::Tuple(parts.into_iter().map(Val::Str).collect()));
         }
     }
-    let ln_cs = res.dict("archetype_profile").map(|p| p.f("ln_chordstream"));
-    let sk_wo: Vec<(String, f64)> = sc.0.iter().filter_map(|(k, v)| match k {
-        Key::S(k) if k != "overall" => Some((k.clone(), v.f())),
-        _ => None,
-    }).collect();
-    names_card(picked, &sk_wo, ln_cs, res.f("keys") as usize).into_iter().map(Val::Dict).collect()
+    // A type leading its own entry reads "Family · Type" too, and SV kinds "SV · Kind". No "LN Chordstream" texture renames:
+    // LN and the pattern show as separate entries (user 2026-11-08).
+    for d in &mut picked {
+        let name = str_of(d, "name").unwrap();
+        if name.contains(" · ") || name.ends_with("Stamina") || name.starts_with("Tech ") {
+            continue;
+        }
+        let first = parts_of(d).into_iter().next().unwrap_or_default();
+        if let Some(&(key, family, t)) = TYPES.iter().find(|x| x.0 == first) {
+            let shown = share(key).is_none_or(|v| v >= TYPE_SHOWN);
+            d.set("name", if shown { format!("{family} · {t}") } else { format!("{family} · Mix") });
+        } else if let Some(&(_, kind)) = SV_TYPES.iter().find(|x| x.0 == name).filter(|_| first == "sv") {
+            d.set("name", format!("SV · {kind}"));
+        }
+    }
+    picked.into_iter().map(Val::Dict).collect()
 }
 
 // ---- archetype_names ----
 
-pub fn profile(chart: &Chart, rate: f64) -> f64 {
-    if chart.len() == 0 {
-        return 0.0;
-    }
-    let mut rows: Vec<(f64, u32, Vec<(u8, f64)>)> = Vec::new();
-    for i in 0..chart.len() {
-        let (t, e, c) = (chart.t[i], chart.end[i], chart.col[i]);
-        match rows.last_mut() {
-            Some(r) if t - r.0 <= 3.0 => {
-                r.1 |= 1 << c;
-                r.2.push((c, e));
-            }
-            _ => rows.push((t, 1 << c, vec![(c, e)])),
-        }
-    }
-    let mut bins: Vec<(i64, [f64; 2])> = Vec::new();
-    let mut held: Vec<(u8, f64)> = Vec::new();
-    let origin = rows[0].0;
-    for (t, cols, ends) in &rows {
-        let bucket = ((t - origin) / 1000.0 / rate) as i64;
-        let n = cols.count_ones() as f64;
-        let taps = ends.iter().filter(|(_, e)| e - t <= 3.0).count();
-        let locked = held.iter().any(|&(c, e)| e > t + 3.0 && cols >> c & 1 == 0);
-        let bi = match bins.iter().position(|b| b.0 == bucket) {
-            Some(i) => i,
-            None => {
-                bins.push((bucket, [0.0, 0.0]));
-                bins.len() - 1
-            }
-        };
-        bins[bi].1[0] += n;
-        if locked && n >= 2.0 && taps > 0 {
-            bins[bi].1[1] += n;
-        }
-        for &(c, e) in ends {
-            if e > t + 3.0 {
-                match held.iter_mut().find(|x| x.0 == c) {
-                    Some(x) => x.1 = e,
-                    None => held.push((c, e)),
-                }
-            }
-        }
-    }
-    let get = |j: i64| bins.iter().find(|b| b.0 == j).map_or([0.0, 0.0], |b| b.1);
-    let den = py::sum(bins.iter().map(|b| b.1[0]));
-    let mut total = 0.0f64;
-    for &(index, b) in &bins {
-        let nb = [get(index - 1), get(index), get(index + 1)];
-        let mass = py::sum(nb.iter().map(|v| v[0]));
-        total += b[0] * py::sum(nb.iter().map(|v| v[1])) / 1f64.max(mass);
-    }
-    py::round_digits(total / 1f64.max(den), 6)
-}
-
-fn descriptor(sk: &[(String, f64)], ln_cs: Option<f64>, keys: usize) -> Option<(&'static str, [&'static str; 3])> {
-    let ln_cs = ln_cs?;
-    let g = |k: &str| sk.iter().find(|(kk, _)| kk == k).map_or(0.0, |x| x.1);
-    let flow: [&str; 4] = if keys == 4 { ["stream", "dump", "jumpstream", "handstream"] } else { ["stream", "delay", "chordstream", "bracket"] };
-    let mut primary = flow[0];
-    for f in &flow[1..] {
-        if g(f) > g(primary) {
-            primary = f;
-        }
-    }
-    let top = sk.iter().map(|x| x.1).fold(None, |m: Option<f64>, x| Some(match m { Some(m) if m >= x => m, _ => x })).unwrap_or(0.0);
-    if top <= 0.0 || g(primary) < 0.6 * top {
-        return None;
-    }
-    if ln_cs >= 0.25 && g("ln") >= 0.65 * top && g("chordstream").max(g("handstream")) >= 0.65 * top {
-        return Some(("LN Chordstream", ["ln", "ln_general", if keys == 4 { "handstream" } else { "chordstream" }]));
-    }
-    None
-}
-
-fn an_name(k: &str) -> &str {
-    match k {
-        "stream" => "Stream", "dump" => "Dump", "jumpstream" => "Jumpstream", "handstream" => "Handstream",
-        "delay" => "Stream", "chordstream" => "Chordstream", "bracket" => "Bracket", "minijack" => "Minijack",
-        "anchor" => "Anchor", "ln" => "LN", "ln_general" => "LN General", "ln_release" => "LN Release", _ => k,
-    }
-}
-
-fn rename(name: &str, desc: Option<(&str, [&str; 3])>) -> String {
-    let Some((dname, parts)) = desc else { return name.to_string() };
-    let prefix = if name.starts_with("Tech ") { "Tech " } else { "" };
-    let text = &name[prefix.len()..];
-    let suffix = if text.ends_with(" Stamina") { " Stamina" } else { "" };
-    let plain = &text[..text.len() - suffix.len()];
-    if !parts.iter().any(|p| an_name(p) == plain) {
-        return name.to_string();
-    }
-    format!("{prefix}{dname}{suffix}")
-}
-
-fn names_card(entries: Vec<Dict>, sk: &[(String, f64)], ln_cs: Option<f64>, keys: usize) -> Vec<Dict> {
-    let desc = descriptor(sk, ln_cs, keys);
-    if entries.is_empty() || desc.is_none() {
-        return entries;
-    }
-    let first_name = str_of(&entries[0], "name").unwrap();
-    let name = rename(&first_name, desc);
-    if name == first_name {
-        return entries;
-    }
-    let (_, dparts) = desc.unwrap();
-    let mut first = entries[0].clone();
-    first.set("name", name);
-    let mut parts = parts_of(&entries[0]);
-    for p in dparts {
-        if !parts.iter().any(|x| x == p) {
-            parts.push(p.to_string());
-        }
-    }
-    first.set("parts", Val::Tuple(parts.into_iter().map(Val::Str).collect()));
-    let mut out = vec![first];
-    for e in &entries[1..] {
-        if !parts_of(e).iter().any(|p| dparts.contains(&p.as_str())) {
-            out.push(e.clone());
-        }
-    }
-    out
-}
 
 /// skill_calc.describe → (dominant text, tags).
 pub fn describe(res: &Dict, k: &Knobs) -> (String, Vec<String>) {
@@ -539,7 +472,7 @@ pub fn describe(res: &Dict, k: &Knobs) -> (String, Vec<String>) {
     if peak >= k.BURST_TAG * sc.f("overall") && sc.f("overall") > 0.0 {
         tags.push("short burst".to_string());
     }
-    let shown: Vec<String> = entries.iter().flat_map(|e| if let Val::Dict(d) = e { parts_of(d) } else { Vec::new() }).collect();
+    let on_card: Vec<String> = entries.iter().flat_map(|e| if let Val::Dict(d) = e { parts_of(d) } else { Vec::new() }).collect();
     let names = names_for(res);
     let val = |g: &str| sc.f(g);
     let mut extra = Vec::new();
@@ -550,7 +483,7 @@ pub fn describe(res: &Dict, k: &Knobs) -> (String, Vec<String>) {
         (&["mash"], 0.25),
     ];
     for (group, share) in groups {
-        if shown.iter().any(|p| group.contains(&p.as_str())) {
+        if on_card.iter().any(|p| group.contains(&p.as_str())) {
             continue;
         }
         let mut best: Option<&str> = None;
@@ -567,7 +500,9 @@ pub fn describe(res: &Dict, k: &Knobs) -> (String, Vec<String>) {
             continue;
         }
         if val(kk) > 0. && val(kk) >= share * a.f("rating") {
-            extra.push(format!("{} {:.1}", names(kk), val(kk)));
+            // Names only, like the skills on the card: the numbers are in Details (user 2026-11-09: "also LN 4.9" beside an LN
+            // bar of 3.35 was the raw rating, and the card had too many numbers).
+            extra.push(names(kk));
         }
     }
     if !extra.is_empty() {
@@ -579,32 +514,6 @@ pub fn describe(res: &Dict, k: &Knobs) -> (String, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sk(v: &[(&str, f64)]) -> Vec<(String, f64)> {
-        v.iter().map(|&(k, x)| (k.to_string(), x)).collect()
-    }
-
-    #[test]
-    fn old_jackstream_evidence_does_not_rename_patterns() {
-        let mut a = Dict::new();
-        a.set("name", "Tech Stream");
-        a.set("parts", Val::strs(&["stream", "technical"]));
-        let entries = vec![a];
-        let sk = sk(&[("stream", 1.0), ("minijack", 0.8), ("technical", 0.8)]);
-        assert_eq!(names_card(entries.clone(), &sk, None, 4), entries);
-    }
-
-    #[test]
-    fn ln_chordstream_names_the_texture_with_valid_parts() {
-        let s = sk(&[("chordstream", 1.0), ("ln", 0.9), ("ln_general", 0.85)]);
-        assert_eq!(rename("Chordstream", descriptor(&s, Some(0.95), 7)), "LN Chordstream");
-        for (keys, texture) in [(4, "handstream"), (7, "chordstream")] {
-            let s = sk(&[(texture, 1.0), ("ln", 0.9), ("ln_general", 0.85)]);
-            let (_, parts) = descriptor(&s, Some(0.8), keys).unwrap();
-            let names: Vec<&str> = skills(keys).iter().map(|k| k.name()).collect();
-            assert!(parts.iter().all(|p| names.contains(p)), "{keys}K {parts:?}");
-        }
-    }
 
     #[test]
     fn card_names_fit_the_card() {

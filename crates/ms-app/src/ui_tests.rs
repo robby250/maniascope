@@ -56,6 +56,10 @@ fn the_expected_accuracy_waits_for_enough_of_the_players_own_plays() {
     h.state_mut().card.as_mut().unwrap().sure = true;
     h.step();
     h.get_by_label_contains("Expected ~96.2%");
+    assert!(h.query_by_label_contains("pp").is_none(), "no stars, no pp");
+    h.state_mut().card.as_mut().unwrap().pp_expected = Some(312.4); // unranked maps too (a player 2026-11-08: a pp counter)
+    h.step();
+    h.get_by_label_contains("~312pp");
     h.state_mut().s.display.prediction = false;
     h.step();
     assert!(h.query_by_label_contains("Expected").is_none(), "its switch hides it");

@@ -511,10 +511,10 @@ impl App {
                             self.request_save();
                         }
                     });
+                    self.key_picker(ui, mode); // first: the skill tree below follows it (user 2026-11-09: "keymodes should be at the top")
                     theme::section(ui, "SKILLS");
                     self.skill_picker(ui);
                     theme::section(ui, "MAPS");
-                    self.key_picker(ui, mode);
                     self.acc_target(ui, mode);
                     self.rate_range(ui, mode);
                     theme::section(ui, "MIX");
@@ -756,7 +756,7 @@ impl App {
         tab
     }
 
-    /// PP, NPS and the custom playlists (in place of Skills, user 2026-11-06) in their saved order, then "+" and Stats. Every
+    /// PP, NPS and the custom playlists (in place of Skills, user 2026-11-06) in their saved order, then "+" (Stats sits top right). Every
     /// tab drags like a browser tab (user 2026-11-08: "feel exactly like chrome tabs", PP and NPS too): the held tab follows
     /// the pointer, the others slide aside to show where it lands, and on release it settles there.
     fn tab_strip(&mut self, ui: &mut Ui, mode: &str) {
@@ -874,9 +874,6 @@ impl App {
             self.views.get_mut("skills").expect("a tab").settings = true; // a new one starts at its settings
             self.sync_rec();
         }
-        if ui.selectable_label(self.stats_open, "Stats").clicked() {
-            self.set_stats(true);
-        }
         if let Some((i, mut text)) = self.open.rename.take() {
             let mut keep = true;
             egui::Window::new("Rename playlist").collapsible(false).resizable(false).show(ui.ctx(), |ui| {
@@ -946,6 +943,12 @@ impl App {
                     self.tracking_toggled(!on);
                 }
             }
+            // Top right, away from the playlist tabs (user 2026-11-09: "so that it doesnt compete with the tabs").
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.selectable_label(self.stats_open, "Stats").clicked() {
+                    self.set_stats(true);
+                }
+            });
         });
         ui.add_space(6.);
         // The selected map lives in the main window only (user 2026-11-02: "too much repeating information").

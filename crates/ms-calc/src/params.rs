@@ -166,7 +166,7 @@ knobs! {
     LOCAL_TOL: f64 = 1.75,   // the star scale of that level (it was the 2 s horizon's tolerance)
     BIN: f64 = 0.5,
     PHASES: usize = 8,
-    RATE_G: f64 = 0.12,
+    RATE_G: f64 = 0.0,
     ACC_TARGET: f64 = 0.10, // the rating is the skill whose average note loses this much (skills::accuracy_rating)
     FATIGUE_W: f64 = 0.2,   // a note's level × (1 + this·fatigue), fatigue from model::endurance (skills::powered)
     FATIGUE_W_KEYS: f64 = 3.0, // that weight as (keys/7)^this: wide keymodes are finger-limited, so fatigue weighs more

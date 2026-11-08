@@ -32,35 +32,36 @@ fn member(key: &str, child: &'static str) -> &'static str {
 }
 
 fn shared() -> [Skill; 7] {
+    // Types read "Family · Type", the card's names (user 2026-11-09: playlists and stats "should also follow this convention").
     [
         // A player, 2026-11-04: Hybrid deleted; General/Tech/Inverse/Release each rate their own 7K LN Dan practice pack top
         // (ms_calc::skills::attribute). The tree keys stay; a child's member is its own LN skill (`member`).
         family("ln", "LN", &["ln", "ln_general", "ln_tech", "ln_inverse", "ln_release", "shield"], &[
-            ("general", "LN General", "Holds and taps without one dominant LN specialty."),
-            ("tech", "LN Tech", "Irregular hold rhythms and awkward transitions inside LN."),
-            ("inverse", "Inverse", "Most columns held most of the time: the gaps are the notes."),
-            ("release", "LN Release", "Releasing one finger while others of the hand keep holding."),
-            ("shield", "Shields", "A tap immediately followed by a hold in the same column.")], ""),
+            ("general", "LN · General", "Holds and taps without one dominant LN specialty."),
+            ("tech", "LN · Tech", "Irregular hold rhythms and awkward transitions inside LN."),
+            ("inverse", "LN · Inverse", "Most columns held most of the time: the gaps are the notes."),
+            ("release", "LN · Release", "Releasing one finger while others of the hand keep holding."),
+            ("shield", "LN · Shields", "A tap immediately followed by a hold in the same column.")], ""),
         family("technical", "Technical", &["technical", "patterntech", "rhythmtech"], &[
             ("patterntech", "Pattern Tech", "Awkward finger control and genuinely difficult transitions."),
             ("rhythmtech", "Rhythm Tech", "Irregular execution timing, not merely changing global note gaps.")], ""),
         family("sv", "SV", &["sv"], &[
-            ("sv_fast", "Fast SV", "Shortened readable approach time."),
-            ("sv_slow", "Slowjam SV", "Compressed spacing and crowded notes at low scroll speed."),
-            ("sv_accel", "Accelerations", "Increasing scroll speed during note approach."),
-            ("sv_stutter", "Stutters", "Repeated meaningful speed-direction changes."),
-            ("sv_brake", "Brakes", "Decreasing approach speed and timing uncertainty near judgement.")], ""),
+            ("sv_fast", "SV · Fast", "Shortened readable approach time."),
+            ("sv_slow", "SV · Slowjam", "Compressed spacing and crowded notes at low scroll speed."),
+            ("sv_accel", "SV · Accel", "Increasing scroll speed during note approach."),
+            ("sv_stutter", "SV · Stutters", "Repeated meaningful speed-direction changes."),
+            ("sv_brake", "SV · Brakes", "Decreasing approach speed and timing uncertainty near judgement.")], ""),
         family("stamina", "Stamina", &["stamina"], &[], "Sustained effort, not simply a long song."),
         family("jackspeed", "Jacks", &["jackspeed", "jack", "minijack", "longjack", "vibro"], &[
-            ("minijack", "Minijacks", "Short repeated-column bursts inside other patterns."),
-            ("longjack", "Longjacks", "Sustained single-column repetition."),
-            ("vibro", "Vibro", "Specialist ultra-fast repetition. Only explicitly selecting Vibro includes pure vibro drills.")],
+            ("minijack", "Jacks · Minijack", "Short repeated-column bursts inside other patterns."),
+            ("longjack", "Jacks · Longjack", "Sustained single-column repetition."),
+            ("vibro", "Jacks · Vibro", "Specialist ultra-fast repetition. Only explicitly selecting Vibro includes pure vibro drills.")],
             "Single-column repetition and short jack bursts; distinct from changing overlapping chords."),
         family("chordjack", "Chordjack", &["chordjack"], &[], "Repeated or partly overlapping chords."),
         family("trills", "Trills", &["jumptrill", "trill1h", "splittrill"], &[
-            ("jumptrill", "Jumptrill", "Alternating hand impulses, including timing-feasible rolls."),
-            ("trill1h", "1H Trill", "Alternation between fingers on one hand."),
-            ("splittrill", "Split Trill", "Both hands alternate fingers independently; not ordinary Jumptrill.")], ""),
+            ("jumptrill", "Trills · Jumptrill", "Alternating hand impulses, including timing-feasible rolls."),
+            ("trill1h", "Trills · 1H", "Alternation between fingers on one hand."),
+            ("splittrill", "Trills · Split", "Both hands alternate fingers independently; not ordinary Jumptrill.")], ""),
     ]
 }
 
@@ -222,7 +223,8 @@ pub fn normalize(selected: &[String]) -> Vec<String> {
     // child while the match filter still rejected its whole family.
     for n in &trees().all {
         if let Some(&inherited) = states.get(&n.key) {
-            if !n.children.is_empty() && n.children.iter().any(|c| states.get(&c.key) == Some(&-inherited)) {
+            // Only an excluded parent: an included one keeps its own members (plain Stream) beside an excluded child.
+            if inherited < 0 && !n.children.is_empty() && n.children.iter().any(|c| states.get(&c.key) == Some(&-inherited)) {
                 for child in &n.children {
                     states.entry(child.key.clone()).or_insert(inherited);
                 }
@@ -265,7 +267,10 @@ pub fn set_state(selected: &[String], key: &str, new: i8) -> Vec<String> {
     let as_list = |v: &BTreeSet<String>| v.iter().cloned().collect::<Vec<_>>();
     if let Some((parent, _)) = key.split_once('/') {
         // Expand inherited state before editing a child: neutral really means untargeted, not re-included by its parent.
-        if state(&as_list(&values), parent) != 0 {
+        // An included family minus one type stays the family ("Stream" ✓ + "Anchors" ✕ kept plain stream; expanded, it
+        // asked for no stream at all on 7K, user 2026-11-09).
+        let keep = state(&as_list(&values), parent) == 1 && new == -1;
+        if !keep && state(&as_list(&values), parent) != 0 {
             for child in &node(parent).unwrap().children {
                 let s = state(&as_list(&values), &child.key);
                 if s != 0 {
@@ -367,6 +372,14 @@ mod tests {
         assert_eq!((state(&neutral, "ln/inverse"), state(&neutral, "ln/release")), (0, 1));
         assert_eq!(cycle(&neutral, "ln"), v(&["ln"]));
         assert!(label(&v(&["!sv"])).contains("exclude SV"));
+    }
+
+    #[test]
+    fn a_family_minus_one_type_keeps_the_family() {
+        let s = cycle(&cycle(&[], "stream"), "stream/anchor");
+        assert_eq!(s, v(&["stream", "!stream/anchor"]));
+        assert!(mixed(&s, "stream") && state(&s, "stream/anchor") == -1);
+        assert_eq!(cycle(&s, "stream"), v(&["stream"]));
     }
 
     #[test]

@@ -59,7 +59,7 @@ fn run(w: &World, busy: bool) -> Running {
     sandbox();
     let (tx, rx) = channel();
     let tx = Mutex::new(tx);
-    let hooks = Hooks { emit: Arc::new(move |m| { let _ = tx.lock().unwrap().send(m); }), busy: Arc::new(move || busy), game: Arc::new(|| false) };
+    let hooks = Hooks { emit: Arc::new(move |m| { let _ = tx.lock().unwrap().send(m); }), busy: Arc::new(move || busy), game: Arc::new(|| false), list_open: Arc::new(|| true) };
     let (q, halt) = (Arc::new(Queue::default()), Arc::new(AtomicBool::new(false)));
     let public = w.public.clone();
     let thread = spawn(move |_| Ok(public), q.clone(), hooks, halt.clone(), w.dir.join("rec.db"));

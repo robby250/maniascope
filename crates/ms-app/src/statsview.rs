@@ -431,7 +431,7 @@ impl App {
         let scale = Scale { lo, hi: hi.max(lo + 0.5), dan: rice };
         // Every row's bar starts and ends at the same x, under the dan axis.
         let width = ui.available_width();
-        let l = Layout { name: 110., tail: 150., bar: (width - 110. - 150. - 16.).max(80.) };
+        let l = Layout { name: 135., tail: 150., bar: (width - 135. - 150. - 16.).max(80.) };
         theme::dim(ui, format!("● level   band: uncertainty{}", if page.session { "   ○ this session" } else { "" }));
         ui.horizontal(|ui| {
             ui.add_space(l.name + 8.);

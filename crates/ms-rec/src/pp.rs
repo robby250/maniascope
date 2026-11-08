@@ -567,6 +567,11 @@ pub fn estimates(p: &Prediction, stars: f64, hits: f64, bid: Option<i64>, ledger
     estimates_at(p, pp_scale(stars, hits), bid, ledger)
 }
 
+/// pp of the expected accuracy, ranked or not: what the play gives if the map counts (a player 2026-11-08: "a pp counter").
+pub fn expected(p: &Prediction, stars: f64, hits: f64) -> f64 {
+    pp_scale(stars, hits) * (5. * (1. - p.mu.exp()) - 4.).max(0.)
+}
+
 pub fn estimates_at(p: &Prediction, scale: f64, bid: Option<i64>, ledger: &Ledger) -> (f64, f64, Option<f64>, f64, f64) {
     let pp: Vec<f64> = Z_Q.iter().map(|z| scale * (5. * (1. - (p.mu + PESSIMISM * p.sdm + p.sda * z).exp()) - 4.).max(0.)).collect();
     let best = bid.map_or(0., |b| ledger.best_of(b));

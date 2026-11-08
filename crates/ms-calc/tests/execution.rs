@@ -1,7 +1,7 @@
 //! Compact Mash, honest Tech/SV attribution, archetype qualification.
 mod common;
 use common::*;
-use ms_calc::card::{card, profile};
+use ms_calc::card::card;
 use ms_calc::features::standard_params;
 use ms_calc::pattern::technical_title;
 use ms_calc::scroll::reading;
@@ -72,22 +72,10 @@ fn scores(values: &[(&str, f64)]) -> Dict {
 }
 
 #[test]
-fn rice_has_no_ln_chordstream_profile() {
-    let c = rice((0..100).flat_map(|i| {
-        let cols: &[u8] = if i % 2 == 1 { &[0, 1] } else { &[2, 3] };
-        cols.iter().map(move |&c| (i as f64 * 80., c))
-    }), 4, 5.);
-    assert_eq!(profile(&c, 1.), 0.);
-}
-
-#[test]
 fn ln_release_refinement_precedes_generic_tech_ln() {
     let mut result = Dict::new();
     result.set("keys", 7i64);
     result.set("scores", scores(&[("overall", 10.), ("ln", 10.), ("ln_release", 9.3), ("delay", 9.5), ("technical", 8.), ("ln_general", 6.3), ("chordstream", 7.2)]));
-    let mut archetype = Dict::new();
-    archetype.set("ln_chordstream", 0.4);
-    result.set("archetype_profile", archetype);
     let entry = |name: &str, rating: f64, parts: &[&str]| {
         let mut d = Dict::new();
         d.set("name", name);
@@ -101,18 +89,7 @@ fn ln_release_refinement_precedes_generic_tech_ln() {
     }
     result.set("archetypes", Val::List(vec![tech, entry("LN Release", 9.3, &["ln_release", "ln"])]));
     let Val::Dict(first) = &card(&result)[0] else { panic!() };
-    assert_eq!(first.get("name").and_then(|n| if let Val::Str(s) = n { Some(s.as_str()) } else { None }), Some("LN Release"));
-}
-
-#[test]
-fn local_holds_and_chords_qualify_but_separate_sections_do_not() {
-    let chords = |start: f64, gap: f64, from: i32| (from..150).flat_map(move |i| [2u8, 3].map(|c| (start + i as f64 * gap, start + i as f64 * gap, c)));
-    let mut local = vec![(0., 12000., 0u8)];
-    local.extend(chords(0., 80., 1));
-    assert!(profile(&chart(local, 7, 5.), 1.) > 0.9);
-    let mut separate = vec![(0., 1000., 0u8)];
-    separate.extend(chords(2000., 80., 0));
-    assert_eq!(profile(&chart(separate, 7, 5.), 1.), 0.);
+    assert!(first.get("name").is_some_and(|n| matches!(n, Val::Str(s) if s.starts_with("LN · Release"))));
 }
 
 #[test]

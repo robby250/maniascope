@@ -278,7 +278,7 @@ fn mashed_rolls_read_as_vibro_not_stream() {
     let order = [2, 3, 0, 1];
     let roll: Vec<Note> = (0..1600).map(|i| (1000 + 21 * i, order[i as usize % 4], Some(1000 + 21 * i + 42))).collect();
     let r = res(&roll, 4);
-    assert_eq!(name_of(&card(&r)[0]), "Vibro");
+    assert!(name_of(&card(&r)[0]).starts_with("Jacks · Vibro"));
     assert!(score(&r, "vibro") > 2. * score(&r, "stream").max(score(&r, "dump")).max(score(&r, "ln")));
     // the same roll at a hittable 60 ms per row stays rice
     let slow: Vec<Note> = (0..600).map(|i| (1000 + 60 * i, order[i as usize % 4], None)).collect();
@@ -289,15 +289,15 @@ fn mashed_rolls_read_as_vibro_not_stream() {
 fn card_taxonomy() {
     // a long single-column run is a Longjack (it replaces Jack); a lone pair inside rice is a Minijack
     let long: Vec<Note> = (0..400).map(|i| (1000 + 150 * i, 2, None)).collect();
-    assert_eq!(names(&long, 7)[0], "Longjack");
+    assert!(names(&long, 7)[0].starts_with("Jacks · Longjack"));
     let mini: Vec<Note> = (0..1200i64).map(|i| (1000 + 110 * i, (if i % 4 < 2 { (i / 2) * 3 % 7 } else { (i * 3) % 7 }) as usize, None)).collect();
     let n = names(&mini, 7);
-    assert!(n.iter().any(|x| x == "Minijack") && !n.iter().any(|x| x == "Longjack"));
+    assert!(n.iter().any(|x| x.starts_with("Jacks · Minijack")) && !n.iter().any(|x| x.contains("Longjack")));
     // tap -> hold in the same column (1/4 apart) is Shield; release -> re-press right away is Inverse
     let shield: Vec<Note> = (0..300i64).flat_map(|i| [(1000 + 400 * i, (i % 7) as usize, None), (1100 + 400 * i, (i % 7) as usize, Some(1350 + 400 * i))]).collect();
-    assert!(names(&shield, 7).iter().any(|x| x == "Shield"));
+    assert!(names(&shield, 7).iter().any(|x| x.starts_with("LN · Shields")));
     let inverse: Vec<Note> = (0..300).flat_map(|i| [1, 5].map(|c| (1000 + 300 * i, c, Some(1250 + 300 * i)))).collect();
-    assert!(names(&inverse, 7).iter().any(|x| x.ends_with("Inverse")));
+    assert!(names(&inverse, 7).iter().any(|x| x.starts_with("LN · Inverse")), "{:?}", names(&inverse, 7));
     // broken rhythm reads as Tech <pattern>, never a bare Technical; a component never repeats
     let swing: Vec<Note> = (0..600).map(|i| (1000 + 100 * i + if i % 3 == 1 { 37 } else { 0 }, (i % 7) as usize, None)).collect();
     let entries = card(&res(&swing, 7));
@@ -577,8 +577,12 @@ fn an_ln_type_names_the_ln_entry_instead_of_a_second_rating() {
     // Rolling holds read "LN 4.8 · LN General 4.1" before: LN leads, its strongest type rides on its name.
     let holds: Vec<Note> = (0..400i64).map(|i| (1000 + 200 * i, (i % 7) as usize, Some(1000 + 200 * i + 150 + 40 * (i % 3)))).collect();
     let n = names(&holds, 7);
-    assert!(n.contains(&"LN · General".to_string()), "{n:?}");
-    let ln: Vec<&String> = n.iter().filter(|x| x.starts_with("LN") || *x == "Inverse").collect();
+    assert!(n.iter().any(|x| *x == "LN · General"), "{n:?}");
+    // each type's share of the family's load (drives "Mix"): the LN types add to 1
+    let shares = res(&holds, 7);
+    let total: f64 = ["ln_general", "ln_tech", "ln_inverse", "ln_release", "shield"].iter().filter_map(|t| shares.dict("type_share")?.get(t).map(Val::f)).sum();
+    assert!((total - 1.).abs() < 1e-9, "{total}");
+    let ln: Vec<&String> = n.iter().filter(|x| x.starts_with("LN")).collect();
     assert_eq!(ln.len(), 1, "{n:?}");
 }
 

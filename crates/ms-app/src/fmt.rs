@@ -115,6 +115,9 @@ pub fn prediction_line(c: &Card, pp: bool, shown: &Shown) -> (Line, String) {
     if !form.is_empty() {
         parts.push(vec![Span { bold: true, ..small(form.clone()) }]);
     }
+    if let Some(v) = c.pp_expected {
+        parts.push(vec![bold(format!("~{v:.0}pp"))]);
+    }
     if let (true, true, Some((_, _, best, gain, up))) = (pp, c.ranked, c.pp) {
         parts.push(vec![Span { bold: true, ..small(format!("+{gain:.1}pp")) }, small(format!(" {:.0}% to {}", 100. * up, if best.is_some() { "beat" } else { "count" }))]);
     }
@@ -124,7 +127,7 @@ pub fn prediction_line(c: &Card, pp: bool, shown: &Shown) -> (Line, String) {
         tip.push(format!("Form now: {form} against your rested level on this map"));
     }
     match c.pp.filter(|_| c.ranked) {
-        None => tip.push("No pp (unranked or unranked rate)".into()),
+        None => tip.push(c.pp_expected.map_or_else(|| "No pp: no osu! star rating for this map".into(), |v| format!("~{v:.0}pp at the expected accuracy if this map and rate gave pp"))),
         Some((low, high, best, gain, up)) => tip.push(format!("{low:.0}–{high:.0}pp · {}+{gain:.1}pp expected · {:.0}% to {}", best.map_or(String::new(), |b| format!("best {b:.0} · ")), 100. * up, if best.is_some() { "beat" } else { "count" })),
     }
     if let Some((stars, n)) = c.plays_like {

@@ -105,6 +105,7 @@ pub struct App {
     pub play: Arc<Mutex<Option<Value>>>,
     pub busy: Arc<AtomicBool>,
     pub game: Arc<AtomicBool>,
+    pub list_open: Arc<AtomicBool>, // the playlist window, read by the worker (main.rs keeps it current)
     pub client_name: Arc<Mutex<String>>,
     pub db: Db,
     pub viewer: Arc<Viewer>,
@@ -176,8 +177,9 @@ impl App {
         let (busy, game) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let play = Arc::new(Mutex::new(None));
         let tracking = tracking_switch(&db, debug);
+        let list_open = Arc::new(AtomicBool::new(s.recs_open));
         let mut app = App {
-            s, rx, mail: mail.clone(), q: q.clone(), halt: halt.clone(), play: play.clone(), busy: busy.clone(), game: game.clone(), client_name: Arc::new(Mutex::new(client.clone())), viewer: Arc::default(), db,
+            s, rx, list_open, mail: mail.clone(), q: q.clone(), halt: halt.clone(), play: play.clone(), busy: busy.clone(), game: game.clone(), client_name: Arc::new(Mutex::new(client.clone())), viewer: Arc::default(), db,
             obs: Obs { note: "starting…".into(), ..Obs::default() }, shown: None, pending: None, generation: 0, requested: None, live: None, card: None, card_note: None,
             views: MODES.into_iter().map(|m| (m, view())).collect(), stats: None, stats_open: false, stats_wait: None, chips_open: HashSet::new(), revision: 0, selection_id: 0,
             units: Shown { client, miss_ratio }, result: None, status_text: String::new(), bg_progress: None, blocker: None, foot: String::new(), recs_opened: None, open: Open::default(), save_at: None, page: None, tracking, debug,
@@ -197,9 +199,9 @@ impl App {
         let mut app = App::bare(ctx, Settings::load(), &db_path)?;
         app.sync_rec();
         // The worker: the UI thread never waits on it.
-        let (mail, q, halt, play, busy, game) = (app.mail.clone(), app.q.clone(), app.halt.clone(), app.play.clone(), app.busy.clone(), app.game.clone());
+        let (mail, q, halt, play, busy, game, open) = (app.mail.clone(), app.q.clone(), app.halt.clone(), app.play.clone(), app.busy.clone(), app.game.clone(), app.list_open.clone());
         let m = mail.clone();
-        let hooks = Hooks { emit: Arc::new(move |o| m.send(Msg::Rec(o))), busy: { let b = busy.clone(); Arc::new(move || b.load(Ordering::Relaxed)) }, game: { let g = game.clone(); Arc::new(move || g.load(Ordering::Relaxed)) } };
+        let hooks = Hooks { emit: Arc::new(move |o| m.send(Msg::Rec(o))), busy: { let b = busy.clone(); Arc::new(move || b.load(Ordering::Relaxed)) }, game: { let g = game.clone(); Arc::new(move || g.load(Ordering::Relaxed)) }, list_open: Arc::new(move || open.load(Ordering::Relaxed)) };
         let _ = spawn(crate::public::load, q.clone(), hooks, halt.clone(), db_path);
         let (v, m) = (app.viewer.clone(), mail.clone());
         std::thread::Builder::new().name("selected".into()).spawn(move || { let prm = standard_params(); v.run(&prm, |d| m.send(Msg::Analysed(d))); }).map_err(|e| e.to_string())?;

@@ -44,7 +44,7 @@ struct Live {
 fn hooks(busy: Check) -> (Hooks, Receiver<Out>) {
     let (tx, rx) = channel();
     let tx = Mutex::new(tx);
-    (Hooks { emit: Arc::new(move |m| { let _ = tx.lock().unwrap().send(m); }), busy, game: Arc::new(|| false) }, rx)
+    (Hooks { emit: Arc::new(move |m| { let _ = tx.lock().unwrap().send(m); }), busy, game: Arc::new(|| false), list_open: Arc::new(|| true) }, rx)
 }
 
 fn busy(on: bool) -> Check {
@@ -603,4 +603,21 @@ fn after_a_play_only_the_current_pick_re_aims_its_rate_at_the_target() {
     assert_eq!(l.w.targets["nps"].rate, now.rate);
     assert!(l.rx.try_iter().any(|m| matches!(m, Out::Target { c: Some(c), .. } if c.rate == now.rate)));
     assert_eq!(l.w.playlists["nps"].iter().map(|c| (c.identity(), c.rate)).collect::<Vec<_>>(), rest, "the rest of the list keeps its offers");
+}
+
+#[test]
+fn a_closed_playlist_window_builds_and_publishes_nothing() {
+    let mut l = live("closed", 240, busy(false));
+    let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let o = open.clone();
+    l.w.h.list_open = Arc::new(move || o.load(std::sync::atomic::Ordering::Relaxed));
+    l.w.request_nps();
+    l.w.publish(None).unwrap();
+    assert!(l.w.slot.request.lock().unwrap().is_none());
+    assert!(pools(&l).is_empty());
+    open.store(true, std::sync::atomic::Ordering::Relaxed);
+    l.w.request_nps();
+    l.w.publish(None).unwrap();
+    assert!(l.w.slot.request.lock().unwrap().is_some());
+    assert_eq!(pools(&l).len(), 1);
 }

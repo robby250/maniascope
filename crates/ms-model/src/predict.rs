@@ -1426,7 +1426,7 @@ mod model_tests {
         let state = KeyState { form: vec![0.; n + 1], penalty: vec![0.; n], session: 0., session_tau: 8., fatigue: 0., activation: vec![0.; n] };
         let s = PredSession { warm: true, by_keys: [(7, state)].into_iter().collect(), charts: HashMap::default() };
         let p = m.predict(&f, "m", None, 1., &s).unwrap();
-        assert!((p.acc_mid - (1. - 0.75 * p.mu.exp())).abs() < 1e-12);
+        assert!((p.acc_mid - mash_floor(1. - 0.75 * p.mu.exp())).abs() < 1e-12);
         assert!(p.acc_lo < p.acc_mid && p.acc_mid < p.acc_hi);
     }
 
@@ -1440,9 +1440,10 @@ mod model_tests {
         let (rice, mut holds) = (plain(&m), plain(&m));
         holds.z_tail[0] = 1.;
         let lost = |m: &PredModel, f: &Feats| 1. - m.predict(f, "m", None, 1., &s).unwrap().acc_mid;
-        let lazer = lost(&m, &holds);
+        // lazer's loss before the mash floor (the central prediction is 1 − 0.75·e^mu, then floored)
+        let lazer = 0.75 * m.predict(&holds, "m", None, 1., &s).unwrap().mu.exp();
         m.judged_ln = 0.186;
-        assert!((lost(&m, &holds) / lazer - 0.186f64.exp()).abs() < 1e-9, "every note a hold: stable loses e^0.186 as much");
+        assert!((lost(&m, &holds) - (1. - mash_floor(1. - lazer * 0.186f64.exp()))).abs() < 1e-12, "every note a hold: stable loses e^0.186 as much");
         assert_eq!(lost(&m, &rice), { m.judged_ln = 0.; lost(&m, &rice) }, "no holds, no change");
     }
 
