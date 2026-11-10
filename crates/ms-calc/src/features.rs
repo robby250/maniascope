@@ -92,6 +92,8 @@ pub fn knobs_of(calc: &str) -> Value {
     use serde_json::json;
     // Newest first: (the last calculator before a rule change, the knobs it ran with). Older calculators take every later era's.
     let eras = [
+        ("26eaa7826874", json!({"OHT_MIX": 0})), // before 1H trills counted with the other hand playing
+        ("d3a86f7b014f", json!({"JACK_SHARE": 0.7, "JACK_SHARE_LOW": 0, "W_CENTRE": 0})), // before the jack-share curve and the centre column
         ("09639faa6673", json!({"RATE_G": 0.12})), // before the extra rate factor on the ratings was dropped
         ("882ee20657e4", json!({"W_STAG": 0.3})), // before staggered releases stopped costing extra
         ("21660e31a4f6", json!({"LN_INV_LO": 0.5, "LN_INV_HI": 0.6, "LN_REL_FULL": 1.0, "LN_REL_KEYS": 0})), // before a player's Release sets

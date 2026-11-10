@@ -32,26 +32,7 @@ const TYPES: [(&str, &str, &str); 11] = [
     ("shield", "LN", "Shields"), ("minijack", "Jacks", "Minijack"), ("longjack", "Jacks", "Longjack"), ("vibro", "Jacks", "Vibro"),
     ("jumptrill", "Trills", "Jumptrill"), ("trill1h", "Trills", "1H"), ("splittrill", "Trills", "Split"),
 ];
-/// A type names its family only when it carries at least this share of the family's load; below it the family reads
-/// "LN · Mix" (user 2026-11-09: "if it doesnt cross a threshold it shouldnt show a type", "when there's no dominant we can
-/// write Mix").
-const TYPE_SHOWN: f64 = 0.5;
 const SV_TYPES: [(&str, &str); 5] = [("Fast SV", "Fast"), ("Slowjam SV", "Slowjam"), ("Accel SV", "Accel"), ("Stutter SV", "Stutters"), ("Brakes", "Brakes")];
-
-/// Each type's share of its family's load (summed attributed demand), for the card's "LN · Release 62%" (user 2026-11-09:
-/// "put a percentage at the type to show how much of the total family score it is"). Ratings can't give it: they aren't
-/// linear in load (Azimuth 0.75×: Release 10.5 of LN 11.9 reads 88 % for a smaller share of the holds) and don't add to 100 %.
-pub fn type_shares(series: &Series) -> Val {
-    let load = |key: &str| Sk::from_name(key).filter(|s| series.has(*s)).map_or(0., |s| py::sum(series.get(s).iter().copied()));
-    let mut d = Dict::new();
-    for (key, family, _) in TYPES {
-        let all: f64 = TYPES.iter().filter(|t| t.1 == family).map(|t| load(t.0)).sum();
-        if all > 0. {
-            d.set(key, load(key) / all);
-        }
-    }
-    Val::Dict(d)
-}
 
 /// The family entries a type joins: the family's own skills.
 fn family_parts(family: &str) -> &'static [&'static str] {
@@ -362,13 +343,13 @@ pub fn card_top(res: &Dict, n: usize) -> Vec<Val> {
     let mut used: Vec<String> = Vec::new();
     // A family entry is named after its strongest type, even when another entry ("LN Stamina") already took it (a player
     // 2026-11-08: Azimuth, Release pack, read "LN · Tech" at 0.75× with Release 10.6 > Tech 7.1).
-    let shares = res.dict("type_share");
-    // The type's share of its family's load; none for a chart analysed before shares were stored. Not printed: the card
-    // already has enough numbers (user 2026-11-09).
-    let share = |key: &str| shares.and_then(|d| d.get(key)).map(Val::f);
-    // The strongest type by rating, "Mix" when it carries too little of the family (no shares stored: as before).
-    let strongest = |family: &str| TYPES.iter().filter(|t| t.1 == family && scf(t.0) > 0.).max_by(|a, b| scf(a.0).total_cmp(&scf(b.0)))
-        .map(|t| if share(t.0).is_none_or(|v| v >= TYPE_SHOWN) { t.2 } else { "Mix" });
+    // The strongest type by rating, never "Mix"; a specialty within GENERAL_YIELD of General names the chart (a player
+    // 2026-11-10: Chinese Pop LN Release sets read "LN · Mix"/General; Release labels 27→36/39, dan packs 35→33/48:
+    // General 7–8 read Release, as General 11–14 already did).
+    const GENERAL_YIELD: f64 = 0.75;
+    let weight = |key: &str| scf(key) * if key == "ln_general" { GENERAL_YIELD } else { 1. };
+    let strongest = |family: &str| TYPES.iter().filter(|t| t.1 == family && scf(t.0) > 0.).max_by(|a, b| weight(a.0).total_cmp(&weight(b.0)))
+        .map(|t| t.2);
     for (_, _, e) in cands {
         if picked.len() == n || (!picked.is_empty() && e.f("rating") < 0.3 * picked[0].f("rating")) {
             break;
@@ -382,9 +363,13 @@ pub fn card_top(res: &Dict, n: usize) -> Vec<Val> {
         // skills): with the family entry on the card, the strongest type names it ("LN · General 6.1") and the rest stay off.
         if let [p] = parts.as_slice() {
             if let Some(&(_, family, _)) = TYPES.iter().find(|t| t.0 == p) {
-                if let Some(head) = picked.iter_mut().find(|d| matches!(parts_of(d).as_slice(), [q] if family_parts(family).contains(&q.as_str()))) {
+                // Another type of the family on the card is its head too: one "LN · X" row, never two (a player 2026-11-10: "LN ·
+                // General, LN · Mix" under "LN Stamina", which had taken the plain LN entry).
+                let of_family = |q: &str| family_parts(family).contains(&q) || TYPES.iter().any(|t| t.0 == q && t.1 == family);
+                // The family's stamina row is its head as well ("LN · Release Stamina", user 2026-11-10: stamina after the type).
+                if let Some(head) = picked.iter_mut().find(|d| matches!(parts_of(d).as_slice(), [q] | [q, _] if of_family(q) && parts_of(d).get(1).is_none_or(|x| x == "stamina"))) {
                     let name = str_of(head, "name").unwrap();
-                    if let (false, Some(t)) = (name.contains(" · "), strongest(family)) {
+                    if let (false, false, Some(t)) = (name.contains(" · "), name.ends_with("Stamina"), strongest(family)) {
                         head.set("name", format!("{family} · {t}"));
                     }
                     continue;
@@ -430,13 +415,20 @@ pub fn card_top(res: &Dict, n: usize) -> Vec<Val> {
     // LN and the pattern show as separate entries (user 2026-11-08).
     for d in &mut picked {
         let name = str_of(d, "name").unwrap();
+        let first = parts_of(d).into_iter().next().unwrap_or_default();
+        // Stamina of a typed family reads after the type: "LN · Release Stamina", one row for LN.
+        // A type's own stamina keeps its type; the family's ("ln", "jack") takes the strongest.
+        let own = TYPES.iter().find(|t| t.0 == first).map(|t| (t.1, Some(t.2)));
+        let family = own.or_else(|| TYPES.iter().find(|t| family_parts(t.1).contains(&first.as_str())).map(|t| (t.1, strongest(t.1))));
+        if let (true, Some((family, Some(t)))) = (name.ends_with("Stamina"), family) {
+            d.set("name", format!("{family} · {t} Stamina"));
+            continue;
+        }
         if name.contains(" · ") || name.ends_with("Stamina") || name.starts_with("Tech ") {
             continue;
         }
-        let first = parts_of(d).into_iter().next().unwrap_or_default();
-        if let Some(&(key, family, t)) = TYPES.iter().find(|x| x.0 == first) {
-            let shown = share(key).is_none_or(|v| v >= TYPE_SHOWN);
-            d.set("name", if shown { format!("{family} · {t}") } else { format!("{family} · Mix") });
+        if let Some(&(_, family, t)) = TYPES.iter().find(|x| x.0 == first) {
+            d.set("name", format!("{family} · {}", strongest(family).unwrap_or(t)));
         } else if let Some(&(_, kind)) = SV_TYPES.iter().find(|x| x.0 == name).filter(|_| first == "sv") {
             d.set("name", format!("SV · {kind}"));
         }

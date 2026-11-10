@@ -183,12 +183,13 @@ impl App {
                 TextFormat { font_id: FontId::new(BODY * (0.70 + 0.55 * f), family), color: TEXT.gamma_multiply(0.55 + 0.45 * f), ..TextFormat::default() }
             };
             // Names only, sized by rating: the overall is the card's one number, skill stars are in Details (user 2026-11-09).
-            let text = |i: usize| a.entries[i].name.clone();
+            // A comma ends every skill but the row's last: without the old numbers, same-sized names ran together (user 2026-11-09).
+            let text = |i: usize, end: usize| if i + 1 < end { format!("{},", a.entries[i].name) } else { a.entries[i].name.clone() };
             let width = ui.available_width();
             let row = |range: std::ops::Range<usize>| {
                 let mut j = LayoutJob::default();
                 for i in range.clone() {
-                    j.append(&text(i), if i > range.start { 8. } else { 0. }, format(i));
+                    j.append(&text(i, range.end), if i > range.start { 8. } else { 0. }, format(i));
                 }
                 j.wrap = TextWrapping::truncate_at_width(width);
                 j
@@ -222,7 +223,7 @@ impl App {
                     let at = galley.cursor_from_pos(h - pos).index.0;
                     let mut end = 0;
                     let hit = rest_range.clone().find(|&i| {
-                        end += text(i).chars().count();
+                        end += text(i, rest_range.end).chars().count();
                         at < end
                     });
                     if let Some(i) = hit {

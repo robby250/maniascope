@@ -98,3 +98,20 @@ fn ln_tech_requires_the_original_prevalence_and_demand_without_promotion() {
     assert_eq!(technical_title("LN", 0.55, Some(&[0.8, 0., 0.])), "LN");
     assert_eq!(technical_title("LN", 0.75, Some(&[0.8, 0., 0.])), "Tech LN");
 }
+
+#[test]
+fn ln_types_share_one_row_when_ln_stamina_took_the_ln_entry() {
+    // A player 2026-11-10, Chinese Pop LN Release chart: "LN Stamina · LN · General · LN · Mix". One LN row, the stamina one,
+    // named by Release (within 0.75 of General) with Stamina after it.
+    let mut result = Dict::new();
+    result.set("keys", 7i64);
+    result.set("scores", scores(&[("overall", 6.), ("ln", 6.4), ("stamina", 6.5), ("ln_general", 6.4), ("ln_release", 5.), ("ln_tech", 1.)]));
+    let mut d = Dict::new();
+    d.set("name", "LN Stamina");
+    d.set("rating", 6.5);
+    d.set("parts", Val::strs(&["ln", "stamina"]));
+    result.set("archetypes", Val::List(vec![Val::Dict(d)]));
+    let names: Vec<String> = card(&result).iter().filter_map(|e| match e { Val::Dict(d) => d.get("name").and_then(|n| match n { Val::Str(s) => Some(s.clone()), _ => None }), _ => None }).collect();
+    let ln: Vec<&String> = names.iter().filter(|n| n.starts_with("LN")).collect();
+    assert_eq!(ln, ["LN · Release Stamina"], "{names:?}");
+}

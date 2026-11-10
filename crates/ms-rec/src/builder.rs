@@ -703,7 +703,8 @@ pub struct RankInputs<'a> {
     pub seed: Option<String>,
     pub focus: f64,
     pub count: usize,
-    pub recent: Vec<u8>,
+    pub recent: Vec<(u8, i64)>,
+    pub key_shares: std::collections::BTreeMap<i64, f64>,
     pub skill_weights: Option<std::collections::HashMap<String, f64>>,
     pub selected_skills: &'a [String],
     pub miss_ratio: Option<f64>, // the active client is stable: recdata.shown_acc
@@ -728,7 +729,7 @@ pub fn rank(prepared: &ms_model::choices::Prepared, catalog: &HashMap<String, Ar
         recent_profiles: recent.iter().filter_map(|a| a.a.get("profile")?.as_array().map(|p| p.iter().filter_map(Value::as_f64).collect())).collect(),
         current_keys: session.current_keys(), consumed: &consumed,
         // A custom playlist's slider at "off" (< 0): no shuffle, the best skill match first.
-        shuffle: inputs.seed.filter(|_| inputs.focus >= 0.).map(|s| (s, inputs.focus)), count: Some(inputs.count), recent: inputs.recent, skill_weights: inputs.skill_weights,
+        shuffle: inputs.seed.filter(|_| inputs.focus >= 0.).map(|s| (s, inputs.focus)), count: Some(inputs.count), recent: inputs.recent, key_shares: inputs.key_shares, skill_weights: inputs.skill_weights,
     });
     let picks = rows.into_iter().filter_map(|(i, value, weight, share)| {
         let mut p = prepared_pick(prepared, i, catalog, mode, inputs.selected_skills, store)?;

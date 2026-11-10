@@ -295,6 +295,13 @@ impl Session {
         self.warmup.as_ref().map_or(0., |m| activation(&self.history(m), self.now, keys, family, &self.transfer))
     }
 
+    /// Rust from time away from this keymode, fading with the minutes played in it since the return.
+    pub fn rust(&self, keys: i64) -> f64 {
+        let Some(m) = &self.warmup else { return 0. };
+        let later: Vec<(f64, f64)> = self.history(m).iter().filter(|d| d.keys == Some(keys)).map(|d| (d.end, d.seconds / 60.)).collect();
+        m.rust.at(keys, &later, self.now)
+    }
+
     /// Minutes into the session, any keymode.
     pub fn session_clock(&self) -> f64 {
         self.warmup.as_ref().map_or(0., |m| session_minutes(&self.history(m), self.now))
@@ -438,12 +445,14 @@ impl Session {
             fatigue = m.fatigue(k, clock);
             session = m.session_cold(k, clock, 0.) - fatigue;
         }
-        KeyState { form: self.posterior(k), penalty, session, session_tau: SESSION_TAU, fatigue, activation }
+        KeyState { form: self.posterior(k), penalty, session, session_tau: SESSION_TAU, fatigue, activation, rust: self.rust(k) }
     }
 
     /// What moves results right now: (reason, log-error shift, positive = worse).
     pub fn form_state(&self, keys: i64) -> (Option<&'static str>, f64) {
-        let Some(m) = self.warmup.as_ref().filter(|_| !self.warm_flag) else { return (None, 0.) };
+        let rust = self.rust(keys);
+        let rusty = (rust > FORM_NOTICE).then_some("rusty");
+        let Some(m) = self.warmup.as_ref().filter(|_| !self.warm_flag) else { return (rusty, rust) };
         let p = m.parameters(keys);
         let clock = self.session_clock();
         let unit = if p.log_rate { 3. } else { 1. };
@@ -453,6 +462,8 @@ impl Session {
         let form = self.correction(keys, None);
         let reason = if cold > FORM_NOTICE {
             Some("warming up")
+        } else if rusty.is_some() {
+            rusty
         } else if fatigue > FORM_NOTICE / 2. {
             Some("fading")
         } else if form < -FORM_NOTICE {
@@ -462,7 +473,7 @@ impl Session {
         } else {
             None
         };
-        (reason, cold + fatigue + form)
+        (reason, cold + fatigue + form + rust)
     }
 
     fn zs(&self) -> Vec<(&Arc<Attempt>, f64)> {

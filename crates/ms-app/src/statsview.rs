@@ -422,7 +422,7 @@ impl App {
         let (local, public, newest) = page.evidence;
         let c = ms_rec::engine::commas;
         let based = format!("{} local plays · {} website bests{}", c(local), c(public), if newest != 0. { format!(" · newest {}", date(newest, "%Y-%m-%d")) } else { String::new() });
-        theme::dim(ui, format!("{based}. {} charts · {} plays. Level = the chart difficulty you play at ~{target}, from your own recent completed plays. ≈ dan: the hardest dan whose songs you would play at 95% on your better half of plays, after grinding (one song, not passing the course).", c(page.maps), c(page.plays)));
+        theme::dim(ui, format!("{based}. {} charts · {} plays. Level = the chart difficulty you play at ~{target}, from your own recent completed plays. ≈ dan: the hardest dan whose songs you would play at {peak} on your better half of plays, after grinding (one song, not passing the course).", c(page.maps), c(page.plays), peak = format!("{:.0}%", 100. * ms_rec::dans::PEAK)));
         let measured: Vec<&Group> = groups.values().filter(|g| g.value.is_some()).collect();
         let ends = peak.map(|p| p.1);
         let lo = measured.iter().map(|g| g.low).chain(ends).fold(f64::MAX, f64::min);

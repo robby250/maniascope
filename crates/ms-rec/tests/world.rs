@@ -73,7 +73,8 @@ fn the_ability_number_inverts_the_shared_model_and_the_session_overlay_is_separa
     let profile = ms_rec::stats::build(&e, &w.db).unwrap();
     let group = |p: &ms_rec::stats::Profile| p.pages[&7].groups["overall"].clone();
     let base = group(&profile).value.unwrap();
-    assert!((base - 2.).abs() < 0.02, "{base}");
+    let truth = 2. * ((1. - ms_rec::stats::TARGET) / 0.06).sqrt(); // where `sloped` plays at the Level target
+    assert!((base - truth).abs() < 0.02, "{base} {truth}");
     let now = ms_data::store::now();
     let cold = ms_rec::stats::current(&profile, &e.state_at(&w.db, 0.94, now).unwrap(), &e);
     let (current, shown) = (cold.pages[&7].groups["overall"].current.unwrap(), cold.pages[&7].groups["overall"].value.unwrap());

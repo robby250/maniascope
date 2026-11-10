@@ -56,6 +56,8 @@ pub struct Ui {
     pub nps_focus: f64,
     pub web_bias: HashMap<String, f64>,
     pub web_weighted: HashMap<String, bool>,
+    pub by_count: HashMap<String, bool>, // tab → keymode shares follow map counts (else even)
+    pub key_weights: HashMap<String, BTreeMap<i64, f64>>, // tab → keymode → how much of the list (several keymodes)
     pub converts: HashMap<String, BTreeMap<i64, Setting>>, // tab → target keymode
     pub targets: HashMap<String, f64>,
     pub rates: HashMap<String, (f64, f64)>, // NPS and Skills HT/DT range
@@ -116,7 +118,7 @@ fn pp_settings(v: &Value) -> PpSettings {
 
 // ui.json keys a playlist owns, top-level and per tab.
 const PRESET: [&str; 9] = ["skills_keys", "practice_skills", "skill_weights", "skill_avoid", "skill_other", "skills_focus", "skills_acc_target", "skills_rates", "skills_mix"];
-const PRESET_TABS: [&str; 3] = ["web_bias", "web_weighted", "converts"];
+const PRESET_TABS: [&str; 5] = ["web_bias", "web_weighted", "converts", "key_weights", "by_count"];
 pub const FOCUS_OFF: f64 = -0.05; // the slider's leftmost notch
 
 fn mix_json(m: &PpMix) -> Value {
@@ -247,6 +249,8 @@ impl Ui {
             skill_avoid: per_skill(&v["skill_avoid"]), skill_other: v["skill_other"].as_f64().unwrap_or(0.),
             nps_focus: normalize_focus(v["nps_focus"].as_f64().unwrap_or(0.5)), web_bias: ["nps", "skills"].into_iter().map(|m| (m.to_string(), normalize_focus(v["web_bias"][m].as_f64().unwrap_or(0.5)))).collect(),
             web_weighted: ["nps", "skills"].into_iter().map(|m| (m.to_string(), v["web_weighted"][m].as_bool().unwrap_or(true))).collect(),
+            by_count: ["nps", "skills"].into_iter().map(|m| (m.to_string(), v["by_count"][m].as_bool().unwrap_or(false))).collect(),
+            key_weights: ["nps", "skills"].into_iter().map(|m| (m.to_string(), v["key_weights"][m].as_object().map_or_else(BTreeMap::new, |o| o.iter().filter_map(|(k, w)| Some((k.parse().ok().filter(|k| SUPPORTED_KEYS.contains(k))?, w.as_f64()?.clamp(0.1, 10.)))).collect()))).collect(),
             converts: ["nps", "skills"].into_iter().map(|m| (m.to_string(), v["converts"][m].as_object().map_or_else(BTreeMap::new, |o| o.iter().filter_map(|(k, s)| {
                 let target: i64 = k.parse().ok().filter(|k| SUPPORTED_KEYS.contains(k))?;
                 let sources = s["sources"].as_array().map_or_else(|| default_sources(target), |a| a.iter().filter_map(|x| x.as_i64()).filter(|x| SUPPORTED_KEYS.contains(x) && *x != target).collect());
@@ -299,9 +303,9 @@ impl Ui {
         let keys = |m: &str| if self.keys_auto.contains(m) { Value::Null } else { json!(self.keys[m]) };
         let d = &self.display;
         let (p, m) = (&self.pp, &self.mix);
-        json!({"mode": "auto", "recommendation_mode": self.mode, "next_action": self.next_action, "auto_next": self.auto_next, "keep_above": self.keep_above, "overlay": self.overlay,
+        let mut v = json!({"mode": "auto", "recommendation_mode": self.mode, "next_action": self.next_action, "auto_next": self.auto_next, "keep_above": self.keep_above, "overlay": self.overlay,
                "pp_keys": self.keys["pp"], "nps_keys": keys("nps"), "skills_keys": keys("skills"), "practice_skills": self.practice, "skill_weights": self.skill_weights, "skill_avoid": self.skill_avoid, "skill_other": self.skill_other, "nps_focus": self.nps_focus, "web_bias": self.web_bias,
-               "web_weighted": self.web_weighted, "converts": self.converts.iter().map(|(m, t)| (m.clone(), Value::Object(t.iter().map(|(k, s)| (k.to_string(), json!({"on": s.on, "sources": s.sources, "often": s.often, "weighted": s.weighted}))).collect()))).collect::<serde_json::Map<_, _>>(),
+               "web_weighted": self.web_weighted, "key_weights": self.key_weights.iter().map(|(m, t)| (m.clone(), Value::Object(t.iter().map(|(k, w)| (k.to_string(), json!(w))).collect()))).collect::<serde_json::Map<_, _>>(), "converts": self.converts.iter().map(|(m, t)| (m.clone(), Value::Object(t.iter().map(|(k, s)| (k.to_string(), json!({"on": s.on, "sources": s.sources, "often": s.often, "weighted": s.weighted}))).collect()))).collect::<serde_json::Map<_, _>>(),
                "nps_acc_target": self.targets["nps"], "skills_acc_target": self.targets["skills"], "nps_rates": [self.rates["nps"].0, self.rates["nps"].1], "skills_rates": [self.rates["skills"].0, self.rates["skills"].1],
                "pp_settings": {"min_gain": p.min_gain, "min_chance": p.min_chance, "ht": p.ht, "ht_chance": p.ht_chance, "ht_gain": p.ht_gain, "dt": p.dt, "push": p.push, "cooldown_days": p.cooldown_days, "top100": p.top100},
                "pp_mix": {"on": m.on, "every": m.every, "min_gain": m.min_gain, "chance": m.chance, "ht_chance": m.ht_chance},
@@ -310,7 +314,9 @@ impl Ui {
                "display": {"title": d.title, "version": d.version, "info": d.info, "prediction": d.prediction, "rating": d.rating, "nps": d.nps, "timeline": d.timeline, "status": d.status, "skills": d.skills}, "details": self.details,
                "w": self.win.0, "h": self.win.1, "recs_w": self.recs_win.0, "recs_h": self.recs_win.1,
                "recs_pos": self.recs_pos.map(|p| [p.0, p.1]), "pos": self.win_pos.map(|p| [p.0, p.1]), "recs_open": self.recs_open,
-               "stats_keys": self.stats_keys.map_or(json!("all"), |k| json!(k)), "stats_expanded": self.expanded.iter().map(|(k, g)| format!("{k}:{g}")).collect::<Vec<_>>(), "chart_hints": self.chart_hints})
+               "stats_keys": self.stats_keys.map_or(json!("all"), |k| json!(k)), "stats_expanded": self.expanded.iter().map(|(k, g)| format!("{k}:{g}")).collect::<Vec<_>>(), "chart_hints": self.chart_hints});
+        v["by_count"] = json!(self.by_count); // past json!'s recursion limit
+        v
     }
 
     pub fn save(&mut self) {

@@ -19,6 +19,7 @@ pub struct Model {
     pub report: HashMap<i64, WarmReport>,
     pub slopes: Slopes,
     pub prior: FormPrior,
+    pub rust: crate::personal::Rust,
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -51,7 +52,7 @@ fn pooled(modes: &HashMap<i64, Mode>, families: usize) -> Mode {
 
 impl Model {
     pub fn new(fit: &WarmModels, slopes: Slopes, prior: FormPrior, families: usize) -> Model {
-        Model { modes: fit.modes.clone(), fallback: pooled(&fit.control, families), history: fit.history.clone(), report: fit.report.clone(), slopes, prior }
+        Model { modes: fit.modes.clone(), fallback: pooled(&fit.control, families), history: fit.history.clone(), report: fit.report.clone(), slopes, prior, rust: fit.rust.clone() }
     }
 
     /// No cross-keymode activation: only a mode too sparse to identify itself borrows the pooled curve.

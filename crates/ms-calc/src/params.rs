@@ -132,7 +132,7 @@ knobs! {
     JACK_P: f64 = 0.5,      // on 4K; wider keymodes as (keys/4)^JACK_P_KEYS (open loop p8/p12: wide keys want a steeper jack speed curve)
     JACK_P_KEYS: f64 = 1.0,
     W_IJACK: f64 = 0.4,
-    JACK_SHARE: f64 = 0.7,
+    JACK_SHARE: f64 = 1.4,
     MIRROR: f64 = 0.25,
     W_SPLIT: f64 = 1.5,
     W_ALT: f64 = 0.75,
@@ -167,6 +167,8 @@ knobs! {
     BIN: f64 = 0.5,
     PHASES: usize = 8,
     RATE_G: f64 = 0.0,
+    W_CENTRE: f64 = 0.3,    // an odd keymode's middle column (the thumb) costs × (1 + this): round 18 residual mining, centre share
+    JACK_SHARE_LOW: f64 = 1.0, // below 7K the chordjack discount × (keys/7)^this (round 18: 4K/5K keep less, 7K+ want more)
     ACC_TARGET: f64 = 0.10, // the rating is the skill whose average note loses this much (skills::accuracy_rating)
     FATIGUE_W: f64 = 0.2,   // a note's level × (1 + this·fatigue), fatigue from model::endurance (skills::powered)
     FATIGUE_W_KEYS: f64 = 3.0, // that weight as (keys/7)^this: wide keymodes are finger-limited, so fatigue weighs more
@@ -176,6 +178,7 @@ knobs! {
     RT_FULL: f64 = 0.2,
     COLUMN_ORIGIN: f64 = 0.0, // 1: column-run bins count from the first note, as the demand does
     OHT_FULL: f64 = 0.5,
+    OHT_MIX: f64 = 1.0, // a 1H trill also counts while the other hand plays sparse notes between (round 19: 5–7K, own 7K/10K better)
     ANC_FULL: f64 = 0.5,
     PT_FULL: f64 = 0.05,
     PT_CHAIN: f64 = 1.5,

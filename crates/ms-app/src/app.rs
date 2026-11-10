@@ -62,6 +62,7 @@ pub struct View {
     pub hover: bool,
     pub settings: bool,
     pub warmup: bool, // the list's phase: Skip warmup shows only then
+    pub key_counts: std::collections::BTreeMap<i64, usize>, // your maps and converts per keymode in this tab
     pub played: bool, // the target was finished: Next moves on instead of skipping it
 }
 
@@ -146,7 +147,7 @@ pub struct App {
 }
 
 fn view() -> View {
-    View { shown: Vec::new(), pending: None, ready: false, target: None, target_msg: String::new(), target_tip: None, note: String::new(), note_tip: String::new(), loaded: false, analysing: None, revision: 0, hover: false, settings: false, warmup: false, played: false }
+    View { shown: Vec::new(), pending: None, ready: false, target: None, target_msg: String::new(), target_tip: None, note: String::new(), note_tip: String::new(), loaded: false, analysing: None, revision: 0, hover: false, settings: false, warmup: false, played: false, key_counts: Default::default() }
 }
 
 /// Only source/debug runs get the pause switch (user 2026-10-01). Release builds have no way back on, so an old pause is
@@ -253,7 +254,7 @@ impl App {
         let s = &self.s;
         self.q.put(Task::Configure(Box::new(Config {
             mode: s.mode.clone(), keys: s.keys.clone(), action: s.next_action.clone(), revision: self.revision, practice_skills: Some(s.practice.clone()), nps_focus: Some(s.nps_focus),
-            acc_targets: s.targets.clone(), rates: s.rates.clone(), web_bias: s.web_bias.clone(), web_weighted: s.web_weighted.clone(), converts: s.converts.clone(), pp_settings: Some(s.pp.clone()), pp_mix: Some(s.mix.clone()), skills_focus: Some(s.skills_focus), skills_mix: Some(s.skills_mix.clone()), skill_weights: Some(s.skill_weights.clone()), skill_tuning: Some(s.skill_tuning()),
+            acc_targets: s.targets.clone(), rates: s.rates.clone(), web_bias: s.web_bias.clone(), web_weighted: s.web_weighted.clone(), key_weights: s.key_weights.clone(), by_count: s.by_count.clone(), converts: s.converts.clone(), pp_settings: Some(s.pp.clone()), pp_mix: Some(s.mix.clone()), skills_focus: Some(s.skills_focus), skills_mix: Some(s.skills_mix.clone()), skill_weights: Some(s.skill_weights.clone()), skill_tuning: Some(s.skill_tuning()),
         })));
         self.request_save();
     }
@@ -425,7 +426,7 @@ impl App {
                     self.stats_wait = (on && total > 0).then(|| (format!("Learning your level from your plays · {} / {} charts analysed{eta} — your stats fill in as this runs", ms_rec::engine::commas(done), ms_rec::engine::commas(total)), done, total));
                 }
             }
-            Out::Pool { mode, revision, selection_id, phase, shown, note, summary, progress } => {
+            Out::Pool { mode, revision, selection_id, phase, shown, note, summary, progress, key_counts } => {
                 if !self.profile_asked {
                     self.profile_asked = true;
                     self.q.put(Task::Profile); // a model is ready: the main window can compare maps with you
@@ -435,7 +436,8 @@ impl App {
                     return;
                 }
                 let view = self.views.get_mut(m).expect("a tab");
-                view.pending = Some(Out::Pool { mode, revision, selection_id, phase, shown, note, summary, progress });
+                view.key_counts.clone_from(&key_counts);
+                view.pending = Some(Out::Pool { mode, revision, selection_id, phase, shown, note, summary, progress, key_counts });
                 if !view.hover || !view.ready {
                     self.flush_pool(m);
                 }

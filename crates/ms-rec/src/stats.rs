@@ -1,5 +1,5 @@
 //! Player ability in chart-difficulty units, using the existing personal model. A skill estimate is the difficulty giving
-//! 94% displayed accuracy on a diverse set of that player's representative chart shapes. It is not a raw regression
+//! 96% displayed accuracy on a diverse set of that player's representative chart shapes. It is not a raw regression
 //! coefficient, an average of personal bests, or a claimed population percentile. No chart analyses or model fits are
 //! started by this page.
 use crate::dans;
@@ -18,7 +18,7 @@ use ms_model::warmup::Model;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-pub const TARGET: f64 = 0.94;
+pub const TARGET: f64 = 0.96; // user 2026-11-10: "we should put this at like 96%" (was .94)
 const FORM_SESSIONS: usize = 12;
 const CALIBRATION_HALF_LIFE: f64 = 6.; // months before the keymode's last play
 const CALIBRATION_MIN: f64 = 20.;      // effective recent plays for a skill's own calibration; fewer use the keymode's
@@ -30,6 +30,7 @@ const MIN_RECENT: f64 = 3.;             // charts, halved per year: below it and
 const MIN_CHARTS: usize = 10;          // charts before a skill gets a number (4K LN from 3 charts read "Yume+", user 2026-10-30)
 const HISTORY_BW: f64 = 1.;            // months: Gaussian smoothing of the monthly history (a peak month stays visible)
 const UNSEEN: &str = "profile:unseen";
+const VIBRO: &str = "jackspeed/vibro";
 
 #[derive(Clone, Default)]
 pub struct Group {
@@ -256,7 +257,8 @@ impl Ctx<'_> {
 
     /// Rating on the series' dan ladder where the player's peak predicted accuracy on its dan songs crosses dans::PEAK.
     /// The level's own rating sat ~2 tiers high on the dans: it is a median over the player's chart shapes, and 4K ones
-    /// ranged from ≈ Beta (stable bests) to ≈ Delta (2026 lazer plays).
+    /// ranged from ≈ Beta (stable bests) to ≈ Delta (2026 lazer plays). Dan course plays get no say: the reading is for
+    /// players who never played the dans (user 2026-11-10); the user's 7K LN Gamma course sat +.12 off the all-plays line.
     fn dan_rating(&self, series: &str, line: Option<(f64, f64)>) -> Option<f64> {
         let (tiers, songs, (c, d)) = (dans::tiers(series)?, dans::songs(series, &self.rec.c), line?);
         let y: Vec<Option<f64>> = tiers.iter().map(|(tier, _)| songs.get(tier).filter(|f| !f.is_empty()).map(|fs| {
@@ -358,7 +360,10 @@ pub fn build(rec: &Engine, db: &Db) -> Result<Profile> {
     let ctx = Ctx { model: &target.model, fit: &target.fit, warmup: &target.warmup, rec, dicts };
     let month = crate::evidence::now_months();
     let mut pages = BTreeMap::new();
-    let of_keys = |keys: i64| usable.iter().filter(|r| r.keys == keys).copied().collect::<Vec<&Evidence>>();
+    // Vibro charts are mashed: only the Vibro skill reads them (Consts::vibro_chart).
+    let vibro = |r: &Evidence| rec.c.vibro_chart(&f.rows.feats[r.f]);
+    let of_keys = |keys: i64| usable.iter().filter(|r| r.keys == keys && !vibro(r)).copied().collect::<Vec<&Evidence>>();
+    let vibro_of = |keys: i64| usable.iter().filter(|r| r.keys == keys && vibro(r)).copied().collect::<Vec<&Evidence>>();
     let plays: Vec<(i64, usize)> = SUPPORTED_KEYS.filter(|k| ctx.fit.keys.contains(k)).map(|k| (k, of_keys(k).iter().filter(|r| r.src != "public" && r.completed).count())).collect();
     let overall_only = ["overall".to_string()];
     let slope_of = |k: i64, fit: &dyn Fn(&[(f64, f64, f64)]) -> Option<(f64, f64)>| ctx.calibration(&of_keys(k), &overall_only, fit).get("overall").map(|l| l.1);
@@ -390,11 +395,26 @@ pub fn build(rec: &Engine, db: &Db) -> Result<Profile> {
         let mut names = vec!["overall".to_string()];
         names.extend(skills::dimensions(keys).iter().map(|n| n.key.clone()));
         let known = ctx.fit.keys.contains(&keys);
-        let calibration = if known { ctx.calibration(&rows, &names, &|p| steepened(p, fit_line(p), slope)) } else { HashMap::default() };
+        let mut calibration = if known { ctx.calibration(&rows, &names, &|p| steepened(p, fit_line(p), slope)) } else { HashMap::default() };
+        let vibro_rows = vibro_of(keys);
+        let mut vibro_charts: HashMap<&str, &Evidence> = HashMap::default();
+        for &row in &vibro_rows {
+            if vibro_charts.get(row.chart.as_str()).is_none_or(|old| overall(row) > overall(old)) {
+                vibro_charts.insert(&row.chart, row);
+            }
+        }
+        if known && !vibro_rows.is_empty() {
+            let own = ctx.calibration(&vibro_rows, &["overall".to_string()], &|p| steepened(p, fit_line(p), slope));
+            if let Some(line) = own.get("overall") {
+                calibration.insert(VIBRO.to_string(), *line);
+            }
+        }
         let mut groups: BTreeMap<String, Group> = BTreeMap::new();
         let mut capacities: std::collections::HashMap<(String, u64, u64, u64), (f64, f64)> = Default::default();
         for group in &names {
-            let mut relevant: Vec<&Evidence> = representatives.iter().filter(|r| group == "overall" || ctx.dict(r).is_some_and(|d| skills::demanded(d).contains(&group.as_str()))).copied().collect();
+            let mut relevant: Vec<&Evidence> = if group == VIBRO { vibro_charts.values().copied().collect() } else {
+                representatives.iter().filter(|r| group == "overall" || ctx.dict(r).is_some_and(|d| skills::demanded(d).contains(&group.as_str()))).copied().collect()
+            };
             let newest = relevant.iter().map(|r| r.ts.unwrap_or(0.)).fold(0., f64::max);
             let count = relevant.len();
             if count < MIN_CHARTS || !known {

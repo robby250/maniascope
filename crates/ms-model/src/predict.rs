@@ -186,6 +186,8 @@ pub struct Consts {
     recent_idx: Vec<usize>,
 }
 
+pub const VIBRO_CHART: f64 = 0.4;
+
 impl Consts {
     pub fn standard() -> Consts {
         let v: Value = serde_json::from_str(include_str!("consts.json")).expect("consts.json");
@@ -214,6 +216,13 @@ impl Consts {
     }
 
     /// warmup.family(skill) as a FAMILIES index.
+    /// A vibro chart: mashed, so its rating says nothing about rice, jacks or the keymode's Level. The user's 4K plays were
+    /// mostly vibro packs rated 11–19★ at ~90 % (sk vibro .42–1.00; their normal 4K charts ≤ .38), which read as a
+    /// Delta 4K player and chordjack as the best skill (user 2026-11-10: "never anywhere near delta").
+    pub fn vibro_chart(&self, f: &Feats) -> bool {
+        self.idx.get("vibro").is_some_and(|&i| f.sk[i] >= VIBRO_CHART)
+    }
+
     pub fn family(&self, skill: &str) -> usize {
         let name = self.members.iter().find(|(_, m)| m.iter().any(|x| x == skill)).map(|(k, _)| k.as_str())
             .unwrap_or(if self.families.iter().any(|x| x == skill) { skill } else { "rice" });
@@ -873,6 +882,7 @@ pub struct KeyState {
     pub session_tau: f64,
     pub fatigue: f64,         // warmup fatigue(keys, session_clock)
     pub activation: Vec<f64>, // activation(keys, family) per family
+    pub rust: f64,            // personal::Rust at now: time away from the keymode, warm or not
 }
 
 /// What the session knows of one played chart: Session.rate_penalty, chart_correction and retry read it.
@@ -1263,7 +1273,7 @@ impl PredModel {
             }
         };
         let seconds = f.length / 1000. / rate.max(0.01);
-        let cold = historical(seconds);
+        let cold = historical(seconds) + st.rust;
         let mut correction = st.form[0];
         let total: f64 = weights.iter().sum();
         for (i, &w) in weights.iter().enumerate() {
@@ -1274,7 +1284,7 @@ impl PredModel {
         let (a, bb, judged) = (self.shown.0, self.shown.1, self.judged_ln * f.z_tail[0]);
         let shown = |y: f64| mash_floor(0f64.max(1f64.min(1. - (20f64.min(a + bb * y + judged)).exp())));
         let spread = sda.hypot(sdm);
-        let opening = historical(0.);
+        let opening = historical(0.) + st.rust;
         let activation = if s.warm {
             10.
         } else if !mode.log_rate {
@@ -1423,7 +1433,7 @@ mod model_tests {
         m.aff.clear();
         let f = plain(&m);
         let n = m.c.families.len();
-        let state = KeyState { form: vec![0.; n + 1], penalty: vec![0.; n], session: 0., session_tau: 8., fatigue: 0., activation: vec![0.; n] };
+        let state = KeyState { form: vec![0.; n + 1], penalty: vec![0.; n], session: 0., session_tau: 8., fatigue: 0., activation: vec![0.; n], rust: 0. };
         let s = PredSession { warm: true, by_keys: [(7, state)].into_iter().collect(), charts: HashMap::default() };
         let p = m.predict(&f, "m", None, 1., &s).unwrap();
         assert!((p.acc_mid - mash_floor(1. - 0.75 * p.mu.exp())).abs() < 1e-12);
@@ -1435,7 +1445,7 @@ mod model_tests {
         let mut m = model(Pop::default());
         m.aff.clear();
         let n = m.c.families.len();
-        let state = KeyState { form: vec![0.; n + 1], penalty: vec![0.; n], session: 0., session_tau: 8., fatigue: 0., activation: vec![0.; n] };
+        let state = KeyState { form: vec![0.; n + 1], penalty: vec![0.; n], session: 0., session_tau: 8., fatigue: 0., activation: vec![0.; n], rust: 0. };
         let s = PredSession { warm: true, by_keys: [(7, state)].into_iter().collect(), charts: HashMap::default() };
         let (rice, mut holds) = (plain(&m), plain(&m));
         holds.z_tail[0] = 1.;

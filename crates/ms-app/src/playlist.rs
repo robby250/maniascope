@@ -70,6 +70,27 @@ fn slider(ui: &mut Ui, name: &str, value: &mut f64, range: (f64, f64, f64), defa
     })
 }
 
+/// 0.1×–10× on a log scale in 0.01 steps (user 2026-11-09: finer than the 0.25× notches); arrow keys over it or focused
+/// move it by 0.01, the wheel by 0.05, double-click resets to 1×.
+fn fine_slider(ui: &mut Ui, name: &str, value: &mut f64, show: impl Fn(f64) -> String, tip: Option<&str>) -> bool {
+    let tip = format!("{}Double-click: 1×. Arrow keys: 0.01. Wheel: 0.05.", tip.map_or(String::new(), |t| format!("{t}\n")));
+    row(ui, name, Some(&tip), |ui| {
+        ui.spacing_mut().slider_width = (ui.available_width() - VALUE - 30.).max(60.);
+        let r = ui.add(egui::Slider::new(value, 0.1..=10.).logarithmic(true).step_by(0.01).show_value(false)).on_hover_text(name);
+        let mut changed = r.changed() | nudge(ui, &r, value, (0.1, 10., 0.05), 1.);
+        if r.hovered() && !r.has_focus() {
+            let step = ui.input(|i| i.num_presses(egui::Key::ArrowRight) as f64 + i.num_presses(egui::Key::ArrowUp) as f64 - i.num_presses(egui::Key::ArrowLeft) as f64 - i.num_presses(egui::Key::ArrowDown) as f64);
+            if step != 0. {
+                *value = (*value + 0.01 * step).clamp(0.1, 10.);
+                changed = true;
+            }
+        }
+        *value = (*value * 100.).round() / 100.;
+        ui.label(show(*value));
+        changed
+    })
+}
+
 /// The slider steps through a list.
 fn stepped(ui: &mut Ui, name: &str, value: &mut f64, values: &[f64], default: f64, show: impl Fn(f64) -> String, tip: Option<&str>) -> bool {
     let tip = format!("{}Double-click: default. Wheel over it: one step.", tip.map_or(String::new(), |t| format!("{t}\n")));
@@ -248,6 +269,26 @@ impl App {
         });
         if let Some(v) = next {
             self.set_keys(mode, v);
+        }
+        // Several keymodes take turns in the list; each one's share (user 2026-11-09: a 7K–10K list was mostly 10K).
+        if keys.len() > 1 {
+            let mut on = self.s.by_count.get(mode).copied().unwrap_or(false);
+            if switch(ui, "Shares follow map counts", &mut on, Some("On: each keymode gets the list in proportion to its maps here (yours and converts), × its slider. Off: even turns, × its slider.")) {
+                self.s.by_count.insert(mode.to_string(), on);
+                self.sync_rec();
+            }
+            let at = |s: &crate::settings::Ui, k: i64| s.key_weights.get(mode).and_then(|t| t.get(&k)).copied().unwrap_or(1.);
+            // Computed here from the worker's counts, so the % follows the slider at once (user 2026-11-09).
+            let counts = self.views.get(mode).map(|v| v.key_counts.clone()).unwrap_or_default();
+            let shares = ms_model::choices::key_shares(&keys, &self.s.key_weights.get(mode).cloned().unwrap_or_default(), &counts, on);
+            for &k in &keys {
+                let mut v = at(&self.s, k);
+                let share = shares.get(&k).map_or(String::new(), |s| format!(" · {:.0}%", 100. * s));
+                if fine_slider(ui, &format!("{k}K"), &mut v, |x| format!("{x:.2}×{share}"), Some("Multiplies this keymode's share of the list; the % is its share now.")) {
+                    self.s.key_weights.entry(mode.to_string()).or_default().insert(k, v);
+                    self.sync_rec();
+                }
+            }
         }
     }
 

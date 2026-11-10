@@ -217,6 +217,33 @@ pub fn pattern_evidence(rows: &[Row], trill: &[Trill], k: &Knobs) -> (Vec<f64>, 
     (ins, sws)
 }
 
+/// 1H Trill runs with the other hand playing in between: the hand's own rows alternate two single columns at a steady
+/// gap ≤ 0.2 s, and the other hand plays on at most 3 of the run's rows (its own or between: chords on every trill row are a bracket) and never alternates two columns itself (that is
+/// a split trill or bracket). hand_patterns only finds trills where the other hand is silent: the user's 2,201 7K charts
+/// never rated 1H Trill above .28 (2026-11-10, "0 1h trill plays").
+fn mixed_trills(rows: &[Row], hand_mask: [u32; 2], oht: &mut [bool]) {
+    for (h, &hm) in hand_mask.iter().enumerate() {
+        let other = hand_mask[1 - h];
+        let mine: Vec<usize> = (0..rows.len()).filter(|&r| rows[r].mask & hm != 0).collect();
+        for w in mine.windows(4) {
+            let m: Vec<u32> = w.iter().map(|&r| rows[r].mask & hm).collect();
+            if m.iter().any(|x| x & (x - 1) != 0) || m[0] == m[1] || m[0] != m[2] || m[1] != m[3] {
+                continue;
+            }
+            let gaps: Vec<f64> = w.windows(2).map(|p| rows[p[1]].t - rows[p[0]].t).collect();
+            let (mx, mn) = gaps.iter().fold((f64::MIN, f64::MAX), |a, &g| (a.0.max(g), a.1.min(g)));
+            if mx > 0.2 || mx > 1.6 * mn {
+                continue;
+            }
+            let between: Vec<u32> = (w[0]..=w[3]).map(|r| rows[r].mask & other).filter(|&x| x != 0).collect();
+            let alternating = between.len() >= 3 && between.windows(3).all(|t| t[0] == t[2] && t[0] != t[1] && t[0] & (t[0] - 1) == 0);
+            if between.len() <= 3 && !alternating {
+                w.iter().for_each(|&r| oht[r] = true);
+            }
+        }
+    }
+}
+
 /// Row membership of 1H Trill and Anchor.
 fn hand_patterns(rows: &[Row], hand_mask: [u32; 2], keys: usize) -> (Vec<bool>, Vec<bool>) {
     let n = rows.len();
@@ -315,7 +342,7 @@ pub fn demand(
     // One curve over keymodes (user 2026-11-03: "gradients over the 4k-10k spectrum").
     let w_jack = if keys == 7 && k.W_JACK_7K > 0.0 { k.W_JACK_7K } else { k.W_JACK * (7.0 / keys as f64).powf(k.W_JACK_KEYS) };
     let w_group = k.W_GROUP * (keys.min(7) as f64 / 7.0).powf(k.GROUP_KEYS);
-    let jack_share = k.JACK_SHARE * (7.0 / keys.max(7) as f64).powf(k.JACK_SHARE_KEYS);
+    let jack_share = k.JACK_SHARE * (7.0 / keys.max(7) as f64).powf(k.JACK_SHARE_KEYS) * (keys.min(7) as f64 / 7.0).powf(k.JACK_SHARE_LOW);
     let jack_p = k.JACK_P * (keys as f64 / 4.0).powf(k.JACK_P_KEYS);
     // Per-row and per-note powers with few distinct inputs, computed once (same calls, same values).
     let by_count = |e: f64| -> Vec<f64> { (0..=keys).map(|c| (c as f64).powf(e)).collect() };
@@ -389,7 +416,10 @@ pub fn demand(
     }
     let (p_ins, p_sw) = pattern_evidence(rows, &trill, k);
     let roll = &g.roll;
-    let (oht, anc) = hand_patterns(rows, hand_mask, keys);
+    let (mut oht, anc) = hand_patterns(rows, hand_mask, keys);
+    if k.OHT_MIX > 0.0 {
+        mixed_trills(rows, hand_mask, &mut oht);
+    }
     let keys_out = part_keys(wide);
     let mut comp = vec![0.0f64; NP * nbins];
     let mut hands = vec![0.0f64; 3 * nbins];
@@ -634,6 +664,7 @@ pub fn demand(
             let cost = 1. + mix[h] + many[h] + if size as f64 >= k.GROUP_SIZE { w_group * (groups - 1.) } else { 0. };
             // V_FINGER over keymodes (·(keys/7)^x) rejected 2026-11-07 (r6c): DevSelect better, DevConfirm 4K and 10K worse.
             let rice = (e_hand + e_jack) * above_one(vdj / k.V_FINGER, if jacked { vf_jacked } else { 1.0 }) * cost;
+            let rice = if keys % 2 == 1 && c == keys / 2 { rice * (1.0 + k.W_CENTRE) } else { rice };
             let mut held_same = 0.0f64;
             let mut held_other = 0.0f64;
             for &oc in &order[..nseen] {

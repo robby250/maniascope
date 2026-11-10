@@ -89,7 +89,8 @@ pub fn fit(db: &Db, public: &Arc<Public>, calc: &str, c: &Arc<Consts>) -> Result
     let session = Session::new(load_events(db, ((current - HISTORY_S) / 60.).floor() * 60.)?, current, None, c.clone(), Arc::new(family_transfer(c)));
     let begin = session.events.iter().filter(|e| e.kind == "start").map(|e| e.t).fold(f64::INFINITY, f64::min);
     let month = now_months();
-    let historical: Vec<&Evidence> = rows.rows.iter().filter(|r| r.ts.is_none_or(|t| t == 0. || t < begin)).collect();
+    // Vibro charts are mashed: kept out of the ability fit (Consts::vibro_chart).
+    let historical: Vec<&Evidence> = rows.rows.iter().filter(|r| r.ts.is_none_or(|t| t == 0. || t < begin) && !c.vibro_chart(&rows.feats[r.f])).collect();
     let levels = play_levels(&historical, month);
     let shown = fit_shown(db, begin)?;
     // Evidence is in lazer units; a stable player's forecasts are what stable judges (more lost per hold).

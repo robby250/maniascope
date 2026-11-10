@@ -70,7 +70,7 @@ fn data() -> &'static Data {
 /// The accuracy on a dan's songs, on the player's better plays after grinding, that reads as passing it, in every series.
 /// Real passes are 96 % regular, 95 % LN (user 2026-11-01, no source online). One value: at 96 % for regular and 95 % for LN
 /// on one shift, the user's 7K LN would read well above Azimuth (estimated from the tier table, not run).
-pub const PEAK: f64 = 0.95;
+pub const PEAK: f64 = 0.96; // user 2026-11-10: the dan line at 96 % too (was .95)
 
 pub fn tiers(series: &str) -> Option<&'static Tiers> {
     data().series.get(series)
@@ -199,7 +199,7 @@ pub fn ability_kind(skill: &str) -> &'static str {
     if skill.split('/').next() == Some("ln") { "ln" } else { "rice" }
 }
 
-/// Dan whose charts sit at a player's ~94 % difficulty for this Stats skill. scale: {kind: factor} from the player's
+/// Dan whose charts sit at a player's Level difficulty (stats::TARGET) for this Stats skill. scale: {kind: factor} from the player's
 /// predicted accuracy on the dan songs; without it the level's rating is placed. None for vibro (its dans need a vibro
 /// speed) and keymodes without dans.
 pub fn ability(keys: i64, value: f64, skill: &str, scale: &HashMap<String, f64>) -> Option<String> {

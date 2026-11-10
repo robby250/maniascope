@@ -30,7 +30,7 @@ fn pick(sha: char) -> Pick {
 }
 
 fn pool(a: &App, mode: &str, revision: u64, shown: Vec<Pick>) -> Out {
-    Out::Pool { mode: mode.into(), revision, selection_id: a.selection_id, phase: "warmup".into(), shown, note: "Synthetic UI check · target ~94%".into(), summary: "No actual prediction".into(), progress: None }
+    Out::Pool { mode: mode.into(), revision, selection_id: a.selection_id, phase: "warmup".into(), shown, note: "Synthetic UI check · target ~94%".into(), summary: "No actual prediction".into(), progress: None, key_counts: Default::default() }
 }
 
 fn tasks(a: &App) -> Vec<Task> {
@@ -159,8 +159,8 @@ fn skip_warmup_shows_only_while_the_tab_warms_up() {
     h.get_by_label("Skip warmup").click();
     h.step();
     assert!(tasks(h.state()).iter().any(|t| matches!(t, Task::SkipWarmup)));
-    let Out::Pool { mode, revision, selection_id, shown, note, summary, progress, .. } = pool(h.state(), "nps", h.state().revision, vec![pick('a')]) else { unreachable!() };
-    h.state_mut().on_rec(Out::Pool { mode, revision, selection_id, phase: "build".into(), shown, note, summary, progress });
+    let Out::Pool { mode, revision, selection_id, shown, note, summary, progress, key_counts, .. } = pool(h.state(), "nps", h.state().revision, vec![pick('a')]) else { unreachable!() };
+    h.state_mut().on_rec(Out::Pool { mode, revision, selection_id, phase: "build".into(), shown, note, summary, progress, key_counts });
     h.step();
     assert!(h.query_by_label("Skip warmup").is_none());
 }

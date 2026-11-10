@@ -275,8 +275,8 @@ fn the_form_readout_names_the_reason() {
 fn the_prior_changes_rate_demand_by_readiness() {
     let (c, m) = (consts(), model(Vec::new(), Vec::new()));
     let capacity = |minutes| m.capacity(&c, 7, Some("chordstream"), minutes);
-    assert!((capacity(0.) - 0.9).abs() < 1e-12);
-    assert!(0.9 < capacity(4.) && capacity(4.) < capacity(12.) && capacity(12.) < 1.);
+    // A player without a fit of their own starts on the user's 7K curve: cold capacity under 1, recovering with readiness.
+    assert!(capacity(0.) < 0.95 && capacity(0.) < capacity(4.) && capacity(4.) < capacity(12.) && capacity(12.) < 1.);
     let penalty = |seconds, slope| m.penalty(&c, 7, Some("chordstream"), 0., seconds, Some(slope), 0.);
     assert!(penalty(120., 5.) > penalty(120., 2.));
     assert!(penalty(240., 3.) < penalty(0., 3.));

@@ -232,7 +232,8 @@ pub struct Ranking<'a> {
     pub consumed: &'a dyn Fn(&Choice) -> bool,
     pub shuffle: Option<(String, f64)>, // pp_playlist.preview's (str(seed), focus)
     pub count: Option<usize>,
-    pub recent: Vec<u8>, // this tab's last offers, oldest first: REAL, WEB or CONVERT
+    pub recent: Vec<(u8, i64)>, // this tab's last offers, oldest first: (REAL, WEB or CONVERT, keymode)
+    pub key_shares: std::collections::BTreeMap<i64, f64>, // keymode → its share of the list (`key_shares`; equal when empty)
     pub skill_weights: Option<std::collections::HashMap<String, f64>>, // {included skill: how often} when the sliders differ
 }
 
@@ -355,7 +356,10 @@ impl Prepared {
         }
         let streams: Vec<u8> = available.iter().map(|x| items[x.0].stream()).collect();
         let odds = stream_odds([r.web, r.convert], r.weighted, &streams);
-        let order = mix_order(&streams, odds, &r.recent);
+        // Several keymodes take turns in equal shares, each with its own stream mix: by weight alone, 10K natives plus
+        // 7–9K maps converted to 10K filled the 7K–10K list (user 2026-11-09: 265 of 292 offers 10K).
+        let keymodes: Vec<i64> = available.iter().map(|x| items[x.0].keys).collect();
+        let order = keymode_order(&keymodes, &streams, |s| stream_odds([r.web, r.convert], r.weighted, s), &r.recent, &r.key_shares);
         let mut out: Vec<(usize, f64, f64, f64)> = order.into_iter().map(|i| available[i]).collect();
         if let Some(n) = r.count {
             out.truncate(n);
@@ -421,6 +425,40 @@ pub fn stream_odds(sliders: [f64; 2], weighted: [bool; 2], streams: &[u8]) -> [f
 /// first row, so 0 of 167 picks at 15 % were website charts (G835LX 2026-10-27..31, user 2026-10-31).
 fn credit(recent: &[u8], stream: u8, share: f64) -> f64 {
     recent.iter().fold(0., |c: f64, &s| (c + share - if s == stream { 1. } else { 0. }).clamp(-1., 1.))
+}
+
+/// Each keymode's share of a list over several keymodes: its slider, × its maps and converts here when `by_count` (user
+/// 2026-11-09: even turns by default, map counts as a switch). Shares sum to 1 over `modes`.
+pub fn key_shares(modes: &[i64], weights: &std::collections::BTreeMap<i64, f64>, counts: &std::collections::BTreeMap<i64, usize>, by_count: bool) -> std::collections::BTreeMap<i64, f64> {
+    let weight = |k: &i64| weights.get(k).copied().unwrap_or(1.).max(0.01) * if by_count { counts.get(k).copied().unwrap_or(0).max(1) as f64 } else { 1. };
+    let total: f64 = modes.iter().map(weight).sum();
+    modes.iter().map(|k| (*k, weight(k) / total)).collect()
+}
+
+/// Indices interleaved by keymode, each keymode owed its share (`key_shares`; equal when missing) after its recent offers
+/// (as `credit`), its own entries in `mix_order` with odds against its own maps.
+pub fn keymode_order(keys: &[i64], streams: &[u8], odds: impl Fn(&[u8]) -> [f64; 3], recent: &[(u8, i64)], shares: &std::collections::BTreeMap<i64, f64>) -> Vec<usize> {
+    let mut modes: Vec<i64> = keys.to_vec();
+    modes.sort_unstable();
+    modes.dedup();
+    let weight = |k: &i64| shares.get(k).copied().unwrap_or(1. / modes.len() as f64).max(1e-3);
+    let total: f64 = modes.iter().map(weight).sum();
+    let shares: Vec<f64> = modes.iter().map(|k| weight(k) / total).collect();
+    let mut queues: Vec<std::collections::VecDeque<usize>> = modes.iter().map(|&k| {
+        let at: Vec<usize> = (0..keys.len()).filter(|&i| keys[i] == k).collect();
+        let s: Vec<u8> = at.iter().map(|&i| streams[i]).collect();
+        let mine: Vec<u8> = recent.iter().filter(|r| r.1 == k).map(|r| r.0).collect();
+        mix_order(&s, odds(&s), &mine).into_iter().map(|j| at[j]).collect()
+    }).collect();
+    let mut owed: Vec<f64> = modes.iter().zip(&shares).map(|(&k, s)| recent.iter().fold(0., |c: f64, r| (c + s - if r.1 == k { 1. } else { 0. }).clamp(-1., 1.))).collect();
+    let mut out = Vec::with_capacity(keys.len());
+    while out.len() < keys.len() {
+        owed.iter_mut().zip(&shares).for_each(|(o, s)| *o += s);
+        let m = (0..modes.len()).filter(|&m| !queues[m].is_empty()).max_by(|&a, &b| owed[a].total_cmp(&owed[b]).then(b.cmp(&a))).expect("an entry left");
+        owed[m] -= 1.;
+        out.extend(queues[m].pop_front());
+    }
+    out
 }
 
 /// nps.mix: your maps, website charts and converts interleaved, each stream in its ranked order, at its share of the
@@ -581,6 +619,20 @@ mod stream_tests {
         // nps.mix's order at 1:1 from zero: a website chart once its share is due.
         assert_eq!(mix_order(&[REAL, REAL, WEB, WEB], [1., 1., 0.], &[]), [0, 2, 1, 3]);
     }
+
+    #[test]
+    fn keymodes_take_turns_by_their_sliders_after_recent_offers() {
+        let keys = [10, 10, 10, 10, 10, 10, 7, 7, 7];
+        let counts = [(7, 3), (10, 6)].into_iter().collect();
+        let order = |w: &[(i64, f64)], recent: &[(u8, i64)]| -> Vec<i64> {
+            keymode_order(&keys, &[REAL; 9], |_| [1., 0., 0.], recent, &key_shares(&[7, 10], &w.iter().copied().collect(), &counts, true)).iter().map(|&i| keys[i]).collect()
+        };
+        assert_eq!(&order(&[], &[])[..6], [10, 7, 10, 10, 7, 10]); // 6 of 9 maps are 10K: two thirds of the picks
+        assert_eq!(&order(&[(7, 2.)], &[])[..4], [7, 10, 7, 10]); // 7K's slider at 2× evens 3 maps against 6
+        assert_eq!(order(&[], &[(REAL, 10), (REAL, 10)])[0], 7); // 10K was just offered twice: 7K is owed
+        let even: Vec<i64> = keymode_order(&keys, &[REAL; 9], |_| [1., 0., 0.], &[], &key_shares(&[7, 10], &Default::default(), &counts, false)).iter().map(|&i| keys[i]).collect();
+        assert_eq!(&even[..4], [7, 10, 7, 10]); // the toggle off: even turns
+    }
 }
 
 /// Family best, density floor, focus, popularity prior and sliders on synthetic choices.
@@ -622,7 +674,7 @@ mod list_tests {
         let taste = HashMap::default();
         let (rows, _, _) = p.rank(Ranking { keys: a.keys, nps: a.nps, web: a.web, convert: 0., weighted: [false, false], taste: &taste, eventful: &|_| false, freshness: &|_, _, _| 1.,
                                             recent_families: Vec::new(), recent_profiles: Vec::new(), current_keys: None, consumed: &|_| false, shuffle: a.shuffle, count: a.count,
-                                            recent: Vec::new(), skill_weights: a.weights });
+                                            recent: Vec::new(), key_shares: Default::default(), skill_weights: a.weights });
         rows.into_iter().map(|(i, _, weight, _)| (p.list.items[i].clone(), weight)).collect()
     }
 

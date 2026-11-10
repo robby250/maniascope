@@ -805,6 +805,91 @@ pub struct WarmModels {
     pub modes: HashMap<i64, Mode>,
     pub report: HashMap<i64, WarmReport>,
     pub history: Vec<Completion>,
+    pub rust: Rust,
+}
+
+/// Rust from too little recent practice in a keymode, in log-error units (positive = worse). Practice = minutes
+/// played in the keymode, each fading over `memory_days`; readiness = e^(−practice/`minutes`) runs 1 (none) → 0.
+/// Shift = amplitude · max(0, readiness − the keymode's usual readiness over its plays): the level already holds the
+/// usual amount. The user's 4K came back after 5 months at its May level (G835LX 2026-11-09: 96 % offered, 90 % played).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Rust {
+    pub amplitude: f64,
+    pub memory_days: f64,
+    pub minutes: f64,
+    /// Per keymode at fit time: (last own completion's end, practice minutes then, usual readiness).
+    pub state: HashMap<i64, (f64, f64, f64)>,
+}
+
+impl Rust {
+    /// The keymode's rust at `now` after the fit's state and later completions (end, played minutes).
+    pub fn at(&self, keys: i64, later: &[(f64, f64)], now: f64) -> f64 {
+        let Some(&(mut last, mut practice, usual)) = self.state.get(&keys).filter(|_| self.amplitude > 0.) else { return 0. };
+        let mut later: Vec<(f64, f64)> = later.iter().copied().filter(|x| x.0 > last).collect();
+        later.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (end, played) in later {
+            practice = practice * self.fade(end - last) + played;
+            last = end;
+        }
+        practice *= self.fade((now - last).max(0.));
+        self.amplitude * ((-practice / self.minutes).exp() - usual).max(0.)
+    }
+
+    fn fade(&self, seconds: f64) -> f64 {
+        (-seconds / 86400. / self.memory_days).exp()
+    }
+}
+
+/// Rust's curve on own completions' residuals from the level: one pooled curve over keymodes, memory and minutes from
+/// a grid, amplitude by ridge least squares. No positive amplitude: no rust.
+// ponytail: the level curve is fitted before rust, so rusty months still pull it down a little; refit it on
+// rust-corrected residuals if the two start to trade off.
+fn fit_rust(rows: &[Row], feats: &[Feats], resid: &[f64], w: &[f64]) -> Rust {
+    let mut order: Vec<usize> = (0..rows.len()).filter(|&i| {
+        let r = &rows[i];
+        r.local && !r.public && r.ts != 0. && !r.rd && r.completed
+    }).collect();
+    order.sort_by(|&a, &b| rows[a].ts.total_cmp(&rows[b].ts));
+    let mut seen = std::collections::HashSet::new();
+    order.retain(|&i| seen.insert((rows[i].chart.clone(), round(rows[i].ts) as i64, rows[i].rate3.to_bits())));
+    let played: Vec<f64> = order.iter().map(|&i| (feats[rows[i].f].length / 1000. / rows[i].rate.max(0.01) / 60.).clamp(0., 30.)).collect();
+    let mut best = Rust::default();
+    let mut gain = 0.;
+    for memory_days in [7., 14., 30., 60.] {
+        for minutes in [10., 20., 30., 60., 120., 240.] {
+            let mut probe = Rust { memory_days, minutes, ..Rust::default() };
+            // Practice before each play, then each keymode's usual readiness.
+            let mut last: HashMap<i64, (f64, f64)> = HashMap::default();
+            let x: Vec<f64> = order.iter().zip(&played).map(|(&i, &p)| {
+                let r = &rows[i];
+                let start = r.ts - p * 60.;
+                let s = last.entry(r.keys).or_insert((start, 0.));
+                let before = s.1 * probe.fade((start - s.0).max(0.));
+                *s = (r.ts, before + p);
+                (-before / minutes).exp()
+            }).collect();
+            let mut usual: HashMap<i64, (f64, f64)> = HashMap::default();
+            order.iter().zip(&x).for_each(|(&i, &v)| {
+                let u = usual.entry(rows[i].keys).or_default();
+                u.0 += w[i] * v;
+                u.1 += w[i];
+            });
+            let usual: HashMap<i64, f64> = usual.into_iter().map(|(k, (s, m))| (k, s / m.max(1e-9))).collect();
+            let (mut xy, mut xx) = (0., 1.); // the 1: a ridge toward no rust
+            for (&i, &v) in order.iter().zip(&x) {
+                let v = (v - usual[&rows[i].keys]).max(0.);
+                xy += w[i] * v * resid[i];
+                xx += w[i] * v * v;
+            }
+            if xy > 0. && xy * xy / xx > gain {
+                gain = xy * xy / xx;
+                probe.amplitude = xy / xx;
+                probe.state = last.into_iter().map(|(k, (t, p))| (k, (t, p, usual[&k]))).collect();
+                best = probe;
+            }
+        }
+    }
+    best
 }
 
 /// Both warm-up fits and the historical cold adjustment per row key. The rate response replaces the constant one in
@@ -1011,6 +1096,7 @@ pub fn personal_fit(c: &Consts, mut rows: Vec<Row>, feats: &[Feats], now: f64, l
 
     // Skill mix: ridge on what the level leaves, per keymode with enough rows.
     let mut u: Vec<f64> = (0..n).map(|i| e[i] - l_at[i]).collect();
+    let rust = fit_rust(&rows, feats, &u, &w);
     let shape_report = |s: &Shape, zc: &[f64], p: usize| -> ShapeReport {
         let column = |j: usize| zc.iter().skip(j).step_by(p).copied();
         ShapeReport {
@@ -1143,7 +1229,7 @@ pub fn personal_fit(c: &Consts, mut rows: Vec<Row>, feats: &[Feats], now: f64, l
     out.kap_c = kap_c;
     out.sd_all = sd_all;
     out.retry = retry;
-    out.warmup = models;
+    out.warmup = WarmModels { rust, ..models };
     out
 }
 
@@ -1154,6 +1240,30 @@ mod tests {
     fn row(chart: &str, rate: f64, ts: f64, rd: bool) -> Row {
         Row { keys: 7, y: 0., base: 0., t: 300., ts, public: false, local: true, rd, completed: true, chart: chart.into(),
               rate, rate3: round_digits(rate, 3), best: Best::None, family: chart.into(), f: 0 }
+    }
+
+    #[test]
+    fn rust_after_a_layoff_is_found_and_fades_with_play() {
+        let c = Consts::standard();
+        let mut f = Feats::bare(7, 5., 8., &c);
+        f.length = 180_000.;
+        let day = 86400.;
+        // Daily 10-map sessions for 40 days, 90 days off, then 10 days more: the first maps back play worse.
+        let ts: Vec<f64> = (0..50).filter(|d| *d < 40 || *d >= 45).flat_map(|d| {
+            let start = if d < 40 { d as f64 * day } else { (d as f64 + 85.) * day };
+            (0..10).map(move |m| start + (m as f64 + 1.) * 200.)
+        }).collect();
+        let rows: Vec<Row> = ts.iter().enumerate().map(|(i, &t)| row(&i.to_string(), 1., t, false)).collect();
+        let back = 40. * day + 1000.;
+        let resid: Vec<f64> = ts.iter().map(|&t| if t > back { 0.6 * (-(rows.iter().filter(|r| r.ts > back && r.ts < t).count() as f64) * 3. / 30.).exp() } else { 0. }).collect();
+        let rust = fit_rust(&rows, &[f], &resid, &vec![1.; rows.len()]);
+        assert!(rust.amplitude > 0.2, "{rust:?}");
+        let last = *ts.last().unwrap();
+        assert!(rust.at(7, &[], last + 120. * day) > 0.2);
+        assert!(rust.at(7, &[], last + 600.) < 0.05);
+        // Live plays after the fit wear it off again.
+        let later: Vec<(f64, f64)> = (0..20).map(|m| (last + 120. * day + m as f64 * 200., 3.)).collect();
+        assert!(rust.at(7, &later, last + 120. * day + 4000.) < 0.05);
     }
 
     #[test]

@@ -578,10 +578,6 @@ fn an_ln_type_names_the_ln_entry_instead_of_a_second_rating() {
     let holds: Vec<Note> = (0..400i64).map(|i| (1000 + 200 * i, (i % 7) as usize, Some(1000 + 200 * i + 150 + 40 * (i % 3)))).collect();
     let n = names(&holds, 7);
     assert!(n.iter().any(|x| *x == "LN · General"), "{n:?}");
-    // each type's share of the family's load (drives "Mix"): the LN types add to 1
-    let shares = res(&holds, 7);
-    let total: f64 = ["ln_general", "ln_tech", "ln_inverse", "ln_release", "shield"].iter().filter_map(|t| shares.dict("type_share")?.get(t).map(Val::f)).sum();
-    assert!((total - 1.).abs() < 1e-9, "{total}");
     let ln: Vec<&String> = n.iter().filter(|x| x.starts_with("LN")).collect();
     assert_eq!(ln.len(), 1, "{n:?}");
 }

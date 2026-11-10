@@ -13,7 +13,7 @@ use ms_data::imports::{self, add_live_score, import_library, Imported};
 use ms_data::public::Public;
 use ms_data::store::{acc_lazer, acc320, connect, kv_get, kv_set, log_event, now, parse_stats, predictable_context, stable_miss_ratio, timestamp, tracking_allowed, Db, Result, Stats, SUPPORTED_KEYS};
 use ms_data::{replays, webmaps};
-use ms_model::choices::{mix_order, ChoiceList, Prepared, CONVERT, REAL, WEB};
+use ms_model::choices::{key_shares, keymode_order, ChoiceList, Prepared, CONVERT, REAL, WEB};
 use crate::converts::{self, Setting};
 use ms_model::predict::{Consts, FeatStore, HashMap};
 use ms_model::session::SESSION_GAP;
@@ -66,6 +66,8 @@ pub struct Config {
     pub skill_weights: Option<std::collections::HashMap<String, f64>>,
     pub skill_tuning: Option<skills::Tuning>,
     pub web_weighted: std::collections::HashMap<String, bool>,
+    pub key_weights: std::collections::HashMap<String, BTreeMap<i64, f64>>, // tab → keymode → share multiplier
+    pub by_count: std::collections::HashMap<String, bool>, // tab → keymode shares follow map counts
     pub converts: std::collections::HashMap<String, BTreeMap<i64, Setting>>,
 }
 
@@ -126,7 +128,7 @@ pub struct Verdict {
 
 pub enum Out {
     Status { text: String, progress: Option<(usize, usize)>, blocking: bool, learning: Option<bool> },
-    Pool { mode: String, revision: u64, selection_id: u64, phase: String, shown: Vec<Pick>, note: String, summary: String, progress: Option<(usize, usize)> },
+    Pool { mode: String, revision: u64, selection_id: u64, phase: String, shown: Vec<Pick>, note: String, summary: String, progress: Option<(usize, usize)>, key_counts: BTreeMap<i64, usize> },
     Target { mode: String, revision: u64, selection_id: u64, c: Option<Box<Pick>>, msg: String, copy: Option<String> },
     Copy { text: String, msg: String },
     Card { c: Option<Box<Card>>, note: Option<String>, path: Option<PathBuf>, rate: Option<f64> },
@@ -247,6 +249,8 @@ pub struct Worker {
     skills_mix: PpMix,
     web_bias: std::collections::HashMap<&'static str, f64>,
     web_weighted: std::collections::HashMap<&'static str, bool>,
+    key_weights: std::collections::HashMap<&'static str, BTreeMap<i64, f64>>,
+    by_count: std::collections::HashMap<&'static str, bool>,
     converts: std::collections::HashMap<&'static str, BTreeMap<i64, Setting>>,
     odds: std::collections::HashMap<&'static str, [f64; 3]>,
     convert_turn: Arc<AtomicU64>, // the newest convert to deliver: a skipped one never reaches the game
@@ -365,7 +369,7 @@ impl Worker {
             q, h, halt, db, db_path, c, rec: None, public: None, store: Arc::new(RwLock::new(store)), slot: Arc::new(BuildSlot { request: Mutex::new(None), wake: Condvar::new() }), generation: 0, local_request: 0,
             mode: "pp".into(), action: "auto".into(), revision: 0, selection_id: 0,
             keys: [("pp", SUPPORTED_KEYS.collect()), ("nps", vec![7]), ("skills", vec![7])].into_iter().collect(),
-            target: None, targets: Default::default(), playlists: empty(), consumed: VecDeque::new(), nps_focus: 0.5, skills_focus: 0., skills_mix: PpMix { on: false, ..PpMix::default() }, web_bias: [("nps", 0.5), ("skills", 0.5)].into_iter().collect(), skill_weights: Default::default(), skill_tuning: Default::default(), web_weighted: [("nps", true), ("skills", true)].into_iter().collect(),
+            target: None, targets: Default::default(), playlists: empty(), consumed: VecDeque::new(), nps_focus: 0.5, skills_focus: 0., skills_mix: PpMix { on: false, ..PpMix::default() }, web_bias: [("nps", 0.5), ("skills", 0.5)].into_iter().collect(), skill_weights: Default::default(), skill_tuning: Default::default(), web_weighted: [("nps", true), ("skills", true)].into_iter().collect(), key_weights: Default::default(), by_count: Default::default(),
             converts: [("nps", BTreeMap::new()), ("skills", BTreeMap::new())].into_iter().collect(), odds: [("nps", [1., 1., 0.]), ("skills", [1., 1., 0.])].into_iter().collect(), convert_turn: Arc::new(AtomicU64::new(0)),
             acc_targets: [("nps", DEFAULT_TARGET), ("skills", DEFAULT_TARGET)].into_iter().collect(), rates: [("nps", builder::DEFAULT_RATES), ("skills", builder::DEFAULT_RATES)].into_iter().collect(), pp_mix: PpMix::default(), settings: PpSettings::default(), practice_skills: Vec::new(),
             states: [("nps", ListState::default()), ("skills", ListState::default())].into_iter().collect(), credible: Default::default(), restored: HashSet::new(),
@@ -661,7 +665,7 @@ impl Worker {
             };
         }
         let progress = st.as_ref().and_then(ListState::progress);
-        (self.h.emit)(Out::Pool { mode: mode.to_string(), revision: self.revision, selection_id: self.selection_id, phase, shown, note, summary: self.summary(), progress });
+        (self.h.emit)(Out::Pool { mode: mode.to_string(), revision: self.revision, selection_id: self.selection_id, phase, shown, note, summary: self.summary(), progress, key_counts: self.key_counts(mode) });
         Ok(())
     }
 
@@ -673,9 +677,23 @@ impl Worker {
     }
 
     /// Which how-often slider each of this tab's last offers answered to, oldest first.
-    fn recent(n: &Now, mode: &str) -> Vec<u8> {
-        let of = |e: &Arc<ms_data::store::Event>| if e.info["convert"].as_bool() == Some(true) { CONVERT } else if e.info["web"].as_bool() == Some(true) { WEB } else { REAL };
-        let all: Vec<u8> = n.session.all.iter().filter(|e| e.kind == "offer" && e.info["mode"].as_str() == Some(mode)).map(of).collect();
+    /// The open tab's keymode shares (`choices::key_shares`) from its catalogue: your maps and converts, website charts out.
+    fn key_shares(&self, mode: &str) -> BTreeMap<i64, f64> {
+        key_shares(&self.keys[mode], &self.key_weights.get(mode).cloned().unwrap_or_default(), &self.key_counts(mode), self.by_count.get(mode).copied().unwrap_or(false))
+    }
+
+    /// Your maps and converts per keymode in the tab's catalogue (the settings page computes the shares from these live).
+    fn key_counts(&self, mode: &str) -> BTreeMap<i64, usize> {
+        let mut counts: BTreeMap<i64, usize> = BTreeMap::new();
+        for i in self.states.get(mode).map(|s| s.catalog.values()).into_iter().flatten().filter(|i| i.installed || i.convert_of.is_some()) {
+            *counts.entry(i.keys).or_default() += 1;
+        }
+        counts
+    }
+
+    fn recent(n: &Now, mode: &str) -> Vec<(u8, i64)> {
+        let of = |e: &Arc<ms_data::store::Event>| (if e.info["convert"].as_bool() == Some(true) { CONVERT } else if e.info["web"].as_bool() == Some(true) { WEB } else { REAL }, e.info["keys"].as_i64().unwrap_or(0));
+        let all: Vec<(u8, i64)> = n.session.all.iter().filter(|e| e.kind == "offer" && e.info["mode"].as_str() == Some(mode)).map(of).collect();
         all[all.len().saturating_sub(40)..].to_vec()
     }
 
@@ -749,7 +767,7 @@ impl Worker {
         let store = self.store.read().unwrap();
         let (ranked, odds) = rank(&prepared, &st.catalog, &n.session, &store, RankInputs {
             keys: self.keys[mode].clone(), mode, web: web_factor(self.web_bias[mode]), convert, weighted: [self.web_weighted[mode], active.iter().any(|s| s.weighted)], recent_sets: &recent_sets, recent_convert_sets: &recent_convert_sets, taste: if mode == "nps" { &self.taste_cache.1 } else { &none }, consumed: &consumed, seed, focus: if mode == "nps" { self.nps_focus } else { self.skills_focus }, count: 60,
-            recent: Self::recent(&n, mode), skill_weights: shares, selected_skills: &self.practice_skills, miss_ratio: (self.shown.client == "stable").then_some(self.shown.miss_ratio),
+            recent: Self::recent(&n, mode), key_shares: self.key_shares(mode), skill_weights: shares, selected_skills: &self.practice_skills, miss_ratio: (self.shown.client == "stable").then_some(self.shown.miss_ratio),
         });
         drop(store);
         self.odds.insert(mode, odds);
@@ -899,7 +917,9 @@ impl Worker {
         if local {
             // Kept maps you don't have outlive the played ones and piled up at the top (user 2026-10-26).
             let streams: Vec<u8> = shown.iter().map(Pick::stream).collect();
-            let order = mix_order(&streams, self.odds[mode], &Self::recent(&n, mode));
+            let keys: Vec<i64> = shown.iter().map(|p| p.keys).collect();
+            let odds = self.odds[mode];
+            let order = keymode_order(&keys, &streams, |_| odds, &Self::recent(&n, mode), &self.key_shares(mode));
             shown = order.into_iter().map(|i| shown[i].clone()).collect();
         }
         shown.truncate(20);
@@ -1105,6 +1125,20 @@ impl Worker {
         if let Some(m) = c.skills_mix.filter(|m| *m != self.skills_mix) {
             self.skills_mix = m;
             self.playlists.insert("skills", Vec::new());
+        }
+        for (m, value) in &c.key_weights {
+            let m = key_mode(m);
+            if self.key_weights.get(m) != Some(value) {
+                self.key_weights.insert(m, value.clone());
+                self.playlists.insert(m, Vec::new());
+            }
+        }
+        for (m, on) in &c.by_count {
+            let m = key_mode(m);
+            if self.by_count.get(m) != Some(on) {
+                self.by_count.insert(m, *on);
+                self.playlists.insert(m, Vec::new());
+            }
         }
         for (m, on) in &c.web_weighted {
             let m = key_mode(m);

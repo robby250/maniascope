@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex};
 
 /// recommend.predictor_id of the model the Rust port reproduces: forecasts stay comparable across the port. A change to
 /// the prediction model takes a new id, so old forecasts are not read as this model's.
-pub const PREDICTOR_ID: &str = "6d720089aed6"; // mash floor (2026-11-06); was 86660d70dccc
-pub const CALC_ID: &str = "d3a86f7b014f";
+pub const PREDICTOR_ID: &str = "a6d61e058f5d"; // vibro charts out of the ability fit (2026-11-10); was dfd6aaab0957
+pub const CALC_ID: &str = "f92680b7b136";
 /// Differ from CALC_ID in calibration only (calib/carry.json), newest first: a crawl still running holds the website rows back a whole
 /// calculator, so those can start older than the library's. Each carry keeps its source row.
 pub const CARRIED_CALCS: [&str; 10] = ["2f01eca5e738", "7cee1dfdba7f", "a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f"];
