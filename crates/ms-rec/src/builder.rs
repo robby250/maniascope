@@ -19,10 +19,11 @@ use std::sync::{Arc, RwLock};
 
 pub use ms_calc::structure::STRUCTURE_VERSION; // offers of another version are skipped
 pub const DEFAULT_TARGET: f64 = 0.95;
-const LEAD: usize = 300; // charts re-predicted first after a play or refit (the shown 20 come from the top ~60)
 const STABLE_RATES: [f64; 3] = [0.75, 1., 1.5]; // stable has HT/NM/DT only (user 2026-10-31)
-pub const PROFILE: [&str; 22] = ["stream", "delay", "jumpstream", "handstream", "chordstream", "chordjack", "jack", "jackspeed", "minijack", "longjack", "jumptrill",
-    "splittrill", "bracket", "ln", "ln_general", "ln_tech", "ln_inverse", "ln_release", "shield", "patterntech", "rhythmtech", "sv"];
+/// The skills of a chart's pattern profile: every shown skill (the skill table's rows).
+pub fn profile() -> Vec<String> {
+    ms_calc::taxonomy::kept().filter(|s| ms_calc::taxonomy::shown(*s)).map(|s| s.name().to_string()).collect()
+}
 
 pub fn offerable(rate: f64, client: &str) -> bool {
     client != "stable" || STABLE_RATES.contains(&rate)
@@ -164,7 +165,6 @@ pub struct Published {
     pub analyzed: usize,
     pub failed: usize,
     pub error: String,
-    pub partial: bool,
     pub revision: u64,
     pub generation: u64,
     pub keys_by_mode: (Vec<i64>, Vec<i64>),
@@ -172,6 +172,7 @@ pub struct Published {
 
 pub enum Update {
     Ready(Published),
+    Progress { mode: String, revision: u64, generation: u64, total: usize, analyzed: usize, failed: usize }, // background analysis after the publication
     Failed { error: String, mode: String, revision: u64, generation: u64 },
 }
 
@@ -186,7 +187,6 @@ pub struct Builder {
     web: HashSet<String>,
     window: Option<Vec<(i64, u64, u64)>>,
     installed_md5: HashSet<String>,
-    lead: BTreeMap<String, Vec<String>>,
     pub prm: Arc<Params>,
     pub wanted: Arc<dyn Fn() -> bool + Send + Sync>, // a newer request is waiting, or the app is closing
     pub busy: Arc<dyn Fn() -> bool + Send + Sync>,   // the existing gameplay pause policy
@@ -206,7 +206,7 @@ fn publish_job(sha: &str, inst: &Inst, public: &Public) -> ScoreJob {
 impl Builder {
     pub fn new(store: Arc<RwLock<FeatStore>>, prm: Arc<Params>) -> Builder {
         Builder { store, catalog: HashMap::default(), order: Vec::new(), catalog_key: None, catalog_error: String::new(), loaded_rowid: 0, web: HashSet::new(), window: None, installed_md5: HashSet::new(), index_size: 256,
-                  lead: BTreeMap::new(), prm, wanted: Arc::new(|| false), busy: Arc::new(|| false), game: Arc::new(|| false), emit: Arc::new(|_| {}) }
+                  prm, wanted: Arc::new(|| false), busy: Arc::new(|| false), game: Arc::new(|| false), emit: Arc::new(|_| {}) }
     }
 
     /// A failed build's catalogue is not reusable.
@@ -220,7 +220,7 @@ impl Builder {
         self.catalog = installed.iter().map(|i| (i.sha256.clone(), i.clone())).collect();
         self.apply_converts(db, &r.converts)?; // a saved list is half converts on 10K, none with a library row
         let mut source = crate::evidence::FeatureSource { public: r.public.clone(), calc: r.calc.clone(), cache: Default::default() };
-        let mut store = FeatStore::new(skills::feat_trees(), PROFILE.iter().map(|s| s.to_string()).collect(), r.model.c.clone(), STRUCTURE_VERSION).expect("skill trees");
+        let mut store = FeatStore::new(skills::feat_trees(), profile(), r.model.c.clone(), STRUCTURE_VERSION).expect("skill trees");
         let (mut catalog, mut order): (HashMap<String, Arc<Inst>>, Vec<String>) = Default::default();
         for (sha, rate) in refs {
             let Some(inst) = self.catalog.get(sha) else { continue };
@@ -419,16 +419,18 @@ impl Builder {
         Ok(true)
     }
 
-    fn snapshot(&self, r: &Request, list: ChoiceList, partial: bool, subset: Option<HashMap<String, Arc<Inst>>>, failed: usize) -> Update {
+    fn snapshot(&self, r: &Request, list: ChoiceList, failed: usize) -> Update {
         let store = self.store.read().unwrap();
         let total = self.catalog.len();
         let analyzed = self.catalog.keys().filter(|s| store.current(s)).count();
-        Update::Ready(Published { mode: r.mode.clone(), candidates: Arc::new(list), catalog: Arc::new(subset.unwrap_or_else(|| self.catalog.clone())), selected_skills: r.selected_skills.clone(),
-                                  total, analyzed, failed, error: self.catalog_error.clone(), partial, revision: r.revision, generation: r.generation,
+        Update::Ready(Published { mode: r.mode.clone(), candidates: Arc::new(list), catalog: Arc::new(self.catalog.clone()), selected_skills: r.selected_skills.clone(),
+                                  total, analyzed, failed, error: self.catalog_error.clone(), revision: r.revision, generation: r.generation,
                                   keys_by_mode: (r.keys.clone(), r.skills_keys.clone()) })
     }
 
-    /// One request, published as it improves; returns when finished or superseded.
+    /// One request, published once: the whole library re-predicted and the charts that can reach the top analysed at their
+    /// exact rates (user 2026-11-13: "merge them all into 1 stage"). Analysis of the rest goes on unpublished and joins
+    /// the next request; returns when finished or superseded.
     pub fn build(&mut self, db: &Db, r: &Request) -> Result<()> {
         if r.mode != "nps" && r.mode != "skills" {
             return Ok(()); // PP never waits for an invisible tab
@@ -456,7 +458,7 @@ impl Builder {
             self.apply_converts(db, &r.converts)?;
             self.index_size = 256;
             self.catalog_key = catalog_key;
-            *self.store.write().unwrap() = FeatStore::new(skills::feat_trees(), PROFILE.iter().map(|s| s.to_string()).collect(), r.model.c.clone(), STRUCTURE_VERSION).expect("skill trees");
+            *self.store.write().unwrap() = FeatStore::new(skills::feat_trees(), profile(), r.model.c.clone(), STRUCTURE_VERSION).expect("skill trees");
             self.loaded_rowid = 0;
             self.web.clear();
             self.swap_web(db, r, &allowed, reaches.as_ref(), web.as_ref())?;
@@ -494,19 +496,6 @@ impl Builder {
             let jobs: Vec<ScoreJob> = shas.iter().filter_map(|s| catalog.get(s).map(|i| publish_job(s, i, &r.public))).collect();
             r.model.score_into(choices, &tables, store, &jobs, &selected, &r.tuning, r.target, r.rates, skills_mode, skills::wants_vibro(&selected), !selected.is_empty(), r.nps_weight, now)
         };
-        let now = ms_data::store::now();
-        // A play or refit re-predicts the whole library. The previous request's leading charts go first, so the shown
-        // list follows the new session within a second.
-        let lead: Vec<String> = self.lead.get(&r.mode).map_or_else(Vec::new, |l| l.iter().filter(|s| self.catalog.contains_key(*s)).cloned().collect());
-        if !lead.is_empty() {
-            let subset: HashMap<String, Arc<Inst>> = lead.iter().map(|s| (s.clone(), self.catalog[s].clone())).collect();
-            let mut quick = Choices::new(lead.clone(), forecast.clone());
-            let store = self.store.read().unwrap();
-            if score(&mut quick, &lead, &subset, &store, now).is_ok() {
-                drop(store);
-                (self.emit)(self.snapshot(r, quick.snapshot(), true, Some(subset), 0));
-            }
-        }
         // Deterministic per-chart order spreads unplayed coverage across collections.
         let (mut unknown, mut enrich): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
         {
@@ -543,7 +532,9 @@ impl Builder {
         }
         let memo_forecast = forecast.clone();
         let mut memo = Choices::new(self.order.clone(), forecast);
-        let (mut bad, mut count, mut last_publish) = (HashMap::<String, String>::default(), 0usize, None::<std::time::Instant>);
+        // `shown`: the request's list is out. Only an empty one (nothing analysed yet) is replaced by the first that isn't.
+        let (mut bad, mut count, mut emitted, mut shown) = (HashMap::<String, String>::default(), 0usize, false, false);
+        let mut told = std::time::Instant::now(); // last progress note
         let (mut refined, mut refined_counts, mut groups_done): (Vec<(String, f64)>, HashMap<String, u32>, BTreeMap<(i64, String), u32>) = Default::default();
         let mut pending_unknown: VecDeque<String> = unknown.into();
         let mut pending_enrich: VecDeque<String> = enrich.into();
@@ -559,13 +550,6 @@ impl Builder {
                 let blocked: HashSet<String> = refined_counts.iter().filter(|x| *x.1 >= 6).map(|x| x.0.clone()).chain(bad.keys().cloned()).collect();
                 memo.proposals(&refined, &blocked)
             };
-            let publish_now = last_publish.is_none_or(|t| t.elapsed().as_secs_f64() > 10.) || count == 0;
-            let snapshot = memo.snapshot();
-            if publish_now {
-                self.lead.insert(r.mode.clone(), snapshot.lead(LEAD));
-                (self.emit)(self.snapshot(r, snapshot.clone(), false, None, bad.len()));
-                last_publish = Some(std::time::Instant::now());
-            }
             let mut jobs: Vec<(String, f64)> = Vec::new();
             {
                 let store = self.store.read().unwrap();
@@ -613,12 +597,18 @@ impl Builder {
                 }
                 out
             };
+            // The shortlist is exact once the frontier asks for no more rates: that is the request's one publication.
+            if !shown && jobs.is_empty() {
+                let snapshot = memo.snapshot();
+                if !emitted || !snapshot.items.is_empty() {
+                    (emitted, shown) = (true, !snapshot.items.is_empty());
+                    (self.emit)(self.snapshot(r, snapshot, bad.len()));
+                }
+            }
             jobs.extend(take(&mut pending_enrich, &mut pending_unknown, &bad, &self.store.read().unwrap()));
             // A useful exact shortlist needs no endless refinement, but unanalysed maps keep going until the library is
             // done: a calculator change left ~10k waiting for two weeks at 160 per update (user 2026-10-25).
             if jobs.is_empty() {
-                self.lead.insert(r.mode.clone(), snapshot.lead(LEAD));
-                (self.emit)(self.snapshot(r, snapshot, false, None, bad.len()));
                 if !self.wait_idle() || !self.index_converts(db, r, web.as_ref(), reaches.as_ref())? {
                     return Ok(());
                 }
@@ -661,6 +651,12 @@ impl Builder {
                     }
                 }
                 tx.commit()?;
+                if told.elapsed().as_secs() >= 2 {
+                    told = std::time::Instant::now();
+                    let store = self.store.read().unwrap();
+                    let analyzed = self.catalog.keys().filter(|s| store.current(s)).count();
+                    (self.emit)(Update::Progress { mode: r.mode.clone(), revision: r.revision, generation: r.generation, total: self.catalog.len(), analyzed, failed: bad.len() });
+                }
                 jobs = if analysing.elapsed() < bookkeeping { take(&mut pending_enrich, &mut pending_unknown, &bad, &self.store.read().unwrap()) } else { Vec::new() };
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
@@ -771,7 +767,7 @@ mod convert_tests {
 
     fn builder() -> Builder {
         let c = Arc::new(ms_model::predict::Consts::standard());
-        Builder::new(Arc::new(RwLock::new(FeatStore::new(skills::feat_trees(), PROFILE.iter().map(|s| s.to_string()).collect(), c, STRUCTURE_VERSION).unwrap())), Arc::new(ms_calc::features::standard_params()))
+        Builder::new(Arc::new(RwLock::new(FeatStore::new(skills::feat_trees(), profile(), c, STRUCTURE_VERSION).unwrap())), Arc::new(ms_calc::features::standard_params()))
     }
 
     #[test]

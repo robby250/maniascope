@@ -835,6 +835,14 @@ impl Rust {
         self.amplitude * ((-practice / self.minutes).exp() - usual).max(0.)
     }
 
+    /// Rust over a subset of the keymode's plays (end, played minutes), e.g. one skill's charts: the same curve, practice
+    /// counted on those plays alone, against the keymode's usual readiness.
+    pub fn of_plays(&self, keys: i64, plays: &[(f64, f64)], now: f64) -> f64 {
+        let Some(&(_, _, usual)) = self.state.get(&keys).filter(|_| self.amplitude > 0.) else { return 0. };
+        let practice: f64 = plays.iter().map(|&(end, played)| played * self.fade((now - end).max(0.))).sum();
+        self.amplitude * ((-practice / self.minutes).exp() - usual).max(0.)
+    }
+
     fn fade(&self, seconds: f64) -> f64 {
         (-seconds / 86400. / self.memory_days).exp()
     }
@@ -1027,6 +1035,8 @@ pub struct Fit {
 /// recommend.Personal.__init__ on the kept evidence rows.
 pub fn personal_fit(c: &Consts, mut rows: Vec<Row>, feats: &[Feats], now: f64, levels: &HashMap<i64, f64>, knobs: Knobs, warmup: &WarmupArgs) -> Fit {
     let Knobs { half_life, level_bw, history_zone, recent_months, att_sd, session_gap } = knobs;
+    // A row whose chart has no population prediction (no features) would spread NaN through its keymode's level curve.
+    rows.retain(|r| r.y.is_finite() && r.base.is_finite());
     let (models, cold) = warmup_models(c, &rows, feats, warmup);
     // A typical warmed baseline, not a mixture that counts the historical cold deficit here and again at
     // next-session startup.

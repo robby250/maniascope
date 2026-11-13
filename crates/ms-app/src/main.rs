@@ -19,7 +19,11 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::Ordering;
 
-const INSTANCE_PORT: u16 = 24051; // a second launch raises the first instance's window
+/// A second launch raises the first instance's window. With MANIASCOPE_REC set (another data folder: two versions side by side,
+/// tools/side-by-side.sh) the port follows that folder, so each folder has its own single instance.
+fn instance_port() -> u16 {
+    std::env::var("MANIASCOPE_REC").map_or(24051, |p| 24100 + (p.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32)) % 900) as u16)
+}
 
 const ICON: &[u8] = include_bytes!("../../../assets/icon.png");
 
@@ -105,12 +109,12 @@ fn self_test() -> i32 {
 fn webmaps(args: &[String]) -> i32 {
     let command = args.first().map_or("", String::as_str);
     let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1));
-    let keys = value("--keys").map_or_else(Default::default, |k| k.split(',').filter_map(|x| x.parse().ok()).collect());
-    let stars = value("--stars").and_then(|s| { let (a, b) = s.split_once('-')?; Some((a.parse().ok()?, b.parse().ok()?)) });
-    // No --status: a paused batch from before the choice, which listed every status.
-    let groups: Vec<&str> = value("--status").map_or_else(|| vec!["ranked", "unranked"], |s| s.split(',').collect());
+    // --wants JSON: the window's per-keymode choice (`webmaps::Want`); --pp-floor ★: the new-ranked-PP-maps run for --keys
+    let wants: Vec<ms_data::webmaps::Want> = value("--wants").and_then(|w| serde_json::from_str(w).ok()).unwrap_or_default();
+    let keys: Vec<i64> = value("--keys").map_or_else(Vec::new, |k| k.split(',').filter_map(|x| x.parse().ok()).collect());
+    let pp = value("--pp-floor").and_then(|f| f.parse().ok()).map(|floor| ms_data::webmaps::PpAuto { keys, floor });
     let prm = ms_calc::features::standard_params();
-    match ms_data::webmaps::crawl(&keys, &ms_data::webmaps::statuses(&groups), stars, command == "check", false, None, ms_rec::engine::CALC_ID, &prm) {
+    match ms_data::webmaps::crawl(&wants, command == "check", false, None, ms_rec::engine::CALC_ID, &prm, pp) {
         Ok(()) => 0,
         Err(ms_data::webmaps::CrawlError::Stopped) => 0,
         Err(ms_data::webmaps::CrawlError::Failed(e)) => {
@@ -171,6 +175,7 @@ impl eframe::App for Shell {
                 b = b.with_always_on_top();
             }
             let closed = ctx.show_viewport_immediate(windows::playlist_id(), b, |ui, _| {
+                theme::dark_frame(ui.ctx());
                 egui::CentralPanel::default().frame(egui::Frame::central_panel(ui.style()).inner_margin(14)).show(ui, |ui| app.playlist_ui(ui));
                 let c = ui.ctx().clone();
                 app.track_playlist(&c);
@@ -195,8 +200,50 @@ impl eframe::App for Shell {
     }
 }
 
+/// `--side-by-side OLD_BINARY` (user 2026-11-12: "a way to run 2 different maniascope versions at the same time to compare"):
+/// OLD runs on a copy of the data folder (files changed since the last copy are copied again), this build on the real one with
+/// MANIASCOPE_REC set, so each has its own instance port. Settings in the config folder are shared.
+fn side_by_side(args: &[String]) -> i32 {
+    let Some(old) = args.first() else {
+        eprintln!("usage: maniascope --side-by-side OLD_BINARY");
+        return 2;
+    };
+    let real = ms_data::paths::rec_dir();
+    let copy = ms_data::paths::data().with_file_name("maniascope-side").join("rec");
+    fn sync(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(to)?;
+        for e in std::fs::read_dir(from)?.flatten() {
+            let (src, dst) = (e.path(), to.join(e.file_name()));
+            let meta = e.metadata()?;
+            if meta.is_dir() {
+                sync(&src, &dst)?;
+            } else if std::fs::metadata(&dst).map_or(true, |d| d.len() != meta.len() || d.modified().ok() < meta.modified().ok()) {
+                std::fs::copy(&src, &dst)?;
+            }
+        }
+        Ok(())
+    }
+    eprintln!("copying {} → {}", real.display(), copy.display());
+    if let Err(e) = sync(&real, &copy) {
+        eprintln!("copy failed: {e}");
+        return 1;
+    }
+    let spawn = |bin: &std::ffi::OsStr, rec: &std::path::Path| std::process::Command::new(bin).env("MANIASCOPE_REC", rec).spawn();
+    let me = std::env::current_exe().map(|p| p.into_os_string()).unwrap_or_else(|_| "maniascope".into());
+    match (spawn(old.as_ref(), &copy), spawn(&me, &real)) {
+        (Ok(mut a), Ok(mut b)) => {
+            let _ = (a.wait(), b.wait());
+            0
+        }
+        (a, b) => {
+            eprintln!("could not start: {:?} {:?}", a.err(), b.err());
+            1
+        }
+    }
+}
+
 fn listen(mail: app::Mail) {
-    let Ok(listener) = TcpListener::bind(("127.0.0.1", INSTANCE_PORT)) else { return };
+    let Ok(listener) = TcpListener::bind(("127.0.0.1", instance_port())) else { return };
     std::thread::spawn(move || {
         for s in listener.incoming().flatten() {
             let mut hello = [0u8; 10];
@@ -213,9 +260,10 @@ fn main() {
         Some("--self-test") => std::process::exit(self_test()),
         Some("--install-desktop") => std::process::exit(install_desktop()),
         Some("--webmaps") => std::process::exit(webmaps(&args[1..])),
+        Some("--side-by-side") => std::process::exit(side_by_side(&args[1..])),
         _ => {}
     }
-    if let Ok(mut other) = TcpStream::connect(("127.0.0.1", INSTANCE_PORT)) {
+    if let Ok(mut other) = TcpStream::connect(("127.0.0.1", instance_port())) {
         let _ = other.write_all(b"maniascope");
         return; // single instance: the running window comes forward
     }

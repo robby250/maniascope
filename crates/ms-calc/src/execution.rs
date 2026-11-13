@@ -6,7 +6,7 @@ use crate::kern::{off_grid, smooth};
 use crate::params::Knobs;
 use crate::pattern;
 use crate::py;
-use crate::skills::{attribute as sk_attribute, Series, Sk, SV_KINDS};
+use crate::skills::{attribute as sk_attribute, Series, Sk};
 
 /// execution.analyse output (per-bin averages).
 #[derive(Clone, Debug, Default)]
@@ -22,7 +22,7 @@ pub struct Info {
     pub flow: f64,
 }
 
-pub fn analyse(chart: &Chart, g: &Geometry, bin_seconds: f64, centre_split: bool) -> Info {
+pub fn analyse(chart: &Chart, g: &Geometry, bin_seconds: f64) -> Info {
     let (times, ends, cols) = (&g.times, &g.ends, &g.columns);
     let n = times.len();
     if n == 0 {
@@ -96,7 +96,7 @@ pub fn analyse(chart: &Chart, g: &Geometry, bin_seconds: f64, centre_split: bool
     let roll = pattern::smooth_rolls(rows, chart.keys);
     // Odd keymodes: the middle key with each hand in turn, averaged, as demand and smooth_rolls do (user 2026-11-03: "a
     // thumb is a finger … do 3"); it went to the right hand only.
-    let splits: Vec<u32> = if chart.keys % 2 == 1 && centre_split { vec![((1u64 << (half + 1)) - 1) as u32, ((1u64 << half) - 1) as u32] } else { vec![((1u64 << half) - 1) as u32] };
+    let splits: Vec<u32> = if chart.keys % 2 == 1 { vec![((1u64 << (half + 1)) - 1) as u32, ((1u64 << half) - 1) as u32] } else { vec![((1u64 << half) - 1) as u32] };
     let mut pulses = vec![(0.0f64, 0.0f64); rows.len()];
     for &lo_mask in &splits {
         for (ri, p) in hand_pulses(rows, lo_mask, &roll).into_iter().enumerate() {
@@ -205,35 +205,15 @@ fn hand_pulses(rows: &[crate::demand::Row], lo_mask: u32, roll: &[Vec<f64>; 2]) 
     out
 }
 
-/// Per bin: share of notes inside same-column runs (absolute played-time bins, as execution.column_runs).
+/// Per bin: share of notes inside vibro runs (`structure::column_runs`), bins from the first note like every other series
+/// (absolute song time put every run of a chart starting late into its last bin).
 pub fn column_runs(chart: &Chart, rate: f64, bins: usize, k: &Knobs) -> Vec<f64> {
-    let mut by: Vec<Vec<f64>> = vec![Vec::new(); chart.keys];
-    for i in 0..chart.len() {
-        by[chart.col[i] as usize].push(chart.t[i] * 0.001 / rate);
-    }
-    let first = if k.COLUMN_ORIGIN > 0.0 { chart.t.first().map_or(0.0, |t| t * 0.001 / rate) } else { 0.0 };
     let mut inrun = vec![0.0f64; bins];
     let mut count = vec![0.0f64; bins];
-    for times in &mut by {
-        if times.is_empty() {
-            continue;
-        }
-        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let mut run = vec![times[0]];
-        for &t in times[1..].iter().chain(std::iter::once(&f64::INFINITY)) {
-            if t - run[run.len() - 1] < k.VIBRO_GAP {
-                run.push(t);
-                continue;
-            }
-            let full = run.len() >= k.VIBRO_MIN;
-            for &x in &run {
-                let b = (bins - 1).min(((x - first) / k.BIN) as usize);
-                count[b] += 1.0;
-                inrun[b] += full as u8 as f64;
-            }
-            run = vec![t];
-        }
-    }
+    let first = chart.t.first().copied().unwrap_or(0.0);
+    let bin = |i: usize| (bins - 1).min(((chart.t[i] - first) * 0.001 / rate / k.BIN) as usize);
+    (0..chart.len()).for_each(|i| count[bin(i)] += 1.0);
+    crate::structure::column_runs(chart, rate, k.VIBRO_GAP, k).iter().flatten().for_each(|&i| inrun[bin(i)] += 1.0);
     inrun.iter().zip(&count).map(|(&i, &c)| if c != 0.0 { i / c } else { 0.0 }).collect()
 }
 
@@ -250,8 +230,10 @@ pub fn attribute(
     motion: &gestures::Analysis,
     quad: &(Vec<f64>, f64),
     k: &Knobs,
-) -> (Parts, Vec<(&'static str, f64)>) {
+) -> (Parts, Vec<(&'static str, f64)>, Vec<f64>) {
     let m = &info.mash;
+    // Rice: the base skills of the rice and chord fit families (mash and rolls take from them).
+    let rice: Vec<Sk> = crate::taxonomy::TABLE.iter().filter(|r| r.role == crate::taxonomy::Role::Base && matches!(r.fit, "rice" | "chords") && series.has(r.sk)).map(|r| r.sk).collect();
     let mut changed = parts.clone();
     let zipn = |a: usize, b: usize| a.min(b);
     {
@@ -287,15 +269,13 @@ pub fn attribute(
             series.set(s, &v);
         }
     };
-    for s in [Sk::stream, Sk::delay, Sk::dump, Sk::jumpstream, Sk::handstream, Sk::chordstream, Sk::minijack, Sk::bracket] {
+    for &s in &rice {
         let n = series.get(s).len().min(m.len());
         scale(series, s, &|b| 1.0 - m[b], n);
     }
     let ln_shared = info.release_sync;
-    for s in [Sk::ln, Sk::release, Sk::shield] {
-        let n = series.get(s).len().min(m.len());
-        scale(series, s, &|b| 1.0 - m[b] * ln_shared, n);
-    }
+    let n = series.get(Sk::ln).len().min(m.len());
+    scale(series, Sk::ln, &|b| 1.0 - m[b] * ln_shared, n);
     let sum_total = py::sum(total.iter().copied());
     let weight = 1f64.max(sum_total);
     let mash = py::sum(total.iter().zip(m).map(|(t, v)| t * v)) / weight;
@@ -324,52 +304,30 @@ pub fn attribute(
     let nown = vib.len().min(runs.len()).min(rows.len());
     let own: Vec<f64> = (0..nown)
         .map(|b| {
-            let o = (1f64.min(vib[b] / 0.8)).max(runs[b] * smooth(rows[b] / k.BIN, 28.0, 36.0));
+            let o = (1f64.min(vib[b] / 0.8)).max(runs[b]); // the same chord re-struck, or a column's vibro run
             if o >= 0.02 { o } else { 0.0 }
         })
         .collect();
-    let own_at = |i: usize| if i < own.len() { own[i] } else { 0.0 };
-    let vibro: Vec<f64> = nosv.iter().enumerate().map(|(i, t)| t * own_at(i)).collect();
-    series.set(Sk::vibro, &vibro);
-    for s in [
-        Sk::stream, Sk::delay, Sk::dump, Sk::jumpstream, Sk::handstream, Sk::chordstream, Sk::bracket, Sk::ln,
-        Sk::release, Sk::inverse, Sk::hybrid, Sk::shield,
-    ] {
-        let n = series.get(s).len();
-        scale(series, s, &|i| 1.0 - own_at(i), n);
-    }
-    let rice: Vec<Sk> =
-        [Sk::stream, Sk::delay, Sk::dump, Sk::jumpstream, Sk::handstream, Sk::chordstream].into_iter().filter(|&s| series.has(s)).collect();
+    // Rolled rice is jumptrill: the rolled share of each rice skill moves to it (shares still sum to the bin's total).
     let rolled = &gs[gestures::s::ROLLED];
     for b in 0..rolled.len().min(total.len()) {
         let strength = rolled[b];
         if strength <= 0.0 {
             continue;
         }
-        let moved = rice.iter().map(|&s| series.get(s)[b]).fold(None, |m: Option<f64>, x| Some(match m {
-            Some(m) if m >= x => m,
-            _ => x,
-        })).unwrap_or(0.0) * strength;
-        let jt = &mut series.get_mut(Sk::jumptrill)[b];
-        *jt = jt.max(moved);
+        let moved: f64 = rice.iter().filter_map(|&s| series.get(s).get(b)).sum::<f64>() * strength;
+        if let Some(jt) = series.get_mut(Sk::jumptrill).get_mut(b) {
+            *jt += moved;
+        }
         for &s in &rice {
-            series.get_mut(s)[b] *= 1.0 - strength;
+            if let Some(x) = series.get_mut(s).get_mut(b) {
+                *x *= 1.0 - strength;
+            }
         }
     }
     for (name, v) in gestures::FEATURES.iter().zip(motion.features) {
         extra.push((name, v));
     }
     extra.push(("full_chord_stream_share", quad.1));
-    if chart.keys == 4 {
-        let q: Vec<f64> = nosv.iter().zip(&quad.0).map(|(t, s)| t * 1f64.min(s / k.MJ_FULL)).collect();
-        series.set(Sk::quadstream, &q);
-    }
-    let sv = series.get(Sk::sv).to_vec();
-    let psv = parts.get(P::sv);
-    for (sk, p) in SV_KINDS.iter().zip(crate::demand::SV_KINDS) {
-        let pk = parts.get(p);
-        let v: Vec<f64> = sv.iter().enumerate().map(|(b, &v)| v * 1f64.min(pk[b] / 1e-9f64.max(psv[b]))).collect();
-        series.set(*sk, &v);
-    }
-    (changed, extra)
+    (changed, extra, own)
 }

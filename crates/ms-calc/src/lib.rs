@@ -16,6 +16,7 @@ pub mod py;
 pub mod scroll;
 pub mod skills;
 pub mod structure;
+pub mod taxonomy;
 pub mod val;
 
 // Every binary links the calculator: its many short-lived vectors made the system allocator ~9 % of a chart's analysis.
@@ -23,4 +24,4 @@ pub mod val;
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // A refit takes the sha256 of calib/difficulty.json; a rules-only change (labels, same stars) that of it plus the rule commit.
-pub const CALC_ID: &str = "f92680b7b136";
+pub const CALC_ID: &str = "2789b337ae54";

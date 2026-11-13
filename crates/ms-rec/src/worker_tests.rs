@@ -120,10 +120,46 @@ fn the_queue_drops_maps_that_fell_out_of_the_current_ranking() {
     let mut l = live("credible", 240, busy(false));
     let list = fresh_list(&mut l);
     let (stale, kept, new) = (list[0].clone(), list[1].clone(), list[2].clone());
-    l.w.playlists.insert("nps", vec![stale, kept.clone()]);
+    l.w.playlists.insert("nps", vec![kept.clone(), stale]);
     l.w.credible.insert("nps".into(), [kept.identity().unwrap(), new.identity().unwrap()].into_iter().collect());
     let shown = l.w.prepared_playlist("nps", vec![new.clone()]).unwrap();
     assert_eq!(shas(&shown), shas(&[kept, new]));
+}
+
+#[test]
+fn the_next_map_stays_first_at_its_rate_through_background_updates() {
+    let mut l = live("pinned", 240, busy(false));
+    let list = fresh_list(&mut l);
+    let (next, b, c) = (list[0].clone(), list[1].clone(), list[2].clone());
+    l.w.playlists.insert("nps", vec![next.clone(), b.clone()]);
+    l.w.targets.insert("nps".into(), Box::new(next.clone())); // Next offered it
+    // A refit that drops the next map from the ranking does not take it away.
+    l.w.credible.insert("nps".into(), [b.identity().unwrap(), c.identity().unwrap()].into_iter().collect());
+    for fresh in [vec![c.clone(), b.clone()], vec![b.clone(), c.clone()]] {
+        let shown = l.w.prepared_playlist("nps", fresh).unwrap();
+        assert_eq!((shown[0].sha.clone(), shown[0].rate), (next.sha.clone(), next.rate));
+    }
+}
+
+#[test]
+fn a_row_that_moves_up_after_a_play_is_aimed_at_the_target() {
+    let mut l = live("aimed", 240, busy(false));
+    let list = fresh_list(&mut l);
+    let (played, mut b) = (list[0].clone(), list[1].clone());
+    b.rate = 1.37; // its prepared rate, never aimed
+    l.w.playlists.insert("nps", vec![b.clone()]);
+    l.w.targets.insert("nps".into(), Box::new(played));
+    let shown = l.w.prepared_playlist("nps", Vec::new()).unwrap();
+    let mut aimed = b.clone();
+    l.w.aim(&mut aimed, "nps").unwrap();
+    assert_ne!(aimed.rate, 1.37, "the fixture must aim somewhere else");
+    let head = shown.iter().find(|c| c.sha == b.sha).unwrap();
+    assert_eq!(head.rate, aimed.rate, "1.10.0: kept at 1.37 because it was first in the queue");
+    // Offered at 1.37, it stays there.
+    l.w.targets.insert("nps".into(), Box::new(b.clone()));
+    l.w.playlists.insert("nps", vec![b.clone()]);
+    let shown = l.w.prepared_playlist("nps", Vec::new()).unwrap();
+    assert_eq!(shown[0].rate, 1.37);
 }
 
 #[test]
@@ -143,6 +179,10 @@ fn a_local_queue_rechecks_readiness_after_a_prediction_refresh_and_pp_does_not()
     };
     let want: Vec<String> = rows.iter().filter(|c| fits(c)).filter_map(|c| c.sha.clone()).collect();
     assert!(!want.is_empty() && want.len() < rows.len(), "{}", want.len());
+    // The queue's first map is the next one and stays even when unready: start with a ready one.
+    let mut rows = rows;
+    let first = rows.iter().position(|c| fits(c)).unwrap();
+    rows.swap(0, first);
     l.w.playlists.insert("nps", rows.clone());
     let mut shown = shas(&l.w.prepared_playlist("nps", Vec::new()).unwrap());
     shown.sort();
@@ -172,7 +212,7 @@ fn a_stale_click_or_filter_opens_nothing() {
 
 fn published(l: &Live, mode: &str) -> Published {
     let w = &l.w;
-    Published { mode: mode.into(), candidates: Arc::default(), catalog: Arc::default(), selected_skills: w.practice_skills.clone(), total: 0, analyzed: 0, failed: 0, error: String::new(), partial: false,
+    Published { mode: mode.into(), candidates: Arc::default(), catalog: Arc::default(), selected_skills: w.practice_skills.clone(), total: 0, analyzed: 0, failed: 0, error: String::new(),
                 revision: w.local_request, generation: w.generation, keys_by_mode: (w.keys["nps"].clone(), w.keys["skills"].clone()) }
 }
 
@@ -457,14 +497,14 @@ fn a_live_result_reads_its_chart_and_keeps_its_metadata_fresh() {
     assert!(l.rx.try_iter().any(|m| matches!(m, Out::Result(v) if v.title.contains("Renamed"))));
 }
 
-/// One builder run to its first whole publication (or the end of the request).
+/// One builder run to its publication (or the end of the request).
 fn built(l: &mut Live, mode: &str, setup: impl FnOnce(&mut Builder)) -> (Builder, Vec<Update>) {
     let r = l.w.request_of(mode).unwrap();
     let mut b = Builder::new(l.w.store.clone(), l.w.rec.as_ref().unwrap().prm.clone());
     let (out, stop) = (Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicBool::new(false)));
     let (o, s) = (out.clone(), stop.clone());
     b.emit = Arc::new(move |u: Update| {
-        s.store(matches!(&u, Update::Ready(p) if !p.partial && p.analyzed + p.failed >= p.total), Ordering::Relaxed);
+        s.store(matches!(&u, Update::Ready(p) if !p.candidates.items.is_empty()), Ordering::Relaxed); // the request's one list
         o.lock().unwrap().push(u);
     });
     let s = stop;
@@ -546,16 +586,29 @@ fn a_filter_nothing_matches_offers_nothing() {
 }
 
 #[test]
+fn a_request_publishes_its_list_once() {
+    let mut l = live("once", 240, busy(false));
+    let r = l.w.request_of("nps").unwrap();
+    let mut b = Builder::new(l.w.store.clone(), l.w.rec.as_ref().unwrap().prm.clone());
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let o = out.clone();
+    b.emit = Arc::new(move |u: Update| o.lock().unwrap().push(u));
+    b.build(&l.world.db, &r).unwrap(); // to the end: the whole library analysed
+    let lists = out.lock().unwrap().iter().filter(|u| matches!(u, Update::Ready(_))).count();
+    assert_eq!(lists, 1, "one publication per request; analysis after it reports progress only");
+}
+
+#[test]
 fn a_newer_request_ends_the_running_build_and_gameplay_pauses_it() {
     let mut l = live("interrupt", 240, busy(false));
     let (_, none) = built(&mut l, "nps", |b| b.wanted = Arc::new(|| true));
-    assert!(none.iter().all(|u| matches!(u, Update::Ready(p) if p.partial)), "superseded at once: no whole publication");
+    assert!(none.iter().all(|u| !matches!(u, Update::Ready(_))), "superseded at once: no publication");
     let (_, paused) = built(&mut l, "nps", |b| {
         b.busy = Arc::new(|| true);
         let start = Instant::now();
         b.wanted = Arc::new(move || start.elapsed() > Duration::from_millis(100));
     });
-    assert!(paused.iter().all(|u| matches!(u, Update::Ready(p) if p.partial)), "gameplay holds the analysis");
+    assert!(paused.iter().all(|u| !matches!(u, Update::Ready(_))), "gameplay holds the analysis");
     let (_, whole) = built(&mut l, "nps", |_| {});
     assert!(!last_ready(&whole).candidates.restart_refs().is_empty(), "the next request still completes");
 }

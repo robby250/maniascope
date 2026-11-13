@@ -48,7 +48,6 @@ fn endurance_recovers_and_depends_on_the_rest() {
 
 #[test]
 fn whole_map_technical_presence_tells_regular_from_irregular_hands() {
-    use ms_calc::pattern::technical_title;
     let regular = rice((0..400).map(|i| (80. * i as f64, (i % 4) as u8)), 4, 8.);
     let mut t = 0.;
     let irregular = rice((0..400).map(|i: usize| { t += [60., 93., 47., 111., 75.][i % 5]; (t, (i % 4) as u8) }), 4, 8.);
@@ -60,8 +59,6 @@ fn whole_map_technical_presence_tells_regular_from_irregular_hands() {
     let (a, b) = (profile(&regular), profile(&irregular));
     assert!(a[0] < 0.1, "{a:?}");
     assert!(b[2] > 0.5 && b[0] > 0.5, "{b:?}");
-    assert_eq!(technical_title("Dump", 0.72, Some(&b)), "Tech Dump");
-    assert_eq!(technical_title("Dump", 0.72, Some(&a)), "Dump");
 }
 
 #[test]
@@ -72,7 +69,7 @@ fn the_calculator_applies_the_calibration_its_rows_are_fitted_on() {
     for (keys, od) in [(7, 3.), (10, 9.5)] {
         let c = rice((0..600).map(|i| (90. * i as f64, masks[i % 4][i % 3] % keys as u8)), keys, od);
         let f = ms_calc::features::features_of(&run(&c, 1.), &prm);
-        let again = ms_calc::features::recalibrated(&f, &prm, 1., &|| Some(ms_calc::flow::flow(&c, 1.)));
+        let again = ms_calc::features::recalibrated(&f, &prm, 1., &|| Some(ms_calc::flow::flow(&c, 1., &prm.k)));
         assert!(again.is_none_or(|g| (g.f("overall") / f.f("overall")).ln().abs() < 1e-9), "{keys}K OD {od}");
     }
 }

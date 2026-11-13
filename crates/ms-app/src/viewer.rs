@@ -3,7 +3,6 @@ use ms_calc::card::{card_top, describe, display_name};
 use ms_calc::chart::{parse, Chart};
 use ms_calc::features::compute_selected;
 use ms_calc::params::Params;
-use ms_calc::skills::skills;
 use ms_calc::val::{Dict, Val};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -15,6 +14,7 @@ pub struct Entry {
     pub name: String,
     pub rating: f64,
     pub parts: Vec<String>,
+    pub tags: Vec<String>, // modifier tags beside the name (Tech, Stamina, Mash)
 }
 
 pub struct Tech {
@@ -109,18 +109,17 @@ pub fn analyse(path: &Path, rate: f64, sv: bool, prm: &Params) -> Result<Analysi
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compute_selected(&data, &chart, rate, sv, prm))).map_err(|_| "internal error (see crash.log)".to_string())??;
     let sc = res.dict("scores").ok_or("no scores")?;
     let keys = chart.keys as i64;
-    let names: Vec<(String, String)> = skills(chart.keys).iter().filter(|s| !ms_calc::skills::FIT_ONLY.contains(s)).map(|s| (s.name().to_string(), display_name(*s).to_string())).collect();
-    let entries = card_top(&res, crate::windows::MAX_SKILLS).iter().filter_map(|e| if let Val::Dict(e) = e { Some(Entry { name: text(e, "name"), rating: e.f("rating"), parts: strings(e.get("parts")) }) } else { None }).collect();
+    let names: Vec<(String, String)> = ms_calc::taxonomy::rated(chart.keys).iter().filter(|s| ms_calc::taxonomy::shown(**s)).map(|s| (s.name().to_string(), display_name(*s).to_string())).collect();
+    let entries = card_top(&res, crate::windows::MAX_SKILLS).iter().filter_map(|e| if let Val::Dict(e) = e { Some(Entry { name: text(e, "name"), rating: e.f("rating"), parts: strings(e.get("parts")), tags: strings(e.get("tags")) }) } else { None }).collect();
     let tech = match res.get("tech_where") {
         Some(Val::List(l)) => l.iter().filter_map(|w| if let Val::Dict(w) = w { Some(Tech { t: w.f("t"), pattern: w.f("pattern"), rhythm: w.f("rhythm"), why: text(w, "why") }) } else { None }).collect(),
         _ => Vec::new(),
     };
-    let notes: Vec<(f64, usize)> = chart.t.iter().zip(&chart.col).map(|(t, c)| (*t, *c as usize)).collect();
     Ok(Analysis {
         path: path.to_path_buf(), rate, sv, keys, overall: sc.f("overall"), notes: res.fget("notes", 0.) as usize, ln_notes: res.fget("ln_notes", 0.), nps: raw_nps(&chart, rate), peak_nps: peak_nps(&chart, rate), bid: beatmap_id(&data),
         span: (chart.len() >= 2).then(|| (chart.t[0], chart.last_end())), timeline: res.get("timeline").map_or_else(Vec::new, Val::list_f), entries, tags: describe(&res, &prm.k).1,
         bars: bars(&names, sc), names, tech, sv_ignored: matches!(res.get("sv"), Some(Val::Str(s)) if s == "ignored"),
-        dan_vibro: ms_rec::dans::vibro_runs(&notes, rate), title: chart.title.clone(), artist: chart.artist.clone(), version: chart.version.clone(), creator: chart.creator.clone(),
+        dan_vibro: ms_rec::dans::vibro_runs(&chart, rate, &prm.k), title: chart.title.clone(), artist: chart.artist.clone(), version: chart.version.clone(), creator: chart.creator.clone(),
     })
 }
 

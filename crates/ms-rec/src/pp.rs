@@ -25,6 +25,41 @@ const Z_Q: [f64; 21] = [-1.9807523966472786, -1.4652337926855223, -1.17976111761
     0.497200570681554, 0.637484160962377, 0.7916386077433746, 0.9674215661017014, 1.1797611176118603, 1.4652337926855223, 1.9807523966472784];
 pub const VARIANTS: [(f64, &str); 3] = [(0.75, "HT"), (1., "NM"), (1.5, "DT")];
 
+// How a PP pick is valued (preferences of the recommender's design, user 2026-09-30 "likely improvements come far more often
+// than long shots"; each named once, both the PP list and its sources read them).
+const COMFORT: f64 = 0.975;            // safe accuracy of a keymode without its own reference plays
+const COMFORT_RANGE: (f64, f64) = (0.965, 0.99);
+const PEAK: f64 = 0.93;                // push accuracy without reference plays
+const PEAK_RANGE: (f64, f64) = (0.88, 0.98);
+const ACC_FIT_SD: f64 = 0.025;         // accuracy under the target costs as a normal curve of this width
+const TIER_FIT_SD: f64 = 0.35;         // ln pp away from the target tier, likewise
+const TIER_FLOOR: f64 = 0.2;           // a pick off the tier keeps this share of its value
+const GAIN_UNIT: f64 = 0.05;           // pp gain compressed as ln(1 + gain/unit)^power: a 46 pp outlier can't erase 100 small ones
+const GAIN_POWER: f64 = 0.65;
+const UTILITY_FLOOR: f64 = 0.3;
+const COLD: f64 = 1.5;                 // activation minutes under which a keymode is cold (only comfortable probes)
+const NORMAL_CHALLENGE: f64 = 1.25;    // attempt sds over the player's typical chart that still count as normal
+const OTHER_KEYMODE: f64 = 0.45;       // a pick in another keymode than the last play's keeps this share
+const FRESH_MIN: f64 = 0.08;           // freshness under this is a repeat
+const READY_MINUTES: f64 = 6.;         // activation minutes until warm-up stops holding readiness back
+const READY_BASE: f64 = 0.45;          // readiness of a warm player with no beaten best yet
+const READY_PUSH: f64 = 0.5;           // readiness added as beaten bests move toward the high-PP edge
+const READY_PULLBACK: f64 = 3.;        // a bad result (form correction, attempt sds) pulls readiness back as exp(−this × it)
+const PUSH_STEPS: f64 = 4.;            // most staircase steps above normal challenge
+const PUSH_MIN_CHANCE: f64 = 0.25;     // a pick above normal challenge needs at least this chance of a gain
+
+fn acc_target(reference: Option<&Reference>, state: f64) -> f64 {
+    (1. - state) * reference.map_or(COMFORT, |r| r.comfort) + state * reference.map_or(PEAK, |r| r.peak_acc)
+}
+
+/// Accuracy fit × tier fit share × compressed gain: what one pick is worth before its chance.
+fn worth(acc_target: f64, acc: f64, pp: f64, target_pp: f64, gain: f64) -> f64 {
+    let accuracy_fit = (-0.5 * ((acc_target - acc).max(0.) / ACC_FIT_SD).powi(2)).exp();
+    let tier_fit = (-0.5 * ((pp.max(1.) / target_pp.max(1.)).ln() / TIER_FIT_SD).powi(2)).exp();
+    let utility = UTILITY_FLOOR + (gain.max(0.) / GAIN_UNIT).ln_1p().powf(GAIN_POWER);
+    utility * (TIER_FLOOR + (1. - TIER_FLOOR) * tier_fit) * accuracy_fit
+}
+
 /// PP tab settings (user 2026-10-30); the defaults are the former fixed bars.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PpSettings {
@@ -45,8 +80,15 @@ impl Default for PpSettings {
     }
 }
 
+/// osu!mania's pp formula (format: the game's own numbers).
 pub fn pp_scale(stars: f64, hits: f64) -> f64 {
     8. * (stars - 0.15).max(0.05).powf(2.2) * (1. + 0.1 * (hits / 1500.).min(1.))
+}
+
+/// The lowest osu! ★ whose perfect play (full length bonus) enters the player's top 100: `pp_scale` inverted at the 100th best
+/// play's pp. 0 under 100 plays: any ranked map can enter.
+pub fn top100_stars(ledger: &Ledger) -> f64 {
+    ledger.p.get(99).map_or(0., |&pp| 0.15 + (pp / 8.8).powf(1. / 2.2))
 }
 
 fn bonus(n: usize) -> f64 {
@@ -250,10 +292,10 @@ pub fn reference(db: &Db, ledger: &Ledger) -> Result<(HashMap<i64, i64>, HashMap
         (k, Reference {
             safe_pp: median(safe.iter().map(|x| x.0).collect()),
             peak_pp: median(peak.iter().map(|x| x.0).collect()),
-            comfort: median(safe.iter().map(|x| x.1).collect()).clamp(0.965, 0.99),
+            comfort: median(safe.iter().map(|x| x.1).collect()).clamp(COMFORT_RANGE.0, COMFORT_RANGE.1),
             // The peak tier contains both precise LN plays and lower-accuracy speed plays. Its lower quartile describes a
             // demonstrated push, not an invented universal 94% floor.
-            peak_acc: percentile(peak.iter().map(|x| x.1).collect(), 25.).clamp(0.88, 0.98),
+            peak_acc: percentile(peak.iter().map(|x| x.1).collect(), 25.).clamp(PEAK_RANGE.0, PEAK_RANGE.1),
             maps: values.len(),
         })
     }).collect();
@@ -342,6 +384,23 @@ pub fn newer_ranked(db: &Db, source: &mut crate::evidence::FeatureSource, instal
                                stars, length: f.length / 1000. / rate, scale: pp_scale(stars, d.f("hits")), skill: top_skill(&f, c), f: Arc::new(f) });
         }
     }
+    // Ranked website charts newer than the pack (the website window's "new ranked PP maps"): offered like the pack's maps
+    // you don't have, Next downloads them.
+    let have: HashSet<&str> = installed.values().filter_map(|i| i.md5.as_deref()).collect();
+    if let Ok(web) = ms_data::webmaps::Web::open(&ms_data::webmaps::web_dir().join("web.msp")) {
+        for (i, m) in web.maps.iter().enumerate() {
+            if !m.status.is_some_and(|s| RANKED_STATUS.contains(&s)) || !keys.contains(&m.keys) || public.md5_bid.contains_key(&m.file_md5) || have.contains(m.file_md5.as_str()) {
+                continue;
+            }
+            for (rate, var) in VARIANTS {
+                let Some(Val::Dict(d)) = web.feature(i, rate) else { continue };
+                let Some(stars) = d.get("stars").filter(|v| !v.is_none()).map(Val::f) else { continue };
+                let Ok(f) = Feats::of(&d, c) else { continue };
+                out.push(Variant { bid: m.bid, rate, var, identity: format!("md5:{}", m.file_md5), md5: m.file_md5.clone(), file: format!("{} - {} [{}]", m.artist, m.title, m.version), set: m.set_id,
+                                   approved: m.status.unwrap_or(0), stars, length: f.length / 1000. / rate, scale: pp_scale(stars, d.f("hits")), skill: top_skill(&f, c), f: Arc::new(f) });
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -381,16 +440,16 @@ fn push_share(steps: f64) -> f64 {
 
 /// push: the PP tab's Safe ↔ Push setting, added after the automatic readiness.
 pub fn readiness(session: &Session, keys: i64, skill: Option<&str>, push: f64) -> f64 {
-    let family = skill.map(|s| session.consts.family(s));
-    let active = (session.activation(keys, family) / 6.).min(1.);
+    // The keymode's warm-up, as the NPS list's readiness: the skill's own would unlock push only on what was just played.
+    let active = (session.activation(keys, None) / READY_MINUTES).min(1.);
     // Warming up unlocks ordinary PP work; each beaten best moves further toward the player's high-PP, lower-accuracy
     // edge. A bad result pulls back at once.
-    let auto = active * (0.45 + 0.5 * push_share(session.push(Some(keys)))) * (-3. * session.correction(keys, skill).max(0.)).exp();
+    let auto = active * (READY_BASE + READY_PUSH * push_share(session.push(Some(keys)))) * (-READY_PULLBACK * session.correction(keys, skill).max(0.)).exp();
     if push != 0. { (auto + push).clamp(0., 1.) } else { auto }
 }
 
 fn comfort(refs: &HashMap<i64, Reference>, keys: i64) -> f64 {
-    refs.get(&keys).map_or(0.975, |r| r.comfort)
+    refs.get(&keys).map_or(COMFORT, |r| r.comfort)
 }
 
 fn shown_of(y: f64) -> f64 {
@@ -411,7 +470,7 @@ pub fn score(variants: &[Variant], s: &Scoring<'_>, threads: usize) -> Vec<Pick>
         let key = (v.f.keys, v.skill.clone());
         states.entry(key).or_insert_with(|| (s.session.push(Some(v.f.keys)), readiness(s.session, v.f.keys, v.skill.as_deref(), opt.push)));
     }
-    let cold: HashMap<i64, bool> = SUPPORTED_KEYS.map(|k| (k, s.session.activation(k, None) < 1.5)).collect();
+    let cold: HashMap<i64, bool> = SUPPORTED_KEYS.map(|k| (k, s.session.activation(k, None) < COLD)).collect();
     struct Row {
         p: Prediction,
         shown: f64,
@@ -443,10 +502,10 @@ pub fn score(variants: &[Variant], s: &Scoring<'_>, threads: usize) -> Vec<Pick>
         let need = (best / v.scale.max(1e-9) + 4.) / 5.; // acc320 that would beat the counted best
         let p_up = if ranked { p_beat(mu + PESSIMISM * sdm, sda, need) } else { 0. };
         let chal: f64 = s.typical.get(&k).map_or(0., |t| { let c: f64 = (mu - t) / sda; if c.is_nan() { 0. } else { c } });
-        let normal = chal <= 1.25;
+        let normal = chal <= NORMAL_CHALLENGE;
         let (ready, state) = states[&(k, v.skill.clone())];
         // Challenge is in attempt sds; each staircase step raises the ceiling by one step.
-        let mut credible = chal <= 1.25 + PUSH_STEP * ready.min(4.) && p_up >= if normal { opt.min_chance } else { opt.min_chance.max(0.25) };
+        let mut credible = chal <= NORMAL_CHALLENGE + PUSH_STEP * ready.min(PUSH_STEPS) && p_up >= if normal { opt.min_chance } else { opt.min_chance.max(PUSH_MIN_CHANCE) };
         credible &= rate_allowed(v.rate, p_up, gain, opt);
         let display = s.display.and_then(|(m, t)| m.predict(f, &v.md5, Some(v.bid), v.rate, t).ok());
         let (dmu, dsd) = display.as_ref().map_or((s.shown.0 + s.shown.1 * mu, s.shown.1 * sdm.hypot(sda)), |d| (d.mu, d.sdm.hypot(d.sda)));
@@ -456,14 +515,11 @@ pub fn score(variants: &[Variant], s: &Scoring<'_>, threads: usize) -> Vec<Pick>
         // Choose the variant for this readiness BEFORE reducing a chart to one entry: otherwise a high-gain DT variant
         // hides its safer NM/HT option.
         let reference = s.references.get(&k);
-        let acc_target: f64 = (1. - state) * reference.map_or(0.975, |r| r.comfort) + state * reference.map_or(0.93, |r| r.peak_acc);
+        let acc_target = acc_target(reference, state);
         let central = v.scale * (1. - 5. * mu.min(20.).exp()).max(0.);
         let pp_target = reference.map_or(central, |r| { let t = (1. - state) * r.safe_pp + state * r.peak_pp; if t != 0. { t } else { central } });
-        let accuracy_fit = (-0.5 * ((acc_target - shown).max(0.) / 0.025).powi(2)).exp();
-        let tier_fit = (-0.5 * (central.max(1.).ln() - pp_target.max(1.).ln()).powi(2) / (0.35f64 * 0.35)).exp();
-        let utility = 0.3 + (gain.max(0.) / 0.05).ln_1p().powf(0.65);
         Ok(Row { shown, lo: (1. - (dmu + BAND_Z * dsd).min(20.).exp()).max(0.), hi: (1. - (dmu - BAND_Z * dsd).min(20.).exp()).max(0.), pp, gain, p_up, best, chal, normal, credible,
-                   value: utility * (0.2 + 0.8 * tier_fit) * accuracy_fit * p_up, central, p, display })
+                   value: worth(acc_target, shown, central, pp_target, gain) * p_up, central, p, display })
     });
     let rows: Vec<Option<Row>> = scored.into_iter().map(std::result::Result::ok).collect();
     let mut order: Vec<usize> = (0..variants.len()).filter(|&i| rows[i].as_ref().is_some_and(|r| r.credible)).collect();
@@ -506,7 +562,7 @@ pub fn prepare(candidates: &[Pick], session: &Session, ledger: &Ledger, referenc
             continue;
         }
         let (keys, acc) = (source.keys, source.pred.acc_mid);
-        let cold = session.activation(keys, None) < 1.5;
+        let cold = session.activation(keys, None) < COLD;
         if cold && acc < comfort(references, keys) {
             continue;
         }
@@ -516,22 +572,17 @@ pub fn prepare(candidates: &[Pick], session: &Session, ledger: &Ledger, referenc
         }
         let state = readiness(session, keys, source.skill.as_deref(), opt.push);
         let reference = references.get(&keys);
-        let target_acc = (1. - state) * reference.map_or(0.975, |r| r.comfort) + state * reference.map_or(0.93, |r| r.peak_acc);
         // Not a hard accuracy floor for ordinary PP play: difficulty can increase as readiness improves, including the
         // user's low-acc top-play style.
-        let accuracy_fit = (-0.5 * ((target_acc - acc).max(0.) / 0.025).powi(2)).exp();
+        let target_acc = acc_target(reference, state);
         let pp = source.pp_mid.or(source.best).unwrap_or(1.);
         let target_pp = reference.map_or(pp, |r| (1. - state) * r.safe_pp + state * r.peak_pp);
-        let tier_fit = (-0.5 * ((pp.max(1.) / target_pp.max(1.)).ln() / 0.35).powi(2)).exp();
-        // Compress, do not erase, utility: a 46pp outlier must not remove a hundred credible 0.1–3pp improvements before
-        // freshness is considered.
-        let utility = 0.3 + (gain / 0.05).ln_1p().powf(0.65);
         let headroom = (pp - source.best.unwrap_or(pp)).max(0.) / (pp * 0.1).max(20.);
-        let continuity = if keys == k0 { 1. } else { 0.45 };
+        let continuity = if keys == k0 { 1. } else { OTHER_KEYMODE };
         let mut c = source.clone();
         c.purpose = (if cold { "probe" } else if source.push_only || state > 0.8 { "push" } else { "farm" }).to_string();
         // Likely improvements come far more often than long shots (user 2026-09-30).
-        c.weight = utility * (0.2 + 0.8 * tier_fit) * accuracy_fit * continuity * (1. + 0.3 * headroom.min(2.)) * p_up;
+        c.weight = worth(target_acc, acc, pp, target_pp, gain) * continuity * (1. + 0.3 * headroom.min(2.)) * p_up;
         let refarm = source.best.map_or_else(|| format!("new map · {:.0}% to count", 100. * p_up), |b| format!("refarm · best {b:.0}pp · {:.0}% to beat", 100. * p_up));
         c.why = format!("{refarm} · expected {:.1}%{}{}", 100. * acc,
             if cold { " · comfortable keymode probe" } else if state > 0.8 { " · peak opportunity" } else { " · current-form fit" },
@@ -545,7 +596,7 @@ pub fn prepare(candidates: &[Pick], session: &Session, ledger: &Ledger, referenc
         c.weight *= c.fresh;
     }
     // Offer or skip never promises a repeat. Only relax when *all* credible choices have been cycled.
-    let fresh: Vec<Pick> = rows.iter().filter(|c| c.fresh >= 0.08).cloned().collect();
+    let fresh: Vec<Pick> = rows.iter().filter(|c| c.fresh >= FRESH_MIN).cloned().collect();
     let relaxed = !rows.is_empty() && fresh.is_empty();
     if relaxed {
         for c in &mut rows {
@@ -646,6 +697,14 @@ mod tests {
     use super::*;
     use ms_data::store::Event;
     use ms_model::personal::WarmModels;
+
+    #[test]
+    fn the_pp_floor_is_where_a_perfect_play_enters_the_top_100() {
+        let ledger = |n: usize| Ledger::new((0..n as i64).map(|b| (b, (500. - b as f64, true, None))).collect());
+        assert_eq!(top100_stars(&ledger(99)), 0., "under 100 plays any ranked map can enter");
+        let s = top100_stars(&ledger(150));
+        assert!((pp_scale(s, 1500.) - 401.).abs() < 1e-6, "the 100th best is 401 pp: {}", pp_scale(s, 1500.));
+    }
     use ms_model::predict::{Consts, Prediction, Slopes};
     use ms_model::warmup::{FormPrior, Model};
     use serde_json::{json, Value};

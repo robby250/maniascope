@@ -36,14 +36,50 @@ pub fn statuses(groups: &[&str]) -> Vec<i64> {
     GROUPS.iter().filter(|g| groups.contains(&g.0)).flat_map(|g| g.1.iter().copied()).collect()
 }
 
-/// The statuses the last crawl was asked for; every status for crawls from before the choice.
-pub fn wanted_statuses(db: &Connection) -> Vec<i64> {
-    kv_get(db, "want_status").and_then(|v| v.as_array().map(|a| a.iter().filter_map(Value::as_i64).collect())).unwrap_or_else(|| STATUSES.to_vec())
+/// One keymode's choice in the website charts window (user 2026-11-13: 4K unranked at 5–7★ is 160,000 maps, 7K ranked is
+/// not): statuses, ★ range at 1.0×, least plays. `on`: this keymode downloads; an off keymode keeps its settings and the
+/// maps it already has in the playlists.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Want {
+    pub keys: i64,
+    pub on: bool,
+    pub statuses: Vec<i64>,
+    pub stars: (f64, f64),
+    pub min_plays: i64,
 }
 
-/// A row's status is chosen; rows listed before the status column count as unranked.
-fn chosen(statuses: &[i64], status: Option<i64>) -> bool {
-    statuses.contains(&status.unwrap_or(-2))
+impl Want {
+    pub fn new(keys: i64, stars: (f64, f64)) -> Want {
+        Want { keys, on: true, statuses: statuses(&["ranked"]), stars, min_plays: 0 }
+    }
+
+    /// Rows listed before the status column count as unranked; charts without a listed rating stay in (the filter only
+    /// drops what it can see).
+    fn takes(&self, status: Option<i64>, notes: i64, length: f64, stars: Option<f64>, plays: i64) -> bool {
+        self.statuses.contains(&status.unwrap_or(-2)) && reachable(notes, length, self.keys) && stars.is_none_or(|s| self.stars.0 <= s && s <= self.stars.1)
+            && plays >= self.min_plays
+    }
+}
+
+/// The keymode's want takes this row (`on_only`: only keymodes that download now).
+#[allow(clippy::too_many_arguments)]
+fn wanted(wants: &[Want], on_only: bool, keys: i64, status: Option<i64>, notes: i64, length: f64, stars: Option<f64>, plays: i64) -> bool {
+    wants.iter().any(|w| w.keys == keys && (w.on || !on_only) && w.takes(status, notes, length, stars, plays))
+}
+
+/// The window's saved choice. Crawls before per-keymode choices saved one keymode set, status set and ★ range: each keymode
+/// with listed rows gets those (off unless it was chosen).
+pub fn wants(db: &Connection) -> Vec<Want> {
+    if let Some(w) = kv_get(db, "wants").and_then(|v| serde_json::from_value(v).ok()) {
+        return w;
+    }
+    let on: HashSet<i64> = kv_get(db, "want_keys").and_then(|v| v.as_array().map(|a| a.iter().filter_map(Value::as_i64).collect())).unwrap_or_default();
+    let statuses = kv_get(db, "want_status").and_then(|v| v.as_array().map(|a| a.iter().filter_map(Value::as_i64).collect())).unwrap_or_else(|| STATUSES.to_vec());
+    let stars = kv_get(db, "stars").and_then(|v| Some((v[0].as_f64()?, v[1].as_f64()?))).unwrap_or((0., 99.));
+    let listed: HashSet<i64> = db.prepare("SELECT DISTINCT keys FROM diffs").and_then(|mut q| q.query_map([], |r| r.get(0))?.collect()).unwrap_or_default();
+    let mut keys: Vec<i64> = listed.union(&on).copied().collect();
+    keys.sort_unstable();
+    keys.into_iter().map(|k| Want { keys: k, on: on.contains(&k), statuses: statuses.clone(), stars, min_plays: 0 }).collect()
 }
 // HT/NM/DT only (user 2026-10-02: ~3x faster crawl, ~3x smaller file). NPS/Skills compute the exact rate a candidate
 // needs on demand, as for installed maps.
@@ -159,12 +195,20 @@ pub fn disk_bytes() -> u64 {
     size(web_dir()) + size(web_dir().join("osu"))
 }
 
-/// Charts without a listed rating stay in; the filter only drops what it can see.
-fn in_stars(stars: Option<f64>, range: Option<(f64, f64)>) -> bool {
-    match (stars, range) {
-        (Some(s), Some((lo, hi))) => lo <= s && s <= hi,
-        _ => true,
-    }
+/// New ranked maps for the PP list (user 2026-11-13): ranked or approved, the PP tab's keymodes, from the ★ where a perfect play
+/// enters the player's top 100. Kept beside the window's own choice: one crawl's publish never drops the other's maps.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PpAuto {
+    pub keys: Vec<i64>,
+    pub floor: f64,
+}
+
+fn pp_auto(db: &Connection) -> Option<PpAuto> {
+    kv_get(db, "pp_auto").and_then(|v| serde_json::from_value(v).ok())
+}
+
+fn pp_wanted(auto: Option<&PpAuto>, status: Option<i64>, keys: i64, stars: Option<f64>) -> bool {
+    auto.is_some_and(|a| crate::store::RANKED_STATUS.contains(&status.unwrap_or(-2)) && a.keys.contains(&keys) && stars.is_some_and(|s| s >= a.floor))
 }
 
 /// The metadata density can reach the NPS range at 1.5× (the NPS ranking's density floor ≈ 20·k/7).
@@ -192,6 +236,7 @@ pub struct Estimate {
     pub disk: u64,
     pub checked: Option<f64>,
     pub unlisted: Vec<i64>,
+    pub per_key: BTreeMap<i64, i64>, // charts to download per keymode
 }
 
 /// What lazer already holds, by revision and by map. The website index only adds what isn't in the client (user 2026-11-02:
@@ -251,20 +296,22 @@ fn forget(db: &Connection, client: &InClient, osu: &Path) -> rusqlite::Result<us
     Ok(held.len())
 }
 
-/// What a crawl for these keymodes and ★ range still has to do.
-pub fn estimate(db: &Connection, keys: &HashSet<i64>, statuses: &[i64], stars: Option<(f64, f64)>, calc: &str) -> rusqlite::Result<Estimate> {
-    let (mut fetch, mut analyse, mut ready) = (0, 0, 0);
-    let mut q = db.prepare("SELECT d.keys,d.notes,d.length,d.stars,d.sha,d.fetched,d.md5,f.sha IS NOT NULL,d.bid,d.status FROM diffs d LEFT JOIN feats f ON f.sha=d.sha AND f.calc=? WHERE d.error IS NULL")?;
+/// What a crawl of the keymodes that download still has to do.
+pub fn estimate(db: &Connection, wants: &[Want], calc: &str) -> rusqlite::Result<Estimate> {
+    let (mut fetch, mut analyse, mut ready, mut per_key) = (0, 0, 0, BTreeMap::new());
+    let mut q = db.prepare("SELECT d.keys,d.notes,d.length,d.stars,d.sha,d.fetched,d.md5,f.sha IS NOT NULL,d.bid,d.status,d.playcount FROM diffs d LEFT JOIN feats f ON f.sha=d.sha AND f.calc=? WHERE d.error IS NULL")?;
     let rows = q.query_map([calc], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?, r.get::<_, Option<f64>>(3)?, r.get::<_, Option<String>>(4)?,
-                                           r.get::<_, Option<String>>(5)?, r.get::<_, Option<String>>(6)?, r.get::<_, bool>(7)?, r.get::<_, i64>(8)?, r.get::<_, Option<i64>>(9)?)))?;
-    let client = InClient::read();
+                                           r.get::<_, Option<String>>(5)?, r.get::<_, Option<String>>(6)?, r.get::<_, bool>(7)?, r.get::<_, i64>(8)?, r.get::<_, Option<i64>>(9)?,
+                                           r.get::<_, Option<i64>>(10)?)))?;
+    let (client, auto) = (InClient::read(), pp_auto(db));
     for row in rows {
-        let (k, notes, length, s, sha, fetched, md5, done, bid, status) = row?;
-        if !keys.contains(&k) || !chosen(statuses, status) || !reachable(notes, length, k) || !in_stars(s, stars) || client.holds(bid, md5.as_deref().unwrap_or("")) {
+        let (k, notes, length, s, sha, fetched, md5, done, bid, status, plays) = row?;
+        if !(wanted(wants, true, k, status, notes, length, s, plays.unwrap_or(0)) || pp_wanted(auto.as_ref(), status, k, s)) || client.holds(bid, md5.as_deref().unwrap_or("")) {
             continue;
         }
         if sha.is_none() || fetched != md5 {
             fetch += 1;
+            *per_key.entry(k).or_insert(0) += 1;
         } else if !done {
             analyse += 1;
         } else {
@@ -272,14 +319,17 @@ pub fn estimate(db: &Connection, keys: &HashSet<i64>, statuses: &[i64], stars: O
         }
     }
     let mut unlisted = Vec::new();
-    for &status in statuses {
-        let listed = listed_keys(db, status)?;
-        unlisted.extend(keys.iter().filter(|k| !listed.contains(k)));
+    for w in wants.iter().filter(|w| w.on) {
+        for &status in &w.statuses {
+            if !listed_keys(db, status)?.contains(&w.keys) {
+                unlisted.push(w.keys);
+            }
+        }
     }
     unlisted.sort_unstable();
     unlisted.dedup();
     Ok(Estimate { fetch, analyse: fetch + analyse, ready, new_bytes: fetch * CHART_BYTES, seconds: seconds(db, fetch, fetch + analyse), disk: disk_bytes(),
-                  checked: kv_get(db, "checked").and_then(|v| v.as_f64()), unlisted })
+                  checked: kv_get(db, "checked").and_then(|v| v.as_f64()), unlisted, per_key })
 }
 
 /// Newest-first per status; an incremental crawl stops a day past the last watermark.
@@ -389,11 +439,12 @@ fn crawl_meta(db: &Connection, keys: &HashSet<i64>, statuses: &[i64], full: bool
 }
 
 /// Chart text once per revision, most-played first; empty body = unavailable.
-fn fetch(db: &Connection, keys: &HashSet<i64>, statuses: &[i64], limit: usize, stars: Option<(f64, f64)>) -> Result<usize, CrawlError> {
-    let client = InClient::read();
-    let mut q = db.prepare("SELECT bid,md5,keys,notes,length,stars,status FROM diffs WHERE error IS NULL AND (sha IS NULL OR fetched IS NOT md5) ORDER BY playcount DESC")?;
-    let rows: Vec<(i64, String)> = q.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, f64>(4)?, r.get::<_, Option<f64>>(5)?, r.get::<_, Option<i64>>(6)?)))?
-        .filter_map(Result::ok).filter(|r| keys.contains(&r.2) && chosen(statuses, r.6) && reachable(r.3, r.4, r.2) && in_stars(r.5, stars) && !client.holds(r.0, &r.1)).take(limit).map(|r| (r.0, r.1)).collect();
+fn fetch(db: &Connection, wants: &[Want], limit: usize) -> Result<usize, CrawlError> {
+    let (client, auto) = (InClient::read(), pp_auto(db));
+    let mut q = db.prepare("SELECT bid,md5,keys,notes,length,stars,status,playcount FROM diffs WHERE error IS NULL AND (sha IS NULL OR fetched IS NOT md5) ORDER BY playcount DESC")?;
+    let rows: Vec<(i64, String)> = q.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, f64>(4)?, r.get::<_, Option<f64>>(5)?, r.get::<_, Option<i64>>(6)?, r.get::<_, Option<i64>>(7)?)))?
+        .filter_map(Result::ok).filter(|r| (wanted(wants, true, r.2, r.6, r.3, r.4, r.5, r.7.unwrap_or(0)) || pp_wanted(auto.as_ref(), r.6, r.2, r.5)) && !client.holds(r.0, &r.1))
+        .take(limit).map(|r| (r.0, r.1)).collect();
     let (t0, done) = (std::time::Instant::now(), kv_get(db, "progress").and_then(|p| p["fetched"].as_u64()).unwrap_or(0) as usize);
     let total = rows.len();
     let (send, receive) = std::sync::mpsc::sync_channel::<(i64, Vec<u8>)>(1); // one ahead of the store loop, ~60/min
@@ -502,7 +553,7 @@ const NPS_FIELDS: [&str; 13] = ["active", "burst", "chord", "drill", "family", "
 
 fn compact(f: &Dict) -> Dict {
     let mut out = Dict::new();
-    for k in ["keys", "overall", "od", "ln", "notes", "length", "stam", "description", "sk", "stars"] {
+    for k in ["keys", "overall", "od", "ln", "notes", "length", "stam", "description", "sk", "stars", "hits"] {
         out.set(k, f.get(k).cloned().unwrap_or(Val::None));
     }
     let mut endurance = Dict::new();
@@ -575,11 +626,18 @@ pub fn carry(from: &str, to: &str, after: &Params, chart: &(dyn Fn(&str) -> Opti
         }
         tx.commit().map_err(text)?;
     }
-    if !todo.is_empty() {
-        let stars = kv_get(&db, "stars").and_then(|v| Some((v[0].as_f64()?, v[1].as_f64()?)));
-        publish(&db, to, &wanted_statuses(&db), stars).map_err(|e| format!("{e:?}"))?;
+    // another version's web.msp (user 2026-11-12: back on 1.9.0 after 1.10.1, no website charts): rebuilt for this calculator
+    // even when nothing needed carrying
+    let stale = published_calc().is_some_and(|c| c != to);
+    if !todo.is_empty() || stale {
+        publish(&db, to, &wants(&db)).map_err(|e| format!("{e:?}"))?;
     }
     Ok(())
+}
+
+/// The calculator the website list (web.msp) was published for.
+pub fn published_calc() -> Option<String> {
+    Web::open(&web_dir().join("web.msp")).ok().map(|w| w.calc)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -589,15 +647,19 @@ struct WebMeta {
     maps: Vec<WebMap>,
 }
 
-fn publish(db: &Connection, calc: &str, statuses: &[i64], stars: Option<(f64, f64)>) -> Result<(), CrawlError> {
-    let mut q = db.prepare("SELECT d.sha,d.bid,d.set_id,d.status,d.keys,d.file_md5,d.playcount,d.artist,d.title,d.version,d.creator,d.stars,f.data \
+/// Every keymode's want, on or off: turning a keymode's downloads off keeps its maps in the playlists.
+fn publish(db: &Connection, calc: &str, wants: &[Want]) -> Result<(), CrawlError> {
+    let mut q = db.prepare("SELECT d.sha,d.bid,d.set_id,d.status,d.keys,d.file_md5,d.playcount,d.artist,d.title,d.version,d.creator,d.stars,f.data,d.notes,d.length \
                             FROM diffs d JOIN feats f ON f.sha=d.sha AND f.calc=? WHERE d.error IS NULL")?;
     let mut rows = q.query([calc])?;
     let text = |r: &rusqlite::Row<'_>, i: usize| r.get::<_, Option<String>>(i).map(Option::unwrap_or_default);
-    let (mut maps, mut records, mut seen) = (Vec::new(), Vec::new(), HashSet::new());
+    let (mut maps, mut records, mut seen, auto) = (Vec::new(), Vec::new(), HashSet::new(), pp_auto(db));
     while let Some(r) = rows.next()? {
         let sha = text(r, 0)?;
-        if !chosen(statuses, r.get(3)?) || !in_stars(r.get(11)?, stars) || !seen.insert(sha.clone()) {
+        let plays = r.get::<_, Option<i64>>(6)?.unwrap_or(0);
+        let wanted = wanted(wants, false, r.get(4)?, r.get(3)?, r.get::<_, Option<i64>>(13)?.unwrap_or(0), r.get::<_, Option<f64>>(14)?.unwrap_or(0.), r.get(11)?, plays)
+            || pp_wanted(auto.as_ref(), r.get(3)?, r.get(4)?, r.get(11)?);
+        if !wanted || !seen.insert(sha.clone()) {
             continue;
         }
         let Ok(fs) = read_cell(&r.get::<_, Vec<u8>>(12)?) else { continue };
@@ -691,35 +753,45 @@ fn window_rates(ov: &[(f64, f64)], reach: Option<(f64, f64)>) -> Option<Vec<f64>
 
 /// Everything a crawl does: listing, chart text, analysis, publication. `check` stops after the listing, so the app
 /// can show counts, size and time before Start.
-pub fn crawl(keys: &HashSet<i64>, statuses: &[i64], stars: Option<(f64, f64)>, check: bool, full: bool, threads: Option<usize>, calc: &str, prm: &Params) -> Result<(), CrawlError> {
+/// `wants`: the window's choice (saved; the app reopens with it). `pp`: the new-ranked-PP-maps run (`PpAuto`, `wants` unused)
+/// instead: it fetches only its own maps, and every publish keeps the window's choice.
+pub fn crawl(wants: &[Want], check: bool, full: bool, threads: Option<usize>, calc: &str, prm: &Params, pp: Option<PpAuto>) -> Result<(), CrawlError> {
     let db = state_db()?;
     let Some(_held) = lock() else { return Err(CrawlError::Failed("another crawl is running".into())) };
     let _ = std::fs::remove_file(web_dir().join("stop"));
-    let mut wanted: Vec<i64> = keys.iter().copied().collect();
-    wanted.sort_unstable();
-    kv_set(&db, "want_keys", &json!(wanted))?; // the app's window reopens with these
-    kv_set(&db, "want_status", &json!(statuses))?;
-    kv_set(&db, "command", &json!(if check { "check" } else { "crawl" }))?;
-    db.execute("DELETE FROM kv WHERE k='reopen'", [])?;
-    if let Some((lo, hi)) = stars {
-        kv_set(&db, "stars", &json!([lo, hi]))?; // remembered: later runs and the app keep the chosen range
-    }
-    let stars = kv_get(&db, "stars").and_then(|v| Some((v[0].as_f64()?, v[1].as_f64()?)));
+    let (keys, list, fetching): (HashSet<i64>, Vec<i64>, Vec<Want>) = match &pp {
+        Some(a) => {
+            kv_set(&db, "pp_auto", &json!(a))?;
+            (a.keys.iter().copied().collect(), crate::store::RANKED_STATUS.to_vec(), Vec::new())
+        }
+        None => {
+            kv_set(&db, "wants", &json!(wants))?;
+            kv_set(&db, "command", &json!(if check { "check" } else { "crawl" }))?;
+            db.execute("DELETE FROM kv WHERE k='reopen'", [])?;
+            let on: Vec<&Want> = wants.iter().filter(|w| w.on).collect();
+            let mut list: Vec<i64> = on.iter().flat_map(|w| w.statuses.iter().copied()).collect();
+            list.sort_unstable();
+            list.dedup();
+            (on.iter().map(|w| w.keys).collect(), list, wants.to_vec())
+        }
+    };
+    let all = self::wants(&db); // saved above: the window's whole choice, also for a PP run
+    let (keys, fetching, all) = (&keys, &fetching[..], &all[..]);
     let run = || -> Result<(), CrawlError> {
-        crawl_meta(&db, keys, statuses, full)?;
+        crawl_meta(&db, keys, &list, full)?;
         forget(&db, &InClient::read(), &web_dir().join("osu"))?;
         if check {
             progress(&db, json!({"phase": "checked"}))?;
             return Ok(());
         }
-        let plan = estimate(&db, keys, statuses, stars, calc)?;
+        let plan = estimate(&db, fetching, calc)?;
         progress(&db, json!({"phase": "download", "fetched": 0, "fetch_total": plan.fetch, "analysed": 0, "analyse_total": plan.analyse, "error": null}))?;
         // Publish every chunk; small first chunks so a new player sees website maps within minutes, not after 5,000
         // downloads (fresh-install run 2026-10-02).
         for size in [300, 1500].into_iter().chain(std::iter::repeat(5000)) {
-            let more = fetch(&db, keys, statuses, size, stars)?;
+            let more = fetch(&db, fetching, size)?;
             analyse(&db, calc, prm, threads)?;
-            publish(&db, calc, statuses, stars)?;
+            publish(&db, calc, all)?;
             if more == 0 {
                 break;
             }
@@ -739,12 +811,21 @@ pub fn crawl(keys: &HashSet<i64>, statuses: &[i64], stars: Option<(f64, f64)>, c
 
 /// {key: value} of the crawl's saved state, for the app's window.
 pub fn state(db: &Connection) -> BTreeMap<String, Value> {
-    ["progress", "want_keys", "stars", "checked", "reopen", "command"].iter().filter_map(|k| Some((k.to_string(), kv_get(db, k)?))).collect()
+    ["progress", "checked", "reopen", "command"].iter().filter_map(|k| Some((k.to_string(), kv_get(db, k)?))).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pp_fetch_takes_ranked_maps_of_its_keymodes_from_the_floor() {
+        let a = PpAuto { keys: vec![7], floor: 5. };
+        assert!(pp_wanted(Some(&a), Some(1), 7, Some(5.2)) && pp_wanted(Some(&a), Some(2), 7, Some(5.)));
+        assert!(!pp_wanted(Some(&a), Some(4), 7, Some(6.)), "loved pays no pp");
+        assert!(!pp_wanted(Some(&a), Some(1), 4, Some(6.)) && !pp_wanted(Some(&a), Some(1), 7, Some(4.9)) && !pp_wanted(Some(&a), Some(1), 7, None));
+        assert!(!pp_wanted(None, Some(1), 7, Some(9.)), "off: nothing");
+    }
 
     #[test]
     fn a_chart_in_the_client_is_forgotten_and_a_convert_source_keeps_its_file() {
@@ -806,13 +887,6 @@ mod tests {
     }
 
     #[test]
-    fn the_star_filter_keeps_unrated_charts() {
-        let range = Some((6., 12.));
-        assert!(in_stars(Some(7.), range) && in_stars(None, range) && in_stars(Some(2.), None));
-        assert!(!in_stars(Some(5.9), range) && !in_stars(Some(12.1), range));
-    }
-
-    #[test]
     fn the_estimate_counts_what_a_crawl_still_has_to_do() {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT); CREATE TABLE feats(sha TEXT, calc TEXT);
@@ -821,22 +895,38 @@ mod tests {
             db.execute("INSERT INTO diffs(bid,status,keys,md5,notes,length,playcount,stars) VALUES(?,1,7,?,2000,120,?,?)", rusqlite::params![bid, format!("m{bid}"), bid, if bid < 4 { 8. } else { 3. }]).unwrap();
         }
         db.execute("INSERT INTO diffs(bid,status,keys,md5,notes,length,playcount,stars) VALUES(9,-2,7,'m9',2000,120,9,8)", []).unwrap();
-        let keys = |k: &[i64]| k.iter().copied().collect::<HashSet<i64>>();
-        let all = statuses(&["ranked", "unranked"]);
-        let estimate = |k: &[i64], s: &[i64]| estimate(&db, &keys(k), s, Some((6., 12.)), "c").unwrap();
-        assert_eq!(estimate(&[7], &statuses(&["ranked"])).unlisted, Vec::<i64>::new(), "older crawls: their rows' keymodes");
-        assert_eq!(estimate(&[7], &statuses(&["unranked"])).fetch, 1, "a graveyard chart only when unranked is ticked");
-        assert_eq!(estimate(&[7], &all).fetch, 4);
+        let want = |k: i64, s: &[&str]| Want { statuses: statuses(s), ..Want::new(k, (6., 12.)) };
+        let estimate = |w: &[Want]| estimate(&db, w, "c").unwrap();
+        assert_eq!(estimate(&[want(7, &["ranked"])]).unlisted, Vec::<i64>::new(), "older crawls: their rows' keymodes");
+        assert_eq!(estimate(&[want(7, &["unranked"])]).fetch, 1, "a graveyard chart only when unranked is ticked");
+        assert_eq!(estimate(&[want(7, &["ranked", "unranked"])]).fetch, 4);
+        assert_eq!(estimate(&[Want { min_plays: 3, ..want(7, &["ranked", "unranked"]) }]).fetch, 2, "plays 3 and 9");
+        assert_eq!(estimate(&[Want { stars: (2., 4.), ..want(7, &["ranked"]) }]).fetch, 1, "each keymode its own ★ range");
+        assert_eq!(estimate(&[Want { on: false, ..want(7, &["ranked"]) }]).fetch, 0, "an off keymode downloads nothing");
         kv_set(&db, "keys", &json!([7])).unwrap();
-        let e = estimate(&[4, 7], &statuses(&["ranked"]));
+        let e = estimate(&[want(4, &["ranked"]), want(7, &["ranked"])]);
         assert_eq!((e.fetch, e.analyse, e.ready, e.unlisted.clone()), (3, 3, 0, vec![4]));
+        assert_eq!(e.per_key, BTreeMap::from([(7, 3)]));
         assert_eq!(e.new_bytes, 3 * CHART_BYTES);
         assert!(e.seconds > 0.);
-        let ranked = statuses(&["ranked"]);
-        assert_eq!(estimate(&[4], &ranked).fetch, 0);
+        assert_eq!(estimate(&[want(4, &["ranked"])]).fetch, 0);
         db.execute("UPDATE diffs SET sha='s1', fetched='m1' WHERE bid=1", []).unwrap();
-        assert_eq!(estimate(&[7], &ranked).fetch, 2, "a resume fetches only the rest");
+        assert_eq!(estimate(&[want(7, &["ranked"])]).fetch, 2, "a resume fetches only the rest");
         db.execute("INSERT INTO feats VALUES('s1','c')", []).unwrap();
-        assert_eq!(estimate(&[7], &ranked).ready, 1);
+        assert_eq!(estimate(&[want(7, &["ranked"])]).ready, 1);
+    }
+
+    #[test]
+    fn old_crawls_become_one_want_per_listed_keymode() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT); CREATE TABLE diffs(bid INTEGER PRIMARY KEY, keys INTEGER);
+                          INSERT INTO diffs VALUES(1,4),(2,10);").unwrap();
+        kv_set(&db, "want_keys", &json!([7])).unwrap();
+        kv_set(&db, "stars", &json!([5., 7.])).unwrap();
+        let w = wants(&db);
+        assert_eq!(w.iter().map(|w| (w.keys, w.on)).collect::<Vec<_>>(), [(4, false), (7, true), (10, false)]);
+        assert!(w.iter().all(|w| w.stars == (5., 7.) && w.statuses == STATUSES));
+        kv_set(&db, "wants", &json!([Want::new(4, (1., 2.))])).unwrap();
+        assert_eq!(wants(&db), [Want::new(4, (1., 2.))]);
     }
 }

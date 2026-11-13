@@ -181,7 +181,7 @@ fn mark(p: &egui::Painter, r: Rect, (a, b): (f32, f32), text: String) {
 
 /// Overall level per month, dan lines behind it, peak and today marked; hover for a month's level, its change and plays.
 fn history_chart(ui: &mut Ui, keys: i64, h: &[(i64, f64, f64)], peak: (i64, f64), page: &Page, hints: &mut u32) {
-    let dan = page.dan_scale.get("rice").copied().unwrap_or(1.);
+    let dan = 1.;
     let (r, response, fx, marked) = zoomable(ui, ("history", keys), 110., |r| (r.left() + 8., r.right() - 74.));
     let values: Vec<f64> = h.iter().map(|x| x.1).collect();
     let lo = values.iter().copied().fold(f64::MAX, f64::min) * 0.97;
@@ -224,7 +224,7 @@ fn history_chart(ui: &mut Ui, keys: i64, h: &[(i64, f64, f64)], peak: (i64, f64)
         let (m, v, plays) = if near_peak { h.iter().copied().find(|e| e.0 == peak.0).unwrap_or(h[i]) } else { h[i] };
         plot.vline(x(m), (r.top() + 4.)..=(r.bottom() - 16.), Stroke::new(1., TEXT.gamma_multiply(0.35)));
         plot.circle_filled(pos2(x(m), y(v)), 4., TEXT);
-        let dan = dans::ability(keys, v, "overall", &page.dan_scale).map_or(String::new(), |d| format!(" · ≈ {d}"));
+        let dan = dans::ability(keys, v, "overall").map_or(String::new(), |d| format!(" · ≈ {d}"));
         let text = if near_peak {
             let ago = (page.now - m as f64).round() as i64;
             format!("Peak {:.1} · {} · {}{dan}", st(keys, v), month_name(m), match ago { 0 => "this month".to_string(), 1 => "a month ago".to_string(), n => format!("{n} months ago") })
@@ -298,7 +298,7 @@ impl App {
         let mut pointed = None;
         let row = page.groups.get(&node.key);
         let value = row.and_then(|g| g.value);
-        let dan = value.and_then(|v| dans::ability(keys, v, &node.key, &page.dan_scale));
+        let dan = row.and_then(|g| g.dan.clone()).or_else(|| value.and_then(|v| dans::ability(keys, v, &node.key)));
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.;
             ui.scope(|ui| {
@@ -320,11 +320,10 @@ impl App {
             let bar = skill_bar(ui, keys, row, scale, page.session, l.bar, line);
             let at = bar.hover_pos().map(|p| scale.level(p.x, bar.rect));
             pointed = at;
-            let at = at.map_or(String::new(), |v| format!("\nAt the line: level {:.2}{}", st(keys, v), dans::ability(keys, v, &node.key, &page.dan_scale).map_or(String::new(), |d| format!(" ≈ {d}"))));
+            let at = at.map_or(String::new(), |v| format!("\nAt the line: level {:.2}{}", st(keys, v), dans::ability(keys, v, &node.key).map_or(String::new(), |d| format!(" ≈ {d}"))));
             if let Some(g) = row {
                 if let Some(v) = g.value {
-                    let examples: Vec<String> = g.examples.iter().map(|(t, r, d)| format!("{t} · {r:.2}× · difficulty {:.1}", st(keys, *d))).collect();
-                    bar.on_hover_text(format!("Level {:.2}; likely between {:.2} and {:.2}. {} plays on {} charts.{}{at}", st(keys, v), st(keys, g.low), st(keys, g.high), g.plays, g.maps, if examples.is_empty() { String::new() } else { format!("\n{}", examples.join("\n")) }));
+                    bar.on_hover_text(format!("Level {:.2}; likely between {:.2} and {:.2}. {} plays on {} charts.{at}", st(keys, v), st(keys, g.low), st(keys, g.high), g.plays, g.maps));
                 } else if g.extrapolated {
                     bar.on_hover_text(format!("Evidence reaches difficulty {:.1}; the fitted limit is not measured.{at}", st(keys, g.tested_to)));
                 } else if !at.is_empty() {
@@ -341,6 +340,9 @@ impl App {
                             ui.label(RichText::new(format!("{:.1}", st(keys, v))).family(egui::FontFamily::Name("bold".into())));
                             if let Some(d) = &dan {
                                 theme::dim_small(ui, format!("≈ {d}"));
+                            }
+                            if row.is_some_and(|g| g.rusty) {
+                                theme::dim_small(ui, "rusty").on_hover_text("Not played for a while: expect worse results until you are back in practice. The level is what you reach once warmed up again.");
                             }
                         }
                         None => { ui.label("—"); }
@@ -367,12 +369,11 @@ impl App {
         let groups = &page.groups;
         let overall = groups.get("overall");
         let value = overall.and_then(|g| g.value);
-        let dan_scale = &page.dan_scale;
         ui.horizontal(|ui| match value {
             Some(v) => {
                 ui.label(RichText::new(format!("{:.1}", st(keys, v))).size(theme::BODY * 2.2).family(egui::FontFamily::Name("bold".into())));
                 ui.label(RichText::new(format!("your {keys}K level")).family(egui::FontFamily::Name("bold".into())));
-                if let Some(d) = dans::ability(keys, v, "overall", dan_scale) {
+                if let Some(d) = dans::ability(keys, v, "overall") {
                     ui.label(format!("·  ≈ {d}"));
                 }
             }
@@ -384,7 +385,7 @@ impl App {
         let mut lines = Vec::new();
         if let (Some(v), Some(p)) = (value, peak) {
             if p.1 > v + 0.05 {
-                lines.push(format!("Peak {:.1} in {}{}", st(keys, p.1), month_name(p.0), dans::ability(keys, p.1, "overall", dan_scale).map_or(String::new(), |d| format!(" (≈ {d})"))));
+                lines.push(format!("Peak {:.1} in {}{}", st(keys, p.1), month_name(p.0), dans::ability(keys, p.1, "overall").map_or(String::new(), |d| format!(" (≈ {d})"))));
             } else if !stale {
                 lines.push("This is your peak so far.".to_string());
             }
@@ -402,7 +403,7 @@ impl App {
         }
         let target = format!("{:.3}", 100. * self.units.acc(TARGET));
         let target = format!("{}%", target.trim_end_matches('0').trim_end_matches('.'));
-        let rice = dan_scale.get("rice").copied().unwrap_or(1.);
+        let rice = 1.;
         if page.history.len() >= 2 {
             let end = page.history[page.history.len() - 1];
             history_chart(ui, keys, &page.history, peak.unwrap_or((end.0, end.1)), page, &mut self.s.chart_hints);
@@ -422,7 +423,9 @@ impl App {
         let (local, public, newest) = page.evidence;
         let c = ms_rec::engine::commas;
         let based = format!("{} local plays · {} website bests{}", c(local), c(public), if newest != 0. { format!(" · newest {}", date(newest, "%Y-%m-%d")) } else { String::new() });
-        theme::dim(ui, format!("{based}. {} charts · {} plays. Level = the chart difficulty you play at ~{target}, from your own recent completed plays. ≈ dan: the hardest dan whose songs you would play at {peak} on your better half of plays, after grinding (one song, not passing the course).", c(page.maps), c(page.plays), peak = format!("{:.0}%", 100. * ms_rec::dans::PEAK)));
+        // One line (user 2026-11-11: "too much yapping"); the method sits in its tooltip.
+        theme::dim(ui, format!("{} plays · ≈ dan = the dan you'd clear warmed up", c(page.plays)))
+            .on_hover_text(format!("{based}. {} charts · {} plays. Level = the chart difficulty you play at ~{target}, from your own recent completed plays. Level, skills and ≈ dan: the dan whose songs you would clear at its pass mark (96 %, 7K LN 95 %, 4K LN 97 % ScoreV2), predicted as for a chart you have played once, rested and warmed up, at the form of your warmed-up plays in your last 5 sessions; your scores on dan charts are not used.", c(page.maps), c(page.plays)));
         let measured: Vec<&Group> = groups.values().filter(|g| g.value.is_some()).collect();
         let ends = peak.map(|p| p.1);
         let lo = measured.iter().map(|g| g.low).chain(ends).fold(f64::MAX, f64::min);
@@ -442,7 +445,8 @@ impl App {
         let line_id = ui.scope_id().with(("skill-line", keys));
         let line = ui.data(|d| d.get_temp::<f64>(line_id));
         let mut pointed = None;
-        for parent in parents {
+        // SV is not read from anything that measures it (no dan songs, few own charts): it showed "Reg 6th" (user 2026-11-11).
+        for parent in parents.iter().filter(|p| p.key != "sv") {
             if parent.children.is_empty() {
                 pointed = pointed.or(self.skill_row(ui, keys, parent, page, scale, &l, false, None, line));
                 continue;
@@ -518,7 +522,7 @@ impl App {
         ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 8.;
             let Some(data) = self.stats.take() else {
-                ui.label("Reading your score history… (it appears here as soon as your plays are read and analysed; progress is shown above)");
+                ui.label("Reading your score history… (it appears here as soon as your plays are read and analysed; progress is shown at the bottom of the window)");
                 return;
             };
             match self.s.stats_keys {

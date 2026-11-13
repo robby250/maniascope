@@ -1,7 +1,7 @@
 //! The main window: glanceable difficulty of the selected map, kept small as an OBS source.
 use crate::app::{open_external, App};
 use crate::fmt::{self, bold, plain, small};
-use crate::theme::{self, ACCENT, BODY, DIM, TEXT};
+use crate::theme::{self, ACCENT, BODY, DIM, SMALL, TEXT};
 use crate::viewer::Analysis;
 use eframe::egui::{self, epaint::{text::{LayoutJob, TextFormat, TextWrapping}, Mesh, Vertex, WHITE_UV}, Align, Color32, FontId, Layout, RichText, Sense, Shape, Stroke, TextStyle, Ui, Vec2};
 use ms_model::skills;
@@ -165,7 +165,7 @@ impl App {
             let v = ms_calc::py::round_digits(ms_rec::shown::stars(a.keys, a.overall), 2);
             let (text, pill) = fmt::rating_colours(v);
             let you = self.you(a.keys).and_then(|p| Some((p.groups.get("overall")?.value?, p)));
-            let versus = you.map_or(String::new(), |(y, p)| format!("\n{:+.1} vs your {}K {:.1}{}", v - ms_rec::shown::stars(a.keys, y), a.keys, ms_rec::shown::stars(a.keys, y), ms_rec::dans::ability(a.keys, y, "overall", &p.dan_scale).map_or(String::new(), |d| format!(" · ≈ {d}"))));
+            let versus = you.map_or(String::new(), |(y, _)| format!("\n{:+.1} vs your {}K {:.1}{}", v - ms_rec::shown::stars(a.keys, y), a.keys, ms_rec::shown::stars(a.keys, y), ms_rec::dans::ability(a.keys, y, "overall").map_or(String::new(), |d| format!(" · ≈ {d}"))));
             theme::gradient(&mut ui, &format!("{v:.2}"), BODY * 2.4, None, &text, Some(pill))
                 .on_hover_text(format!("Overall difficulty: level a well-rounded player needs for controlled, accurate play. Provisional calibration — one decimal is already generous.{versus}"));
             ui.add_space(4.);
@@ -184,12 +184,30 @@ impl App {
             };
             // Names only, sized by rating: the overall is the card's one number, skill stars are in Details (user 2026-11-09).
             // A comma ends every skill but the row's last: without the old numbers, same-sized names ran together (user 2026-11-09).
-            let text = |i: usize, end: usize| if i + 1 < end { format!("{},", a.entries[i].name) } else { a.entries[i].name.clone() };
+            // A tag sits beside its name in the accent colour, Tech before it and Stamina after ("Tech Stream", "LN Release
+            // Stamina", user 2026-11-12), never under the theme's SMALL size ("the font on the modifier on the 3rd skill is way too small").
+            let tagged = |i: usize| -> (String, String) {
+                let t = &a.entries[i].tags;
+                (t.iter().filter(|t| *t == "Tech").map(|t| format!("{t} ")).collect(), t.iter().filter(|t| *t != "Tech").map(|t| format!(" {t}")).collect())
+            };
+            let comma = |i: usize, end: usize| if i + 1 < end { "," } else { "" };
+            let text = |i: usize, end: usize| { let (b, f) = tagged(i); format!("{b}{}{f}{}", a.entries[i].name, comma(i, end)) };
             let width = ui.available_width();
             let row = |range: std::ops::Range<usize>| {
                 let mut j = LayoutJob::default();
                 for i in range.clone() {
-                    j.append(&text(i, range.end), if i > range.start { 8. } else { 0. }, format(i));
+                    let f = format(i);
+                    let small = TextFormat { font_id: FontId::new((f.font_id.size * 0.62).max(SMALL), egui::FontFamily::Proportional), color: ACCENT, valign: Align::TOP, ..TextFormat::default() };
+                    let (b, t) = tagged(i);
+                    let gap = if i > range.start { 8. } else { 0. };
+                    if !b.is_empty() {
+                        j.append(&b, gap, small.clone());
+                    }
+                    j.append(&a.entries[i].name, if b.is_empty() { gap } else { 0. }, f.clone());
+                    if !t.is_empty() {
+                        j.append(&t, 0., small);
+                    }
+                    j.append(comma(i, range.end), 0., f);
                 }
                 j.wrap = TextWrapping::truncate_at_width(width);
                 j

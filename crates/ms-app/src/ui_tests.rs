@@ -30,7 +30,7 @@ fn pick(sha: char) -> Pick {
 }
 
 fn pool(a: &App, mode: &str, revision: u64, shown: Vec<Pick>) -> Out {
-    Out::Pool { mode: mode.into(), revision, selection_id: a.selection_id, phase: "warmup".into(), shown, note: "Synthetic UI check · target ~94%".into(), summary: "No actual prediction".into(), progress: None, key_counts: Default::default() }
+    Out::Pool { mode: mode.into(), revision, selection_id: a.selection_id, phase: "warmup".into(), shown, note: "Synthetic UI check · target ~94%".into(), summary: "No actual prediction".into(), progress: None, key_counts: Default::default(), nps_pool: Default::default() }
 }
 
 fn tasks(a: &App) -> Vec<Task> {
@@ -159,8 +159,8 @@ fn skip_warmup_shows_only_while_the_tab_warms_up() {
     h.get_by_label("Skip warmup").click();
     h.step();
     assert!(tasks(h.state()).iter().any(|t| matches!(t, Task::SkipWarmup)));
-    let Out::Pool { mode, revision, selection_id, shown, note, summary, progress, key_counts, .. } = pool(h.state(), "nps", h.state().revision, vec![pick('a')]) else { unreachable!() };
-    h.state_mut().on_rec(Out::Pool { mode, revision, selection_id, phase: "build".into(), shown, note, summary, progress, key_counts });
+    let Out::Pool { mode, revision, selection_id, shown, note, summary, progress, key_counts, nps_pool, .. } = pool(h.state(), "nps", h.state().revision, vec![pick('a')]) else { unreachable!() };
+    h.state_mut().on_rec(Out::Pool { mode, revision, selection_id, phase: "build".into(), shown, note, summary, progress, key_counts, nps_pool });
     h.step();
     assert!(h.query_by_label("Skip warmup").is_none());
 }
@@ -704,4 +704,68 @@ fn tabs_drag_like_browser_tabs_and_pp_moves_too() {
     h.run();
     assert_eq!(h.state().s.tabs().last(), Some(&crate::settings::Tab::Mode("pp")), "PP dropped at the end");
     assert!(h.get_by_label("PP").rect().left() > h.get_by_label("Jacks").rect().left());
+}
+
+#[test]
+fn a_card_row_carries_its_modifier_tags_beside_the_name() {
+    // Tech/Stamina are tags beside a skill's name: Tech before it, Stamina after (user 2026-11-12).
+    let ctx = egui::Context::default();
+    let mut a = app(prefs(), &ctx);
+    let entry = |name: &str, rating: f64, tags: &[&str]| crate::viewer::Entry { name: name.into(), rating, parts: Vec::new(), tags: tags.iter().map(|t| t.to_string()).collect() };
+    let analysis = crate::viewer::Analysis {
+        path: "x.osu".into(), rate: 1., sv: true, keys: 7, title: "Cyber Shaman".into(), artist: "Cosmo".into(), version: "Local difficulty".into(), creator: "someone".into(),
+        overall: 6.1, notes: 2400, ln_notes: 900., nps: Some(14.2), span: Some((0., 150_000.)), timeline: (0..60).map(|i| 4. + (i as f64 / 6.).sin()).collect(),
+        entries: vec![entry("LN Release", 6.0, &["Tech"]), entry("Stream", 5.6, &["Stamina"]), entry("Chordjack", 4.9, &[])], tags: Vec::new(), bars: Vec::new(),
+        peak_nps: None, bid: None, names: Vec::new(), tech: Vec::new(), sv_ignored: false, dan_vibro: Default::default(),
+    };
+    a.shown = Some(crate::app::Selected { path: "x.osu".into(), rate: 1., sv: true, result: Ok(std::sync::Arc::new(analysis)) });
+    a.s.display.skills = 3;
+    let mut h = Harness::builder().with_size(egui::vec2(460., 260.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.main_ui(ui), a);
+    h.step();
+    h.get_by_label_contains("Tech LN Release"); // Tech before the name (user 2026-11-12); the second row is one painted galley, seen in the screenshot
+    // MS_SHOT=path: a themed screenshot of this card (software Vulkan is enough).
+    if let Ok(path) = std::env::var("MS_SHOT") {
+        h.render().expect("render").save(path).expect("save");
+    }
+}
+
+#[test]
+fn slider_values_and_the_website_button_stay_inside_the_settings_page() {
+    // user 2026-11-13: "80% NPS · 7899 m…" and "0.4× per ma…" ran past the right edge at ~440 px.
+    for width in [440., 320.] {
+        let mut h = Harness::builder().with_size(egui::vec2(width, 200.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, v: &mut f64| {
+            crate::playlist::slider(ui, "Variety to high NPS", v, (0., 1., 0.05), 0.5, |x| format!("{} · 78,999 maps", crate::playlist::focus_label(x)), None);
+            crate::playlist::slider(ui, "Maps you don't have", v, (0., 1., 0.05), 0.5, |_| "10.0× per map, weighted".to_string(), None);
+        }, 0.8);
+        h.step();
+        for text in ["80% NPS · 78,999 maps", "10.0× per map, weighted"] {
+            let right = h.get_by_label(text).rect().right() as f32;
+            assert!(right <= width, "{text} ends at {right} of {width}");
+        }
+    }
+    let ctx = egui::Context::default();
+    let mut a = app(prefs(), &ctx);
+    a.views.get_mut("nps").unwrap().settings = true;
+    let mut h = Harness::builder().with_size(egui::vec2(440., 760.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.playlist_ui(ui), a);
+    h.step();
+    let right = h.get_by_label("Website charts…").rect().right() as f32;
+    assert!(right <= 440., "Website charts ends at {right}");
+}
+
+#[test]
+fn no_text_or_button_runs_past_any_settings_page() {
+    use egui::accesskit::Role;
+    use egui_kittest::kittest::NodeT;
+    for mode in ["nps", "skills", "pp"] {
+        for width in [440., 360.] {
+            let ctx = egui::Context::default();
+            let mut a = app(json!({"recommendation_mode": mode, "skills_keys": [7]}), &ctx);
+            a.views.get_mut(mode).unwrap().settings = true;
+            let mut h = Harness::builder().with_size(egui::vec2(width, 2400.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.playlist_ui(ui), a);
+            h.step();
+            let past: Vec<String> = h.query_all(egui_kittest::kittest::by().predicate(|n| matches!(n.role(), Role::Label | Role::Button) && n.bounding_box().is_some_and(|r| r.x1 > width as f64 + 0.5)))
+                .map(|n| format!("{:?} ends at {:.0}", n.accesskit_node().label(), n.rect().right())).collect();
+            assert!(past.is_empty(), "{mode} at {width}: {past:?}");
+        }
+    }
 }

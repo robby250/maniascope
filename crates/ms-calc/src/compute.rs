@@ -1,20 +1,18 @@
 //! Full analysis of a chart at a rate (skill_calc.compute/_compute).
 use crate::card;
 use crate::chart::Chart;
-use crate::demand::{self, Geometry, Parts, Run, P};
+use crate::demand::{self, Geometry, Parts, Run};
 use crate::execution::{self, Info};
 use crate::gestures;
 use crate::model;
 use crate::params::Params;
 use crate::pattern;
-use crate::py;
 use crate::scroll;
 use crate::skills::{self, Series, Sk};
 use crate::structure;
 use crate::val::{Dict, Key, Val};
 
 pub const MODEL_VERSION: &str = "3.5-technical-presence";
-const SV_NAMES: [&str; 5] = ["Fast SV", "Slowjam SV", "Accel SV", "Stutter SV", "SV"];
 
 pub struct Trace {
     pub total: Vec<f64>,
@@ -22,6 +20,8 @@ pub struct Trace {
     pub switch: Vec<f64>,
     pub parts: Parts,
     pub result: Dict,
+    /// Each slice's evidence density where it can slice (skills::slice).
+    pub densities: Vec<(Sk, Vec<f64>)>,
 }
 
 #[derive(Default)]
@@ -66,14 +66,13 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     let keys = chart.keys;
     let mut res = Dict::new();
     res.set("model", MODEL_VERSION);
-    res.set("sv_name", "SV");
     res.set("keys", keys);
     res.set("rate", rate);
     res.set("notes", n);
     res.set("ln_notes", chart.t.iter().zip(&chart.end).filter(|(t, e)| e > t).count());
     let mut sc = Dict::new();
     sc.set("overall", 0.0);
-    for s in skills::skills(keys) {
+    for s in crate::taxonomy::rated(keys) {
         sc.set(s.name(), 0.0);
     }
     res.set("scores", sc.clone());
@@ -137,7 +136,32 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     sc.set("stamina", skills::stamina_rating(&total, &judged, keys, k));
     let mut series = skills::attribute(&parts, &total, keys, false, k);
     let mut rated = Vec::new();
-    // Before execution::attribute only model::vector's skills are read (physical_sk); the rest are rated once, after it.
+    if shared.execution.is_none() {
+        shared.execution = Some(execution::analyse(chart, shared.geometry.as_ref().unwrap(), k.BIN));
+    }
+    if shared.gestures.is_none() {
+        // Off: empty series (every reader is length-guarded), zero features, no roll plans.
+        shared.gestures = Some(if prm.off("gestures") {
+            gestures::Analysis::default()
+        } else {
+            gestures::analyse(chart, rate, k)
+        });
+    }
+    if shared.quadstream.is_none() {
+        shared.quadstream =
+            Some(if prm.off("quadstream") { (vec![0.0; total.len()], 0.0) } else { pattern::quadstream(chart, rate, k.BIN) });
+    }
+    let (changed, extra, own) = if prm.off("execution") {
+        (parts.clone(), Vec::new(), Vec::new())
+    } else {
+        execution::attribute(
+            &parts, &total, &mut series, chart, rate, shared.execution.as_ref().unwrap(), shared.gestures.as_ref().unwrap(),
+            shared.quadstream.as_ref().unwrap(), k,
+        )
+    };
+    parts = changed;
+    let quad: &[f64] = shared.quadstream.as_ref().map_or(&[], |q| &q.0);
+    let densities = skills::slice(&mut series, &parts, &total, &skills::Evidence { own: &own, quad, interleaved: interleaved(chart) }, keys, overall, k);
     series_dict_scores(&mut sc, &series, &judged, keys, prm, &mut rated, Some(&model::VECTOR_SKILLS));
     let mut psk = Dict::new();
     for (key, v) in &sc.0 {
@@ -148,30 +172,6 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
         }
     }
     res.set("physical_sk", psk);
-    if shared.execution.is_none() {
-        shared.execution = Some(execution::analyse(chart, shared.geometry.as_ref().unwrap(), k.BIN, k.CENTRE_SPLIT > 0.0));
-    }
-    if shared.gestures.is_none() {
-        // Off: empty series (every reader is length-guarded), zero features, no roll plans.
-        shared.gestures = Some(if prm.off("gestures") {
-            gestures::Analysis::default()
-        } else {
-            gestures::analyse(chart, rate, k.BIN)
-        });
-    }
-    if shared.quadstream.is_none() {
-        shared.quadstream =
-            Some(if prm.off("quadstream") { (vec![0.0; total.len()], 0.0) } else { pattern::quadstream(chart, rate, k.BIN) });
-    }
-    let (changed, extra) = if prm.off("execution") {
-        (parts.clone(), Vec::new())
-    } else {
-        execution::attribute(
-            &parts, &total, &mut series, chart, rate, shared.execution.as_ref().unwrap(), shared.gestures.as_ref().unwrap(),
-            shared.quadstream.as_ref().unwrap(), k,
-        )
-    };
-    parts = changed;
     let mut ex = Dict::new();
     for (name, v) in extra {
         ex.set(name, v);
@@ -191,21 +191,11 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     }
     let switch = series.remove(Sk::switch);
     series_dict_scores(&mut sc, &series, &judged, keys, prm, &mut rated, None);
-    res.set("archetypes", Val::List(card::archetypes(&series, &sc, &judged, keys, &switch, k)));
+    res.set("tags", card::tags(&series, &sc, &judged, keys, k));
     res.set("tech_where", Val::List(card::tech_where(&series, &parts, chart.t[0] / 1000.0, rate, k)));
-    let sv_tot = py::sum(parts.get(P::sv).iter().copied());
-    if sv_tot != 0.0 {
-        let shares: Vec<f64> = demand::SV_KINDS.iter().map(|&p| py::sum(parts.get(p).iter().copied()) / sv_tot).collect();
-        if let Some(i) = shares.iter().position(|&f| f >= k.SV_KIND_SHARE) {
-            res.set("sv_name", SV_NAMES[i]);
-        }
-    }
     let tl = skills::local_levels(&total, k.LOCAL_WINDOW, k);
-    let rk = rate.powf(k.RATE_G);
-    sc.map_values(|v| v * rk);
     res.set("scores", sc);
-    model::scale_archetypes(&mut res, rk);
-    res.set("timeline", Val::floats(&tl.iter().map(|x| x * rk).collect::<Vec<f64>>()));
+    res.set("timeline", Val::floats(&tl));
     let ((load, peak), ftl) = shared.endurance.clone().unwrap();
     let mut en = Dict::new();
     en.set("load", load);
@@ -230,29 +220,6 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
         }
     }
     res.set("jack_width", pressure / 1usize.max(pairs) as f64);
-    let has_bracket = res.dict("scores").unwrap().has("bracket");
-    let mut bracket_gate = 1.0f64;
-    if has_bracket {
-        let half = keys / 2;
-        let all = ((1u64 << keys) - 1) as u32;
-        // Odd keymodes: the middle key with each hand in turn, averaged (user 2026-11-03: "a thumb is a finger"); it was in neither.
-        let lo = ((1u64 << half) - 1) as u32;
-        let lefts: Vec<[u32; 2]> = if keys % 2 == 1 && k.CENTRE_SPLIT > 0.0 { vec![[(lo << 1) | 1, all & !((lo << 1) | 1)], [lo, all & !lo]] } else { vec![[lo, lo << (keys - half)]] };
-        bracket_gate = 0.;
-        for &hands in &lefts {
-            let (mut moves, mut interleaved) = (0usize, 0usize);
-            for w2 in rs.windows(2) {
-                for h in hands {
-                    let (pa, pb) = (w2[0].1 & h, w2[1].1 & h);
-                    if pa != 0 && pb != 0 && pa & pb == 0 && pa.count_ones().max(pb.count_ones()) >= 2 {
-                        moves += 1;
-                        interleaved += (crate::kern::inner(pa, keys) & pb != 0 || crate::kern::inner(pb, keys) & pa != 0) as usize;
-                    }
-                }
-            }
-            bracket_gate += if moves > 0 { 1f64.min(interleaved as f64 / (k.BRACKET_IL_FULL * moves as f64)) } else { 1.0 } / lefts.len() as f64;
-        }
-    }
     let sv_physical = sv && !chart.sv.is_empty() && any_strain;
     if sv_physical {
         let physical = compute_inner(chart, rate, false, shared, prm)?;
@@ -277,37 +244,50 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     res.set("length", if length.fract() == 0.0 && length.abs() < 9e15 { Val::Int(length as i64) } else { Val::F(length) });
     if prm.model["joint"]["modes"][chart.keys.to_string()].is_object() {
         if let Some(e) = res.dict_mut("execution") {
-            crate::flow::flow(chart, rate).store(e);
+            crate::flow::flow(chart, rate, &prm.k).store(e);
         }
     }
     model::apply(prm, &mut res, chart.od, rate);
-    if has_bracket && bracket_gate < 1.0 {
-        let scd = res.dict_mut("scores").unwrap();
-        let bv = scd.f("bracket") * bracket_gate;
-        scd.set("bracket", bv);
-        let cs = scd.f("chordstream");
-        if let Some(Val::List(items)) = res.get_mut("archetypes") {
-            for a in items.iter_mut() {
-                if let Val::Dict(d) = a {
-                    if matches!(d.get("parts"), Some(Val::Tuple(p)) if p.iter().any(|x| matches!(x, Val::Str(s) if s == "bracket"))) {
-                        let r = d.f("rating");
-                        d.set("rating", r * bracket_gate);
-                    }
-                }
-            }
-            items.retain(|a| match a {
-                Val::Dict(d) => !matches!(d.get("name"), Some(Val::Str(s)) if s == "Bracket") || bv >= k.REFINE_Q * cs,
-                _ => true,
-            });
-        }
-    }
     if tracing {
-        let tr = Trace { total, series, switch, parts, result: res.clone() };
+        let tr = Trace { total, series, switch, parts, result: res.clone(), densities };
         let t = shared.trace.as_mut().unwrap();
         t.retain(|(key, _)| *key != sv);
         t.push((sv, tr));
     }
     Ok(res)
+}
+
+/// The share of a hand's disjoint chord-group moves that interleave (one group's fingers inside the other's span), averaged
+/// over the hand splits (odd keymodes: the middle key with each hand in turn, user 2026-11-03: "a thumb is a finger"); 1 with
+/// no such moves. Disjoint moves that never interleave are chordstream (user 2026-10-11: cigarettes).
+pub fn interleaved(chart: &Chart) -> f64 {
+    let keys = chart.keys;
+    let mut rs: Vec<(f64, u32)> = Vec::new();
+    for i in 0..chart.len() {
+        match rs.last_mut() {
+            Some(x) if x.0 == chart.t[i] => x.1 |= 1 << chart.col[i],
+            _ => rs.push((chart.t[i], 1 << chart.col[i])),
+        }
+    }
+    let half = keys / 2;
+    let all = ((1u64 << keys) - 1) as u32;
+    let lo = ((1u64 << half) - 1) as u32;
+    let lefts: Vec<[u32; 2]> = if keys % 2 == 1 { vec![[(lo << 1) | 1, all & !((lo << 1) | 1)], [lo, all & !lo]] } else { vec![[lo, lo << (keys - half)]] };
+    let mut out = 0.0;
+    for &hands in &lefts {
+        let (mut moves, mut inter) = (0usize, 0usize);
+        for w2 in rs.windows(2) {
+            for h in hands {
+                let (pa, pb) = (w2[0].1 & h, w2[1].1 & h);
+                if pa != 0 && pb != 0 && pa & pb == 0 && pa.count_ones().max(pb.count_ones()) >= 2 {
+                    moves += 1;
+                    inter += (crate::kern::inner(pa, keys) & pb != 0 || crate::kern::inner(pb, keys) & pa != 0) as usize;
+                }
+            }
+        }
+        out += if moves > 0 { inter as f64 / moves as f64 } else { 1.0 } / lefts.len() as f64;
+    }
+    out
 }
 
 /// Full analysis of a parsed chart at a constant rate (skill_calc.compute).

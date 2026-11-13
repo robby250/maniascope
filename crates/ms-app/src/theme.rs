@@ -33,8 +33,8 @@ pub fn apply(ctx: &egui::Context) {
     let fallback = fonts.families[&FontFamily::Proportional].clone();
     fonts.families.entry(FontFamily::Name("bold".into())).or_default().extend(fallback);
     ctx.set_fonts(fonts);
-    // Windows keeps its light title bar over a dark app unless the window is told (user 2026-11-01).
     ctx.set_theme(egui::Theme::Dark);
+    dark_frame(ctx);
     let mut v = egui::Visuals::dark();
     v.panel_fill = BG;
     v.window_fill = BG;
@@ -69,6 +69,14 @@ fn format(s: &Span, size: Option<f32>) -> TextFormat {
     let px = size.unwrap_or(if s.small { SMALL } else { BODY });
     let family = if s.bold { FontFamily::Name("bold".into()) } else { FontFamily::Proportional };
     TextFormat { font_id: FontId::new(px, family), color: s.color.unwrap_or(if s.small { DIM } else { TEXT }), ..TextFormat::default() }
+}
+
+/// Windows keeps a light title bar over a dark app unless each window is told: set_theme colours only egui (user 2026-11-01,
+/// back with eframe 0.37). Sent on a window's first pass, so a reopened window gets it again.
+pub fn dark_frame(ctx: &egui::Context) {
+    if ctx.cumulative_pass_nr() == 0 {
+        ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
+    }
 }
 
 pub fn job(line: &Line, rows: usize, width: f32) -> LayoutJob {

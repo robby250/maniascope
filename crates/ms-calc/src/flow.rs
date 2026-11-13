@@ -2,16 +2,13 @@
 //! 7k", "mental and physical endurance are different"). Descriptors only: what they weigh is fitted per keymode.
 use crate::chart::Chart;
 
-const LINK: f64 = 0.25;     // s: a hand's next note further than this starts a new phrase
-const FLOOR: f64 = 0.04;    // s: faster than this counts the same
-const MEMORY: usize = 32;   // rows: a pair of rows seen this recently is no new pattern
-const FAST_LN: f64 = 0.05;  // s: LN heads this close on adjacent columns roll
+use crate::params::Knobs;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Flow {
     pub broken: f64,  // speed-weighted share of a hand's notes out of finger order: not a roll, not a trill
     pub skip: f64,    // speed-weighted fingers jumped over per note
-    pub change: f64,  // share of rows making a pair the last MEMORY rows didn't have
+    pub change: f64,  // share of rows making a pair the last FLOW_MEMORY rows didn't have
     pub fast_ln: f64, // share of LN heads rolling onto a neighbour
     pub split: f64,   // speed-weighted share of a hand's rows that are a chord with a finger left out inside it (`1011`)
     pub imbalance: f64, // density²-weighted |L − R| / (L + R) of 1 s bins: one hand carrying the load (MinaCalc HandBalance)
@@ -110,6 +107,11 @@ pub const LEVEL: usize = 3 * DIRECT;
 /// step `[l0, s]`, then products of two row inputs `[a, b]` (level² is the raw→rating curve's bend), then each skill past
 /// `dominant` (the pattern that defines the chart). The fit and the app both build columns here, so they can't drift.
 pub fn extended(row: &[f64], spec: &serde_json::Value) -> Vec<f64> {
+    extended_with(row, row, spec)
+}
+
+/// `extended` with the products built from `pin` (the app pins the level inside the fitted range, see `joint_shift`).
+pub fn extended_with(row: &[f64], pin: &[f64], spec: &serde_json::Value) -> Vec<f64> {
     let mut out = row.to_vec();
     let pair = |v: &serde_json::Value| (v[0].as_f64().unwrap_or(0.), v[1].as_f64().unwrap_or(0.));
     for step in spec["arms"].as_array().into_iter().flatten() {
@@ -118,7 +120,7 @@ pub fn extended(row: &[f64], spec: &serde_json::Value) -> Vec<f64> {
     }
     for p in spec["pairs"].as_array().into_iter().flatten() {
         let (a, b) = pair(p);
-        out.push(row[a as usize] * row[b as usize]);
+        out.push(pin[a as usize] * pin[b as usize]);
     }
     if let Some(t) = spec["dominant"].as_f64() {
         out.extend(row[..crate::model::SR_SKILLS.len()].iter().map(|v| (v - t).max(0.)));
@@ -159,27 +161,27 @@ pub fn rows(chart: &Chart, rate: f64) -> Vec<(f64, u32)> {
     rows
 }
 
-pub fn flow(chart: &Chart, rate: f64) -> Flow {
+pub fn flow(chart: &Chart, rate: f64, k: &Knobs) -> Flow {
     let scale = 0.001 / rate;
     let rows = rows(chart, rate);
     let splits: &[bool] = if chart.keys % 2 == 1 { &[true, false] } else { &[true] };
     let (mut broken, mut skip, mut split, mut imbalance, mut ohj, mut ring, mut polyrate, mut variety, mut chaos) = (0., 0., 0., 0., 0., 0., 0., 0., 0.);
     for &centre_left in splits {
-        let (b, s) = order(chart, scale, centre_left);
+        let (b, s) = order(chart, scale, centre_left, k);
         let part = splits.len() as f64;
         broken += b / part;
         skip += s / part;
-        split += gapped(&rows, chart.keys, centre_left) / part;
+        split += gapped(&rows, chart.keys, centre_left, k) / part;
         imbalance += hand_imbalance(&rows, chart.keys, centre_left) / part;
-        ohj += jump_chains(&rows, chart.keys, centre_left) / part;
+        ohj += jump_chains(&rows, chart.keys, centre_left, k) / part;
         ring += ring_conflicts(&rows, chart.keys, centre_left) / part;
         polyrate += hand_rates(&rows, chart.keys, centre_left) / part;
-        variety += rhythm_variety(&rows, chart.keys, centre_left) / part;
-        chaos += gap_chaos(&rows, chart.keys, centre_left) / part;
+        variety += rhythm_variety(&rows, chart.keys, centre_left, k) / part;
+        chaos += gap_chaos(&rows, chart.keys, centre_left, k) / part;
     }
-    let even = evenness(chart, scale);
-    let (coupling, roll, flam) = (coupling(chart, scale), rolls(chart, scale), flams(chart, scale));
-    let (isolated, vibro_run, jack_comp) = (isolation(&rows), vibro_runs(chart, scale), jack_compensation(chart, scale));
+    let even = evenness(chart, scale, k);
+    let (coupling, roll, flam) = (coupling(chart, scale, k), rolls(chart, scale, k), flams(chart, scale, k));
+    let (isolated, vibro_run, jack_comp) = (isolation(&rows), vibro_runs(chart, rate, k), jack_compensation(chart, scale, k));
     let (mut gaps, mut hold_tap, holds, mut shape_load) = ([0.; 4], [0.; 2], held(chart), 0.);
     for &centre_left in splits {
         shape_load += shape_loads(&rows, chart.keys, centre_left) / splits.len() as f64;
@@ -188,17 +190,17 @@ pub fn flow(chart: &Chart, rate: f64) -> Flow {
         let h = hold_taps(&rows, &holds, chart.keys, centre_left);
         (0..2).for_each(|i| hold_tap[i] += h[i] / splits.len() as f64);
     }
-    let (mut changed, mut seen) = (0usize, Vec::with_capacity(MEMORY));
+    let (mut changed, mut seen) = (0usize, Vec::with_capacity(k.FLOW_MEMORY));
     for pair in rows.windows(2) {
         let p = (pair[0].1, pair[1].1);
         changed += usize::from(!seen.contains(&p));
-        if seen.len() == MEMORY {
+        if seen.len() == k.FLOW_MEMORY {
             seen.remove(0);
         }
         seen.push(p);
     }
     let heads: Vec<(f64, u8)> = (0..chart.len()).filter(|&n| chart.end[n] > chart.t[n]).map(|n| (chart.t[n] * scale, chart.col[n])).collect();
-    let rolled = heads.windows(2).filter(|w| w[1].0 - w[0].0 <= FAST_LN && w[1].0 > w[0].0 && w[1].1.abs_diff(w[0].1) == 1).count();
+    let rolled = heads.windows(2).filter(|w| w[1].0 - w[0].0 <= k.FAST_LN && w[1].0 > w[0].0 && w[1].1.abs_diff(w[0].1) == 1).count();
     Flow { broken, skip, change: changed as f64 / rows.len().max(2).saturating_sub(1) as f64, fast_ln: rolled as f64 / heads.len().max(1) as f64, split, imbalance, even, coupling, roll, flam, ohj, ring, polyrate, isolated, vibro_run, variety, chaos, jack_comp, gaps, hold_tap, shape_load }
 }
 
@@ -291,7 +293,7 @@ fn gap_profile(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> [f64; 4] 
 /// Split hand chords: the hand must hold a finger up between two pressing ones (finger enslaving). Replays, 7K and 10K alike:
 /// about +1 pp of accuracy lost on each such note against an adjacent chord at the same speed and size (2026-11-04).
 /// A chart-level hand-shape entropy (2 s, Hick–Hyman) was tried beside it and didn't help the fit (2026-11-04).
-fn gapped(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
+fn gapped(rows: &[(f64, u32)], keys: usize, centre_left: bool, k: &Knobs) -> f64 {
     let (mut total, mut split, mut last, hm) = (0., 0., [f64::NEG_INFINITY; 2], hand_masks(keys, centre_left));
     for &(t, mask) in rows {
         let hands = [mask & hm[0], mask & hm[1]];
@@ -299,7 +301,7 @@ fn gapped(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
             if hands[h] == 0 {
                 continue;
             }
-            let weight = 1. / (t - last[h]).max(FLOOR);
+            let weight = 1. / (t - last[h]).max(k.FLOW_FLOOR);
             last[h] = t;
             total += weight;
             if (hands[h] & !(hands[h] << 1)).count_ones() > 1 {
@@ -335,7 +337,7 @@ fn hand_imbalance(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
 
 /// Sunny's unevenness, inverted: a note whose neighbouring finger on the same hand is repeating at the same interval
 /// (|Δ| < 20 ms, both under 0.5 s) moves with it as one motion. Speed-weighted share.
-fn evenness(chart: &Chart, scale: f64) -> f64 {
+fn evenness(chart: &Chart, scale: f64, k: &Knobs) -> f64 {
     let keys = chart.keys;
     let (mut last, mut gap) = (vec![f64::NEG_INFINITY; keys], vec![f64::INFINITY; keys]);
     let (mut total, mut even) = (0., 0.);
@@ -343,7 +345,7 @@ fn evenness(chart: &Chart, scale: f64) -> f64 {
         let (c, t) = (chart.col[n] as usize, chart.t[n] * scale);
         let d = t - last[c];
         if d <= 0.5 {
-            let weight = 1. / d.max(FLOOR);
+            let weight = 1. / d.max(k.FLOW_FLOOR);
             total += weight;
             let paired = [c.wrapping_sub(1), c + 1].into_iter().filter(|&o| o < keys && same_hand(o, c, keys)).any(|o| t - last[o] <= d && (gap[o] - d).abs() < 0.02);
             if paired {
@@ -362,7 +364,7 @@ fn same_hand(a: usize, b: usize, keys: usize) -> bool {
 
 /// Sunny's same-column × cross-column coupling: per 0.5 s bin S = Σ 1/jack gap, X = Σ 1/gap of notes off the previous
 /// note's column, T = X/(X+S+1); √S·T^1.5 summed over √S summed: jack-heavy stretches that also move across columns.
-fn coupling(chart: &Chart, scale: f64) -> f64 {
+fn coupling(chart: &Chart, scale: f64, k: &Knobs) -> f64 {
     let mut last = vec![f64::NEG_INFINITY; chart.keys];
     let (mut prev_t, mut prev_c) = (f64::NEG_INFINITY, usize::MAX);
     let start = chart.t.first().map_or(0., |t| t * scale);
@@ -371,10 +373,10 @@ fn coupling(chart: &Chart, scale: f64) -> f64 {
         let (c, t) = (chart.col[n] as usize, chart.t[n] * scale);
         let bin = &mut bins[((t - start) * 2.).floor() as usize];
         if t - last[c] <= 0.5 {
-            bin[0] += 1. / (t - last[c]).max(FLOOR);
+            bin[0] += 1. / (t - last[c]).max(k.FLOW_FLOOR);
         }
-        if c != prev_c && t > prev_t && t - prev_t <= LINK {
-            bin[1] += 1. / (t - prev_t).max(FLOOR);
+        if c != prev_c && t > prev_t && t - prev_t <= k.FLOW_LINK {
+            bin[1] += 1. / (t - prev_t).max(k.FLOW_FLOOR);
         }
         last[c] = t;
         (prev_t, prev_c) = (t, c);
@@ -389,14 +391,14 @@ fn coupling(chart: &Chart, scale: f64) -> f64 {
 
 /// Interlude's variety, on rhythm: each hand's gap to its previous row in quarter-octave buckets; per row, the distinct
 /// (hand, bucket) pairs within ±0.75 s, averaged, /10.
-fn rhythm_variety(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
+fn rhythm_variety(rows: &[(f64, u32)], keys: usize, centre_left: bool, k: &Knobs) -> f64 {
     let mut marks: Vec<(f64, i32)> = Vec::new();
     let (mut last, hm) = ([f64::NEG_INFINITY; 2], hand_masks(keys, centre_left));
     for &(t, mask) in rows {
         for h in 0..2 {
             if mask & hm[h] != 0 {
                 let gap = t - last[h];
-                let bucket = if gap > LINK { -1 } else { ((gap.max(FLOOR) * 1000.).log2() * 4.).round() as i32 };
+                let bucket = if gap > k.FLOW_LINK { -1 } else { ((gap.max(k.FLOW_FLOOR) * 1000.).log2() * 4.).round() as i32 };
                 marks.push((t, bucket * 2 + h as i32));
                 last[h] = t;
             }
@@ -426,7 +428,7 @@ fn rhythm_variety(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
 
 /// MinaCalc's Chaos: on each hand, the longer of two consecutive gaps over the shorter; how far it sits from a whole number
 /// (1:1, 2:1 read clean, 3:2 or 4:3 poly-ish), speed-weighted.
-fn gap_chaos(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
+fn gap_chaos(rows: &[(f64, u32)], keys: usize, centre_left: bool, k: &Knobs) -> f64 {
     let (mut last, mut gap, hm) = ([f64::NEG_INFINITY; 2], [f64::INFINITY; 2], hand_masks(keys, centre_left));
     let (mut total, mut chaos) = (0., 0.);
     for &(t, mask) in rows {
@@ -435,10 +437,10 @@ fn gap_chaos(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
                 continue;
             }
             let g = t - last[h];
-            if g <= LINK && gap[h] <= LINK {
+            if g <= k.FLOW_LINK && gap[h] <= k.FLOW_LINK {
                 let ratio = g.max(gap[h]) / g.min(gap[h]).max(1e-3);
                 let frac = ratio.fract();
-                let weight = 1. / g.max(FLOOR);
+                let weight = 1. / g.max(k.FLOW_FLOOR);
                 total += weight;
                 chaos += weight * frac.min(1. - frac);
             }
@@ -450,7 +452,7 @@ fn gap_chaos(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
 
 /// Interlude's jack compensation: a re-tap of a column through a same-hand neighbour (c·o·c); its jack gap over its stream
 /// gap, log2, √, ≤ 1, is how far the stream (not the jack) sets it. Here the jack's share, 1 − that, speed-weighted.
-fn jack_compensation(chart: &Chart, scale: f64) -> f64 {
+fn jack_compensation(chart: &Chart, scale: f64, k: &Knobs) -> f64 {
     let keys = chart.keys;
     let mates: Vec<Vec<usize>> = (0..keys).map(|c| (0..keys).filter(|&o| o != c && same_hand(o, c, keys)).collect()).collect();
     let mut last = vec![f64::NEG_INFINITY; keys];
@@ -459,7 +461,7 @@ fn jack_compensation(chart: &Chart, scale: f64) -> f64 {
         let (c, t) = (chart.col[n] as usize, chart.t[n] * scale);
         let jd = t - last[c];
         if jd <= 0.5 {
-            let weight = 1. / jd.max(FLOOR);
+            let weight = 1. / jd.max(k.FLOW_FLOOR);
             total += weight;
             let between = mates[c].iter().filter(|&&o| last[o] > last[c] && last[o] < t).map(|&o| t - last[o]).fold(f64::INFINITY, f64::min);
             if between.is_finite() {
@@ -473,7 +475,7 @@ fn jack_compensation(chart: &Chart, scale: f64) -> f64 {
 
 /// MinaCalc's rolls: a single note one column on from the previous single, the same way as the step before, its gap within
 /// 20 % of that step's: a roll the hand sweeps, not a stream it reads.
-fn rolls(chart: &Chart, scale: f64) -> f64 {
+fn rolls(chart: &Chart, scale: f64, k: &Knobs) -> f64 {
     let mut singles: Vec<(f64, i32)> = Vec::new();
     let mut i = 0;
     while i < chart.len() {
@@ -486,10 +488,10 @@ fn rolls(chart: &Chart, scale: f64) -> f64 {
     let (mut total, mut roll) = (0., 0.);
     for w in singles.windows(3) {
         let (g1, g2) = (w[1].0 - w[0].0, w[2].0 - w[1].0);
-        if g2 > LINK {
+        if g2 > k.FLOW_LINK {
             continue;
         }
-        let weight = 1. / g2.max(FLOOR);
+        let weight = 1. / g2.max(k.FLOW_FLOOR);
         total += weight;
         let (s1, s2) = (w[1].1 - w[0].1, w[2].1 - w[1].1);
         if s1 == s2 && s1.abs() == 1 && (g2 - g1).abs() <= 0.2 * g1 {
@@ -501,7 +503,7 @@ fn rolls(chart: &Chart, scale: f64) -> f64 {
 
 /// MinaCalc's flammed jumpjacks: a note 1–30 ms off another column's note (a chord played as a flam), weighted by how fast
 /// its column jacks; share of the jack-weighted notes.
-fn flams(chart: &Chart, scale: f64) -> f64 {
+fn flams(chart: &Chart, scale: f64, k: &Knobs) -> f64 {
     let mut last = vec![f64::NEG_INFINITY; chart.keys];
     let (mut total, mut flam) = (0., 0.);
     for n in 0..chart.len() {
@@ -511,7 +513,7 @@ fn flams(chart: &Chart, scale: f64) -> f64 {
         if jd > 0.5 {
             continue;
         }
-        let weight = 1. / jd.max(FLOOR);
+        let weight = 1. / jd.max(k.FLOW_FLOOR);
         total += weight;
         let near = |m: usize| chart.col[m] as usize != c && (chart.t[m] * scale - t).abs() > 0.0005 && (chart.t[m] * scale - t).abs() <= 0.03;
         let lo = (0..n).rev().take_while(|&m| t - chart.t[m] * scale <= 0.03).any(near);
@@ -523,8 +525,8 @@ fn flams(chart: &Chart, scale: f64) -> f64 {
     if total > 0. { flam / total } else { 0. }
 }
 
-/// One-hand jump chains: a hand's row of ≥ 2 notes right after (≤ LINK) another ≥ 2-note row of that hand sharing a column.
-fn jump_chains(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
+/// One-hand jump chains: a hand's row of ≥ 2 notes right after (≤ k.FLOW_LINK) another ≥ 2-note row of that hand sharing a column.
+fn jump_chains(rows: &[(f64, u32)], keys: usize, centre_left: bool, k: &Knobs) -> f64 {
     let (mut last, mut prev, hm) = ([f64::NEG_INFINITY; 2], [0u32; 2], hand_masks(keys, centre_left));
     let (mut total, mut chain) = (0., 0.);
     for &(t, mask) in rows {
@@ -534,9 +536,9 @@ fn jump_chains(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
                 continue;
             }
             let gap = t - last[h];
-            let weight = 1. / gap.max(FLOOR);
+            let weight = 1. / gap.max(k.FLOW_FLOOR);
             total += weight;
-            if gap <= LINK && hands[h].count_ones() > 1 && prev[h].count_ones() > 1 && hands[h] & prev[h] != 0 {
+            if gap <= k.FLOW_LINK && hands[h].count_ones() > 1 && prev[h].count_ones() > 1 && hands[h] & prev[h] != 0 {
                 chain += weight;
             }
             (last[h], prev[h]) = (t, hands[h]);
@@ -604,25 +606,15 @@ fn isolation(rows: &[(f64, u32)]) -> f64 {
     if notes > 0. { alone / notes } else { 0. }
 }
 
-/// A column re-tapped at ≥ 9/s is vibro; a note more than 2 s into such an unbroken run counts (arm-tension vibro tires fast,
-/// user 2026-11-05: "very fatiguing and intense"; wrist vibro doesn't, so the fit's level arms decide who it costs).
-fn vibro_runs(chart: &Chart, scale: f64) -> f64 {
-    let (mut last, mut began) = (vec![f64::NEG_INFINITY; chart.keys], vec![0.; chart.keys]);
-    let mut long = 0.;
-    for n in 0..chart.len() {
-        let (c, t) = (chart.col[n] as usize, chart.t[n] * scale);
-        if t - last[c] > 1. / 9. {
-            began[c] = t;
-        } else if t - began[c] > 2. {
-            long += 1.;
-        }
-        last[c] = t;
-    }
-    long / chart.len().max(1) as f64
+/// A note more than 2 s into a vibro run (`structure::column_runs`) counts (arm-tension vibro tires fast, user 2026-11-05:
+/// "very fatiguing and intense"; wrist vibro doesn't, so the fit's level arms decide who it costs).
+fn vibro_runs(chart: &Chart, rate: f64, k: &Knobs) -> f64 {
+    let long = crate::structure::column_runs(chart, rate, k.VIBRO_GAP, k).iter().flat_map(|r| r.iter().map(move |&i| chart.t[i] - chart.t[r[0]])).filter(|&d| d / 1000. / rate > 2.).count();
+    long as f64 / chart.len().max(1) as f64
 }
 
 /// (broken, skip) of both hands' finger order, the middle key of an odd keymode with the left hand or not.
-fn order(chart: &Chart, scale: f64, centre_left: bool) -> (f64, f64) {
+fn order(chart: &Chart, scale: f64, centre_left: bool, k: &Knobs) -> (f64, f64) {
     let mut hands: [Vec<(f64, f64)>; 2] = Default::default();
     let mut i = 0;
     while i < chart.len() {
@@ -645,10 +637,10 @@ fn order(chart: &Chart, scale: f64, centre_left: bool) -> (f64, f64) {
         for w in notes.windows(3) {
             let (gap1, gap2) = (w[1].0 - w[0].0, w[2].0 - w[1].0);
             let (s1, s2) = (w[1].1 - w[0].1, w[2].1 - w[1].1);
-            if gap1 > LINK || gap2 > LINK || s1 == 0. || s2 == 0. {
+            if gap1 > k.FLOW_LINK || gap2 > k.FLOW_LINK || s1 == 0. || s2 == 0. {
                 continue; // a jack has no order; its cost is elsewhere
             }
-            let weight = 1. / gap2.max(FLOOR);
+            let weight = 1. / gap2.max(k.FLOW_FLOOR);
             total += weight;
             skip += weight * (s2.abs() - 1.).max(0.);
             if s1 * s2 < 0. && (w[2].1 - w[0].1).abs() > 1e-9 {
@@ -664,9 +656,27 @@ fn order(chart: &Chart, scale: f64, centre_left: bool) -> (f64, f64) {
 mod tests {
     use super::*;
 
+    fn flow(c: &Chart, rate: f64) -> Flow {
+        super::flow(c, rate, &Knobs::default())
+    }
+
     fn chart(keys: usize, cols: &[u8], step: f64) -> Chart {
         let t: Vec<f64> = (0..cols.len()).map(|i| i as f64 * step).collect();
         Chart { keys, end: t.clone(), t, col: cols.to_vec(), ..Chart::default() }
+    }
+
+    /// level² reads the level pinned at its fitted edge (Iota past Theta), the level column itself is clamped as before.
+    #[test]
+    fn products_read_the_level_inside_its_fitted_range() {
+        let model = serde_json::json!({"spec": {"pairs": [[LEVEL, LEVEL]]}, "columns": [LEVEL, LEVEL + 1], "low": [0., 0.], "high": [1.38, 9.],
+                                       "mean": [0., 0.], "sd": [1., 1.], "coeff": [0., -0.1], "limit": 9.});
+        let at = |l: f64| {
+            let mut row = vec![0.; LEVEL + 1];
+            row[LEVEL] = l;
+            crate::model::joint_shift(&model, &row)
+        };
+        assert_eq!(at(1.5), at(1.38));
+        assert!((at(1.2) + 0.1 * 1.44).abs() < 1e-12);
     }
 
     fn repeated(pattern: &[u8], n: usize) -> Vec<u8> {

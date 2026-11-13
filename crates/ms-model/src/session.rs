@@ -11,6 +11,9 @@ use std::sync::Arc;
 
 pub const SESSION_GAP: f64 = 3000.;
 pub const HISTORY_S: f64 = 3. * 86400.;
+/// Form fades over this across sessions (walk-forward since 2026-11-03, 179 plays: current session at 30 min 1.144 pp,
+/// 1 day 1.141, 3 days 1.132; 10K 1.07 → 1.05, 4K 2.35 → 2.31).
+pub const FORM_DECAY_S: f64 = 3. * 86400.;
 pub const EXPOSURE_S: f64 = 14. * 86400.;
 pub const SNOOZE_S: f64 = 12. * 3600.; // a right-click "Skip for 12 h"
 pub const FORM_NOTICE: f64 = 0.08; // log error: about .4 point at 95 %, under it the readout says nothing
@@ -323,13 +326,13 @@ impl Session {
         }
         let mut order: Vec<String> = Vec::new();
         let mut blocks: HashMap<String, Vec<(Vec<f64>, f64, f64, f64)>> = HashMap::default();
-        for a in &self.attempts {
+        for a in &self.seen_attempts {
             if a.keys() != Some(keys) || !a.evidence() {
                 continue;
             }
             let Some(error) = a.error() else { continue };
             let sd = a.num("sd").filter(|&s| s != 0.).unwrap_or(prior.noise_variance.sqrt());
-            let age = (-(self.now - a.end).max(0.) / 1800.).exp();
+            let age = (-(self.now - a.end).max(0.) / FORM_DECAY_S).exp();
             let mut loading = vec![1.];
             let total: f64 = a.weights.iter().sum();
             loading.extend(a.weights.iter().map(|w| if total > 0. { w / total } else { 1. / FAMILIES_DIM as f64 }));
@@ -445,7 +448,7 @@ impl Session {
             fatigue = m.fatigue(k, clock);
             session = m.session_cold(k, clock, 0.) - fatigue;
         }
-        KeyState { form: self.posterior(k), penalty, session, session_tau: SESSION_TAU, fatigue, activation, rust: self.rust(k) }
+        KeyState { form: self.posterior(k), penalty, session, session_tau: SESSION_TAU, fatigue, activation, warmth: self.activation(k, None), rust: self.rust(k) }
     }
 
     /// What moves results right now: (reason, log-error shift, positive = worse).

@@ -277,7 +277,8 @@ fn jumptrills(notes: &Notes, rows: &Rows, hand_of: &[u8], window: f64) -> [Vec<f
     res
 }
 
-fn repetition_lock(rows: &Rows, masks: &[u32], clean: &[bool]) -> Vec<f64> {
+/// Per row: how many rows in a row strike this same chord (time-decayed, 0.5 s).
+fn same_chord(rows: &Rows, masks: &[u32], clean: &[bool]) -> Vec<f64> {
     let n = rows.len();
     let mut left = vec![0.0f64; n];
     let mut right = vec![0.0f64; n];
@@ -291,7 +292,7 @@ fn repetition_lock(rows: &Rows, masks: &[u32], clean: &[bool]) -> Vec<f64> {
             right[r] = (-(rows[r + 1].0 - rows[r].0) / 0.5).exp() * (1.0 + right[r + 1]);
         }
     }
-    left.iter().zip(&right).map(|(a, b)| smooth(1.0 + a + b, 6.0, 12.0)).collect()
+    left.iter().zip(&right).map(|(a, b)| 1.0 + a + b).collect()
 }
 
 /// [vibro, vibro_easy, vibro_control, vibro_sustain, vibro_locked] per note.
@@ -324,7 +325,8 @@ fn vibro(notes: &Notes, rows: &Rows) -> [Vec<f64>; 5] {
     if !speed.iter().any(|&x| x != 0.0) {
         return res;
     }
-    let locked = repetition_lock(rows, &masks, &clean);
+    let chain = same_chord(rows, &masks, &clean);
+    let locked: Vec<f64> = chain.iter().map(|&c| smooth(c, 6.0, 12.0)).collect();
     let mut pressure = vec![0.0f64; n];
     let mut start = 1usize;
     while start < n {
@@ -336,6 +338,8 @@ fn vibro(notes: &Notes, rows: &Rows) -> [Vec<f64>; 5] {
         while end < n && connected[end] {
             end += 1;
         }
+        // the run's sameness: a vibro section re-strikes one chord; a chordjack section keeps changing it
+        let same = similarity[start..end].iter().filter(|&&x| x == 1.0).count() as f64 / (end - start) as f64;
         for r in start..end {
             if speed[r] == 0.0 {
                 continue;
@@ -357,7 +361,8 @@ fn vibro(notes: &Notes, rows: &Rows) -> [Vec<f64>; 5] {
             pressure[r] = v;
             let (_, a, z) = rows[r];
             for i in a..z {
-                res[0][i] = v * (0.25 + 0.75 * easy);
+                // changing chords at speed are chordjack, not vibro (user 2026-11-13: Gengaozo [A O], Cyberstorm [Extinction (Jacks of All)])
+                res[0][i] = v * (0.25 + 0.75 * easy) * same;
                 res[1][i] = v * easy;
                 res[2][i] = v * (1.0 - easy);
                 res[4][i] = v * easy * locked[r];
@@ -386,7 +391,8 @@ pub struct Analysis {
     pub rows: Rows,
 }
 
-pub fn analyse(chart: &Chart, rate: f64, bin_seconds: f64) -> Analysis {
+pub fn analyse(chart: &Chart, rate: f64, k: &crate::params::Knobs) -> Analysis {
+    let bin_seconds = k.BIN;
     let origin = chart.t.first().copied().unwrap_or(0.0);
     let conv = |x: f64| (x - origin) * 0.001 / rate;
     let notes = Notes { t: chart.t.iter().map(|&x| conv(x)).collect(), e: chart.end.iter().map(|&x| conv(x)).collect(), c: chart.col.clone() };

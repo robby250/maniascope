@@ -186,7 +186,6 @@ pub struct Consts {
     recent_idx: Vec<usize>,
 }
 
-pub const VIBRO_CHART: f64 = 0.4;
 
 impl Consts {
     pub fn standard() -> Consts {
@@ -217,10 +216,11 @@ impl Consts {
 
     /// warmup.family(skill) as a FAMILIES index.
     /// A vibro chart: mashed, so its rating says nothing about rice, jacks or the keymode's Level. The user's 4K plays were
-    /// mostly vibro packs rated 11–19★ at ~90 % (sk vibro .42–1.00; their normal 4K charts ≤ .38), which read as a
-    /// Delta 4K player and chordjack as the best skill (user 2026-11-10: "never anywhere near delta").
+    /// mostly vibro packs rated 11–19★ at ~90 %, which read as a Delta 4K player and chordjack as the best skill (user
+    /// 2026-11-10: "never anywhere near delta"). The dan label's note rule, not the calc's vibro share: sk vibro ≥ .4 also
+    /// took REFORM Iota/Kappa and Delta–Eta songs, hard rice with vibro sections (user 2026-11-11).
     pub fn vibro_chart(&self, f: &Feats) -> bool {
-        self.idx.get("vibro").is_some_and(|&i| f.sk[i] >= VIBRO_CHART)
+        ms_calc::structure::vibro_only(&ms_calc::structure::Vibro { share: f.vibro.0, speed: 0., rest: f.vibro.1 })
     }
 
     pub fn family(&self, skill: &str) -> usize {
@@ -396,7 +396,7 @@ impl PredModel {
                                 String::new()
                             };
                             Some(Arc::new(Choice {
-                                practice, group: GROUPS[self.group(feats)].to_string(), nps: entry.offer.nps, length: entry.offer.play_span.unwrap_or(0.) / rate,
+                                practice, group: groups()[self.group(feats)].0.to_string(), nps: entry.offer.nps, length: entry.offer.play_span.unwrap_or(0.) / rate,
                                 family: entry.offer.family.clone(), description: entry.offer.description.clone(), profile: entry.profile.clone(), acc_mid: p.acc_mid, matched,
                                 sha: j.sha.clone(), md5: j.md5.clone(), keys: j.keys, rate, value, installed: j.installed, convert: j.convert,
                                 playcount: j.playcount, pred: p, generated_at: now,
@@ -502,9 +502,10 @@ pub struct Tree {
 
 /// One request's skill_practice.normalize selection against a Tree (None: not a dimension, strength 0).
 struct Selection {
-    excluded: Vec<(Option<usize>, f64)>, // with how much of it a map may hold, as a share of the map's strongest skill
+    excluded: Vec<(Option<usize>, f64)>, // with the percentile a map's share of it must stay under (skills::avoid_percentile)
     positive: Vec<Option<usize>>,
     other: bool,                         // charts with no included skill stay in the list
+    cut: f64,                            // the percentile a dimension needs to count (skills::cut)
 }
 
 impl Tree {
@@ -513,9 +514,10 @@ impl Tree {
         // A child only the other keymode has (Stream/Dump on 7K) still asks for its family; an exclusion of one stays narrow.
         let wanted = |k: &str| at(k).or_else(|| k.split_once('/').and_then(|(p, _)| at(p)));
         Selection {
-            excluded: selected.iter().filter_map(|k| k.strip_prefix('!')).map(|k| (at(k), tuning.hold(k))).collect(),
+            excluded: selected.iter().filter_map(|k| k.strip_prefix('!')).map(|k| (at(k), crate::skills::avoid_percentile(tuning.hold(k)))).collect(),
             positive: selected.iter().filter(|k| !k.starts_with('!')).map(|k| wanted(k)).collect(),
             other: tuning.other > 0.,
+            cut: crate::skills::cut(),
         }
     }
 }
@@ -524,6 +526,7 @@ impl Tree {
 struct SkillValues {
     values: Vec<f64>,
     practice: Vec<(usize, f64)>, // where it differs from `values`: a full copy per chart was 24 MB
+    percent: Vec<(u8, u8)>,      // each dimension's (practice, raw) standing (skills::percentiles), whole percent
 }
 
 impl SkillValues {
@@ -538,38 +541,38 @@ impl SkillValues {
                 }
             }
         }
-        SkillValues { values, practice }
+        let percent = crate::skills::percentiles(f).into_iter().map(|(p, r)| ((100. * p).round() as u8, (100. * r).round() as u8)).collect();
+        SkillValues { values, practice, percent }
+    }
+
+    /// Dimension i counts on this chart at percentile `at`.
+    fn counts(&self, i: usize, at: f64) -> bool {
+        self.percent.get(i).is_some_and(|p| p.0 as f64 >= (100. * at).round())
     }
 
     fn practice(&self, i: usize) -> f64 {
         self.practice.iter().find(|p| p.0 == i).map_or(self.values[i], |p| p.1)
     }
 
-    /// An avoided skill reaches what the map may hold. The strictest step reaches below the 0.45 a skill needs to count as
-    /// demanded: "maps with any of it" has to catch what the other steps call too little to matter.
+    /// An avoided skill reaches the percentile its step allows.
     fn avoided(&self, s: &Selection) -> bool {
-        let maximum = self.values.iter().copied().fold(0., f64::max);
-        s.excluded.iter().any(|&(k, hold)| k.is_some_and(|i| self.values[i] >= (if hold < 0.6 { 0.2f64 } else { 0.45 }).max(hold * maximum)))
+        s.excluded.iter().any(|&(k, at)| k.is_some_and(|i| self.percent.get(i).is_some_and(|p| p.1 as f64 >= (100. * at).round())))
     }
 
     /// skill_practice.match(f, selected)[0]
     fn strength(&self, s: &Selection) -> f64 {
-        let maximum = self.values.iter().copied().fold(0., f64::max);
-        let floor = 0.45f64.max(0.60 * maximum);
         if self.avoided(s) {
             return 0.;
         }
         if s.positive.is_empty() {
             return 1.;
         }
-        let matched = s.positive.iter().map(|&k| k.map_or(0., |i| self.practice(i))).filter(|&v| v >= floor).map(|v| v.min(1.)).fold(0., f64::max);
+        let matched = s.positive.iter().flatten().filter(|&&i| self.counts(i, s.cut)).map(|&i| self.practice(i).min(1.)).fold(0., f64::max);
         if matched == 0. && s.other { 1. } else { matched }
     }
 
     /// skill_practice.describe_match: the two strongest matches, by raw strength.
     fn describe(&self, s: &Selection, tree: &Tree) -> String {
-        let maximum = self.values.iter().copied().fold(0., f64::max);
-        let floor = 0.45f64.max(0.60 * maximum);
         if self.avoided(s) {
             return "Mixed skills".to_string();
         }
@@ -578,7 +581,7 @@ impl SkillValues {
         } else {
             s.positive.iter().flatten().copied().collect()
         };
-        let mut matched: Vec<usize> = requested.into_iter().filter(|&i| self.practice(i) >= floor).collect();
+        let mut matched: Vec<usize> = requested.into_iter().filter(|&i| self.counts(i, s.cut)).collect();
         matched.sort_by(|&a, &b| self.values[b].total_cmp(&self.values[a]));
         let names: Vec<&str> = matched.iter().take(2).map(|&i| crate::skills::name(&tree.dims[i])).collect();
         if names.is_empty() { "Mixed skills".to_string() } else { names.join(" / ") }
@@ -586,8 +589,7 @@ impl SkillValues {
 
     /// skill_practice.match(f, selected)[1], as indices into the included skills.
     fn matched(&self, s: &Selection) -> Vec<usize> {
-        let floor = 0.45f64.max(0.60 * self.values.iter().copied().fold(0., f64::max));
-        s.positive.iter().enumerate().filter(|(_, k)| k.is_some_and(|i| self.practice(i) >= floor)).map(|(j, _)| j).collect()
+        s.positive.iter().enumerate().filter(|(_, k)| k.is_some_and(|i| self.counts(i, s.cut))).map(|(j, _)| j).collect()
     }
 }
 
@@ -605,9 +607,8 @@ impl FeatStore {
     /// Per class (4K, wider) [(dimension, members)]; nps.PROFILE; the structure version.
     pub fn new(trees: Vec<Vec<(String, Vec<String>)>>, profile: Vec<String>, c: Arc<Consts>, version: i64) -> Res<Self> {
         let trees: Vec<Tree> = trees.into_iter().map(|dims| Tree {
-            tech: ["technical", "technical/patterntech", "technical/rhythmtech"].iter()
-                .filter_map(|k| dims.iter().position(|d| d.0 == *k).map(|i| (i, k.rsplit('/').next().unwrap().to_string())))
-                .collect(),
+            // the technical family's dimensions read their practice value (tech_profile leaf)
+            tech: dims.iter().enumerate().filter(|(_, d)| d.0.split('/').next() == Some("technical")).map(|(i, d)| (i, d.0.rsplit('/').next().unwrap().to_string())).collect(),
             members: dims.iter().map(|d| d.1.clone()).collect(),
             dims: dims.into_iter().map(|d| d.0).collect(),
         }).collect();
@@ -656,7 +657,7 @@ impl FeatStore {
 
     /// nps.group of an analysed rate.
     pub fn group(&self, sha: &str, rate: f64, model: &PredModel) -> Option<&'static str> {
-        self.feats(sha, rate).map(|f| GROUPS[model.group(f)])
+        self.feats(sha, rate).map(|f| groups()[model.group(f)].0)
     }
 
     /// What a list shows of an analysed rate; `practice` for the Skills list.
@@ -668,7 +669,7 @@ impl FeatStore {
         let included: Vec<&String> = selected.iter().filter(|k| !k.starts_with('!')).collect();
         let skill = e.skill.as_ref().filter(|_| practice);
         Some(crate::choices::Metadata {
-            family: e.offer.family.clone(), group: GROUPS[model.group(feats)].to_string(), nps: e.offer.nps, length: e.offer.play_span.unwrap_or(e.offer.length / 1000.) / rate,
+            family: e.offer.family.clone(), group: groups()[model.group(feats)].0.to_string(), nps: e.offer.nps, length: e.offer.play_span.unwrap_or(e.offer.length / 1000.) / rate,
             profile: e.profile.clone(), description: e.offer.description.clone(), matched: skill.map_or_else(Vec::new, |s| s.matched(&sel).into_iter().map(|i| included[i].clone()).collect()),
             practice: skill.map_or_else(String::new, |s| s.describe(&sel, &self.trees[tree])),
         })
@@ -766,8 +767,11 @@ impl Ctx {
         }
         gap
     }
+    /// How much density counts: the player's warm-up on the keymode. The chart family's own warm-up is already in the
+    /// prediction (cold penalty, opening floor); reading it here too rewarded the family just played with density and
+    /// locked the list onto it (user 2026-11-12: every 4K offer LN for a night, rice the night before).
     fn ready(&self, p: &Prediction) -> f64 {
-        if self.warm { 1. } else { -(-p.activation / p.tau).exp_m1() }
+        if self.warm { 1. } else { -(-p.warmth / p.tau).exp_m1() }
     }
     /// nps.practice_value (NPS) or skill_practice.value (Skills) at `rate`, with acc_mid → `acc`.
     fn value(&self, o: &Offer, strength: Option<f64>, nps: f64, p: &Prediction, acc: f64, rate: f64, target: f64) -> Option<f64> {
@@ -784,7 +788,11 @@ impl Ctx {
     }
 }
 
-const GROUPS: [&str; 7] = ["rice", "chords", "chordjack", "jack", "ln", "trill", "sv"];
+/// The fit families a chart can lead with (technical is a modifier, never a chart's pattern).
+fn groups() -> &'static [(&'static str, Vec<&'static str>)] {
+    static G: std::sync::OnceLock<Vec<(&'static str, Vec<&'static str>)>> = std::sync::OnceLock::new();
+    G.get_or_init(|| ms_calc::taxonomy::fit_groups().into_iter().filter(|g| g.0 != "technical").map(|(k, m)| (k, m.iter().map(|s| s.name()).collect())).collect())
+}
 
 /// What the predictor reads of one feature dict.
 #[derive(Clone)]
@@ -798,6 +806,7 @@ pub struct Feats {
     pub z_tail: [f64; 5],              // ln, stam, load, chord/keys, overlap
     pub width: f64,
     pub geometry: Option<Vec<f64>>,
+    pub vibro: (f64, f64), // share of notes in vibro runs, notes/s outside them (structure v4)
 }
 
 impl Feats {
@@ -821,7 +830,7 @@ impl Feats {
 
     /// A chart known by its rating alone (nps.reach's search).
     pub fn bare(keys: i64, overall: f64, od: f64, c: &Consts) -> Feats {
-        Feats { keys, overall, od, length: 0., sk: vec![0.; c.names.len()], dom: c.family("rice"), z_tail: [0.; 5], width: 0., geometry: None }
+        Feats { keys, overall, od, length: 0., sk: vec![0.; c.names.len()], dom: c.family("rice"), z_tail: [0.; 5], width: 0., geometry: None, vibro: (0., 0.) }
     }
 
     pub fn of(f: &Dict, c: &Consts) -> Res<Feats> {
@@ -864,6 +873,7 @@ impl Feats {
             z_tail: [need("ln")?.f(), need("stam")?.f(), load, chord / (keys.max(1) as f64), overlap],
             width,
             geometry,
+            vibro: (sub("nps", "vibro_runs", 0.), sub("nps", "vibro_rest", 0.)),
         })
     }
 }
@@ -882,6 +892,7 @@ pub struct KeyState {
     pub session_tau: f64,
     pub fatigue: f64,         // warmup fatigue(keys, session_clock)
     pub activation: Vec<f64>, // activation(keys, family) per family
+    pub warmth: f64,          // activation(keys, None): minutes warmed up on the keymode, any family
     pub rust: f64,            // personal::Rust at now: time away from the keymode, warm or not
 }
 
@@ -908,6 +919,7 @@ pub struct Prediction {
     pub acc_hi: f64,
     pub opening_acc: f64,
     pub activation: f64,
+    pub warmth: f64, // the keymode's activation: how far into practice the player is, whatever the chart
     pub slope: f64,
     pub tau: f64,
     pub ln: f64, // the chart's LN share: a stable result on it converts to lazer units by it (ms_rec::evidence)
@@ -1006,7 +1018,7 @@ impl PredModel {
         if !has(proposal) && (!eligible_a || (e.acc_mid - target).abs() > ACC_TOL || anchor_missed.is_some()) {
             let nps = if ctx.skills { o.nps } else { o.nps * proposal / r };
             if let Some(q) = ctx.value(o, sa, nps, e, target, proposal, target) {
-                prop = Some((q, proposal, GROUPS[self.group(f)]));
+                prop = Some((q, proposal, groups()[self.group(f)].0));
             }
         }
         // The band only says which rates may be offered; the one offered is the closest to the target (user 2026-11-05: 0.82×
@@ -1029,14 +1041,11 @@ impl PredModel {
         });
         Ok(Some((best_out, prop, best.map(|(i, _)| rated.swap_remove(i).2))))
     }
-    /// nps._group: the chart's leading pattern family (GROUPS index).
+    /// nps._group: the chart's leading pattern family (GROUPS index): the strongest of each fit family's members.
     pub fn group(&self, f: &Feats) -> usize {
+        let groups = groups();
         let g = |names: &[&str]| names.iter().map(|n| self.c.idx.get(*n).map_or(0., |&i| f.sk[i])).fold(f64::NEG_INFINITY, f64::max);
-        let values = [
-            g(&["stream", "delay", "dump", "jumpstream", "handstream"]), g(&["chordstream"]), g(&["chordjack"]),
-            g(&["jackspeed", "jack", "minijack", "longjack"]), g(&["ln", "release", "hybrid", "inverse", "shield"]),
-            g(&["jumptrill", "splittrill", "bracket"]), g(&["sv"]),
-        ];
+        let values: Vec<f64> = groups.iter().map(|m| g(&m.1)).collect();
         let mut best = 0;
         for i in 1..values.len() {
             if values[i] > values[best] {
@@ -1305,6 +1314,7 @@ impl PredModel {
             acc_hi: shown(mu - BAND_Z * spread),
             opening_acc: shown(mu + 0f64.max(opening - cold)),
             activation,
+            warmth: if s.warm { 10. } else { st.warmth },
             slope,
             tau: mode.tau,
             ln: f.z_tail[0],
@@ -1354,6 +1364,15 @@ mod model_tests {
 
     fn plain(m: &PredModel) -> Feats {
         Feats::bare(7, 5., 8., &m.c)
+    }
+
+    #[test]
+    fn a_vibro_chart_is_mostly_runs_with_little_else() {
+        let c = Consts::standard();
+        let with = |share: f64, rest: f64| Feats { vibro: (share, rest), ..Feats::bare(4, 15., 8., &c) };
+        assert!(c.vibro_chart(&with(0.6, 9.)), "a vibro dan song");
+        assert!(!c.vibro_chart(&with(0.26, 27.6)), "REFORM Iota: a quarter vibro, dense rice besides");
+        assert!(!c.vibro_chart(&with(0.1, 5.)), "a few runs");
     }
 
     #[test]
@@ -1433,7 +1452,7 @@ mod model_tests {
         m.aff.clear();
         let f = plain(&m);
         let n = m.c.families.len();
-        let state = KeyState { form: vec![0.; n + 1], penalty: vec![0.; n], session: 0., session_tau: 8., fatigue: 0., activation: vec![0.; n], rust: 0. };
+        let state = KeyState { form: vec![0.; n + 1], penalty: vec![0.; n], session: 0., session_tau: 8., fatigue: 0., activation: vec![0.; n], warmth: 0., rust: 0. };
         let s = PredSession { warm: true, by_keys: [(7, state)].into_iter().collect(), charts: HashMap::default() };
         let p = m.predict(&f, "m", None, 1., &s).unwrap();
         assert!((p.acc_mid - mash_floor(1. - 0.75 * p.mu.exp())).abs() < 1e-12);
@@ -1445,7 +1464,7 @@ mod model_tests {
         let mut m = model(Pop::default());
         m.aff.clear();
         let n = m.c.families.len();
-        let state = KeyState { form: vec![0.; n + 1], penalty: vec![0.; n], session: 0., session_tau: 8., fatigue: 0., activation: vec![0.; n], rust: 0. };
+        let state = KeyState { form: vec![0.; n + 1], penalty: vec![0.; n], session: 0., session_tau: 8., fatigue: 0., activation: vec![0.; n], warmth: 0., rust: 0. };
         let s = PredSession { warm: true, by_keys: [(7, state)].into_iter().collect(), charts: HashMap::default() };
         let (rice, mut holds) = (plain(&m), plain(&m));
         holds.z_tail[0] = 1.;
@@ -1576,9 +1595,15 @@ mod skill_tests {
         SkillValues::of(f, &t).strength(&t.select(&normalize(&strings(selected)), tuning))
     }
 
+    /// A share at standing p against a top family of 1 (skills::relative).
+    fn rank(_skill: &str, p: f64) -> f64 {
+        p
+    }
+
     #[test]
     fn avoid_steps_nest_and_the_middle_is_the_old_filter() {
-        let (lead, some, little) = (feature(7, &[("chordstream", 1.), ("sv", 0.95)]), feature(7, &[("chordstream", 1.), ("sv", 0.7)]), feature(7, &[("chordstream", 1.), ("sv", 0.35)]));
+        let sv = |p: f64| feature(7, &[("chordstream", 1.), ("sv", rank("sv", p))]);
+        let (lead, some, little) = (sv(0.95), sv(0.7), sv(0.4));
         let hold = |h: f64| crate::skills::Tuning { avoid: [("sv".to_string(), h)].into(), other: 0. };
         let kept = |h: f64| [&lead, &some, &little].map(|f| tuned(f, &["!sv"], &hold(h)) > 0.);
         assert_eq!(kept(0.9), [false, true, true]);
@@ -1618,7 +1643,7 @@ mod skill_tests {
         assert_eq!(crate::skills::state(&selected, "ln/inverse"), 1);
         assert_eq!(crate::skills::state(&selected, "ln/release"), -1);
         let choice: Vec<&str> = selected.iter().map(String::as_str).collect();
-        assert!(strength(&feature(7, &[("ln", 1.), ("ln_inverse", 0.9)]), &choice) > 0.);
+        assert!(strength(&feature(7, &[("ln", rank("ln", 0.2)), ("ln_inverse", 0.9)]), &choice) > 0.);
         assert_eq!(normalize(&selected), selected);
     }
 
@@ -1646,7 +1671,8 @@ mod skill_tests {
             f.set("tech_profile", profile);
             f
         };
-        let weak = with(0.1, 0.08);
+        // A practice value at a low population rank of its skill is no technical character.
+        let weak = with(rank("technical", 0.2).powi(2), rank("patterntech", 0.2).powi(2));
         assert_eq!(strength(&weak, &["technical"]), 0.);
         assert_eq!(strength(&weak, &["technical/patterntech"]), 0.);
         assert_eq!(strength(&weak, &["!technical"]), 0., "a material forbidden passage stays forbidden");
@@ -1672,7 +1698,7 @@ mod skill_tests {
 
     #[test]
     fn broad_membership_union_not_incidental_traces() {
-        let f = feature(7, &[("ln", 1.), ("ln_release", 0.9), ("chordjack", 0.85), ("sv", 0.15)]);
+        let f = feature(7, &[("ln", 1.), ("ln_release", 0.9), ("chordjack", 0.85), ("sv", rank("sv", 0.2))]);
         assert!(strength(&f, &["ln", "sv"]) > 0.);
         assert_eq!(strength(&f, &["sv"]), 0.);
         assert!(strength(&f, &["chordjack"]) > 0.8);
@@ -1682,7 +1708,7 @@ mod skill_tests {
 
     #[test]
     fn jacks_related_but_not_same_as_chordjacks() {
-        for leaf in ["jack", "jackspeed", "minijack", "longjack"] {
+        for leaf in ["jack", "minijack", "longjack"] {
             let f = feature(7, &[(leaf, 1.)]);
             assert!(strength(&f, &["jack"]) == 1. && strength(&f, &["chordjack"]) == 0., "{leaf}");
         }
@@ -1728,6 +1754,19 @@ mod target_tests {
 
     fn prediction(acc: f64, opening: f64) -> Prediction {
         Prediction { acc_mid: acc, opening_acc: opening, tau: 6., ..Prediction::default() }
+    }
+
+    #[test]
+    fn density_counts_by_the_keymodes_warm_up_not_the_family_just_played() {
+        let offer = Offer { rate: 1., notes: 2000., length: 150_000., version: None, nps: 16., play_span: Some(150.), drill: 0., vibro: false,
+                            family: String::new(), description: String::new() };
+        let value = |activation: f64, warmth: f64| {
+            let p = Prediction { acc_mid: 0.96, sdm: 0.4, activation, warmth, ..prediction(0.96, 0.96) };
+            ctx(0.96, false).value(&offer, None, 16., &p, 0.96, 1., 0.96).unwrap()
+        };
+        // 2 minutes into 4K after LN: an LN chart (its family warm) and a rice chart (cold) weigh density alike.
+        assert_eq!(value(2., 2.), value(0.3, 2.));
+        assert!(value(0.3, 6.) > value(0.3, 0.5), "a warmer keymode still counts density more");
     }
 
     #[test]

@@ -12,7 +12,7 @@ use ms_calc::val::Dict;
 use ms_data::store::{Db, Result};
 use ms_model::personal::{self, Fit, FATIGUE_ONSET};
 use ms_model::session::{WARMUP_MAX, WARMUP_MINUTES};
-use ms_model::predict::{Feats, HashMap, PredModel};
+use ms_model::predict::{ChartSession, Feats, HashMap, KeyState, PredModel, PredSession};
 use ms_model::skills;
 use ms_model::warmup::Model;
 use std::collections::BTreeMap;
@@ -20,16 +20,8 @@ use std::sync::Arc;
 
 pub const TARGET: f64 = 0.96; // user 2026-11-10: "we should put this at like 96%" (was .94)
 const FORM_SESSIONS: usize = 12;
-const CALIBRATION_HALF_LIFE: f64 = 6.; // months before the keymode's last play
-const CALIBRATION_MIN: f64 = 20.;      // effective recent plays for a skill's own calibration; fewer use the keymode's
-const PEAK_SHARE: f64 = 0.5;           // of a player's plays, measured against expectation; a raw accuracy cut would keep only the easy charts
-const GRIND: f64 = -0.15;              // log(1 − acc) a ground course gains on those plays: the user's 7K history lands on Gamma, their stated level
-const THIN_LINE: f64 = 5.;              // effective recent plays that can still carry the main keymode's slope
-const CARRY_LOSS: f64 = 0.25;           // Level lost per keymode going down: the user's and a player's pairs give no gap, so the smallest step
-const MIN_RECENT: f64 = 3.;             // charts, halved per year: below it and without a line of its own a keymode has no Level
-const MIN_CHARTS: usize = 10;          // charts before a skill gets a number (4K LN from 3 charts read "Yume+", user 2026-10-30)
+const BINS: usize = 10;                 // rating deciles of the keymode's charts a ★ level reads
 const HISTORY_BW: f64 = 1.;            // months: Gaussian smoothing of the monthly history (a peak month stays visible)
-const UNSEEN: &str = "profile:unseen";
 const VIBRO: &str = "jackspeed/vibro";
 
 #[derive(Clone, Default)]
@@ -44,10 +36,11 @@ pub struct Group {
     pub newest: f64,
     pub confidence: &'static str,
     pub references: usize,
-    pub examples: Vec<(String, f64, f64)>, // title, rate, difficulty
     pub tested_to: f64,
     pub extrapolated: bool,
     pub activation: f64,
+    pub dan: Option<String>, // Vibro: its dan from the vibro dan songs (vibro tiers are in vibro speed, not ★)
+    pub rusty: bool,         // the skill's charts unplayed long enough that rust shifts results past the noise (the level stays)
 }
 
 #[derive(Clone, Default)]
@@ -62,6 +55,7 @@ pub struct FormHistory {
     pub sessions: Vec<FormSession>,
     pub warmup: f64,
     pub fatigue: f64,
+    pub warm_form: f64, // the shown sessions' warmed-up form, log miss against the model (+ = worse), shrunk by the fitted FormPrior
 }
 
 #[derive(Clone, Default)]
@@ -71,8 +65,6 @@ pub struct Page {
     pub order: Vec<String>,
     pub history: Vec<(i64, f64, f64)>, // month, level, plays that month
     pub now: f64,
-    pub dan_at: HashMap<String, (String, Option<f64>)>,
-    pub dan_scale: std::collections::HashMap<String, f64>,
     pub form: Option<FormHistory>,
     pub evidence: (usize, usize, f64),
     pub peak: Option<(i64, f64)>,
@@ -93,111 +85,26 @@ pub struct Current {
     pub phase: String,
 }
 
-/// Weighted quantile of (value, weight), as the first pair past the share.
-fn quantile(values: &[f64], weights: &[f64], q: f64) -> f64 {
-    let mut pairs: Vec<(f64, f64)> = values.iter().copied().zip(weights.iter().copied()).collect();
-    pairs.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
-    let total: f64 = pairs.iter().map(|p| p.1).sum();
-    let mut acc = 0.;
-    for (value, weight) in &pairs {
-        acc += weight;
-        if acc >= total * q {
-            return *value;
+/// Each tier's (log miss, songs) made non-decreasing up the ladder by pooling violators weighted by their songs, so every
+/// dan song has a say and one song predicted easy can't carry a tier past harder ones (user 2026-11-11: "check expected acc
+/// on all dan songs").
+fn pooled(y: &[Option<(f64, f64)>]) -> Vec<Option<f64>> {
+    let mut blocks: Vec<(f64, f64, Vec<usize>)> = Vec::new(); // (mean, weight, tiers)
+    for (j, &(v, w)) in y.iter().enumerate().filter_map(|(j, v)| v.as_ref().map(|v| (j, v))) {
+        blocks.push((v, w, vec![j]));
+        while blocks.len() > 1 && blocks[blocks.len() - 2].0 > blocks[blocks.len() - 1].0 {
+            let (v2, w2, j2) = blocks.pop().unwrap();
+            let (v1, w1, j1) = blocks.last_mut().unwrap();
+            *v1 = (*v1 * *w1 + v2 * w2) / (*w1 + w2);
+            *w1 += w2;
+            j1.extend(j2);
         }
     }
-    pairs.last().map_or(0., |p| p.0)
-}
-
-fn unseen(model: &PredModel, f: &Feats, overall: f64) -> f64 {
-    let mut c = f.clone();
-    c.overall = overall;
-    model.personal(&c, UNSEEN, None, 1.).0
-}
-
-/// (the rating at target_y, the slope there). Shape, timing-window and sustained-demand context stay fixed; only the
-/// calibrated difficulty coordinate is inverted. Unseen-chart predictions omit a map's learned affinity.
-fn capacity(model: &PredModel, f: &Feats, target_y: f64) -> (f64, f64) {
-    let (mut lo, mut hi) = (0.1f64.ln(), 60f64.ln());
-    for _ in 0..18 {
-        let mid = (lo + hi) / 2.; // 6.4 / 2^19: 0.001 % of the rating
-        if unseen(model, f, mid.exp()) < target_y { lo = mid } else { hi = mid }
+    let mut out = vec![None; y.len()];
+    for (v, _, js) in blocks {
+        js.into_iter().for_each(|j| out[j] = Some(v));
     }
-    let value = ((lo + hi) / 2.).exp();
-    let (lower, upper) = (unseen(model, f, value * 0.99), unseen(model, f, value * 1.01));
-    (value, 0.25f64.max((upper - lower) / (1.01f64 / 0.99).ln()))
-}
-
-/// (c, d) of the weighted least-squares line y = c + d·x over (x, y, w), or None.
-fn fit_line(points: &[(f64, f64, f64)]) -> Option<(f64, f64)> {
-    let total: f64 = points.iter().map(|p| p.2).sum();
-    if total < CALIBRATION_MIN {
-        return None;
-    }
-    line(points)
-}
-
-/// The keymode whose slope `keys` may take: the most played above it, if played more than `keys` itself. Skill carries down the
-/// keymodes, never up (user 2026-11-01: "7k skill translates to 4k but 4k skill means nothing in 7k", "same for 7k->10k").
-fn slope_source(keys: i64, plays: &[(i64, usize)]) -> Option<i64> {
-    let own = plays.iter().find(|p| p.0 == keys).map_or(0, |p| p.1);
-    plays.iter().filter(|p| p.0 > keys && p.1 > own).max_by_key(|p| p.1).map(|p| p.0)
-}
-
-/// A Level at least what each keymode above carries down, whichever is played more. Never a ceiling: being better at a keymode you
-/// play less is real (user 2026-11-02: "just because you play a keymode more doesn't mean that you can't be better at the other
-/// keymode"). Never upward: "your 7k skill is almost useless for 10k". The loss is speed: "you'll be slower overall".
-fn carried(level: f64, above: &[(f64, i64)]) -> f64 {
-    above.iter().fold(level, |best, (source, steps)| best.max(source - CARRY_LOSS * *steps as f64))
-}
-
-/// Display only: predictions never read a Page. Highest keymode first, so a chain carries the already moved Level.
-pub fn carry_down(pages: &mut BTreeMap<i64, Page>) {
-    for keys in pages.keys().rev().copied().collect::<Vec<_>>() {
-        let above = |of: fn(&Group) -> Option<f64>| -> Vec<(f64, i64)> {
-            pages.range(keys + 1..).filter_map(|(k, p)| Some((p.groups.get("overall").and_then(of)?, k - keys))).collect()
-        };
-        let (value, current) = (above(|g| g.value), above(|g| g.current));
-        let Some(g) = pages.get_mut(&keys).and_then(|p| p.groups.get_mut("overall")) else { continue };
-        let Some(own) = g.value else { continue }; // no Level of its own: stays hidden
-        let moved = carried(own, &value);
-        (g.value, g.low, g.high) = (Some(moved), g.low + moved - own, g.high + moved - own);
-        g.current = g.current.map(|c| carried(c, &current));
-    }
-}
-
-/// `fit` no flatter than `slope`, a more played higher keymode's: a side keymode's few plays sit near one difficulty, so its own
-/// slope reads flat and the rating runs off (the user's 6K at d 0.39: Level over 7K, the dan past the top of the ladder).
-/// The line stays through the plays. Too few plays for a fit of their own still get one, down to THIN_LINE.
-fn steepened(points: &[(f64, f64, f64)], fit: Option<(f64, f64)>, slope: Option<f64>) -> Option<(f64, f64)> {
-    let total: f64 = points.iter().map(|p| p.2).sum();
-    let Some(slope) = slope.filter(|s| fit.map_or(total >= THIN_LINE, |f| f.1 < *s)) else { return fit };
-    let mean = |i: fn(&(f64, f64, f64)) -> f64| points.iter().map(|p| i(p) * p.2).sum::<f64>() / total;
-    Some((mean(|p| p.1) - slope * mean(|p| p.0), slope))
-}
-
-/// The line through the better half of a player's plays, moved by GRIND. A dan is passed after grinding it, not on a first
-/// try, so a line through every play read a 7K Gamma player as 9th (user 2026-11-01: "the upper 50%" and "shift the values").
-fn peak_line(points: &[(f64, f64, f64)], slope: Option<f64>) -> Option<(f64, f64)> {
-    let (c, d) = steepened(points, fit_line(points), slope)?;
-    let left: Vec<f64> = points.iter().map(|p| p.1 - c - d * p.0).collect();
-    let cut = quantile(&left, &points.iter().map(|p| p.2).collect::<Vec<_>>(), PEAK_SHARE);
-    let best: Vec<(f64, f64)> = points.iter().zip(&left).filter(|x| *x.1 <= cut).map(|x| (x.0.2, *x.1)).collect();
-    let kept: Vec<(f64, f64, f64)> = points.iter().zip(&left).filter(|x| *x.1 <= cut).map(|x| *x.0).collect();
-    // Too few plays to set a slope (a player's 4K read 15.9 on five): keep the line's, moved up to them.
-    let (c, d) = steepened(&kept, fit_line(&kept), slope).unwrap_or((c + best.iter().map(|b| b.0 * b.1).sum::<f64>() / best.iter().map(|b| b.0).sum::<f64>(), d));
-    Some((c + GRIND, d))
-}
-
-fn line(points: &[(f64, f64, f64)]) -> Option<(f64, f64)> {
-    let total: f64 = points.iter().map(|p| p.2).sum();
-    let mean = |g: &dyn Fn(&(f64, f64, f64)) -> f64| points.iter().map(|p| g(p) * p.2).sum::<f64>() / total;
-    let (mx, my) = (mean(&|p| p.0), mean(&|p| p.1));
-    let var = mean(&|p| (p.0 - mx).powi(2));
-    if var < 1e-6 {
-        return None;
-    }
-    let d = mean(&|p| (p.0 - mx) * (p.1 - my)) / var;
-    (d > 0.2).then_some((my - d * mx, d))
+    out
 }
 
 /// The fractional tier where the tiers' log(1 − acc) crosses `goal`: a tier below the easiest or above the hardest when
@@ -212,12 +119,57 @@ fn crossing(y: &[Option<f64>], goal: f64) -> Option<f64> {
     Some(j as f64 + (i - j) as f64 * (goal - at) / (v - at))
 }
 
+/// Fractional tier where per-tier (log miss vs mark, songs) crosses the mark. Past the group's own songs inside the ladder
+/// the songs measure nothing: LN General has songs to 4th only (hard LN songs all read a specialty), so a Gamma player
+/// read 6th from the low tiers' slope. Off the ladder's ends it stays (below 0th, Stellium+).
+fn dan_crossing(y: &[Option<(f64, f64)>]) -> Option<f64> {
+    (y.iter().flatten().count() >= 2).then_some(())?;
+    let at = crossing(&pooled(y), 0.)?;
+    let (first, last) = (y.iter().position(Option::is_some)?, y.iter().rposition(Option::is_some)?);
+    (!(at > last as f64 && last + 1 < y.len()) && !(at < first as f64 && first > 0)).then_some(at)
+}
+
+/// One reading for every Stats row (plan 2026-11-11 P5): bins of charts in difficulty order, each bin's (log of its mean
+/// predicted miss against its mark, charts, ln rating); where the pooled curve crosses the mark. → (ln rating there, the
+/// curve's slope there in log miss per ln rating, the bins' spread around the curve in log miss). None off the ends.
+fn reading(bins: &[Option<(f64, f64, f64)>]) -> Option<(f64, f64, f64)> {
+    let pooled = pooled(&bins.iter().map(|b| b.map(|b| (b.0, b.1))).collect::<Vec<_>>());
+    let at = crossing(&pooled, 0.)?;
+    let known: Vec<(f64, f64, f64)> = bins.iter().zip(&pooled).filter_map(|(b, p)| Some((b.as_ref()?.2, (*p)?, b.as_ref()?.1))).collect();
+    (known.len() >= 2 && at >= 0. && at <= (bins.len() - 1) as f64).then_some(())?;
+    // the bracketing bins: the last at or under the mark and the next one over it
+    let j = bins.iter().zip(&pooled).enumerate().filter(|(i, (b, p))| b.is_some() && p.is_some_and(|p| p <= 0.) && (*i as f64) <= at).map(|x| x.0).max()?;
+    let i = (j + 1..bins.len()).find(|&i| bins[i].is_some()).unwrap_or(j);
+    let (xj, pj) = (bins[j]?.2, pooled[j]?);
+    let (x, slope) = if i == j { (xj, 0.) } else {
+        let (xi, pi) = (bins[i]?.2, pooled[i]?);
+        let t = if pi > pj { (0. - pj) / (pi - pj) } else { 0. };
+        (xj + t * (xi - xj), if xi > xj { (pi - pj) / (xi - xj) } else { 0. })
+    };
+    let w: f64 = known.iter().map(|k| k.2).sum();
+    let spread = (bins.iter().zip(&pooled).filter_map(|(b, p)| Some(b.as_ref()?.1 * (b.as_ref()?.0 - (*p)?).powi(2))).sum::<f64>() / w).sqrt();
+    Some((x, slope, spread))
+}
+
+/// ★ bins: charts (ln rating, predicted miss) in BINS equal-count rating quantiles, each against TARGET.
+fn rating_bins(mut charts: Vec<(f64, f64)>) -> Vec<Option<(f64, f64, f64)>> {
+    charts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let n = charts.len();
+    let bins = BINS.min(n);
+    (0..bins).map(|b| {
+        let part = &charts[b * n / bins..(b + 1) * n / bins];
+        let m = part.len() as f64;
+        (m > 0.).then(|| ((part.iter().map(|c| c.1).sum::<f64>() / m).max(1e-6).ln() - (1. - TARGET).ln(), m, part.iter().map(|c| c.0).sum::<f64>() / m))
+    }).collect()
+}
+
 struct Ctx<'a> {
     model: &'a PredModel,
     fit: &'a Fit,
     warmup: &'a Arc<Model>,
     rec: &'a Engine,
     dicts: HashMap<(String, u64), Arc<Dict>>,
+    shown: (f64, f64), // displayed log miss = a + b · the model's
 }
 
 impl Ctx<'_> {
@@ -229,45 +181,50 @@ impl Ctx<'_> {
         self.dicts.get(&(r.chart.clone(), r.rate.to_bits()))
     }
 
-    /// {group: (c, d)}: the player's recent completed lazer results against the unseen-chart baseline, displayed
-    /// y ≈ c + d·baseline. The baseline alone put 4K at 9.1 (≈ Delta) where the player's plays reached 94 % around 7.5
-    /// (user 2026-10-30): it leaves out warm-up, fatigue and chart choice, and its difficulty slope was twice the player's.
-    /// Groups without enough plays use the keymode's line.
-    fn calibration(&self, rows: &[&Evidence], groups: &[String], line: &dyn Fn(&[(f64, f64, f64)]) -> Option<(f64, f64)>) -> HashMap<String, (f64, f64)> {
-        let own: Vec<&&Evidence> = rows.iter().filter(|r| r.src != "public" && r.completed).collect();
-        let Some(last) = own.iter().map(|r| r.t).max_by(f64::total_cmp) else { return HashMap::default() };
-        let mut points: HashMap<String, Vec<(f64, f64, f64)>> = HashMap::default();
-        for r in own {
-            let w = 0.5f64.powf((last - r.t) / CALIBRATION_HALF_LIFE);
-            if w < 0.02 {
-                continue;
-            }
-            let f = self.feats(r);
-            let point = (self.model.personal(f, UNSEEN, None, 1.).0, r.y_lazer, w);
-            points.entry("overall".to_string()).or_default().push(point);
-            for g in self.dict(r).map_or_else(Vec::new, |d| skills::demanded(d)) {
-                if groups.iter().any(|x| x == g) {
-                    points.entry(g.to_string()).or_default().push(point);
-                }
-            }
-        }
-        let Some(base) = points.get("overall").and_then(|p| line(p)) else { return HashMap::default() };
-        groups.iter().map(|g| (g.clone(), points.get(g).and_then(|p| line(p)).unwrap_or(base))).collect()
+    /// Predicted lazer miss of a chart as the playlist predicts an unseen one: rested, warm, neutral form, no rust, practised
+    /// once (the model's retry gain). `id` never matches a played chart, so own scores on it get no say.
+    fn miss(&self, f: &Feats, id: &str, rate: f64) -> Option<f64> {
+        let families = self.rec.c.families.len();
+        let neutral = KeyState { form: vec![0.; families + 1], penalty: vec![0.; families], session: 0., session_tau: 1., fatigue: 0., activation: vec![10.; families], warmth: 10., rust: 0. };
+        let mut session = PredSession { warm: true, by_keys: HashMap::default(), charts: HashMap::default() };
+        session.by_keys.insert(f.keys, neutral);
+        session.charts.insert(id.to_string(), ChartSession { retried: true, ..ChartSession::default() });
+        let miss = (1. - self.model.predict(f, id, None, rate, &session).ok()?.acc_mid).max(1e-6);
+        Some((self.shown.0 + self.shown.1 * miss.ln()).exp())
     }
 
-    /// Rating on the series' dan ladder where the player's peak predicted accuracy on its dan songs crosses dans::PEAK.
-    /// The level's own rating sat ~2 tiers high on the dans: it is a median over the player's chart shapes, and 4K ones
-    /// ranged from ≈ Beta (stable bests) to ≈ Delta (2026 lazer plays). Dan course plays get no say: the reading is for
-    /// players who never played the dans (user 2026-11-10); the user's 7K LN Gamma course sat +.12 off the all-plays line.
-    fn dan_rating(&self, series: &str, line: Option<(f64, f64)>) -> Option<f64> {
-        let (tiers, songs, (c, d)) = (dans::tiers(series)?, dans::songs(series, &self.rec.c), line?);
-        let y: Vec<Option<f64>> = tiers.iter().map(|(tier, _)| songs.get(tier).filter(|f| !f.is_empty()).map(|fs| {
-            let mut v: Vec<f64> = fs.iter().map(|f| c + d * self.model.personal(f, UNSEEN, None, 1.).0).collect();
-            v.sort_by(f64::total_cmp);
-            let n = v.len();
-            if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2. }
-        })).collect();
-        dans::rating_at(series, crossing(&y, (1f64 - dans::PEAK).ln())?)
+    /// Rating on the series' dan ladder where the player's predicted accuracy on the group's dan songs crosses the series'
+    /// pass mark (user 2026-11-11: "estimated acc on each dan course/map", "each dan's acc target"). Overall reads every
+    /// song of a tier (the course's accuracy), a skill only the songs demanding it. Predicted as the playlist predicts an
+    /// unseen chart, rested, warm and in neutral form, practised once (the model's retry gain): own scores on dan charts
+    /// get no say, old ones would drag it (user 2026-11-11). None below two tiers with such songs.
+    fn dan_value(&self, series: &str, group: &str, miss_ratio: f64) -> Option<f64> {
+        let at = self.dan_position(series, group, miss_ratio)?;
+        // Off the ladder the songs measure nothing: the own-charts reading stays, and the dan reads "below 0th" or "Stellium+".
+        (-0.5..=dans::tiers(series)?.len() as f64 - 0.5).contains(&at).then_some(())?;
+        dans::rating_at(series, at)
+    }
+
+    /// The fractional tier where the player's predicted accuracy on the series' songs for `group` crosses each tier's pass mark.
+    fn dan_position(&self, series: &str, group: &str, miss_ratio: f64) -> Option<f64> {
+        let tiers = dans::tiers(series)?;
+        // Each tier's own pass mark, y = log miss against it (crossing at 0). A stable mark judges holds as stable does: each
+        // song's lazer miss × miss_ratio × e^(STABLE_LN_Y × LN share), as the playlist shows a stable client.
+        let pass = |tier: &str| dans::pass(series, tier);
+        let songs = dans::songs(series, &self.rec.c);
+        let mut y = Vec::new();
+        for (tier, _) in tiers {
+            let picked: Vec<(String, &Feats)> = songs.get(tier).into_iter().flatten().enumerate()
+                .filter(|(_, (_, skills))| group == "overall" || skills.contains(&group))
+                .map(|(i, (f, _))| (format!("dan:{series}:{tier}:{i}"), f)).collect();
+            let Some((mark, stable)) = pass(tier) else { y.push(None); continue };
+            let misses: Vec<f64> = picked.iter().filter_map(|(id, f)| {
+                let lazer = self.miss(f, id, 1.)?;
+                Some(if stable { lazer * miss_ratio * (crate::evidence::STABLE_LN_Y * f.z_tail[0]).exp() } else { lazer })
+            }).collect();
+            y.push((!misses.is_empty()).then(|| ((misses.iter().sum::<f64>() / misses.len() as f64).max(1e-6).ln() - (1. - mark).ln(), misses.len() as f64)));
+        }
+        dan_crossing(&y)
     }
 
     /// [(month, ability)]: today's overall ability moved by how much better or worse each month's recorded plays went
@@ -312,6 +269,7 @@ impl Ctx<'_> {
         if sessions.is_empty() {
             return None;
         }
+        let mut warm: Vec<f64> = Vec::new();
         let out = sessions.into_iter().map(|(_, plays)| {
             let at = |s: &personal::Step| local[s.row];
             let first = at(plays[0]).ts.unwrap_or(0.) - plays[0].seconds;
@@ -322,6 +280,9 @@ impl Ctx<'_> {
                 let r = at(s);
                 let m = self.model.personal(self.feats(r), &r.chart, r.b, round_digits(r.rate, 3)).0;
                 let clock = (r.ts.unwrap_or(0.) - s.seconds - first) / 60.;
+                if !cold {
+                    warm.push((r.y_lazer - m).clamp(-3., 3.));
+                }
                 (clock, points(r.y_lazer - m), cold)
             }).collect();
             let n = values.len() as f64;
@@ -334,15 +295,21 @@ impl Ctx<'_> {
             FormSession { t: first, hours: marked[marked.len() - 1].0 / 60., plays: marked }
         }).collect();
         let mean = p.amplitudes.iter().sum::<f64>() / p.amplitudes.len() as f64;
-        Some(FormHistory { sessions: out, warmup: -points(unit * (p.session + mean)), fatigue: -points(unit * p.fatigue) })
+        // Stats shows the warmed-up level you played at recently (user 2026-11-11): the warm plays of the sessions the Form chart
+        // shows, shrunk as the session model shrinks form (FormPrior: the keymode's form variance against a play's noise).
+        let prior = &self.warmup.prior;
+        let tau = prior.by_key.get(&keys).map_or(prior.global_variance, |b| b.0);
+        let n = warm.len() as f64;
+        let warm_form = if n == 0. { 0. } else { warm.iter().sum::<f64>() / (n + prior.noise_variance / tau.max(1e-9)) };
+        Some(FormHistory { sessions: out, warmup: -points(unit * (p.session + mean)), fatigue: -points(unit * p.fatigue), warm_form })
     }
 }
 
 pub fn build(rec: &Engine, db: &Db) -> Result<Profile> {
     let f = &rec.r.fitted;
-    let (a, b) = f.shown;
     let target = f.display.as_ref().unwrap_or(&f.pp);
-    let target_y = if f.display.is_some() { (1f64 - TARGET).ln() } else { ((1f64 - TARGET).ln() - a) / b.max(0.1) };
+    // Without a displayed-accuracy model the pp model's log miss maps to the displayed one by the fitted line.
+    let shown = if f.display.is_some() { (0., 1.) } else { f.shown };
     let usable: Vec<&Evidence> = f.rows.rows.iter().filter(|r| SUPPORTED_KEYS.contains(&r.keys) && !r.rd && f.rows.feats[r.f].overall > 0.1).collect();
     // The representative charts' features, once: Feats keep no display fields.
     let mut source = FeatureSource { public: rec.public.clone(), calc: rec.source.calc.clone(), cache: HashMap::default() };
@@ -357,128 +324,85 @@ pub fn build(rec: &Engine, db: &Db) -> Result<Profile> {
             }
         }
     }
-    let ctx = Ctx { model: &target.model, fit: &target.fit, warmup: &target.warmup, rec, dicts };
+    let ctx = Ctx { model: &target.model, fit: &target.fit, warmup: &target.warmup, rec, dicts, shown };
+    let miss_ratio = ms_data::store::stable_miss_ratio(db)?;
     let month = crate::evidence::now_months();
     let mut pages = BTreeMap::new();
     // Vibro charts are mashed: only the Vibro skill reads them (Consts::vibro_chart).
     let vibro = |r: &Evidence| rec.c.vibro_chart(&f.rows.feats[r.f]);
     let of_keys = |keys: i64| usable.iter().filter(|r| r.keys == keys && !vibro(r)).copied().collect::<Vec<&Evidence>>();
     let vibro_of = |keys: i64| usable.iter().filter(|r| r.keys == keys && vibro(r)).copied().collect::<Vec<&Evidence>>();
-    let plays: Vec<(i64, usize)> = SUPPORTED_KEYS.filter(|k| ctx.fit.keys.contains(k)).map(|k| (k, of_keys(k).iter().filter(|r| r.src != "public" && r.completed).count())).collect();
-    let overall_only = ["overall".to_string()];
-    let slope_of = |k: i64, fit: &dyn Fn(&[(f64, f64, f64)]) -> Option<(f64, f64)>| ctx.calibration(&of_keys(k), &overall_only, fit).get("overall").map(|l| l.1);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0., |d| d.as_secs_f64());
     for keys in SUPPORTED_KEYS {
         let rows = of_keys(keys);
-        let source = slope_source(keys, &plays);
-        let slope = source.and_then(|k| slope_of(k, &fit_line));
-        let peak_slope = source.and_then(|k| slope_of(k, &|p| peak_line(p, None)));
-        // Many retries/rates of one chart are not independent coverage. Choose the highest played difficulty as its
-        // representative, not its best accuracy.
-        let mut charts: HashMap<&str, &Evidence> = HashMap::default();
-        let overall = |r: &Evidence| ctx.feats(r).overall;
-        for &row in &rows {
-            let hit = charts.get(row.chart.as_str()).is_none_or(|old| overall(row) > overall(old));
-            if hit {
-                charts.insert(&row.chart, row);
-            }
+        let known = ctx.fit.keys.contains(&keys);
+        // The keymode's analysed charts, once per chart and rate: predicted miss and rating, whatever was scored on them.
+        let mut charts: HashMap<(&str, u64), &Evidence> = HashMap::default();
+        let vibro_rows = vibro_of(keys);
+        for &row in rows.iter().chain(&vibro_rows) {
+            charts.entry((row.chart.as_str(), ms_calc::py::round_digits(row.rate, 2).to_bits())).or_insert(row);
         }
-        let mut ratings: Vec<f64> = charts.values().map(|r| overall(r)).collect();
-        ratings.sort_by(f64::total_cmp);
-        let floor = if ratings.is_empty() { 0. } else {
-            let at = 0.65 * (ratings.len() - 1) as f64;
-            let (i, x) = (at.floor() as usize, at.fract());
-            (ratings[i] + x * (ratings[(i + 1).min(ratings.len() - 1)] - ratings[i])) * 0.6
-        };
-        let representatives: Vec<&Evidence> = charts.values().filter(|r| overall(r) >= floor).copied().collect();
-        // Each chart's display numbers once, not once per skill group it belongs to.
-        let shown = |r: &Evidence| ctx.dict(r).map_or(0., |d| d.f("overall"));
+        let predicted: HashMap<(&str, u64), (f64, f64)> = if known {
+            charts.iter().filter_map(|(k, r)| Some((*k, (ctx.feats(r).overall.ln(), ctx.miss(ctx.feats(r), &format!("stats:{}", r.chart), ms_calc::py::round_digits(r.rate, 2))?)))).collect()
+        } else { HashMap::default() };
         let mut names = vec!["overall".to_string()];
         names.extend(skills::dimensions(keys).iter().map(|n| n.key.clone()));
-        let known = ctx.fit.keys.contains(&keys);
-        let mut calibration = if known { ctx.calibration(&rows, &names, &|p| steepened(p, fit_line(p), slope)) } else { HashMap::default() };
-        let vibro_rows = vibro_of(keys);
-        let mut vibro_charts: HashMap<&str, &Evidence> = HashMap::default();
-        for &row in &vibro_rows {
-            if vibro_charts.get(row.chart.as_str()).is_none_or(|old| overall(row) > overall(old)) {
-                vibro_charts.insert(&row.chart, row);
-            }
-        }
-        if known && !vibro_rows.is_empty() {
-            let own = ctx.calibration(&vibro_rows, &["overall".to_string()], &|p| steepened(p, fit_line(p), slope));
-            if let Some(line) = own.get("overall") {
-                calibration.insert(VIBRO.to_string(), *line);
-            }
-        }
         let mut groups: BTreeMap<String, Group> = BTreeMap::new();
-        let mut capacities: std::collections::HashMap<(String, u64, u64, u64), (f64, f64)> = Default::default();
+        let shown = |r: &Evidence| ctx.dict(r).map_or(0., |d| d.f("overall"));
         for group in &names {
-            let mut relevant: Vec<&Evidence> = if group == VIBRO { vibro_charts.values().copied().collect() } else {
-                representatives.iter().filter(|r| group == "overall" || ctx.dict(r).is_some_and(|d| skills::demanded(d).contains(&group.as_str()))).copied().collect()
+            // Vibro charts are mashed: only Vibro reads them; every other row reads the charts counted for it (P3's rank).
+            let member = |r: &Evidence| if group == VIBRO { rec.c.vibro_chart(ctx.feats(r)) } else {
+                !rec.c.vibro_chart(ctx.feats(r)) && (group == "overall" || ctx.dict(r).is_some_and(|d| skills::demanded(d).contains(&group.as_str())))
             };
-            let newest = relevant.iter().map(|r| r.ts.unwrap_or(0.)).fold(0., f64::max);
+            let relevant: Vec<(&(&str, u64), &&Evidence)> = charts.iter().filter(|(_, r)| member(r)).collect();
+            let played: Vec<&&Evidence> = rows.iter().chain(&vibro_rows).filter(|r| r.src != "public" && member(r)).collect();
+            let newest = played.iter().map(|r| r.ts.unwrap_or(0.)).fold(0., f64::max);
             let count = relevant.len();
-            if count < MIN_CHARTS || !known {
-                groups.insert(group.clone(), Group { maps: count, newest, confidence: "Not enough evidence", ..Group::default() });
-                continue;
-            }
-            // Decade-old website bests on easy charts extrapolate: the user's 5K read 10.2 from 99 % scores on 3-stars.
-            if !calibration.contains_key(group) && relevant.iter().map(|r| 0.5f64.powf((month - r.t).max(0.) / 12.)).sum::<f64>() < MIN_RECENT {
-                groups.insert(group.clone(), Group { maps: count, newest, confidence: "No recent plays", ..Group::default() });
-                continue;
-            }
-            // Quantile-spaced shapes, not the most retried/favourite charts.
-            relevant.sort_by(|x, y| overall(x).total_cmp(&overall(y)).then_with(|| x.chart.cmp(&y.chart)));
-            let n = count.min(32);
-            let chosen: Vec<&Evidence> = (0..n).map(|i| relevant[((count - 1) as f64 * i as f64 / (n.max(2) - 1) as f64) as usize]).collect();
-            let (c, d) = calibration.get(group).copied().unwrap_or((0., 1.));
-            let (mut values, mut slopes, mut weights) = (Vec::new(), Vec::new(), Vec::new());
-            for row in &chosen {
-                let id = (row.chart.clone(), row.rate.to_bits(), c.to_bits(), d.to_bits());
-                let (value, slope) = *capacities.entry(id).or_insert_with(|| capacity(ctx.model, ctx.feats(row), (target_y - c) / d));
-                values.push(value);
-                slopes.push(d * slope); // per unit of the player's displayed y
-                weights.push(0.5f64.powf((month - row.t).max(0.) / 12.));
-            }
-            let (value, slope) = (quantile(&values, &weights, 0.5), quantile(&slopes, &weights, 0.5));
-            let shape_spread = (quantile(&values, &weights, 0.85).ln() - quantile(&values, &weights, 0.15).ln()) / 2.;
-            let level_var = ctx.fit.level_var.get(&keys).copied().unwrap_or(0.25);
-            // Conservative spread: shape ambiguity and sparse coverage. Not a calibrated 95% confidence interval.
-            let spread = (level_var / 0.25f64.max(slope * slope) + shape_spread.powi(2) + 0.12f64.powi(2) / count.min(25) as f64).sqrt();
-            let eff: f64 = relevant.iter().map(|r| 0.5f64.powf((month - r.t).max(0.) / 12.)).sum();
-            let confidence = if count >= 40 && eff >= 20. { "Strong history" } else if count >= 10 { "Moderate history" } else { "Limited history" };
-            let members: std::collections::HashSet<&str> = relevant.iter().map(|r| r.chart.as_str()).collect();
-            let highest = relevant.iter().map(|r| overall(r)).fold(0., f64::max);
-            let examples = relevant[count.saturating_sub(3)..].iter().map(|r| {
-                let title = rec.r.installed.get(&r.chart).map(|i| i.name()).or_else(|| r.b.and_then(|b| rec.public.map_info(b)).map(|m| m.file.clone())).unwrap_or_else(|| "Unavailable chart title".to_string());
-                (title, r.rate, shown(r))
-            }).collect();
-            let mut g = Group { value: Some(value), low: value * (-spread).exp(), high: value * spread.exp(), slope, maps: count,
-                                plays: rows.iter().filter(|r| members.contains(r.chart.as_str())).count(), newest, confidence, references: chosen.len(), examples,
-                                tested_to: relevant.iter().map(|r| shown(r)).fold(0., f64::max), ..Group::default() };
-            if value > highest * 1.35 {
-                // Easy/near-perfect historical scores do not identify the player's limit. Do not present a huge
-                // extrapolated rating as a measured strength merely because the solver found it.
-                g.value = None;
-                g.confidence = "Limit not measured";
-                g.extrapolated = true;
+            let read = reading(&rating_bins(relevant.iter().filter_map(|(k, _)| predicted.get(*k).copied()).collect()));
+            let rust = ctx.warmup.rust.of_plays(keys, &played.iter().filter(|r| r.completed).filter_map(|r| Some((r.ts?, ctx.feats(r).length / 1000. / r.rate.max(0.01) / 60.))).collect::<Vec<_>>(), now);
+            let mut g = Group { maps: count, plays: played.len(), newest, references: count.min(BINS), rusty: rust > ms_model::session::FORM_NOTICE,
+                                tested_to: relevant.iter().map(|(_, r)| shown(r)).fold(0., f64::max), ..Group::default() };
+            match read {
+                Some((x, slope, spread)) if slope > 0. => {
+                    let value = x.exp();
+                    (g.value, g.slope, g.low, g.high) = (Some(value), slope, value * (-spread / slope).exp(), value * (spread / slope).exp());
+                    g.confidence = if played.len() >= 40 { "Strong history" } else if played.len() >= 10 { "Moderate history" } else { "Limited history" };
+                }
+                _ => {
+                    // Off the charts' range: every chart predicted under (or over) the mark measures no limit.
+                    g.extrapolated = count > 0 && known;
+                    g.confidence = if !known || count == 0 { "Not enough evidence" } else { "Limit not measured" };
+                }
             }
             groups.insert(group.clone(), g);
         }
-        let peak = if known { ctx.calibration(&rows, &["overall".to_string(), "ln".to_string()], &|p| peak_line(p, peak_slope)) } else { HashMap::default() };
-        let mut dan_at = HashMap::default();
-        for (kind, anchor) in [("rice", "overall"), ("ln", "ln")] {
-            if let Some(series) = dans::series(keys, kind) {
-                if groups.get(anchor).is_some_and(|g| g.value.is_some()) {
-                    dan_at.insert(kind.to_string(), (anchor.to_string(), ctx.dan_rating(series, peak.get(anchor).copied())));
-                }
+        // One source for a skill's ★ and its dan: the dan songs' reading replaces the charts' where it exists (the same
+        // estimator on the series' tiers and pass marks).
+        let overall_slope = groups.get("overall").map_or(1., |g| if g.slope > 0. { g.slope } else { 1. });
+        for (name, g) in groups.iter_mut().filter(|(n, _)| known && !n.ends_with("vibro")) {
+            let Some(series) = dans::series(keys, dans::ability_kind(name)) else { continue };
+            let Some(v) = ctx.dan_value(series, name, miss_ratio) else { continue };
+            (g.low, g.high) = match g.value { Some(old) => (g.low * v / old, g.high * v / old), None => (v, v) };
+            if g.value.is_none() {
+                (g.confidence, g.slope, g.extrapolated) = ("From the dan songs", overall_slope, false);
+            }
+            g.value = Some(v);
+        }
+        if let Some(g) = groups.get_mut(VIBRO).filter(|g| g.value.is_some()) {
+            g.dan = ctx.dan_position("4K Vibro", "overall", miss_ratio).and_then(|at| dans::named("4K Vibro", at)).filter(|_| keys == 4);
+        }
+        let local: Vec<&Evidence> = rows.iter().filter(|r| r.src != "public").copied().collect();
+        let form = ctx.form_history(keys, &local);
+        if let Some(f) = form.as_ref().filter(|f| f.warm_form != 0.) {
+            for (_, g) in groups.iter_mut().filter(|(n, g)| g.value.is_some() && g.slope > 0. && n.as_str() != VIBRO) {
+                let k = (-f.warm_form / g.slope).exp();
+                (g.value, g.low, g.high) = (g.value.map(|v| v * k), g.low * k, g.high * k);
             }
         }
         let history = ctx.history(keys, groups.get("overall"));
-        let local: Vec<&Evidence> = rows.iter().filter(|r| r.src != "public").copied().collect();
-        let form = ctx.form_history(keys, &local);
-        pages.insert(keys, Page { keys, order: names, history: history.clone(), now: month, dan_at, form, evidence: (local.len(), rows.len() - local.len(), rows.iter().map(|r| r.ts.unwrap_or(0.)).fold(0., f64::max)),
+        pages.insert(keys, Page { keys, order: names, history: history.clone(), now: month, form, evidence: (local.len(), rows.len() - local.len(), rows.iter().map(|r| r.ts.unwrap_or(0.)).fold(0., f64::max)),
                                   peak: history.iter().map(|&(m, v, _)| (m, v)).max_by(|a, b| a.1.total_cmp(&b.1)), maps: charts.len(), plays: rows.len(),
-                                  mash_maps: charts.values().filter(|r| ctx.dict(r).and_then(|d| d.dict("sk")).is_some_and(|sk| sk.fget("mash", 0.) >= 0.3)).count(), groups, ..Page::default() });
+                                  mash_maps: charts.values().filter(|r| ctx.dict(r).is_some_and(|d| skills::relative(d, d.dict("sk").map_or(0., |sk| sk.fget("mash", 0.))) >= skills::cut())).count(), groups, ..Page::default() });
     }
     // Only frozen pre-play predictions can support a model-error diagnosis. Collapse retries by exact chart, and require
     // several charts before a label.
@@ -525,26 +449,24 @@ pub fn current(profile: &Profile, n: &Now, rec: &Engine) -> Current {
     for (keys, old) in &profile.pages {
         let keys = *keys;
         let mut page = old.clone();
+        let shown_form = page.form.as_ref().map_or(0., |f| f.warm_form); // already in the level: the session moves it from there
         for (group, row) in &mut page.groups {
             let skill = if group == "overall" { None } else { skills::session_skill(group, keys) };
             let family = skill.map(|s| rec.c.family(s));
             row.activation = view.activation(keys, family);
             if let Some(value) = row.value {
                 let cold = if view.warm_flag { 0. } else { warmup.penalty(&rec.c, keys, skill, row.activation, 0., None, view.session_clock()) };
-                let correction = view.correction(keys, skill) + cold;
+                let correction = view.correction(keys, skill) + cold - if group == VIBRO { 0. } else { shown_form };
                 row.current = Some(value * (-correction / row.slope).exp());
             }
         }
         let shown = |v: f64| v;
-        // A displayed level × scale = the dan rating it matches on the player's predicted dan-song accuracy.
-        page.dan_scale = old.dan_at.iter().filter_map(|(kind, (anchor, rating))| Some((kind.clone(), (*rating)? / page.groups.get(anchor)?.value?))).collect();
         page.history = old.history.iter().map(|&(m, v, n)| (m, shown(v), n)).collect();
         page.peak = old.peak.map(|(m, v)| (m, shown(v)));
         // Before a session is warm the session marker only shows the cold start, not the player's form.
         page.session = view.activation(keys, None) >= 1.5;
         pages.insert(keys, page);
     }
-    carry_down(&mut pages);
     Current { target: TARGET, pages, phase: n.session.phase().to_string() }
 }
 
@@ -561,67 +483,46 @@ fn warm_up_marks(seconds: impl Iterator<Item = f64>) -> Vec<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{carry_down, fit_line, peak_line, slope_source, steepened, warm_up_marks, Group, Page};
+    use super::{rating_bins, reading, warm_up_marks, TARGET};
 
     #[test]
     fn a_session_warms_after_three_maps_or_eight_minutes() {
         assert_eq!(warm_up_marks([120., 120., 120., 120., 120.].into_iter()), [true, true, true, false, false]);
         assert_eq!(warm_up_marks([300., 300., 120.].into_iter()), [true, true, false]);
     }
-    use super::crossing;
-    use std::collections::BTreeMap;
+    use super::{crossing, dan_crossing, pooled};
 
     #[test]
-    fn skill_carries_down_with_a_loss_and_a_lower_keymode_may_be_better() {
-        let page = |value: Option<f64>| Page { groups: [("overall".to_string(), Group { value, low: value.unwrap_or(0.) - 1., current: value.map(|v| v + 0.1), ..Group::default() })].into(), ..Page::default() };
-        let mut pages: BTreeMap<i64, Page> = [(4, page(Some(9.))), (6, page(Some(3.))), (5, page(None)), (7, page(Some(8.))), (10, page(Some(6.)))].into();
-        carry_down(&mut pages);
-        let level = |k: i64| pages[&k].groups["overall"].value;
-        assert_eq!((level(4), level(6), level(5), level(7), level(10)), (Some(9.), Some(7.75), None, Some(8.), Some(6.)), "4K stays above 7K, 7K doesn't lift 10K");
-        assert_eq!(pages[&6].groups["overall"].low, 6.75, "the band moves with the Level");
-        assert_eq!(pages[&6].groups["overall"].current, Some(7.85));
+    fn a_level_is_where_the_pooled_rating_bins_cross_the_target() {
+        // 200 charts from ★ 4 to 12, predicted log miss rising 2.5 per ln ★ through the target at ★ 8.
+        let charts: Vec<(f64, f64)> = (0..200).map(|i| {
+            let x = (4. + 8. * i as f64 / 199.).ln();
+            (x, (1. - TARGET) * (2.5 * (x - 8f64.ln())).exp())
+        }).collect();
+        let (x, slope, spread) = reading(&rating_bins(charts.clone())).unwrap();
+        assert!((x.exp() - 8.).abs() < 0.15 && (slope - 2.5).abs() < 0.05 && spread < 0.05, "{} {slope} {spread}", x.exp());
+        // One easy chart predicted hard pools with its neighbours instead of moving the level much.
+        let mut odd = charts.clone();
+        odd[10].1 = 0.5;
+        assert!((reading(&rating_bins(odd)).unwrap().0.exp() - 8.).abs() < 0.4);
+        // Every chart under the mark: no limit measured.
+        assert!(reading(&rating_bins(charts.iter().map(|c| (c.0, 0.001)).collect())).is_none());
     }
 
     #[test]
-    fn the_dan_line_follows_the_best_plays_at_every_difficulty() {
-        // Per difficulty: one play 0.6 worse than expected, one 0.6 better.
-        let points = |n: usize| -> Vec<(f64, f64, f64)> {
-            (0..n).flat_map(|i| {
-                let x = -4. + i as f64 * 0.05;
-                [(x, x + 0.6, 1.), (x, x - 0.6, 1.)]
-            }).collect()
-        };
-        let (all, _) = fit_line(&points(40)).unwrap();
-        let (c, d) = peak_line(&points(40), None).unwrap();
-        assert!((d - 1.).abs() < 1e-9 && (c - (all - 0.6 + super::GRIND)).abs() < 1e-9, "{c} {d}");
-        // Too few better plays for a slope: the whole line's, moved up by them.
-        let (full, slope) = fit_line(&points(15)).unwrap();
-        let (c, d) = peak_line(&points(15), None).unwrap();
-        assert!(d == slope && (c - (full - 0.6 + super::GRIND)).abs() < 1e-9, "{c} {d}");
-    }
-
-    #[test]
-    fn a_slope_only_comes_from_a_higher_keymode_played_more() {
-        let plays = [(4, 300), (6, 50), (7, 9000), (8, 20), (10, 4000)];
-        assert_eq!(slope_source(4, &plays), Some(7));
-        assert_eq!(slope_source(6, &plays), Some(7));
-        assert_eq!(slope_source(7, &plays), None, "the most played keymode keeps its own");
-        assert_eq!(slope_source(8, &plays), Some(10), "7K is below it");
-        assert_eq!(slope_source(10, &plays), None, "nothing above it");
-        assert_eq!(slope_source(7, &[(4, 900), (7, 30)]), None, "4K skill means nothing in 7K");
-    }
-
-    #[test]
-    fn a_side_keymode_takes_the_main_slope_through_its_own_plays() {
-        let flat: Vec<(f64, f64, f64)> = (0..40).map(|i| (-3. + i as f64 * 0.01, -3. + i as f64 * 0.003, 1.)).collect();
-        let (c, d) = fit_line(&flat).map_or((0., 0.), |l| l);
-        assert!(d < 0.31, "{d}");
-        let (c2, d2) = steepened(&flat, Some((c, d)), Some(0.8)).unwrap();
-        let (x, y) = (flat.iter().map(|p| p.0).sum::<f64>() / 40., flat.iter().map(|p| p.1).sum::<f64>() / 40.);
-        assert!(d2 == 0.8 && (c2 + d2 * x - y).abs() < 1e-9, "{c2} {d2}");
-        assert_eq!(steepened(&flat, Some((c, d)), Some(0.1)), Some((c, d)), "a steeper keymode keeps its own");
-        assert_eq!(steepened(&flat[..3], None, Some(0.8)), None, "three plays are no line");
-        assert!(steepened(&flat[..6], None, Some(0.8)).is_some());
+    fn a_dan_reading_needs_songs_on_both_sides_of_the_mark() {
+        let under = |v: f64| Some((v, 2.));
+        // songs to 4th of 15 tiers, all passed: unmeasured, not "one tier past the last song"
+        let mut y = vec![under(-1.9), under(-1.8), under(-1.5), under(-1.3), under(-1.1)];
+        y.resize(15, None);
+        assert_eq!(dan_crossing(&y), None);
+        // every tier passed: Stellium+ stays readable (off the top)
+        let all: Vec<_> = (0..15).map(|i| under(-2. + 0.1 * i as f64)).collect();
+        assert_eq!(dan_crossing(&all), Some(15.));
+        // a bracketed crossing reads as before
+        let mut mid = vec![under(-1.), under(-0.5), under(0.5)];
+        mid.resize(15, None);
+        assert!((dan_crossing(&mid).unwrap() - 1.5).abs() < 1e-9);
     }
 
     #[test]
@@ -635,5 +536,7 @@ mod tests {
         assert_eq!(crossing(&[Some(y(0.1)), Some(y(0.2))], goal), Some(-1.)); // below the first
         assert_eq!(crossing(&[None, Some(y(0.02)), None, Some(y(0.08))], goal), Some(1. + 2. * (goal - y(0.02)) / (y(0.08) - y(0.02))));
         assert_eq!(crossing(&[None, None], goal), None);
+        // A tier predicted easier than the one below pools with it by song count; a gap stays a gap.
+        assert_eq!(pooled(&[Some((-3., 2.)), None, Some((-4.5, 1.)), Some((-1., 1.))]), vec![Some(-3.5), None, Some(-3.5), Some(-1.)]);
     }
 }

@@ -42,42 +42,45 @@ fn row(ui: &mut Ui, name: &str, tip: Option<&str>, add: impl FnOnce(&mut Ui) -> 
     r.inner
 }
 
-/// Double- or right-click: back to `default`; the wheel over it: one step, the page stays put (user 2026-11-02).
-fn nudge(ui: &Ui, r: &egui::Response, value: &mut f64, (lo, hi, step): (f64, f64, f64), default: f64) -> bool {
+/// Double- or right-click: back to `default`. The wheel scrolls the page, never the slider (user 2026-11-12: "scrolling in
+/// settings menus can accidentally move sliders").
+fn nudge(r: &egui::Response, value: &mut f64, default: f64) -> bool {
     let before = *value;
     if r.double_clicked() || r.secondary_clicked() {
         *value = default;
-    } else if r.hovered() {
-        let wheel: f32 = ui.input(|i| i.events.iter().filter_map(|e| if let egui::Event::MouseWheel { delta, .. } = e { Some(delta.y) } else { None }).sum());
-        if wheel != 0. {
-            ui.ctx().input_mut(|i| i.smooth_scroll_delta.y = 0.);
-            *value = (*value + step * f64::from(wheel.signum())).clamp(lo, hi);
-        }
     }
     *value != before
 }
 
+/// The slider track's width: what is left after the widest value text the row can show (at least VALUE). A fixed
+/// VALUE let "80% NPS · 7899 maps" run past the window's right edge (user 2026-11-13).
+fn track(ui: &Ui, texts: &[String]) -> f32 {
+    let gap = ui.spacing().item_spacing.x;
+    let widest = texts.iter().map(|t| ui.painter().layout_no_wrap(t.clone(), egui::FontId::proportional(theme::BODY), theme::TEXT).size().x + gap).fold(VALUE, f32::max);
+    (ui.available_width() - widest).max(60.)
+}
+
 /// A settings row: name, slider, current value.
 #[allow(clippy::too_many_arguments)]
-fn slider(ui: &mut Ui, name: &str, value: &mut f64, range: (f64, f64, f64), default: f64, show: impl Fn(f64) -> String, tip: Option<&str>) -> bool {
-    let tip = format!("{}Double-click: default. Wheel over it: one step.", tip.map_or(String::new(), |t| format!("{t}\n")));
+pub(crate) fn slider(ui: &mut Ui, name: &str, value: &mut f64, range: (f64, f64, f64), default: f64, show: impl Fn(f64) -> String, tip: Option<&str>) -> bool {
+    let tip = format!("{}Double-click: default.", tip.map_or(String::new(), |t| format!("{t}\n")));
     row(ui, name, Some(&tip), |ui| {
-        ui.spacing_mut().slider_width = (ui.available_width() - VALUE).max(60.);
+        ui.spacing_mut().slider_width = track(ui, &[show(range.0), show(range.1), show(*value)]);
         let r = ui.add(egui::Slider::new(value, range.0..=range.1).step_by(range.2).show_value(false)).on_hover_text(name);
-        let changed = r.changed() | nudge(ui, &r, value, range, default);
-        ui.label(show(*value));
+        let changed = r.changed() | nudge(&r, value, default);
+        ui.add(egui::Label::new(show(*value)).wrap()); // below the widest row's width it wraps, never runs off
         changed
     })
 }
 
 /// 0.1×–10× on a log scale in 0.01 steps (user 2026-11-09: finer than the 0.25× notches); arrow keys over it or focused
-/// move it by 0.01, the wheel by 0.05, double-click resets to 1×.
+/// move it by 0.01, double-click resets to 1×.
 fn fine_slider(ui: &mut Ui, name: &str, value: &mut f64, show: impl Fn(f64) -> String, tip: Option<&str>) -> bool {
-    let tip = format!("{}Double-click: 1×. Arrow keys: 0.01. Wheel: 0.05.", tip.map_or(String::new(), |t| format!("{t}\n")));
+    let tip = format!("{}Double-click: 1×. Arrow keys: 0.01.", tip.map_or(String::new(), |t| format!("{t}\n")));
     row(ui, name, Some(&tip), |ui| {
-        ui.spacing_mut().slider_width = (ui.available_width() - VALUE - 30.).max(60.);
+        ui.spacing_mut().slider_width = track(ui, &[show(0.1), show(10.), show(*value)]);
         let r = ui.add(egui::Slider::new(value, 0.1..=10.).logarithmic(true).step_by(0.01).show_value(false)).on_hover_text(name);
-        let mut changed = r.changed() | nudge(ui, &r, value, (0.1, 10., 0.05), 1.);
+        let mut changed = r.changed() | nudge(&r, value, 1.);
         if r.hovered() && !r.has_focus() {
             let step = ui.input(|i| i.num_presses(egui::Key::ArrowRight) as f64 + i.num_presses(egui::Key::ArrowUp) as f64 - i.num_presses(egui::Key::ArrowLeft) as f64 - i.num_presses(egui::Key::ArrowDown) as f64);
             if step != 0. {
@@ -86,23 +89,23 @@ fn fine_slider(ui: &mut Ui, name: &str, value: &mut f64, show: impl Fn(f64) -> S
             }
         }
         *value = (*value * 100.).round() / 100.;
-        ui.label(show(*value));
+        ui.add(egui::Label::new(show(*value)).wrap());
         changed
     })
 }
 
 /// The slider steps through a list.
 fn stepped(ui: &mut Ui, name: &str, value: &mut f64, values: &[f64], default: f64, show: impl Fn(f64) -> String, tip: Option<&str>) -> bool {
-    let tip = format!("{}Double-click: default. Wheel over it: one step.", tip.map_or(String::new(), |t| format!("{t}\n")));
+    let tip = format!("{}Double-click: default.", tip.map_or(String::new(), |t| format!("{t}\n")));
     let index = |v: f64| values.iter().enumerate().min_by(|a, b| (a.1 - v).abs().total_cmp(&(b.1 - v).abs())).map_or(0, |x| x.0);
     let mut at = index(*value);
     let changed = row(ui, name, Some(&tip), |ui| {
-        ui.spacing_mut().slider_width = (ui.available_width() - VALUE).max(60.);
+        ui.spacing_mut().slider_width = track(ui, &values.iter().map(|v| show(*v)).collect::<Vec<_>>());
         let r = ui.add(egui::Slider::new(&mut at, 0..=values.len() - 1).show_value(false)).on_hover_text(name);
         let mut i = at as f64;
-        let nudged = nudge(ui, &r, &mut i, (0., (values.len() - 1) as f64, 1.), index(default) as f64);
+        let nudged = nudge(&r, &mut i, index(default) as f64);
         at = i as usize;
-        ui.label(show(values[at]));
+        ui.add(egui::Label::new(show(values[at])).wrap());
         r.changed() | nudged
     });
     if changed {
@@ -304,12 +307,12 @@ impl App {
     fn rate_range(&mut self, ui: &mut Ui, mode: &str) {
         let mut v = self.s.rates[mode];
         let changed = row(ui, "HT/DT range", Some("Rates this tab may offer. Both knobs on 1.00: no HT or DT. Double-click: back to 0.75–1.50×."), |ui| {
-            let width = (ui.available_width() - VALUE).max(60.);
+            let width = track(ui, &[rate_text(v)]);
             let c = ui.scope(|ui| {
                 ui.set_max_width(width);
                 theme::range_slider(ui, "HT/DT range", &mut v, (MIN_RATE, MAX_RATE), 0.05, DEFAULT_RATES).changed()
             }).inner;
-            ui.label(rate_text(v));
+            ui.add(egui::Label::new(rate_text(v)).wrap());
             c
         });
         if changed {
@@ -517,7 +520,12 @@ impl App {
                     self.rate_range(ui, mode);
                     theme::section(ui, "MIX");
                     let mut focus = self.s.nps_focus;
-                    if slider(ui, "Variety to high NPS", &mut focus, (0., 1., 0.05), 0.5, focus_label, Some("Left: pattern types (jacks, streams, LN…) get an even share of the list. Right: the highest NPS maps, mostly chordstreams and brackets. Both aim at the accuracy target.")) {
+                    let pool = self.views.get(mode).map(|v| v.nps_pool.clone()).unwrap_or_default();
+                    let label = |v: f64| match pool.values().map(|ns| ms_model::choices::nps_eligible(ns, v)).sum::<usize>() {
+                        0 => focus_label(v),
+                        n => format!("{} · {n} maps", focus_label(v)),
+                    };
+                    if slider(ui, "Variety to high NPS", &mut focus, (0., 1., 0.05), 0.5, label, Some("Left: pattern types (jacks, streams, LN…) get an even share of the list. Right: the highest NPS maps, mostly chordstreams and brackets; the lowest NPS a map may have rises with it. Both aim at the accuracy target.")) {
                         self.s.nps_focus = normalize_focus(focus);
                         self.sync_rec();
                     }

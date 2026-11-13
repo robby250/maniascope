@@ -251,17 +251,14 @@ impl Prepared {
         self.by_identity.get(identity).copied()
     }
 
-    /// the old nps.weighted_candidates (family best, quality weights), the unconsumed filter, the NPS shuffle and the web mix (Worker._pool) →
-    /// ([(entry index, value, weight, category_share)], freshness relaxed), in shown order.
-    #[allow(clippy::type_complexity)]
-    pub fn rank(&self, r: Ranking<'_>) -> (Vec<(usize, f64, f64, f64)>, bool, [f64; 3]) {
+    /// Each chart family's best rate among the tab's keymodes and streams; equally good maps then reproduce library proportions.
+    pub fn family_best(&self, keys: &[i64], web: f64, convert: f64) -> Vec<usize> {
         let items = &self.list.items;
-        // Each chart family's best rate; equally good maps then reproduce library proportions.
         let mut best: Vec<usize> = Vec::new();
         let mut family_at: HashMap<(i64, &str), usize> = HashMap::default();
         for &i in &self.kept {
             let c = &items[i];
-            if !r.keys.contains(&c.keys) || (r.web <= 0. && c.stream() == WEB) || (r.convert <= 0. && c.stream() == CONVERT) {
+            if !keys.contains(&c.keys) || (web <= 0. && c.stream() == WEB) || (convert <= 0. && c.stream() == CONVERT) {
                 continue;
             }
             match family_at.get(&(c.keys, c.family.as_str())) {
@@ -276,20 +273,36 @@ impl Prepared {
                 }
             }
         }
-        let mut rows = best;
-        // Twenty NPS is ordinary 7K variety: follow the eligible pool down for lower ability or cold states,
-        // and far below that floor is not NPS practice at all (user 2026-10-22: a 6 NPS map "should never appear").
+        best
+    }
+
+    /// Each keymode's NPS over `rows` (entry indices), sorted: what the NPS floor reads.
+    pub fn nps_pool(&self, rows: &[usize]) -> std::collections::BTreeMap<i64, Vec<f64>> {
+        let mut pool: std::collections::BTreeMap<i64, Vec<f64>> = Default::default();
+        for c in rows.iter().map(|&i| &self.list.items[i]).filter(|c| c.nps > 0.) {
+            pool.entry(c.keys).or_default().push(c.nps);
+        }
+        pool.values_mut().for_each(|ns| ns.sort_by(f64::total_cmp));
+        pool
+    }
+
+    /// the old nps.weighted_candidates (family best, quality weights), the unconsumed filter, the NPS shuffle and the web mix (Worker._pool) →
+    /// ([(entry index, value, weight, category_share)], freshness relaxed), in shown order.
+    #[allow(clippy::type_complexity)]
+    pub fn rank(&self, r: Ranking<'_>) -> (Vec<(usize, f64, f64, f64)>, bool, [f64; 3]) {
+        let items = &self.list.items;
+        let mut rows = self.family_best(&r.keys, r.web, r.convert);
+        // The floor follows each keymode's eligible pool and the Variety ↔ NPS slider: far below it is not NPS practice
+        // (user 2026-10-22: a 6 NPS map "should never appear"; 2026-11-13: "minimum nps should move with the nps/variety slider").
         let mut floor: HashMap<i64, f64> = HashMap::default();
         if r.nps {
-            for &k in &r.keys {
-                let mut ns: Vec<f64> = rows.iter().map(|&i| &items[i]).filter(|c| c.keys == k && c.nps > 0.).map(|c| c.nps).collect();
-                if !ns.is_empty() {
-                    floor.insert(k, (20. * k as f64 / 7.).min(0.85 * quantile(&mut ns, 0.70)));
-                }
+            let focus = r.shuffle.as_ref().map_or(0.5, |s| s.1);
+            for (k, ns) in self.nps_pool(&rows) {
+                floor.insert(k, nps_floor(&ns, focus));
             }
             rows.retain(|&i| {
                 let c = &items[i];
-                !(0. < c.nps && c.nps < 0.75 * floor.get(&c.keys).copied().unwrap_or(0.))
+                !(0. < c.nps && c.nps < NPS_CUT * floor.get(&c.keys).copied().unwrap_or(0.))
             });
         }
         if rows.is_empty() {
@@ -369,6 +382,21 @@ impl Prepared {
 }
 
 /// np.quantile (linear)
+/// Below `NPS_CUT` × the floor a map leaves the NPS list; between that and the floor it is pushed down.
+pub const NPS_CUT: f64 = 0.75;
+
+/// A keymode's NPS floor at slider `focus` over its sorted pool: the pool's 50th percentile at the variety end, 90th at the
+/// NPS end, 70th (the fixed floor before 2026-11-13) in the middle.
+pub fn nps_floor(sorted: &[f64], focus: f64) -> f64 {
+    0.85 * quantile(&mut sorted.to_vec(), 0.5 + 0.4 * focus.clamp(0., 1.))
+}
+
+/// Maps a keymode keeps in the NPS list at slider `focus`.
+pub fn nps_eligible(sorted: &[f64], focus: f64) -> usize {
+    let cut = NPS_CUT * nps_floor(sorted, focus);
+    sorted.len() - sorted.partition_point(|&n| n < cut)
+}
+
 fn quantile(v: &mut [f64], q: f64) -> f64 {
     v.sort_by(|a, b| a.total_cmp(b));
     let pos = q * (v.len() - 1) as f64;
@@ -679,6 +707,20 @@ mod list_tests {
     }
 
     #[test]
+    fn the_nps_floor_follows_the_slider() {
+        let ns: Vec<f64> = (1..=101).map(f64::from).collect(); // NPS 1…101: the q-th percentile is 1 + 100 q
+        assert!((nps_floor(&ns, 0.5) - 0.85 * 71.).abs() < 1e-9, "the middle keeps the fixed 70th percentile");
+        assert!((nps_floor(&ns, 0.) - 0.85 * 51.).abs() < 1e-9 && (nps_floor(&ns, 1.) - 0.85 * 91.).abs() < 1e-9);
+        assert!(nps_eligible(&ns, 0.) > nps_eligible(&ns, 0.5) && nps_eligible(&ns, 0.5) > nps_eligible(&ns, 1.));
+        // the list drops what the count drops
+        let p = prepared((0..101).map(|i| choice(&i.to_string(), f64::from(i + 1), "g")).collect(), &[7]);
+        for focus in [0., 0.5, 1.] {
+            let got = ranked(&p, Ask { shuffle: Some(("1".into(), focus)), ..Ask::default() });
+            assert_eq!(got.len(), nps_eligible(&ns, focus));
+        }
+    }
+
+    #[test]
     fn ranking_keeps_one_choice_per_chart_family_and_keymode() {
         let mut rows: Vec<Choice> = (0..35).map(|i| {
             let g = if i < 25 { 0 } else if i < 30 { 1 } else { 2 };
@@ -706,6 +748,16 @@ mod list_tests {
         rows.extend((0..20).map(|i| choice(&i.to_string(), 25., "chords")));
         let got = ranked(&prepared(rows, &[7]), Ask::default());
         assert!(got.len() == 20 && got.iter().all(|c| c.0.nps == 25.));
+    }
+
+    #[test]
+    fn a_4k_floor_follows_the_4k_pool() {
+        let four = |sha: &str, nps: f64| Choice { keys: 4, ..choice(sha, nps, "chords") };
+        let mut rows = vec![four("low", 12.)];
+        rows.extend((0..20).map(|i| four(&i.to_string(), 18.)));
+        let got = ranked(&prepared(rows, &[4]), Ask { keys: vec![4], ..Ask::default() });
+        assert_eq!(got.last().map(|c| c.0.nps), Some(12.), "12 NPS ranks under a pool of 18 (it led at 11.4 floor)");
+        assert!(got.last().unwrap().1 < got[0].1 * (-3f64).exp(), "its weight falls by more than e³");
     }
 
     #[test]

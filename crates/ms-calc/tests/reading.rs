@@ -26,9 +26,9 @@ fn quadstream_recognition_has_no_new_physical_charge_and_no_wide_name() {
     let four: &[u8] = &[0, 1, 2, 3];
     let c = make(&[&[0], four, &[2], four], 4);
     let a = run(&c, 1.);
-    assert!(title(&a).contains("Quadstream"));
+    assert!(score(&a, "quadstream") > 0.);
     let b = run_with(&c, 1., &Params::new(standard_params().model.clone(), &json!({"off": ["quadstream"]})).unwrap());
-    assert!((score(&a, "overall") - score(&b, "overall")).abs() < 1e-9 && !title(&b).contains("Quadstream"));
+    assert!((a.f("raw_overall") - b.f("raw_overall")).abs() < 1e-9 && score(&b, "quadstream") == 0.);
     assert_eq!(score(&run(&make(&[&[0, 1], four, &[2, 3], four], 4), 1.), "quadstream"), 0.);
     let seven: &[u8] = &[0, 1, 2, 3, 4, 5, 6];
     let wide = make(&[&[0], seven, &[6], seven], 7);

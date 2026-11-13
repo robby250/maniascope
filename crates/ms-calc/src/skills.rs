@@ -1,5 +1,6 @@
 //! Skill keys and the per-skill series (skill_calc.skills / _attribute).
-use crate::demand::{Parts, P, PARTS_4K, PARTS_5K};
+use crate::demand::{Parts, P};
+use crate::taxonomy::Density;
 use crate::params::Knobs;
 use crate::py;
 
@@ -8,24 +9,24 @@ use crate::py;
 #[repr(u8)]
 pub enum Sk {
     stream, jumpstream, handstream, dump, jumptrill, splittrill, jackspeed, chordjack, ln, sv, delay,
-    chordstream, bracket, jack, quadstream, minijack, longjack, vibro, release, inverse, hybrid, shield,
-    ln_general, ln_tech, ln_inverse, ln_release,
+    chordstream, bracket, jack, quadstream, minijack, longjack, vibro, shield,
+    ln_tech, ln_inverse, ln_release, ln_general,
     sv_fast, sv_slow, sv_accel, sv_stutter, sv_brake, trill1h, anchor, patterntech, rhythmtech, technical,
     mash, stamina, overall, switch,
 }
-pub const NSK: usize = 40;
+pub const NSK: usize = 37;
 pub const SK_NAMES: [&str; NSK] = [
     "stream", "jumpstream", "handstream", "dump", "jumptrill", "splittrill", "jackspeed", "chordjack", "ln", "sv",
-    "delay", "chordstream", "bracket", "jack", "quadstream", "minijack", "longjack", "vibro", "release", "inverse",
-    "hybrid", "shield", "ln_general", "ln_tech", "ln_inverse", "ln_release", "sv_fast", "sv_slow", "sv_accel", "sv_stutter", "sv_brake", "trill1h", "anchor",
+    "delay", "chordstream", "bracket", "jack", "quadstream", "minijack", "longjack", "vibro", "shield",
+    "ln_tech", "ln_inverse", "ln_release", "ln_general", "sv_fast", "sv_slow", "sv_accel", "sv_stutter", "sv_brake", "trill1h", "anchor",
     "patterntech", "rhythmtech", "technical", "mash", "stamina", "overall", "_switch",
 ];
 pub const ALL_SK: [Sk; NSK] = {
     use Sk::*;
     [
         stream, jumpstream, handstream, dump, jumptrill, splittrill, jackspeed, chordjack, ln, sv, delay,
-        chordstream, bracket, jack, quadstream, minijack, longjack, vibro, release, inverse, hybrid, shield,
-        ln_general, ln_tech, ln_inverse, ln_release, sv_fast, sv_slow, sv_accel, sv_stutter, sv_brake, trill1h, anchor, patterntech, rhythmtech, technical,
+        chordstream, bracket, jack, quadstream, minijack, longjack, vibro, shield,
+        ln_tech, ln_inverse, ln_release, ln_general, sv_fast, sv_slow, sv_accel, sv_stutter, sv_brake, trill1h, anchor, patterntech, rhythmtech, technical,
         mash, stamina, overall, switch,
     ]
 };
@@ -41,39 +42,6 @@ impl Sk {
 /// The skill with the same key as a demand part.
 pub fn sk_of(p: P) -> Option<Sk> {
     Sk::from_name(crate::demand::P_NAMES[p as usize])
-}
-
-pub const JACK_PARTS: [Sk; 3] = [Sk::chordjack, Sk::jack, Sk::jackspeed];
-pub const LN_KINDS: [Sk; 4] = [Sk::release, Sk::inverse, Sk::hybrid, Sk::shield];
-/// The LN skills a player sees, each defined so its own KomeijiDove 7K LN Dan practice pack (a player 2026-11-04) rates it top:
-/// General (LN without a specialty), Tech, Inverse, Release. Shields stay as they were.
-pub const LN_SKILLS: [Sk; 4] = [Sk::ln_general, Sk::ln_tech, Sk::ln_inverse, Sk::ln_release];
-/// Rated for the families fit's LN columns (model::sr_vector), never shown: Hybrid was deleted (a player 2026-11-04), Release and
-/// Inverse became ln_release/ln_inverse. Redefining these would move every chart's stars.
-pub const FIT_ONLY: [Sk; 3] = [Sk::release, Sk::inverse, Sk::hybrid];
-pub const SV_KINDS: [Sk; 5] = [Sk::sv_fast, Sk::sv_slow, Sk::sv_accel, Sk::sv_stutter, Sk::sv_brake];
-pub const TECH_KEYS: [Sk; 3] = [Sk::patterntech, Sk::rhythmtech, Sk::technical];
-
-/// Skill keys measured for a keymode, in display order for ties.
-pub fn skills(keys: usize) -> Vec<Sk> {
-    use Sk::*;
-    let base: Vec<Sk> = if keys < 5 {
-        vec![stream, jumpstream, handstream, dump, jumptrill, splittrill, jackspeed, chordjack, ln, sv]
-    } else {
-        vec![delay, stream, chordstream, bracket, jumptrill, jack, chordjack, ln, sv]
-    };
-    let i = base.iter().position(|&s| s == ln).unwrap();
-    let mut out = base[..i].to_vec();
-    if keys == 4 {
-        out.push(quadstream);
-    }
-    out.extend([minijack, longjack, vibro, ln]);
-    out.extend(LN_KINDS);
-    out.extend(LN_SKILLS);
-    out.extend_from_slice(&base[i + 1..]);
-    out.extend(SV_KINDS);
-    out.extend([trill1h, anchor, patterntech, rhythmtech, technical, mash, stamina]);
-    out
 }
 
 /// Ordered per-skill series (a Python dict of lists).
@@ -137,14 +105,22 @@ pub fn win(v: &[f64], h: usize) -> Vec<f64> {
     out
 }
 
-/// Per-skill demand series (skill_calc._attribute).
+/// The demand parts of the keymode's base skills (taxonomy: the Base rows measured on it).
+pub fn base_parts(keys: usize) -> Vec<P> {
+    crate::taxonomy::TABLE.iter().filter(|r| r.role == crate::taxonomy::Role::Base && crate::taxonomy::measured(r.sk, keys))
+        .map(|r| crate::demand::P_NAMES.iter().position(|n| *n == r.sk.name()).map(|i| crate::demand::ALL_P[i]).expect("a base skill is a demand part")).collect()
+}
+
+/// Per-skill demand series: every base skill = the bin's total × its part's share of the base parts (plan 2026-11-11: one
+/// rule; it was total × part / the largest part, so the largest part took the bin's whole demand. A p-norm between the two
+/// was screened: p = 1 fit 4K best and tied 7K). The modifiers
+/// (technical, pattern, rhythm) are the same notes seen for one property. Slices come after execution (`slice`).
 pub fn attribute(parts: &Parts, total: &[f64], keys: usize, technical_only: bool, k: &Knobs) -> Series {
     let nb = total.len();
-    let pk: &[P] = if keys < 5 { &PARTS_4K } else { &PARTS_5K };
-    let w = |p: P| win(parts.get(p), 2);
-    let pw: Vec<Vec<f64>> = pk.iter().map(|&p| w(p)).collect();
-    let p_tech = w(P::technical);
-    let p_rows = w(P::rows);
+    let pk = base_parts(keys);
+    let pw: Vec<Vec<f64>> = pk.iter().map(|&p| win(parts.get(p), EVIDENCE_WIN)).collect();
+    let p_tech = win(parts.get(P::technical), EVIDENCE_WIN);
+    let p_rows = win(parts.get(P::rows), EVIDENCE_WIN);
     let rodd = win(parts.get(P::rodd), k.RT_WIN);
     let rrows = win(parts.get(P::rows), k.RT_WIN);
     let pp: Vec<f64> = parts.get(P::pins).iter().zip(parts.get(P::psw)).map(|(a, c)| a + c).collect();
@@ -152,105 +128,162 @@ pub fn attribute(parts: &Parts, total: &[f64], keys: usize, technical_only: bool
     let psw = win(parts.get(P::psw), k.RT_WIN);
     let nosv: Vec<f64> = total.iter().zip(parts.get(P::sv_raw)).map(|(t, s)| 0f64.max(t - s / k.BIN)).collect();
     let mut names: Vec<Sk> =
-        if technical_only { vec![Sk::technical, Sk::patterntech, Sk::rhythmtech] } else { skills(keys) };
+        if technical_only { vec![Sk::technical, Sk::patterntech, Sk::rhythmtech] } else { crate::taxonomy::rated(keys) };
     names.push(Sk::switch);
     names.retain(|&s| s != Sk::stamina);
     let mut se = Series::new(nb, names);
-    let extra = |p: P| if technical_only { Vec::new() } else { w(p) };
-    let (mj, lj, vib, shield, inv, hyb, oht, anc, sus, ln_rel, dump, bracket) = (
-        extra(P::mj), extra(P::lj), extra(P::vib), extra(P::shield), extra(P::inv), extra(P::hyb), extra(P::oht),
-        extra(P::anc), extra(P::sus), extra(P::ln_rel), extra(P::dump), extra(P::bracket),
-    );
-    let ln_i = pk.iter().position(|&p| p == P::ln).unwrap();
     let pk_sk: Vec<Sk> = pk.iter().map(|&p| sk_of(p).unwrap()).collect();
-    let has_dump = se.has(Sk::dump);
-    let has_bracket = se.has(Sk::bracket);
     let nbn = se.nbins;
     let at = |s: Sk, b: usize| s as usize * nbn + b;
-    let mut tech_share = vec![0.0f64; nb];
     for b in 0..nb {
-        let tot = py::sum(pw.iter().map(|x| x[b])) + p_tech[b];
-        if tot == 0.0 || total[b] == 0.0 {
+        let base = py::sum(pw.iter().map(|x| x[b]));
+        if base + p_tech[b] == 0.0 || total[b] == 0.0 {
             continue;
         }
-        if !technical_only {
-            let top = pw.iter().map(|x| x[b]).fold(f64::NEG_INFINITY, f64::max);
+        if !technical_only && base > 0.0 {
             for (x, &s) in pw.iter().zip(&pk_sk) {
-                se.data[at(s, b)] = total[b] * x[b] / top;
+                se.data[at(s, b)] = total[b] * x[b] / base;
             }
         }
-        let rows = p_rows[b];
-        let mut rt = 0.0;
-        let mut pt = 0.0;
-        if rows != 0.0 {
-            if rrows[b] > 0.5 {
-                rt = 1f64.min(0f64.max(rodd[b]) / (k.RT_FULL * rrows[b]));
-                pt = 1f64.min(0f64.max(podd[b]) / (k.PT_FULL * rrows[b]));
-            }
+        if p_rows[b] != 0.0 && rrows[b] > 0.5 {
+            let rt = 1f64.min(0f64.max(rodd[b]) / (k.RT_FULL * rrows[b]));
+            let pt = 1f64.min(0f64.max(podd[b]) / (k.PT_FULL * rrows[b]));
             se.data[at(Sk::rhythmtech, b)] = nosv[b] * rt;
             se.data[at(Sk::patterntech, b)] = nosv[b] * pt;
-            se.data[at(Sk::switch, b)] =
-                if rrows[b] > 0.5 { nosv[b] * 1f64.min(0f64.max(psw[b]) / (k.PT_FULL * rrows[b])) } else { 0.0 };
+            se.data[at(Sk::switch, b)] = nosv[b] * 1f64.min(0f64.max(psw[b]) / (k.PT_FULL * rrows[b]));
             se.data[at(Sk::technical, b)] = nosv[b] * (1.0 - (1.0 - rt) * (1.0 - pt));
-        }
-        if technical_only {
-            continue;
-        }
-        let tb = total[b];
-        if rows != 0.0 {
-            se.data[at(Sk::minijack, b)] = tb * 1f64.min(mj[b] / (k.MJ_FULL * rows));
-            se.data[at(Sk::longjack, b)] = tb * 1f64.min(lj[b] / (k.LJ_FULL * rows));
-            se.data[at(Sk::vibro, b)] = tb * 1f64.min(vib[b] / (k.VIB_FULL * rows));
-            se.data[at(Sk::shield, b)] = tb * 1f64.min(shield[b] / (k.SHIELD_FULL * rows));
-            se.data[at(Sk::inverse, b)] = tb * 1f64.min(inv[b] / (k.INV_FULL * rows));
-            se.data[at(Sk::hybrid, b)] = tb * 1f64.min(hyb[b] / (k.HYB_FULL * rows));
-            se.data[at(Sk::trill1h, b)] = tb * 1f64.min(oht[b] / (k.OHT_FULL * rows));
-            se.data[at(Sk::anchor, b)] = tb * 1f64.min(anc[b] / (k.ANC_FULL * rows));
-        }
-        let jr = mj[b] + sus[b];
-        if jr != 0.0 {
-            let burst = mj[b] / jr;
-            for s in JACK_PARTS {
-                if se.keys.contains(&s) {
-                    let moved = se.data[at(s, b)] * burst;
-                    se.data[at(s, b)] -= moved;
-                    let m = &mut se.data[at(Sk::minijack, b)];
-                    *m = m.max(moved);
-                }
-            }
-        }
-        if pw[ln_i][b] > 0.0 {
-            se.data[at(Sk::release, b)] = se.data[at(Sk::ln, b)] * 1f64.min(ln_rel[b] / (k.REL_FULL * pw[ln_i][b]));
-        }
-        if has_dump {
-            se.data[at(Sk::dump, b)] = tb * 1f64.min(dump[b] / (k.DUMP_FULL * tot));
-        }
-        if has_bracket {
-            se.data[at(Sk::bracket, b)] = tb * 1f64.min(bracket[b] / (k.BRACKET_FULL * tot));
-        }
-        tech_share[b] = 1.0 - (1.0 - rt) * (1.0 - pt);
-    }
-    if !technical_only && se.has(Sk::ln_general) {
-        // Shares of the LN demand, over ±RT_WIN bins. Inverse: the columns in use held most of the time (the gaps are the
-        // notes). Release: releases while another finger of the hand keeps holding (finger independence on the release).
-        // Tech: the technical share (irregular rhythm or awkward transitions) where LN is. General: LN without one of them.
-        let (cover, used, stag, ends) = (win(parts.get(P::cover), k.RT_WIN), win(parts.get(P::used), k.RT_WIN), win(parts.get(P::stag), k.RT_WIN), win(parts.get(P::lnend), k.RT_WIN));
-        let rel_full = k.LN_REL_FULL * (keys as f64 / 7.0).powf(k.LN_REL_KEYS);
-        for b in 0..nb {
-            let ln = se.data[at(Sk::ln, b)];
-            if ln == 0.0 {
-                continue;
-            }
-            let inverse = ((cover[b] / used[b].max(1e-9) - k.LN_INV_LO) / (k.LN_INV_HI - k.LN_INV_LO)).clamp(0.0, 1.0);
-            let release = if ends[b] > 0.0 { 1f64.min(stag[b] / (rel_full * ends[b])) } else { 0.0 };
-            let tech = 1f64.min(tech_share[b] / k.LN_TECH_FULL);
-            se.data[at(Sk::ln_inverse, b)] = ln * inverse;
-            se.data[at(Sk::ln_release, b)] = ln * release;
-            se.data[at(Sk::ln_tech, b)] = ln * tech;
-            se.data[at(Sk::ln_general, b)] = ln * (1.0 - inverse.max(release).max(tech));
         }
     }
     se
+}
+
+/// Bins each side of a bin that the base parts and every slice's evidence are summed over.
+pub const EVIDENCE_WIN: usize = 2;
+
+/// Per-bin evidence the parts don't hold: vibro runs (execution) and quad texture (pattern::quadstream).
+pub struct Evidence<'a> {
+    pub own: &'a [f64],
+    pub quad: &'a [f64],
+    /// compute::interleaved: the chart's share of interleaving disjoint chord-group moves.
+    pub interleaved: f64,
+}
+
+/// A slice's evidence density in each bin (taxonomy::Density over ±EVIDENCE_WIN bins).
+pub fn density(d: Density, parts: &Parts, series: &Series, total: &[f64], ev: &Evidence, keys: usize, k: &Knobs) -> Vec<f64> {
+    let nb = total.len();
+    let w = |p: P| win(parts.get(p), EVIDENCE_WIN);
+    let ratio = |a: Vec<f64>, b: Vec<f64>| -> Vec<f64> { (0..nb).map(|i| if b[i] > 0.0 { a[i] / b[i] } else { 0.0 }).collect() };
+    let at = |v: &[f64], i: usize| v.get(i).copied().unwrap_or(0.0);
+    match d {
+        Density::PerRow(p) => ratio(w(p), w(P::rows)),
+        Density::Ratio(p, q) => ratio(w(p), w(q)),
+        Density::Share(p) | Density::Interleaved(p) => {
+            let base: Vec<f64> = base_parts(keys).iter().map(|&q| w(q)).fold(vec![0.0; nb], |acc, v| acc.iter().zip(&v).map(|(a, b)| a + b).collect());
+            let gate = if matches!(d, Density::Interleaved(_)) { ev.interleaved } else { 1.0 };
+            ratio(w(p), base).into_iter().map(|x| x * gate).collect()
+        }
+        Density::Technical => {
+            let nosv: Vec<f64> = total.iter().zip(parts.get(P::sv_raw)).map(|(t, s)| 0f64.max(t - s / k.BIN)).collect();
+            ratio(series.get(Sk::technical).to_vec(), nosv)
+        }
+        Density::VibroRuns => (0..nb).map(|i| at(ev.own, i)).collect(),
+        Density::Quad => (0..nb).map(|i| at(ev.quad, i)).collect(),
+    }
+}
+
+/// The chart level the ramps are stated at (a reference point: `calib ramps` refits lo and hi around it).
+pub const RAMP_LEVEL: f64 = 5.0;
+
+/// One ramp for every slice: 0 at or under `lo`, 1 at or over `hi`, linear between; both × (keys/7)^e × (level/RAMP_LEVEL)^g,
+/// `level` the chart's raw overall (harder charts hold more of every specialty's evidence).
+pub fn ramp(x: f64, r: [f64; 4], keys: usize, level: f64) -> f64 {
+    let s = (keys as f64 / 7.0).powf(r[2]) * (level.max(0.1) / RAMP_LEVEL).powf(r[3]);
+    let (lo, hi) = (r[0] * s, r[1] * s);
+    if hi <= lo { (x >= hi) as u8 as f64 } else { ((x - lo) / (hi - lo)).clamp(0.0, 1.0) }
+}
+
+/// Slices, layered over their bases (plan 2026-11-12: the base keeps its whole demand, as in 1.9.0). A slice takes ramp(its
+/// density) of what its density is measured against: a density per note row or a share of the bin (Minijacks, Vibro, Dump,
+/// Bracket, 1H Trill, Anchors, Shields, Quadstream) of the bin's whole demand, as 1.9.0 did; a density inside a base's demand
+/// (LN Tech/Inverse/Release, the SV kinds) of that base, where they share at most all of it and a Rest row (LN General)
+/// holds what they leave. Slicing every type from its base's share left Minijacks nearly nothing on a jumpstream chart. A
+/// slice of the bin takes its share out of the bases it slices in other families (Minijacks out of Chordjack).
+/// → each slice's density in the bins it can take from (`calib ramps` fits the ramps on them).
+pub fn slice(series: &mut Series, parts: &Parts, total: &[f64], ev: &Evidence, keys: usize, level: f64, k: &Knobs) -> Vec<(Sk, Vec<f64>)> {
+    use crate::taxonomy::{Role, TABLE};
+    let nb = series.nbins;
+    let slices: Vec<(Sk, &[Sk], Density, Vec<f64>)> = TABLE.iter().filter(|r| series.has(r.sk)).filter_map(|r| match r.role {
+        Role::Slice(of) => {
+            let d = density(r.density?, parts, series, total, ev, keys, k);
+            Some((r.sk, of, r.density?, d))
+        }
+        _ => None,
+    }).collect();
+    // the population a slice's ramp is read on: the bins it can take from (its bases' demand, or any demand for a slice of the bin)
+    let seen: Vec<(Sk, Vec<f64>)> = slices.iter().map(|(s, of, d0, d)| {
+        let can = |b: usize| if within(*d0) { of.iter().any(|&o| series.get(o).get(b).is_some_and(|x| *x > 0.0)) } else { total.get(b).is_some_and(|x| *x > 0.0) };
+        (*s, (0..nb).filter(|&b| can(b)).map(|b| d[b]).collect())
+    }).collect();
+    let slices: Vec<(Sk, &[Sk], bool, Vec<f64>)> = slices.into_iter().map(|(s, of, d, x)| {
+        let r = k.ramp(s);
+        (s, of, within(d), x.into_iter().map(|x| ramp(x, r, keys, level)).collect())
+    }).collect();
+    for (s, _, _, r) in slices.iter().filter(|s| !s.2) {
+        let v: Vec<f64> = (0..series.get(*s).len()).map(|b| total.get(b).copied().unwrap_or(0.0) * r[b]).collect();
+        series.set(*s, &v);
+    }
+    let bases: Vec<Sk> = TABLE.iter().filter(|r| r.role == Role::Base && series.has(r.sk)).map(|r| r.sk).collect();
+    // A slice of the bin over a base of another family takes its notes out of that base (Minijacks out of Chordjack, 1H Trill
+    // out of Stream: 1.9.0 moved jack bursts out of every jack part); within its own family it stays layered.
+    let family = |s: Sk| crate::taxonomy::of(s).family;
+    for &base in &bases {
+        let cut: Vec<f64> = (0..nb).map(|b| slices.iter().filter(|s| !s.2 && s.1.contains(&base) && family(s.0) != family(base)).map(|s| s.3[b]).sum::<f64>().min(1.0)).collect();
+        if cut.iter().any(|c| *c > 0.0) {
+            series.get_mut(base).iter_mut().zip(&cut).for_each(|(x, c)| *x *= 1.0 - c);
+        }
+    }
+    let rests: Vec<(Sk, Sk)> = TABLE.iter().filter(|r| series.has(r.sk)).filter_map(|r| match r.role { Role::Rest(of) => Some((r.sk, of)), _ => None }).collect();
+    // a Rest row starts as its whole base: bins no slice reaches keep it all
+    for &(rest, of) in &rests {
+        let v = series.get(of).to_vec();
+        series.set(rest, &v);
+    }
+    for base in bases {
+        let mine: Vec<&(Sk, &[Sk], bool, Vec<f64>)> = slices.iter().filter(|s| s.2 && s.1.contains(&base)).collect();
+        if mine.is_empty() {
+            continue;
+        }
+        for b in 0..nb.min(series.get(base).len()) {
+            let whole = series.get(base)[b];
+            let r: f64 = mine.iter().map(|s| s.3[b]).sum();
+            if whole == 0.0 || r == 0.0 {
+                continue;
+            }
+            let norm = r.max(1.0);
+            for s in &mine {
+                if let Some(x) = series.get_mut(s.0).get_mut(b) {
+                    *x += whole * s.3[b] / norm;
+                }
+            }
+            // a slice from another family takes its share out of this base (Minijacks out of Chordjack)
+            let out: f64 = mine.iter().filter(|s| family(s.0) != family(base)).map(|s| s.3[b] / norm).sum();
+            series.get_mut(base)[b] = whole * (1.0 - out);
+            for &rest in &rests {
+                if rest.1 == base {
+                    if let Some(x) = series.get_mut(rest.0).get_mut(b) {
+                        *x = whole * (1.0 - r / norm);
+                    }
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// A density measured inside its base's demand (a ratio of two of its parts, or the technical share where the base is): the
+/// slice takes that base's demand. Any other density counts note rows or the bin's share: the slice takes the bin's total.
+fn within(d: Density) -> bool {
+    matches!(d, Density::Ratio(..) | Density::Technical)
 }
 
 pub fn star(level: f64, k: &Knobs) -> f64 {

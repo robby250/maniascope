@@ -165,7 +165,7 @@ pub fn tech_profile(chart: &Chart, rate: f64, info: &Info, k: &Knobs) -> [f64; 3
         let (a, b, c, d) = (w[0].mask, w[1].mask, w[2].mask, w[3].mask);
         let kind = if hs[0].count_ones() == 1 && hs[1].count_ones() == 1 && hs[0] != hs[1] && hs[0] == hs[2] && hs[1] == hs[3] {
             Trill::Jumptrill
-        } else if chart.keys == 4 && a == c && b == d && a & b == 0 {
+        } else if crate::taxonomy::measured(crate::skills::Sk::splittrill, chart.keys) && a == c && b == d && a & b == 0 {
             Trill::Splittrill
         } else {
             Trill::None
@@ -234,16 +234,3 @@ pub fn tech_profile(chart: &Chart, rate: f64, info: &Info, k: &Knobs) -> [f64; 3
     totals.map(|v| py::round_digits(v / total, 6))
 }
 
-/// A persistent technical texture refines a pattern name (pattern_control.technical_title).
-pub fn technical_title(name: &str, technical_sk: f64, profile: Option<&[f64; 3]>) -> String {
-    let Some(p) = profile else { return name.to_string() };
-    if p[0] < 0.5 || technical_sk < 0.6 {
-        return name.strip_prefix("Tech ").unwrap_or(name).to_string();
-    }
-    if name.starts_with("Tech ")
-        || ["SV", "Fast SV", "Slowjam SV", "Accel SV", "Stutter SV", "Brakes", "Vibro", "Mash", "Stamina"].contains(&name)
-    {
-        return name.to_string();
-    }
-    format!("Tech {name}")
-}

@@ -189,8 +189,8 @@ fn stable_library_scores_replays_and_units() {
     // watched replay of someone else is a submitted score (online id), under a name that never played here unsubmitted.
     add_live_score(&db, &live(&sha, 600000), false, None).unwrap();
     std::fs::write(root.join("scores.db"), scores_db(&md5, &[("me", stats, 812345, 64, 1_700_000_000, 0), ("me", stats, 700000, 0, 1_700_000_100, 0),
-        ("Guest", stats, 600000, 64, 1_700_000_200, 0), ("Guest", stats, 500000, 0, 1_700_000_300, 0), ("opti", stats, 450000, 0, 1_700_000_350, 0),
-        ("opti", stats, 440000, 0, 1_700_000_360, 4_000_000_001), ("topplayer", stats, 400000, 0, 1_700_000_400, 4_000_000_002)])).unwrap();
+        ("Guest", stats, 600000, 64, 1_700_000_200, 0), ("Guest", stats, 500000, 0, 1_700_000_300, 0), ("offline", stats, 450000, 0, 1_700_000_350, 0),
+        ("offline", stats, 440000, 0, 1_700_000_360, 4_000_000_001), ("topplayer", stats, 400000, 0, 1_700_000_400, 4_000_000_002)])).unwrap();
     import_library(&db, "stable").unwrap();
     let totals: Vec<i64> = db.prepare("SELECT total FROM scores ORDER BY total").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
     assert_eq!(totals, [440000, 450000, 500000, 600000, 700000, 812345]);

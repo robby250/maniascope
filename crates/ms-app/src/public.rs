@@ -1,5 +1,5 @@
-//! The population evidence: the active snapshot's mapped file, a public.pkl of an older install converted once, or the
-//! published copy for this calculator.
+//! The population evidence: the active snapshot's mapped file, any snapshot's pack of this calculator, a public.pkl of an
+//! older install converted once, or the published copy for this calculator.
 use ms_data::paths::rolling;
 use ms_data::public::{activate, active, Public};
 use ms_rec::engine::CALC_ID;
@@ -19,12 +19,21 @@ fn candidates(dir: &Path) -> [PathBuf; 2] {
 }
 
 fn local() -> Option<Result<Public, String>> {
-    let (name, _) = active()?;
-    let dir = rolling().join(name);
-    if let Some(p) = candidates(&dir).iter().find(|p| p.is_file()) {
-        return Some(ms_model::public::open(p));
+    let dir = active().map(|a| rolling().join(a.0));
+    if let Some(p) = dir.as_ref().and_then(|d| candidates(d).into_iter().find(|p| p.is_file())) {
+        let got = ms_model::public::open(&p);
+        if got.as_ref().map_or(true, |x| x.meta.calc == CALC_ID) {
+            return Some(got);
+        }
+    }
+    // Another snapshot's pack of this calculator: a build activated another folder (1.10.x had no release to download).
+    let mut others: Vec<PathBuf> = std::fs::read_dir(rolling()).into_iter().flatten().flatten().map(|e| e.path().join("calculators").join(CALC_ID).join("public.msp")).filter(|p| p.is_file()).collect();
+    others.sort();
+    if let Some(p) = others.iter().find_map(|p| ms_model::public::open(p).ok().filter(|x| x.meta.calc == CALC_ID)) {
+        return Some(Ok(p));
     }
     // An install from before the mapped format.
+    let dir = dir?;
     for pkl in [dir.join("calculators").join(CALC_ID).join("public.pkl"), dir.join("public.pkl")] {
         if pkl.is_file() {
             let to = pkl.with_extension("msp");
@@ -103,6 +112,12 @@ mod tests {
         assert_eq!(load(&h).unwrap().meta.pop.version, 1, "a failed download keeps the old evidence");
         save(CALC_ID, ms_data::public::POP_VERSION);
         assert!(load(&h).is_ok());
+        // the active folder holds another calculator's pack, a non-active one this calculator's: found offline
+        save("not-this", ms_data::public::POP_VERSION);
+        let other = rolling().join("release").join("calculators").join(CALC_ID);
+        std::fs::create_dir_all(&other).unwrap();
+        write(&other.join("public.msp"), &Meta { calc: CALC_ID.into(), pop: Population { version: ms_data::public::POP_VERSION, ..Population::default() }, ..Meta::default() }, &[]).unwrap();
+        assert_eq!(load(&h).map(|p| p.meta.calc.clone()).unwrap(), CALC_ID);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

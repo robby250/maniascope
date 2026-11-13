@@ -54,12 +54,6 @@ pub fn compute_selected(data: &[u8], parsed: &chart::Chart, rate: f64, sv: bool,
 }
 
 /// Skills whose share of the overall a chart row stores (`sk`): what Stats, skill picks and the card read.
-pub const SKILLS: [&str; 38] = ["stream", "jumpstream", "handstream", "jackspeed", "chordjack", "minijack", "chordstream", "delay",
-    "bracket", "jack", "ln", "release", "inverse", "hybrid", "shield", "sv", "technical", "vibro", "stamina",
-    "dump", "jumptrill", "splittrill", "longjack", "patterntech", "rhythmtech", "trill1h", "anchor", "mash",
-    "quadstream", "sv_fast", "sv_slow", "sv_accel", "sv_stutter", "sv_brake",
-    "ln_general", "ln_tech", "ln_inverse", "ln_release"]; // missing until 2026-11-06: every LN type read 0 charts (a player)
-
 /// calib/difficulty.json: the frozen chart-only calibration.
 pub fn standard_params() -> Params {
     let model: Value = serde_json::from_str(include_str!("../../../calib/difficulty.json")).expect("difficulty.json");
@@ -84,37 +78,7 @@ pub fn params_of(calc: &str) -> Result<Params, String> {
     let patches: Value = serde_json::from_str(include_str!("../../../calib/carry.json")).map_err(|e| e.to_string())?;
     let mut model = standard_params().model;
     merge(&mut model, patches.get(calc).ok_or_else(|| format!("no calibration kept for {calc}"))?);
-    Params::new(model, &knobs_of(calc))
-}
-
-/// The rule knobs a past calculator ran with, for carrying from it.
-pub fn knobs_of(calc: &str) -> Value {
-    use serde_json::json;
-    // Newest first: (the last calculator before a rule change, the knobs it ran with). Older calculators take every later era's.
-    let eras = [
-        ("26eaa7826874", json!({"OHT_MIX": 0})), // before 1H trills counted with the other hand playing
-        ("d3a86f7b014f", json!({"JACK_SHARE": 0.7, "JACK_SHARE_LOW": 0, "W_CENTRE": 0})), // before the jack-share curve and the centre column
-        ("09639faa6673", json!({"RATE_G": 0.12})), // before the extra rate factor on the ratings was dropped
-        ("882ee20657e4", json!({"W_STAG": 0.3})), // before staggered releases stopped costing extra
-        ("21660e31a4f6", json!({"LN_INV_LO": 0.5, "LN_INV_HI": 0.6, "LN_REL_FULL": 1.0, "LN_REL_KEYS": 0})), // before a player's Release sets
-        ("4ccede2d49cf", json!({"LN_BASE": 10, "JACK_SHARE_KEYS": 2, "JACK_P_KEYS": 0, "VF_JACK": 0, "VF_JACK_KEYS": 0})), // before the replay-found jack/LN constants
-        ("7cee1dfdba7f", json!({"LN_TECH_FULL": 0})), // before the LN skills (a player 2026-11-04): the knob only marks the change
-        ("a88aea03e865", json!({"ACC_POWER": 0})), // the peak model: its rules can't be recomputed, the knob only marks the change
-        ("f9622a2b09c8", json!({"V_FINGER": 8})), // before the finger limit came from replays
-        ("65c0a4cb63d6", json!({"W_JACK": 3.3, "W_JACK_KEYS": 0, "W_JACK_7K": 3.0, "MIRROR_ALL": 0, "CENTRE_SPLIT": 0, "V_FAST_KEYS": 2})), // before the revamp
-        ("", json!({"W_GROUP": 0, "W_MIX": 0, "W_SHAPES": 0, "JACK_SHARE_KEYS": 0})), // before the chord rules
-    ];
-    let mut k = json!({});
-    if calc == crate::CALC_ID {
-        return k;
-    }
-    for (last, knobs) in eras {
-        knobs.as_object().into_iter().flatten().for_each(|(name, v)| k[name] = v.clone());
-        if calc == last {
-            break;
-        }
-    }
-    k
+    Params::new(model, &Value::Null) // today's rules: the calibration differs, the rules can't be rebuilt
 }
 
 /// Rows stored under a calibration with display units (score_units, before 2026-11-04) back in rating units.
@@ -171,7 +135,7 @@ pub fn carried(f: &Dict, after: &Params, rate: f64, chart: &dyn Fn() -> Option<s
     let stale = !matches!(f.get("rules"), Some(Val::Str(s)) if *s == rules_stamp(after));
     let found = if stale { chart() } else { None };
     let Some(c) = found else {
-        return recalibrated(f, after, rate, &|| chart().map(|c| crate::flow::flow(&c, rate)));
+        return recalibrated(f, after, rate, &|| chart().map(|c| crate::flow::flow(&c, rate, &after.k)));
     };
     let res = compute::compute(&c, rate, true, after).ok()?;
     let mut fresh = features_of(&res, after);
@@ -213,7 +177,7 @@ pub fn features_of(res: &Dict, prm: &Params) -> Dict {
     let notes = res.get("notes").cloned().unwrap_or(Val::Int(0));
     let mut sk = Dict::new();
     if overall != 0. {
-        for k in SKILLS {
+        for k in crate::taxonomy::kept().map(|s| s.name()) {
             if let Some(v) = scores.get(k).filter(|v| v.truthy()) {
                 sk.set(k, round_digits(v.f() / overall, 4));
             }
@@ -344,48 +308,5 @@ mod shared_tests {
             rosu_pp::any::DifficultyAttributes::Mania(a) => a.stars,
             _ => unreachable!(),
         }
-    }
-}
-
-#[cfg(test)]
-mod revamp_rule_tests {
-    use super::*;
-
-    /// `keys` columns, 600 rows of `rows` cycled, `gap` ms apart.
-    fn chart_of(keys: usize, rows: &[&[usize]], gap: usize) -> chart::Chart {
-        let mut text = format!("osu file format v14\n[General]\nMode:3\n[Difficulty]\nCircleSize:{keys}\nOverallDifficulty:8\n[HitObjects]\n");
-        let mut t = 1000;
-        for i in 0..600 {
-            for &c in rows[i % rows.len()] {
-                text += &format!("{},192,{t},1,0,0:0:0:0:\n", (512 * c + 256) / keys);
-            }
-            t += gap + [0, 45, 15][i % 3]; // uneven, so hand timing has something to read
-        }
-        chart::parse(text.as_bytes()).unwrap()
-    }
-
-    fn overall(c: &chart::Chart, knobs: Value) -> f64 {
-        compute::compute(c, 1., false, &Params::new(standard_params().model, &knobs).unwrap()).unwrap().dict("scores").unwrap().f("overall")
-    }
-
-    #[test]
-    fn the_middle_key_rule_moves_odd_keymodes_only() {
-        // Hand timing goes to the execution numbers (and from there to the fitted columns), not to 7K's raw rating.
-        let k = standard_params().k;
-        let pulses = |c: &chart::Chart, split: bool| { let i = crate::execution::analyse(c, &crate::demand::geometry(c, 1., &k), k.BIN, split); (i.regular, i.switch) };
-        let seven = chart_of(7, &[&[2], &[3], &[4], &[3], &[1, 5]], 90);
-        assert_ne!(pulses(&seven, true), pulses(&seven, false));
-        let ten = chart_of(10, &[&[3], &[4], &[5], &[4], &[1, 8]], 90);
-        assert_eq!(pulses(&ten, true), pulses(&ten, false));
-    }
-
-    #[test]
-    fn the_partial_mirror_rule_reaches_every_keymode_and_needs_jacks() {
-        let (on, off) = (serde_json::json!({}), serde_json::json!({"MIRROR_ALL": 0}));
-        // Both hands jack at once, one with an extra finger moving: a partial mirror.
-        let jacks = chart_of(10, &[&[0, 1, 8], &[0, 2, 8]], 110);
-        assert_ne!(overall(&jacks, on.clone()), overall(&jacks, off.clone()));
-        let stream = chart_of(10, &[&[0], &[1], &[2], &[3], &[4], &[5], &[6], &[7], &[8], &[9]], 90);
-        assert_eq!(overall(&stream, on), overall(&stream, off));
     }
 }

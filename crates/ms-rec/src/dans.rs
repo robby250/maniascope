@@ -15,11 +15,8 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 const TABLE: &str = include_str!("../../../calib/dans.json");
-const VIBRO_GAP: f64 = 100.;  // ms: a column re-hit this fast keeps a vibro run going (10 hits/s)
-const VIBRO_RUN: usize = 6;   // hits in one column before it counts as vibro, not a jack
-pub const VIBRO_SHARE: f64 = 0.10; // share of notes in such runs: 117/120 vibro dan charts, 0.5% of ranked 4K (2026-10-01)
-const VIBRO_ONLY: f64 = 0.25; // 44/48 vibro dan charts reach it; 4/113 REFORM charts, no LN dan chart
-const VIBRO_REST: f64 = 13.;  // notes/s outside vibro runs: vibro dan charts <= 12.3, REFORM charts >= 13.5 at 10%+ vibro
+const COURSES: &str = include_str!("../../../calib/dan_courses.tsv");
+pub const VIBRO_SHARE: f64 = 0.10; // share of notes in vibro runs: 117/120 vibro dan charts, 0.5% of ranked 4K (2026-10-01)
 const LN_SHARE: f64 = 0.22;   // LN dans' charts hold >= 25% LN notes, rice dans' <= 19% (2026-10-01)
 const LN_MAJORITY: f64 = 0.5; // from here holds are most notes: the LN dan alone
 
@@ -67,22 +64,31 @@ fn data() -> &'static Data {
     })
 }
 
-/// The accuracy on a dan's songs, on the player's better plays after grinding, that reads as passing it, in every series.
-/// Real passes are 96 % regular, 95 % LN (user 2026-11-01, no source online). One value: at 96 % for regular and 95 % for LN
-/// on one shift, the user's 7K LN would read well above Azimuth (estimated from the tier table, not run).
-pub const PEAK: f64 = 0.96; // user 2026-11-10: the dan line at 96 % too (was .95)
+/// (accuracy that clears the tier's dan, in stable's units?) from the `pass` column of calib/dan_courses.tsv: "96" stable
+/// accuracy, "97v2" ScoreV2 (counts MAX above 300 like lazer). Each course's
+/// own rule (checked 2026-11-11): Jinjin 7K regular 96 %, LN 95 % (forum t/304618); REFORM 96 % ("like other official
+/// Reform Dan courses", set 1156299); CT's 10K 96 % normal clear (set 2084293); 4K LN v2 97 % ScoreV2 (set 891143). AXian's
+/// 6K sets (2526107/128/129/142, 2531711, 2532062/64/67) name none: 96 % as the other regular dans. Staravia's Vibro
+/// courses (563163/564238) ask only for a pass at HP 8.4–9.2 ("getting bad accuracy will not be very fatal"); the other
+/// Vibro Dan Courses (973783/973787) state Beginner Clear 93 %, Expert 96 %: 93 %.
+pub fn pass(series: &str, tier: &str) -> Option<(f64, bool)> {
+    let row = COURSES.lines().skip(1).map(|l| l.split('\t').collect::<Vec<_>>()).find(|f| f.len() > 8 && f[0] == series && f[2] == tier)?;
+    let (number, v2) = row[8].strip_suffix("v2").map_or((row[8], false), |n| (n, true));
+    Some((number.parse::<f64>().ok()? / 100., !v2))
+}
 
 pub fn tiers(series: &str) -> Option<&'static Tiers> {
     data().series.get(series)
 }
 
-/// {tier: [features at 1.0×]} of the series' dan songs, in tier order of the table.
-pub fn songs(series: &str, c: &Consts) -> HashMap<String, Vec<Feats>> {
+/// {tier: [(features at 1.0×, the skills it demands)]} of the series' dan songs (a course without songs of its own split at
+/// its song boundaries), in tier order of the table.
+pub fn songs(series: &str, c: &Consts) -> HashMap<String, Vec<(Feats, Vec<&'static str>)>> {
     // Read for Stats only: held for the app's life the parsed songs were 12 MB.
     let table: Value = serde_json::from_str(TABLE).unwrap_or(Value::Null);
     table["songs"][series].as_object().map_or_else(HashMap::new, |o| o.iter().map(|(tier, list)| {
         let feats = list.as_array().map_or_else(Vec::new, |l| l.iter().filter_map(|f| match from_json(f) {
-            Val::Dict(d) => Feats::of(&d, c).ok(),
+            Val::Dict(d) => Some((Feats::of(&d, c).ok()?, ms_model::skills::demanded(&d))),
             _ => None,
         }).collect());
         (tier.clone(), feats)
@@ -99,47 +105,7 @@ pub fn rating_at(series: &str, p: f64) -> Option<f64> {
     Some((t[j].1 + (p - j as f64) * (t[j + 1].1 - t[j].1)).exp())
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Vibro {
-    pub share: f64,
-    pub speed: f64,
-    pub rest: f64,
-}
-
-/// Share of notes in same-column runs (>= VIBRO_RUN hits, <= VIBRO_GAP apart at this rate), their median hits per second,
-/// and the other notes per second of chart. Rolls count too: their columns repeat just as fast.
-pub fn vibro_runs(notes: &[(f64, usize)], rate: f64) -> Vibro {
-    let mut cols: HashMap<usize, Vec<f64>> = HashMap::new();
-    for &(start, col) in notes {
-        cols.entry(col).or_default().push(start / rate);
-    }
-    let (mut inrun, mut gaps) = (0, Vec::new());
-    for times in cols.values_mut() {
-        times.sort_by(f64::total_cmp);
-        let mut run = vec![times[0]];
-        for &t in times[1..].iter().chain(std::iter::once(&f64::INFINITY)) {
-            if t - run[run.len() - 1] <= VIBRO_GAP {
-                run.push(t);
-            } else {
-                if run.len() >= VIBRO_RUN {
-                    inrun += run.len();
-                    gaps.extend(run.windows(2).map(|w| w[1] - w[0]));
-                }
-                run = vec![t];
-            }
-        }
-    }
-    gaps.sort_by(f64::total_cmp);
-    let (lo, hi) = notes.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, n| (a.0.min(n.0), a.1.max(n.0)));
-    let span = if notes.is_empty() { 0. } else { (hi - lo) / rate / 1000. };
-    Vibro { share: inrun as f64 / notes.len().max(1) as f64, speed: if gaps.is_empty() { 0. } else { 1000. / gaps[gaps.len() / 2] },
-            rest: if span != 0. { (notes.len() - inrun) as f64 / span } else { 0. } }
-}
-
-/// Mostly vibro runs with little else: the rice/LN dan would name the wrong skill.
-pub fn vibro_only(v: &Vibro) -> bool {
-    v.share >= VIBRO_ONLY && v.rest < VIBRO_REST
-}
+pub use ms_calc::structure::{vibro_only, vibro_runs, Vibro};
 
 fn value(series: &str, rating: f64, vibro: Option<&Vibro>) -> f64 {
     value_with(data().weights, series, rating, vibro)
@@ -165,9 +131,13 @@ pub fn position(t: &[(String, f64)], v: f64) -> f64 {
 
 /// Nearest dan, with −/+ when the chart sits more than a quarter of the way to the next one.
 pub fn place(series: &str, rating: f64, vibro: Option<&Vibro>) -> Option<String> {
+    named(series, position(tiers(series).filter(|t| !t.is_empty())?, value(series, rating, vibro)))
+}
+
+/// The dan at fractional tier p of the series.
+pub fn named(series: &str, p: f64) -> Option<String> {
     let t = tiers(series).filter(|t| !t.is_empty())?;
     let prefix = short(series);
-    let p = position(t, value(series, rating, vibro));
     if p < -0.5 {
         return Some(format!("below {prefix}{}", t[0].0));
     }
@@ -196,23 +166,34 @@ pub fn label(keys: i64, rating: f64, ln_share: f64, vibro: Option<&Vibro>) -> Op
 
 /// The dan series kind a Stats skill is placed on: LN skills on the LN dans.
 pub fn ability_kind(skill: &str) -> &'static str {
-    if skill.split('/').next() == Some("ln") { "ln" } else { "rice" }
+    ms_calc::taxonomy::family_label(skill.split('/').next().unwrap_or("")).map_or("rice", |f| f.1)
 }
 
-/// Dan whose charts sit at a player's Level difficulty (stats::TARGET) for this Stats skill. scale: {kind: factor} from the player's
-/// predicted accuracy on the dan songs; without it the level's rating is placed. None for vibro (its dans need a vibro
-/// speed) and keymodes without dans.
-pub fn ability(keys: i64, value: f64, skill: &str, scale: &HashMap<String, f64>) -> Option<String> {
+/// The dan a Stats value reads as: values come from the player's predicted accuracy on that skill's dan songs
+/// (stats::dan_value), so the rating places directly. None for vibro (its dan is stats::Group::dan) and keymodes without dans.
+pub fn ability(keys: i64, value: f64, skill: &str) -> Option<String> {
     if skill.ends_with("vibro") {
         return None;
     }
-    let k = ability_kind(skill);
-    place(series(keys, k)?, value * scale.get(k).copied().unwrap_or(1.), None)
+    place(series(keys, ability_kind(skill))?, value, None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_dan_tier_has_its_courses_pass_mark() {
+        assert_eq!(pass("7K LN", "1st"), Some((0.95, true)));
+        assert_eq!(pass("4K LN", "1st"), Some((0.97, false))); // ScoreV2
+        assert_eq!(pass("4K REFORM", "Theta"), Some((0.96, true)));
+        assert_eq!(pass("4K Vibro", "Vibro W"), Some((0.93, true)));
+        for (series, tiers) in &data().series {
+            for (tier, _) in tiers {
+                assert!(pass(series, tier).is_some(), "{series} {tier}");
+            }
+        }
+    }
 
     #[test]
     fn ladder_reads_its_own_anchors() {
@@ -223,9 +204,10 @@ mod tests {
 
     #[test]
     fn a_long_vibro_run_counts_and_a_short_one_does_not() {
-        let run: Vec<(f64, usize)> = (0..10).map(|i| (f64::from(i) * 50., 0)).collect();
-        assert_eq!(vibro_runs(&run, 1.).share, 1.);
-        assert_eq!(vibro_runs(&run[..4], 1.).share, 0.);
+        let k = ms_calc::params::Knobs::default();
+        let run = |n: usize| ms_calc::chart::Chart { keys: 4, t: (0..n).map(|i| i as f64 * 50.).collect(), end: (0..n).map(|i| i as f64 * 50.).collect(), col: vec![0; n], ..Default::default() };
+        assert_eq!(vibro_runs(&run(10), 1., &k).share, 1.);
+        assert_eq!(vibro_runs(&run(4), 1., &k).share, 0.);
     }
 }
 

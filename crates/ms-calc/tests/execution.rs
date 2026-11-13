@@ -1,11 +1,9 @@
 //! Compact Mash, honest Tech/SV attribution, archetype qualification.
 mod common;
 use common::*;
-use ms_calc::card::card;
 use ms_calc::features::standard_params;
-use ms_calc::pattern::technical_title;
 use ms_calc::scroll::reading;
-use ms_calc::skills::skills;
+use ms_calc::taxonomy::rated as skills;
 use ms_calc::val::{Dict, Val};
 
 #[test]
@@ -72,46 +70,64 @@ fn scores(values: &[(&str, f64)]) -> Dict {
 }
 
 #[test]
-fn ln_release_refinement_precedes_generic_tech_ln() {
+fn the_card_lists_skills_by_rating_that_count_with_modifier_tags() {
+    // Plan 2026-11-12: one row per family, rated by its strongest member and named by its type; a modifier is a tag.
     let mut result = Dict::new();
     result.set("keys", 7i64);
-    result.set("scores", scores(&[("overall", 10.), ("ln", 10.), ("ln_release", 9.3), ("delay", 9.5), ("technical", 8.), ("ln_general", 6.3), ("chordstream", 7.2)]));
-    let entry = |name: &str, rating: f64, parts: &[&str]| {
+    result.set("scores", scores(&[("overall", 10.), ("ln", 6.0), ("ln_release", 9.3), ("delay", 9.5), ("stream", 9.4), ("technical", 9.9), ("chordstream", 2.0)]));
+    let mut tags = Dict::new();
+    let mut release = Dict::new();
+    release.set("Stamina", 0.95);
+    release.set("Tech", 0.2);
+    tags.set("ln_release", release);
+    result.set("tags", tags);
+    let rows = ms_calc::card::card_with(&result, 6, 0.9, 0.9);
+    let field = |e: &Val, k: &str| match e { Val::Dict(d) => d.get(k).cloned(), _ => None };
+    let names: Vec<String> = rows.iter().filter_map(|e| match field(e, "name") { Some(Val::Str(s)) => Some(s), _ => None }).collect();
+    assert_eq!(names, ["Stream", "LN Release"], "one row per family (Delay and Stream; LN named by its type), technical is a tag, Chordstream under SHOW of the top row");
+    assert!(matches!(field(&rows[1], "tags"), Some(Val::Tuple(t)) | Some(Val::List(t)) if t.len() == 1 && matches!(&t[0], Val::Str(s) if s == "Stamina")));
+}
+
+/// (names, tags) of a card made from scores and per-row tag shares.
+fn card_of(values: &[(&str, f64)], shares: &[(&str, f64, f64)]) -> Vec<(String, Vec<String>)> {
+    let mut result = Dict::new();
+    result.set("keys", 7i64);
+    result.set("scores", scores(values));
+    let mut tags = Dict::new();
+    for (s, tech, stamina) in shares {
         let mut d = Dict::new();
-        d.set("name", name);
-        d.set("rating", rating);
-        d.set("parts", Val::strs(parts));
-        Val::Dict(d)
-    };
-    let mut tech = entry("Tech LN", 10., &["ln", "technical"]);
-    if let Val::Dict(d) = &mut tech {
-        d.set("of", "ln");
+        d.set("Tech", *tech);
+        d.set("Stamina", *stamina);
+        tags.set(*s, d);
     }
-    result.set("archetypes", Val::List(vec![tech, entry("LN Release", 9.3, &["ln_release", "ln"])]));
-    let Val::Dict(first) = &card(&result)[0] else { panic!() };
-    assert!(first.get("name").is_some_and(|n| matches!(n, Val::Str(s) if s.starts_with("LN · Release"))));
+    result.set("tags", tags);
+    let strs = |v: Option<&Val>| match v { Some(Val::List(l) | Val::Tuple(l)) => l.iter().filter_map(|x| if let Val::Str(s) = x { Some(s.clone()) } else { None }).collect(), _ => Vec::new() };
+    ms_calc::card::card_with(&result, 6, 0.9, 0.9).iter().filter_map(|e| match e {
+        Val::Dict(d) => Some((match d.get("name") { Some(Val::Str(s)) => s.clone(), _ => String::new() }, strs(d.get("tags")))),
+        _ => None,
+    }).collect()
 }
 
 #[test]
-fn ln_tech_requires_the_original_prevalence_and_demand_without_promotion() {
-    assert_eq!(technical_title("LN", 0.75, Some(&[0.43, 0., 0.])), "LN");
-    assert_eq!(technical_title("LN", 0.55, Some(&[0.8, 0., 0.])), "LN");
-    assert_eq!(technical_title("LN", 0.75, Some(&[0.8, 0., 0.])), "Tech LN");
+fn one_row_per_family_named_by_its_type_with_1_9_0_tags() {
+    // Plan 2026-11-12: a Stream-led LN chart shows one LN row (the family's whole rating), named by its strongest type.
+    let card = card_of(&[("overall", 10.), ("stream", 8.), ("ln", 7.), ("ln_general", 3.), ("ln_inverse", 6.6), ("ln_release", 6.5), ("ln_tech", 6.9)],
+                       &[("stream", 0.2, 0.5), ("ln", 0.95, 0.95)]);
+    let names: Vec<&str> = card.iter().map(|c| c.0.as_str()).collect();
+    assert_eq!(names, ["Stream", "LN Tech"], "one LN row, never Inverse and Release both; its Stamina tag stands in for the Stamina row");
+    assert!(card[1].1.iter().all(|t| t != "Tech"), "LN Tech carries no Tech tag");
+    assert_eq!(card[1].1, ["Stamina"], "a row ≥ .6 of the top sustained ≥ .9 is tagged");
+    // a row under .6 of the top is not tagged Stamina however sustained; the Stamina row reads the best sustained row
+    let card = card_of(&[("overall", 10.), ("stream", 8.), ("chordjack", 4.)], &[("stream", 0., 0.6), ("chordjack", 0., 1.)]);
+    assert_eq!(card, [("Stream".into(), vec![]), ("Stamina".into(), vec![]), ("Chordjack".into(), vec![])]);
 }
 
 #[test]
-fn ln_types_share_one_row_when_ln_stamina_took_the_ln_entry() {
-    // A player 2026-11-10, Chinese Pop LN Release chart: "LN Stamina · LN · General · LN · Mix". One LN row, the stamina one,
-    // named by Release (within 0.75 of General) with Stamina after it.
-    let mut result = Dict::new();
-    result.set("keys", 7i64);
-    result.set("scores", scores(&[("overall", 6.), ("ln", 6.4), ("stamina", 6.5), ("ln_general", 6.4), ("ln_release", 5.), ("ln_tech", 1.)]));
-    let mut d = Dict::new();
-    d.set("name", "LN Stamina");
-    d.set("rating", 6.5);
-    d.set("parts", Val::strs(&["ln", "stamina"]));
-    result.set("archetypes", Val::List(vec![Val::Dict(d)]));
-    let names: Vec<String> = card(&result).iter().filter_map(|e| match e { Val::Dict(d) => d.get("name").and_then(|n| match n { Val::Str(s) => Some(s.clone()), _ => None }), _ => None }).collect();
-    let ln: Vec<&String> = names.iter().filter(|n| n.starts_with("LN")).collect();
-    assert_eq!(ln, ["LN · Release Stamina"], "{names:?}");
+fn each_tag_goes_on_the_highest_row_that_qualifies() {
+    // user 2026-11-13: one Tech and one Stamina per card; the name Tech uses up nothing; LN General never carries Tech
+    let card = card_of(&[("overall", 10.), ("stream", 8.), ("chordjack", 7.5), ("ln", 7.), ("ln_general", 7.)],
+                       &[("stream", 0.95, 0.5), ("chordjack", 0.95, 0.95), ("ln", 0.95, 0.95)]);
+    assert_eq!(card, [("Stream".into(), vec!["Tech".into()]), ("Chordjack".into(), vec!["Stamina".into()]), ("LN General".into(), vec![])]);
+    let card = card_of(&[("overall", 10.), ("ln", 8.), ("ln_general", 8.), ("stream", 7.5)], &[("ln", 0.95, 0.5), ("stream", 0.95, 0.5)]);
+    assert_eq!(card[..2], [("LN General".into(), vec![]), ("Stream".into(), vec!["Tech".into()])], "LN General passes the Tech tag down");
 }

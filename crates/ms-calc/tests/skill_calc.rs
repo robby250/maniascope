@@ -6,7 +6,8 @@ use ms_calc::chart::{parse, ChartError, Chart};
 use ms_calc::compute::compute;
 use ms_calc::features::standard_params;
 use ms_calc::params::Params;
-use ms_calc::skills::{skills, Sk};
+use ms_calc::skills::Sk;
+use ms_calc::taxonomy::rated as skills;
 use ms_calc::val::{Dict, Val};
 use serde_json::{json, Value};
 
@@ -47,7 +48,7 @@ fn empty_model() -> Params {
 }
 
 fn top(notes: &[Note], keys: usize, n: usize) -> Vec<&'static str> {
-    ranked(&res(notes, keys)).into_iter().take(n).map(Sk::name).collect()
+    ranked(&res(notes, keys), 1.0).into_iter().take(n).map(|r| r.0.name()).collect()
 }
 
 fn name_of(e: &Val) -> String {
@@ -105,13 +106,12 @@ fn parsing_and_rate() {
     let shuffled = parse(&osu(&chords, 7, 3, true, &[DEFAULT_TIMING.to_string()])).unwrap();
     assert_eq!(sc(&chords, 7).values_f(), run(&shuffled, 1.).dict("scores").unwrap().values_f());
     assert!((sc(&stream_at(1200, 100, 7, 91234), 7).f("overall") - a.f("overall")).abs() < 1e-9);
-    // rate applied exactly once: 100 ms stream at 1.25x == 80 ms stream at 1.0x, plus the rate factor. The physical
-    // core invariant, before the fitted score-link transform.
+    // rate applied exactly once: 100 ms stream at 1.25x == 80 ms stream at 1.0x. The physical core invariant, before the
+    // fitted score-link transform.
     let raw = empty_model();
-    let (r, g) = (1.25f64, raw.k.RATE_G);
-    let fast = run_with(&file(&base, 7), r, &raw).dict("scores").unwrap().f("overall");
+    let fast = run_with(&file(&base, 7), 1.25, &raw).dict("scores").unwrap().f("overall");
     let sped = run_with(&file(&stream(1200, 80, 7), 7), 1., &raw).dict("scores").unwrap().f("overall");
-    assert!((fast / r.powf(g) - sped).abs() < 1e-6);
+    assert!((fast - sped).abs() < 1e-6);
     // every keymode parses; non-mania is explicit
     for k in 4..=10 {
         assert!(sc(&stream(400, 100, k as i64), k).f("overall") > 0.);
@@ -146,9 +146,8 @@ fn rate_sweep_is_smooth_and_uncapped() {
 fn a_rate_scales_every_rating_alike() {
     let raw = empty_model();
     let (a, b) = (run_with(&file(&stream(1200, 100, 7), 7), 1.25, &raw), run_with(&file(&stream(1200, 80, 7), 7), 1., &raw));
-    let factor = 1.25f64.powf(raw.k.RATE_G);
     for key in ["overall", "stamina"] {
-        assert!((score(&a, key) / factor / score(&b, key) - 1.).abs() < 1e-10, "{key}");
+        assert!((score(&a, key) / score(&b, key) - 1.).abs() < 1e-10, "{key}");
     }
     let share = |r: &Dict| score(r, "stamina") / score(r, "overall");
     let feature = ms_calc::features::features_of(&a, &raw);
@@ -188,9 +187,9 @@ fn hand_patterns() {
     // same row rate, different hands: one-hand trill > 7-key staircase roll
     let trill: Vec<Note> = (0..600).map(|i| (1000 + 100 * i, (i % 2) as usize, None)).collect();
     assert!(sc(&trill, 7).f("overall") > 1.2 * sc(&stream(600, 100, 7), 7).f("overall"));
-    // single-column jack is Jack (7K) / Jackspeed (4K); repeated chords are chordjack
-    assert_eq!(top(&col(2, 150, 400), 7, 1), ["jack"]);
-    assert_eq!(top(&col(2, 150, 400), 4, 1), ["jackspeed"]);
+    // a long single-column run is Longjack, the slice of Jacks it fills; repeated chords are chordjack
+    assert_eq!(top(&col(2, 150, 400), 7, 1), ["longjack"]);
+    assert_eq!(top(&col(2, 150, 400), 4, 1), ["longjack"]);
     // an anchor with the other hand in between is still a jack in 7K (the hand repeats); 200 ms repeats: since 21660e31a4f6
     // slower 7K jacks cost less (JACK_P curve), and at 240 ms stamina of the 800-note run ranks above it
     let anchor: Vec<Note> = (0..800i64).map(|i| (1000 + 100 * i, if i % 2 == 1 { 1 } else { (5 + (i / 2) % 2) as usize }, None)).collect();
@@ -200,7 +199,7 @@ fn hand_patterns() {
     assert!(!top(&cj, 7, 3).contains(&"bracket"));
     // chords without repeats are chordstream, fast light rice is delay (7777's Delay packs)
     let hs = sc(&rows(&[&[1, 3, 6], &[0, 2, 5]], 160, 400), 7);
-    assert!(hs.f("chordstream") > hs.f("chordjack"));
+    assert!(hs.f("chordstream").max(hs.f("bracket")) > hs.f("chordjack")); // Bracket is a slice of Chordstream
     let rice = |gap: i64| -> Vec<Note> {
         (0..1500i64).flat_map(|i| {
             let mut cols = vec![((i * 3) % 7) as usize];
@@ -220,11 +219,11 @@ fn hand_patterns() {
     // disjoint chord moves that never interleave are chordstream (user 2026-10-11: cigarettes)
     let cs = rows(&[&[0, 1, 4, 5], &[2, 6]], 120, 800);
     assert_eq!(top(&cs, 7, 1), ["chordstream"]);
-    assert!(!top(&cs, 7, 3).contains(&"bracket"));
+    assert!(sc(&cs, 7).f("bracket") < 0.5 * sc(&cs, 7).f("chordstream"));
     // a smooth roll is not technical; broken rhythm is
     assert!(sc(&stream(600, 100, 7), 7).f("technical") < 0.25);
     let swing: Vec<Note> = (0..600).map(|i| (1000 + 100 * i + if i % 3 == 1 { 37 } else { 0 }, (i % 7) as usize, None)).collect();
-    assert!(sc(&swing, 7).f("technical") > 1. && top(&swing, 7, 3).contains(&"technical"));
+    assert!(sc(&swing, 7).f("technical") > 1.); // a modifier: a tag on the card, never a row
     // smooth fast rolls back onto the 1/4 grid and tap -> LN accents are not technical
     let roll: Vec<Note> = (0..300).flat_map(|i| [(0, 0), (19, 1), (38, 2), (57, 3), (150, 5), (225, 6)].map(|(dt, c)| (1000 + 300 * i + dt, c, None))).collect();
     assert!(sc(&roll, 7).f("technical") < 0.25);
@@ -278,8 +277,11 @@ fn mashed_rolls_read_as_vibro_not_stream() {
     let order = [2, 3, 0, 1];
     let roll: Vec<Note> = (0..1600).map(|i| (1000 + 21 * i, order[i as usize % 4], Some(1000 + 21 * i + 42))).collect();
     let r = res(&roll, 4);
-    assert!(name_of(&card(&r)[0]).starts_with("Jacks · Vibro"));
-    assert!(score(&r, "vibro") > 2. * score(&r, "stream").max(score(&r, "dump")).max(score(&r, "ln")));
+    // Vibro and Dump both slice the roll's stream (one rule for every slice): Vibro leads or follows Dump, over plain rice
+    let n: Vec<String> = card(&r).iter().take(2).map(name_of).collect();
+    let s = |k: &str| score(&r, k);
+    assert!(n.iter().any(|x| x == "Vibro"), "{n:?} vibro {} dump {} stream {} stamina {} jackspeed {}", s("vibro"), s("dump"), s("stream"), s("stamina"), s("jackspeed"));
+    assert!(score(&r, "vibro") > 2. * score(&r, "stream").max(score(&r, "ln")));
     // the same roll at a hittable 60 ms per row stays rice
     let slow: Vec<Note> = (0..600).map(|i| (1000 + 60 * i, order[i as usize % 4], None)).collect();
     assert!(sc(&slow, 4).f("vibro") < 0.1);
@@ -289,19 +291,21 @@ fn mashed_rolls_read_as_vibro_not_stream() {
 fn card_taxonomy() {
     // a long single-column run is a Longjack (it replaces Jack); a lone pair inside rice is a Minijack
     let long: Vec<Note> = (0..400).map(|i| (1000 + 150 * i, 2, None)).collect();
-    assert!(names(&long, 7)[0].starts_with("Jacks · Longjack"));
+    assert_eq!(names(&long, 7)[0], "Longjacks");
     let mini: Vec<Note> = (0..1200i64).map(|i| (1000 + 110 * i, (if i % 4 < 2 { (i / 2) * 3 % 7 } else { (i * 3) % 7 }) as usize, None)).collect();
     let n = names(&mini, 7);
-    assert!(n.iter().any(|x| x.starts_with("Jacks · Minijack")) && !n.iter().any(|x| x.contains("Longjack")));
+    assert!(n.iter().any(|x| x == "Minijacks") && !n.iter().any(|x| x.contains("Longjack")), "{n:?}");
     // tap -> hold in the same column (1/4 apart) is Shield; release -> re-press right away is Inverse
     let shield: Vec<Note> = (0..300i64).flat_map(|i| [(1000 + 400 * i, (i % 7) as usize, None), (1100 + 400 * i, (i % 7) as usize, Some(1350 + 400 * i))]).collect();
-    assert!(names(&shield, 7).iter().any(|x| x.starts_with("LN · Shields")));
+    let ss = sc(&shield, 7);
+    assert!(names(&shield, 7).iter().any(|x| x == "LN Shields"), "{:?} shield {} ln {} minijack {} stream {} stamina {}", names(&shield, 7), ss.f("shield"), ss.f("ln"), ss.f("minijack"), ss.f("stream"), ss.f("stamina"));
     let inverse: Vec<Note> = (0..300).flat_map(|i| [1, 5].map(|c| (1000 + 300 * i, c, Some(1250 + 300 * i)))).collect();
-    assert!(names(&inverse, 7).iter().any(|x| x.starts_with("LN · Inverse")), "{:?}", names(&inverse, 7));
-    // broken rhythm reads as Tech <pattern>, never a bare Technical; a component never repeats
+    assert!(names(&inverse, 7).iter().any(|x| x == "LN Inverse"), "{:?}", names(&inverse, 7));
+    // broken rhythm tags the pattern Tech, never a bare Technical row; a component never repeats
     let swing: Vec<Note> = (0..600).map(|i| (1000 + 100 * i + if i % 3 == 1 { 37 } else { 0 }, (i % 7) as usize, None)).collect();
     let entries = card(&res(&swing, 7));
-    assert!(name_of(&entries[0]).starts_with("Tech ") && !entries.iter().any(|e| name_of(e) == "Technical"));
+    let tagged = |e: &Val| matches!(e, Val::Dict(d) if matches!(d.get("tags"), Some(Val::Tuple(t)) | Some(Val::List(t)) if t.iter().any(|x| matches!(x, Val::Str(s) if s == "Tech"))));
+    assert!(tagged(&entries[0]) && !entries.iter().any(|e| name_of(e) == "Technical"));
     let mut parts: Vec<String> = entries.iter().flat_map(parts_of).collect();
     let all = parts.len();
     parts.sort();
@@ -332,7 +336,7 @@ fn changing_jumptrill() {
         let c = file(&rows(changing, 90, 400), keys);
         // Recognition does not change physical demand. The score calibration is pattern-sensitive, checked separately.
         let result = run_with(&c, 1., &empty_model());
-        assert_eq!(ranked(&result)[0].name(), "jumptrill");
+        assert_eq!(ranked(&result, 1.0)[0].0.name(), "jumptrill");
         let plain = run_with(&c, 1., &Params::new(json!({}), &json!({"TRILL_GAP": 0})).unwrap());
         for k in ["overall", "stamina"] {
             assert_eq!(score(&result, k), score(&plain, k));
@@ -426,12 +430,12 @@ fn hand_descriptors() {
 
 #[test]
 fn tech_card() {
-    // tech inside the dump passage: Tech Dump replaces Dump; Technical, Pattern/Rhythm Tech never bare; no part twice;
-    // a partial Tech X never sits next to its own X
+    // tech inside the dump passage: Dump with a Tech tag; Technical, Pattern/Rhythm Tech never rows; no part twice
     let r = res(&dump(&[40, 40, 40, 60, 60], 900, &DUMP_COLS), 4);
     let entries = card(&r);
     let n: Vec<String> = entries.iter().map(name_of).collect();
-    assert!(n[0] == "Tech Dump" && !n.iter().any(|x| x == "Dump"), "{n:?}");
+    let tagged = |e: &Val| matches!(e, Val::Dict(d) if matches!(d.get("tags"), Some(Val::Tuple(t)) | Some(Val::List(t)) if t.iter().any(|x| matches!(x, Val::Str(s) if s == "Tech"))));
+    assert!(n[0] == "Dump" && tagged(&entries[0]), "{n:?}");
     assert!(!n.iter().any(|x| ["Technical", "Pattern Tech", "Rhythm Tech"].contains(&x.as_str())));
     let mut parts: Vec<String> = entries.iter().flat_map(parts_of).collect();
     let all = parts.len();
@@ -492,77 +496,6 @@ fn regular_inserted_jacks_retain_pattern_evidence() {
     assert_eq!(profile_of(&c, 1.), [1., 1., 0.]);
 }
 
-fn with_archetype(scores_of: &[(&str, f64)], name: &str, rating: f64, parts: &[&str], of: Option<&str>, technical: Option<f64>) -> Dict {
-    let mut sc = Dict::new();
-    for s in skills(7) {
-        sc.set(s.name(), 0.);
-    }
-    sc.set("overall", 0.);
-    for (k, v) in scores_of {
-        sc.set(k, *v);
-    }
-    let mut a = Dict::new();
-    a.set("name", name);
-    a.set("rating", rating);
-    a.set("parts", Val::strs(parts));
-    if let Some(of) = of {
-        a.set("of", of);
-    }
-    let mut res = Dict::new();
-    res.set("keys", 7i64);
-    res.set("scores", sc);
-    res.set("archetypes", Val::List(vec![Val::Dict(a)]));
-    if let Some(t) = technical {
-        let mut p = Dict::new();
-        p.set("technical", t);
-        res.set("tech_profile", p);
-    }
-    res
-}
-
-#[test]
-fn preexisting_tech_archetype_obeys_same_profile_qualification() {
-    let of = |t| card(&with_archetype(&[("overall", 10.), ("delay", 9.), ("stamina", 8.8), ("technical", 8.7)], "Tech Stream", 9., &["delay", "technical"], Some("delay"), t));
-    let legacy = of(None);
-    assert_eq!(name_of(&legacy[0]), "Tech Stream");
-    let qualified = of(Some(0.3));
-    assert_eq!(name_of(&qualified[0]), "Stream"); // 7K Delay shows as Stream (one family, 2026-11-02)
-    let rating = |e: &Val| if let Val::Dict(d) = e { d.f("rating") } else { panic!() };
-    assert_eq!(qualified.iter().map(rating).collect::<Vec<_>>(), legacy.iter().map(rating).collect::<Vec<_>>());
-    assert_eq!(parts_of(&qualified[0]), ["delay"]);
-    assert_eq!(of(Some(0.8)), legacy);
-}
-
-#[test]
-fn unqualified_technical_only_archetype_does_not_consume_a_card_slot() {
-    let res = with_archetype(&[("overall", 10.), ("ln", 9.), ("delay", 8.), ("stamina", 7.8), ("technical", 9.5), ("patterntech", 9.)],
-                             "Tech Control", 9.5, &["technical", "patterntech"], None, Some(0.3));
-    let entries = card(&res);
-    assert_eq!((name_of(&entries[0]), parts_of(&entries[0])), ("LN".to_string(), vec!["ln".to_string()]));
-    assert!(entries.iter().all(|e| name_of(e) != "Control"));
-}
-
-#[test]
-fn existing_tech_description_can_be_requalified_and_legacy_is_preserved() {
-    use ms_calc::pattern::technical_title;
-    assert_eq!(technical_title("Tech LN", 0.8, Some(&[0.3, 0., 0.])), "LN");
-    assert_eq!(technical_title("Tech Delay", 0.8, None), "Tech Delay");
-    assert_eq!(technical_title("Delay", 0.8, Some(&[0.8, 0., 0.])), "Tech Delay");
-}
-
-#[test]
-fn delay_keeps_its_stream_name_without_ln_tech_prevalence() {
-    let res = with_archetype(&[("overall", 10.), ("delay", 8.54), ("ln", 8.27), ("release", 7.18), ("technical", 5.17), ("bracket", 7.49)], "x", 0., &[], None, None);
-    let mut res = res;
-    res.set("archetypes", Val::List(Vec::new()));
-    res.set("notes", 100i64);
-    res.set("ln_notes", 83i64);
-    let mut p = Dict::new();
-    p.set("technical", 0.43);
-    res.set("tech_profile", p);
-    assert_eq!(name_of(&card(&res)[0]), "Stream");
-}
-
 #[test]
 fn a_one_note_chart_carries_the_structure_stamp() {
     // The library counts a chart analysed when its nps.version is current; a 1-note chart had none and was analysed forever.
@@ -574,12 +507,10 @@ fn a_one_note_chart_carries_the_structure_stamp() {
 
 #[test]
 fn an_ln_type_names_the_ln_entry_instead_of_a_second_rating() {
-    // Rolling holds read "LN 4.8 · LN General 4.1" before: LN leads, its strongest type rides on its name.
+    // Rolling holds read "LN 4.8 · LN General 4.1" before (a family total beside its type): one LN row, named by its type.
     let holds: Vec<Note> = (0..400i64).map(|i| (1000 + 200 * i, (i % 7) as usize, Some(1000 + 200 * i + 150 + 40 * (i % 3)))).collect();
     let n = names(&holds, 7);
-    assert!(n.iter().any(|x| *x == "LN · General"), "{n:?}");
-    let ln: Vec<&String> = n.iter().filter(|x| x.starts_with("LN")).collect();
-    assert_eq!(ln.len(), 1, "{n:?}");
+    assert!(n.first().is_some_and(|x| x.starts_with("LN ")) && n.iter().filter(|x| x.starts_with("LN")).count() == 1, "{n:?}");
 }
 
 #[test]
@@ -589,5 +520,5 @@ fn a_chart_row_stores_the_ln_types() {
     let data = osu(&holds, 7, 3, false, &[DEFAULT_TIMING.to_string()]);
     let out = ms_calc::features::chart_features(&data, &[1.], &standard_params()).unwrap();
     let sk = out[0].1.dict("sk").expect("sk");
-    assert!(sk.get("ln_general").is_some_and(|v| v.f() > 0.), "{:?}", sk.get("ln"));
+    assert!(sk.get("ln").is_some_and(|v| v.f() > 0.) && sk.get("ln_release").is_some(), "{:?}", sk.get("ln"));
 }

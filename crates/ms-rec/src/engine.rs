@@ -23,11 +23,14 @@ use std::sync::{Arc, Mutex};
 
 /// recommend.predictor_id of the model the Rust port reproduces: forecasts stay comparable across the port. A change to
 /// the prediction model takes a new id, so old forecasts are not read as this model's.
-pub const PREDICTOR_ID: &str = "a6d61e058f5d"; // vibro charts out of the ability fit (2026-11-10); was dfd6aaab0957
-pub const CALC_ID: &str = "f92680b7b136";
+pub const PREDICTOR_ID: &str = "532ce129f6fa"; // predictor families from the skill table (2026-11-11); was a6d61e058f5d
+pub const CALC_ID: &str = "2789b337ae54";
 /// Differ from CALC_ID in calibration only (calib/carry.json), newest first: a crawl still running holds the website rows back a whole
 /// calculator, so those can start older than the library's. Each carry keeps its source row.
-pub const CARRIED_CALCS: [&str; 10] = ["2f01eca5e738", "7cee1dfdba7f", "a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f"];
+// Every shipped calculator, newest last: a ship that leaves its predecessor out drops the scores whose chart file is gone
+// (1.10.0: 7K evidence 8718 → 3959 plays on a copy without the files).
+pub const CARRIED_CALCS: [&str; 17] = ["2f01eca5e738", "7cee1dfdba7f", "a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f",
+                                       "4ccede2d49cf", "09639faa6673", "d3a86f7b014f", "f92680b7b136", "0f9f7da275f1", "a386c60fbb06", "a990d0ea0ada"];
 const SURE_PLAYS: usize = 50; // of the player's own, on a keymode: fewer and the model is mostly the population's guess
 pub const ACTIVE_KEYS: std::ops::RangeInclusive<i64> = 4..=10;
 
@@ -343,7 +346,7 @@ impl Engine {
         };
         let pp = ranked.then(|| estimates(&e.pp, stars.unwrap(), hits, bid, &self.r.ledger));
         let plays_like = self.plays_like(&f, b, rate);
-        let nps = f.dict("nps").map(|d| d.f("nps"));
+        let nps = f.dict("nps").and_then(|d| d.get("nps")).filter(|v| !v.is_none()).map(Val::f); // None under two notes (structure.rs)
         Ok(Some(Card { bid, md5, keys: feats.keys, title, var: rate_label_pp(rate), rate, ranked, artist, song, version, acc_mid: e.shown.acc_mid, acc_lo: e.shown.acc_lo, acc_hi: e.shown.acc_hi, sure: self.own_plays(feats.keys) >= SURE_PLAYS,
                        form: n.session.form_state(feats.keys), length: f.f("length") / 1000. / rate, skill: top_skill(&f), nps, pp, pp_expected: stars.map(|s| crate::pp::expected(&e.pp, s, hits)), plays_like }))
     }
@@ -433,7 +436,7 @@ mod tests {
 /// Stored ratings of the past calculators moved to this one, without their charts. Rows already there stay.
 pub fn carry_rows(db: &ms_data::store::Db) -> std::result::Result<(), String> {
     let charts = Charts::new(db).map_err(|e| e.to_string())?;
-    for from in CARRIED_CALCS {
+    for from in CARRIED_CALCS.iter().rev() { // newest first: the first source carried wins
         ms_data::store::carry_feats(db, from, CALC_ID, &ms_calc::features::standard_params(), &|sha| charts.counted(sha)).map_err(|e| e.to_string())?;
     }
     let missing = charts.missing.load(std::sync::atomic::Ordering::Relaxed);
@@ -447,7 +450,7 @@ pub fn carry_rows(db: &ms_data::store::Db) -> std::result::Result<(), String> {
 pub fn carry_web(db: &ms_data::store::Db) -> std::result::Result<(), String> {
     ms_data::webmaps::forget_in_client()?;
     let charts = Charts::new(db).map_err(|e| e.to_string())?;
-    CARRIED_CALCS.iter().try_for_each(|from| ms_data::webmaps::carry(from, CALC_ID, &ms_calc::features::standard_params(), &|sha| charts.counted(sha)))
+    CARRIED_CALCS.iter().rev().try_for_each(|from| ms_data::webmaps::carry(from, CALC_ID, &ms_calc::features::standard_params(), &|sha| charts.counted(sha)))
 }
 
 /// A stored chart by its sha: lazer's store, the website cache, or a convert remade from its source.
@@ -478,11 +481,11 @@ impl Charts {
         found
     }
 
-    pub fn flow(&self, sha: &str, rate: f64) -> Option<ms_calc::flow::Flow> {
+    pub fn flow(&self, sha: &str, rate: f64, k: &ms_calc::params::Knobs) -> Option<ms_calc::flow::Flow> {
         let mut last = self.last.lock().unwrap();
         if last.as_ref().is_none_or(|l| l.0 != sha) {
             *last = Some((sha.to_string(), self.counted(sha)));
         }
-        last.as_ref()?.1.as_ref().map(|c| ms_calc::flow::flow(c, rate))
+        last.as_ref()?.1.as_ref().map(|c| ms_calc::flow::flow(c, rate, k))
     }
 }

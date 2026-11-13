@@ -13,56 +13,18 @@ pub struct Skill {
     pub tip: &'static str,
 }
 
-fn family(key: &str, name: &'static str, members: &[&'static str], children: &[(&'static str, &'static str, &'static str)], tip: &'static str) -> Skill {
-    Skill {
-        key: key.to_string(), name, members: members.to_vec(), tip,
-        children: children.iter().map(|(child, label, about)| Skill { key: format!("{key}/{child}"), name: label, members: vec![member(key, child)], children: Vec::new(), tip: about }).collect(),
-    }
-}
-
-/// The calculator skill a child reads: its own name, but the LN children's skills carry an `ln_` prefix.
-fn member(key: &str, child: &'static str) -> &'static str {
-    match (key, child) {
-        ("ln", "general") => "ln_general",
-        ("ln", "tech") => "ln_tech",
-        ("ln", "inverse") => "ln_inverse",
-        ("ln", "release") => "ln_release",
-        _ => child,
-    }
-}
-
-fn shared() -> [Skill; 7] {
-    // Types read "Family · Type", the card's names (user 2026-11-09: playlists and stats "should also follow this convention").
-    [
-        // A player, 2026-11-04: Hybrid deleted; General/Tech/Inverse/Release each rate their own 7K LN Dan practice pack top
-        // (ms_calc::skills::attribute). The tree keys stay; a child's member is its own LN skill (`member`).
-        family("ln", "LN", &["ln", "ln_general", "ln_tech", "ln_inverse", "ln_release", "shield"], &[
-            ("general", "LN · General", "Holds and taps without one dominant LN specialty."),
-            ("tech", "LN · Tech", "Irregular hold rhythms and awkward transitions inside LN."),
-            ("inverse", "LN · Inverse", "Most columns held most of the time: the gaps are the notes."),
-            ("release", "LN · Release", "Releasing one finger while others of the hand keep holding."),
-            ("shield", "LN · Shields", "A tap immediately followed by a hold in the same column.")], ""),
-        family("technical", "Technical", &["technical", "patterntech", "rhythmtech"], &[
-            ("patterntech", "Pattern Tech", "Awkward finger control and genuinely difficult transitions."),
-            ("rhythmtech", "Rhythm Tech", "Irregular execution timing, not merely changing global note gaps.")], ""),
-        family("sv", "SV", &["sv"], &[
-            ("sv_fast", "SV · Fast", "Shortened readable approach time."),
-            ("sv_slow", "SV · Slowjam", "Compressed spacing and crowded notes at low scroll speed."),
-            ("sv_accel", "SV · Accel", "Increasing scroll speed during note approach."),
-            ("sv_stutter", "SV · Stutters", "Repeated meaningful speed-direction changes."),
-            ("sv_brake", "SV · Brakes", "Decreasing approach speed and timing uncertainty near judgement.")], ""),
-        family("stamina", "Stamina", &["stamina"], &[], "Sustained effort, not simply a long song."),
-        family("jackspeed", "Jacks", &["jackspeed", "jack", "minijack", "longjack", "vibro"], &[
-            ("minijack", "Jacks · Minijack", "Short repeated-column bursts inside other patterns."),
-            ("longjack", "Jacks · Longjack", "Sustained single-column repetition."),
-            ("vibro", "Jacks · Vibro", "Specialist ultra-fast repetition. Only explicitly selecting Vibro includes pure vibro drills.")],
-            "Single-column repetition and short jack bursts; distinct from changing overlapping chords."),
-        family("chordjack", "Chordjack", &["chordjack"], &[], "Repeated or partly overlapping chords."),
-        family("trills", "Trills", &["jumptrill", "trill1h", "splittrill"], &[
-            ("jumptrill", "Trills · Jumptrill", "Alternating hand impulses, including timing-feasible rolls."),
-            ("trill1h", "Trills · 1H", "Alternation between fingers on one hand."),
-            ("splittrill", "Trills · Split", "Both hands alternate fingers independently; not ordinary Jumptrill.")], ""),
-    ]
+/// One keymode's tree from the skill table (ms_calc::taxonomy): each family label a parent whose members are its rows, each
+/// row with a child key a child of its own.
+fn tree_of(keys: usize) -> Vec<Skill> {
+    use ms_calc::taxonomy::{family, FAMILIES};
+    let on = |r: &&ms_calc::taxonomy::Row| (r.keys.0..=r.keys.1).contains(&keys) && ms_calc::taxonomy::shown(r.sk);
+    FAMILIES.iter().filter_map(|&(key, name, _, tip)| {
+        let rows: Vec<&ms_calc::taxonomy::Row> = family(key).filter(on).collect();
+        (!rows.is_empty()).then(|| Skill {
+            key: key.to_string(), name, tip, members: rows.iter().map(|r| r.sk.name()).collect(),
+            children: rows.iter().filter_map(|r| Some(Skill { key: format!("{key}/{}", r.child?), name: r.name, members: vec![r.sk.name()], children: Vec::new(), tip: r.tip })).collect(),
+        })
+    }).collect()
 }
 
 struct Trees {
@@ -74,28 +36,7 @@ struct Trees {
 fn trees() -> &'static Trees {
     static T: OnceLock<Trees> = OnceLock::new();
     T.get_or_init(|| {
-        // The model's families (consts.json `members`), user 2026-11-02: 1H Trill and Anchors under Delay were "awkward";
-        // Stream and Delay are one Stream here (the calculator keeps both fitted parts). Wide keys have no Split Trill
-        // (its counterpart is Bracket, a chordstream texture: "multiple trills on nearby columns", osu! ranking criteria).
-        let [ln, tech, sv, stamina, jacks, chordjack, trills] = shared();
-        let anchors = ("anchor", "Anchors", "A repeated column embedded in flowing notes.");
-        let four = vec![
-            family("stream", "Stream", &["stream", "dump", "anchor"], &[
-                ("dump", "Dump", "Very fast rice that still needs individual finger control."), anchors], ""),
-            family("jumpstream", "Jumpstream", &["jumpstream"], &[], ""),
-            family("handstream", "Handstream", &["handstream", "quadstream"], &[
-                ("quadstream", "Quadstream", "Single → quad → single stream texture with embedded minijacks; not every quad or chordjack.")], ""),
-            trills.clone(), jacks.clone(), chordjack.clone(), ln.clone(), tech.clone(), stamina.clone(), sv.clone(),
-        ];
-        let mut wide_trills = trills;
-        wide_trills.members.retain(|m| *m != "splittrill");
-        wide_trills.children.retain(|c| c.key != "trills/splittrill");
-        let wide = vec![
-            family("stream", "Stream", &["stream", "delay", "anchor"], &[anchors], "Single-note rice, slow or fast."),
-            family("chordstream", "Chordstream", &["chordstream", "bracket"], &[
-                ("bracket", "Bracket", "A hand alternating between disjoint finger groups, with a chord in at least one group.")], ""),
-            wide_trills, chordjack, jacks, ln, tech, stamina, sv,
-        ];
+        let (four, wide) = (tree_of(4), tree_of(7));
         // A family in both trees with different children (Stream, Trills) holds the union, so a selection made on one
         // keymode keeps its meaning on the other.
         let mut all: Vec<Skill> = Vec::new();
@@ -147,21 +88,45 @@ fn strengths(f: &ms_calc::val::Dict) -> Vec<(&'static str, f64, f64)> {
         let raw = member_value(f, &node.members);
         // Technical practice needs actual technical character, not just an awkward local peak in a smooth chart.
         let leaf = node.key.rsplit('/').next().unwrap_or("");
-        let technical = matches!(node.key.as_str(), "technical" | "technical/patterntech" | "technical/rhythmtech");
+        let technical = node.key.split('/').next() == Some("technical");
         let practice = profile.and_then(|p| p.get(leaf)).filter(|_| technical).map_or(raw, |v| raw.min(v.f().max(0.).sqrt()));
         (node.key.as_str(), raw, practice)
     }).collect()
 }
 
-fn floor(values: &[(&'static str, f64, f64)]) -> f64 {
-    0.45f64.max(0.60 * values.iter().map(|v| v.1).fold(0., f64::max))
+/// A value against the chart's strongest card family (ms_calc::card: Technical and Stamina are tags there, not families), the
+/// card's rule for "counts as X" (plan 2026-11-12; a population percentile per skill before).
+pub fn relative(f: &ms_calc::val::Dict, value: f64) -> f64 {
+    let keys = f.get("keys").map_or(7, |k| k.f() as i64);
+    let top = tree(keys).iter().filter(|n| !matches!(n.key.as_str(), "technical" | "stamina")).map(|n| member_value(f, &n.members)).fold(0., f64::max);
+    if top > 0. { (value / top).min(1.) } else { 0. }
 }
 
-/// Skills g for which match(f, [g]) matches, from one strengths pass.
+/// Per dimension of the chart's keymode tree: (key, its share, its standing, the raw share's standing), standing = `relative`;
+/// a technical dimension read at its practice value (actual technical character, not an awkward local peak); avoidance reads
+/// the raw one (a material forbidden passage stays forbidden).
+pub fn standing(f: &ms_calc::val::Dict) -> Vec<(&'static str, f64, f64, f64)> {
+    strengths(f).into_iter().map(|(key, raw, practice)| (key, raw, relative(f, practice.min(raw)), relative(f, raw))).collect()
+}
+
+/// The standing a skill needs to count on a chart: the card's SHOW.
+pub fn cut() -> f64 {
+    ms_calc::card::SHOW
+}
+
+/// The dimensions a chart counts as (percentile ≥ `at`; skills::cut for "demanded").
+pub fn counted_at(f: &ms_calc::val::Dict, at: f64) -> Vec<&'static str> {
+    standing(f).into_iter().filter(|v| v.2 >= at).map(|v| v.0).collect()
+}
+
+/// The skills a chart counts as.
 pub fn demanded(f: &ms_calc::val::Dict) -> Vec<&'static str> {
-    let values = strengths(f);
-    let bar = floor(&values);
-    values.into_iter().filter(|v| v.2 >= bar).map(|v| v.0).collect()
+    counted_at(f, cut())
+}
+
+/// Per dimension of a tree, a chart's (practice, raw) standing (Tree order).
+pub fn percentiles(f: &ms_calc::val::Dict) -> Vec<(f64, f64)> {
+    standing(f).into_iter().map(|v| (v.2, v.3)).collect()
 }
 
 /// match(f)[1]: the top-level skills a chart demands.
@@ -312,8 +277,15 @@ pub fn label(selected: &[String]) -> String {
     if negative.is_empty() { text } else { format!("{text} · exclude {}", negative.join(", ")) }
 }
 
-/// What an avoided skill may reach, as a share of a map's strongest skill.
+/// The avoid steps (saved codes) and their names. A map is out when the avoided skill's percentile reaches the step's:
+/// "A lot of it" = counts (skills::cut), "Led by it" halfway from there to the top, "Any of it" half the cut.
 pub const AVOID: [(f64, &str); 3] = [(0.9, "Led by it"), (0.6, "A lot of it"), (0.3, "Any of it")];
+
+/// The percentile an avoid step (saved code) keeps a map under.
+pub fn avoid_percentile(hold: f64) -> f64 {
+    let c = cut();
+    if hold >= 0.9 { (1. + c) / 2. } else if hold >= 0.6 { c } else { c / 2. }
+}
 
 /// The sliders that change which maps are in the list.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -353,6 +325,31 @@ mod tests {
 
     fn v(x: &[&str]) -> Vec<String> {
         x.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// One rule for every skill, the card's: a skill counts at SHOW of the chart's strongest family (Technical aside).
+    #[test]
+    fn a_skill_counts_against_the_charts_top_family() {
+        let mut sk = ms_calc::val::Dict::new();
+        for (k, v) in [("stream", 1.), ("jumptrill", 0.35), ("ln", 0.2), ("technical", 3.)] {
+            sk.set(k, v);
+        }
+        let mut f = ms_calc::val::Dict::new();
+        f.set("keys", 7i64);
+        f.set("sk", ms_calc::val::Val::Dict(sk));
+        let d = demanded(&f);
+        assert!(d.contains(&"stream") && d.contains(&"trills") && !d.contains(&"ln"), "{d:?}");
+        assert_eq!(relative(&f, 3.), 1.);
+    }
+
+    /// consts.json's fit families are the skill table's `fit` column (P3 generates them from it).
+    #[test]
+    fn the_fit_families_are_the_tables() {
+        let c: serde_json::Value = serde_json::from_str(include_str!("consts.json")).unwrap();
+        let set = |v: &serde_json::Value| v.as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect::<BTreeSet<_>>();
+        let consts: Vec<(String, BTreeSet<String>)> = c["members"].as_array().unwrap().iter().map(|m| (m[0].as_str().unwrap().to_string(), set(&m[1]))).collect();
+        let table: Vec<(String, BTreeSet<String>)> = ms_calc::taxonomy::fit_groups().into_iter().map(|(k, m)| (k.to_string(), m.iter().map(|s| s.name().to_string()).collect())).collect();
+        assert_eq!(consts.iter().cloned().collect::<HashMap<_, _>>(), table.into_iter().collect::<HashMap<_, _>>());
     }
 
     #[test]
@@ -403,12 +400,12 @@ mod tests {
     #[test]
     fn the_trees_follow_the_model_families_and_old_keys_move_with_their_sign() {
         let parents = |k: i64| tree(k).iter().map(|n| n.name).collect::<Vec<_>>();
-        assert_eq!(parents(7), ["Stream", "Chordstream", "Trills", "Chordjack", "Jacks", "LN", "Technical", "Stamina", "SV"]);
+        assert_eq!(parents(7), ["Stream", "Chordstream", "Trills", "Jacks", "Chordjack", "LN", "Technical", "Stamina", "SV"]);
         assert_eq!(parents(4), ["Stream", "Jumpstream", "Handstream", "Trills", "Jacks", "Chordjack", "LN", "Technical", "Stamina", "SV"]);
         let children = |k: i64, p: &str| tree(k).iter().find(|n| n.key == p).unwrap().children.iter().map(|c| c.key.as_str()).collect::<Vec<_>>();
         assert_eq!(children(7, "stream"), ["stream/anchor"]);
         assert_eq!(children(7, "trills"), ["trills/jumptrill", "trills/trill1h"]);
-        assert_eq!(children(4, "trills"), ["trills/jumptrill", "trills/trill1h", "trills/splittrill"]);
+        assert_eq!(children(4, "trills"), ["trills/jumptrill", "trills/splittrill", "trills/trill1h"]);
         for (old, new) in [("delay", "stream"), ("delay/stream", "stream"), ("delay/anchor", "stream/anchor"), ("delay/trill1h", "trills/trill1h"),
                            ("stream/trill1h", "trills/trill1h"), ("bracket", "chordstream/bracket"), ("jumptrill", "trills/jumptrill"), ("splittrill", "trills/splittrill")] {
             assert_eq!(normalize(&v(&[old])), v(&[new]), "{old}");

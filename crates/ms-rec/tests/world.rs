@@ -86,6 +86,23 @@ fn the_ability_number_inverts_the_shared_model_and_the_session_overlay_is_separa
 }
 
 #[test]
+fn on_the_dan_ladder_the_level_is_where_the_dan_songs_cross_their_pass_mark() {
+    // Players at 96 % around 7★ and 9★: both inside the 7K Regular ladder, read from its songs, not from their own charts.
+    let level = |tag: &str, at: f64| {
+        let w = world(tag, move |o| 1. - 0.04 * (o / at).powi(2), 240);
+        let g = ms_rec::stats::build(&engine(&w), &w.db).unwrap().pages[&7].groups["overall"].clone();
+        g.value.unwrap()
+    };
+    let (low, high) = (level("dan-low", 7.), level("dan-high", 9.));
+    let t = ms_rec::dans::tiers("7K Regular").unwrap();
+    assert!(t[0].1.exp() < low && low < high && high < t[t.len() - 1].1.exp(), "{low} {high}");
+    // The pass mark is 96 % in stable's units, below 96 % displayed in lazer, and a practised song plays better: above
+    // the 96 % point of their own charts (7★ and 9★, where the own-charts reading lands).
+    assert!(low > 7.15 && high > 9.2, "{low} {high}");
+    assert!(!ms_rec::dans::ability(7, high, "overall").unwrap().starts_with("below"));
+}
+
+#[test]
 fn sparse_and_unmeasured_limits_are_not_numeric_ratings() {
     let w = world("sparse", |o| 1. - 0.0005 * (o / 2.).powi(2), 240); // ≥ 99 % up to the hardest fixture chart (9★)
     let profile = ms_rec::stats::build(&engine(&w), &w.db).unwrap();

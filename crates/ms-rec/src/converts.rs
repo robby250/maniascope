@@ -16,7 +16,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const MIRROR: &str = "https://osu.direct/api/d/";
+// catboy.best first: measured 2026-11-11 first byte 0.2 s and 10.8 MB/s vs osu.direct 1.2–2 s and 8.2 MB/s, and osu.direct
+// answered 503 on a set catboy served. osu.direct only when catboy fails.
+const MIRRORS: [&str; 2] = ["https://catboy.best/d/", "https://osu.direct/api/d/"];
 const UA: &str = "maniascope/1.0 (personal osu!mania practice recommender)";
 const CONFIRM: Duration = Duration::from_secs(10);
 
@@ -169,7 +171,23 @@ fn is_chart(name: &str) -> bool {
 }
 
 fn download(set: i64, to: &Path) -> std::result::Result<(), String> {
-    let response = ureq::get(&format!("{MIRROR}{set}")).set("User-Agent", UA).timeout(Duration::from_secs(120)).call().map_err(|e| e.to_string())?;
+    first_ok(&MIRRORS, |m| fetch(&format!("{m}{set}"), to))
+}
+
+/// The first mirror that delivers; every mirror's error when none does.
+fn first_ok(mirrors: &[&str], mut get: impl FnMut(&str) -> std::result::Result<(), String>) -> std::result::Result<(), String> {
+    let mut errors = Vec::new();
+    for m in mirrors {
+        match get(m) {
+            Ok(()) => return Ok(()),
+            Err(e) => errors.push(e),
+        }
+    }
+    Err(errors.join(" · "))
+}
+
+fn fetch(url: &str, to: &Path) -> std::result::Result<(), String> {
+    let response = ureq::get(url).set("User-Agent", UA).timeout(Duration::from_secs(120)).call().map_err(|e| e.to_string())?;
     let part = to.with_extension("osz.part");
     std::io::copy(&mut response.into_reader(), &mut std::fs::File::create(&part).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     std::fs::rename(&part, to).map_err(|e| e.to_string())
@@ -322,6 +340,14 @@ mod tests {
             osu.push_str(&format!("{},192,{},1,0,0:0:0:0:\n", (step * 3 % 7) * 512 / 7 + 36, step * 125));
         }
         osu
+    }
+
+    #[test]
+    fn a_failed_mirror_falls_through_to_the_next() {
+        let mut asked = Vec::new();
+        assert_eq!(first_ok(&["a", "b"], |m| { asked.push(m.to_string()); if m == "a" { Err("503".into()) } else { Ok(()) } }), Ok(()));
+        assert_eq!(asked, ["a", "b"]);
+        assert_eq!(first_ok(&["a", "b"], |m| Err(format!("{m} down"))), Err("a down · b down".to_string()));
     }
 
     #[test]

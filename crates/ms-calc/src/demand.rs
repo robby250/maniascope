@@ -21,6 +21,16 @@ pub const P_NAMES: [&str; NP] = [
     "sv_raw", "ln_rel", "mj", "sus", "lj", "shield", "inv", "hyb", "vib", "sv_fast", "sv_slow", "sv_accel",
     "sv_stutter", "sv_brake", "cover", "stag", "lnend", "used",
 ];
+/// Every part in declaration order (P_NAMES' order).
+pub const ALL_P: [P; NP] = {
+    use P::*;
+    [
+        stream, jumpstream, handstream, jumptrill, splittrill, jackspeed, chordjack, ln, sv, delay,
+        chordstream, jack, technical, bracket, dump, odd, rodd, pins, psw, oht, anc, rows, sv_raw,
+        ln_rel, mj, sus, lj, shield, inv, hyb, vib, sv_fast, sv_slow, sv_accel, sv_stutter, sv_brake,
+        cover, stag, lnend, used,
+    ]
+};
 pub const PARTS_4K: [P; 9] = [P::stream, P::jumpstream, P::handstream, P::jumptrill, P::splittrill, P::jackspeed, P::chordjack, P::ln, P::sv];
 pub const PARTS_5K: [P; 8] = [P::delay, P::stream, P::chordstream, P::jumptrill, P::jack, P::chordjack, P::ln, P::sv];
 pub const SV_KINDS: [P; 5] = [P::sv_fast, P::sv_slow, P::sv_accel, P::sv_stutter, P::sv_brake];
@@ -95,6 +105,8 @@ pub struct Geometry {
     pub ends: Vec<f64>,
     pub columns: Vec<u8>,
     pub vib: Vec<bool>,
+    /// in a Longjacks run: `structure::column_runs` at LJ_GAP, not in a vibro run
+    pub lj: Vec<bool>,
     pub rows: Vec<Row>,
     pub roll: Vec<bool>,
 }
@@ -106,31 +118,9 @@ pub fn geometry(chart: &Chart, rate: f64, k: &Knobs) -> Geometry {
     let ends: Vec<f64> = chart.end.iter().map(|&e| e * inv).collect();
     let columns = chart.col.clone();
     let mut vib = vec![false; n];
-    let mut bycol: Vec<Vec<usize>> = vec![Vec::new(); chart.keys];
-    for (i, &c) in columns.iter().enumerate() {
-        bycol[c as usize].push(i);
-    }
-    for ks in &bycol {
-        if ks.is_empty() {
-            continue;
-        }
-        let mut run = vec![ks[0]];
-        for (x, &a) in ks.iter().enumerate() {
-            let next = ks.get(x + 1).copied();
-            if let Some(kk) = next {
-                if times[kk] - times[a] < k.VIBRO_GAP && ends[a] - times[a] <= 0.003 {
-                    run.push(kk);
-                    continue;
-                }
-            }
-            if run.len() >= k.VIBRO_MIN {
-                for &i in &run {
-                    vib[i] = true;
-                }
-            }
-            run = next.into_iter().collect();
-        }
-    }
+    crate::structure::column_runs(chart, rate, k.VIBRO_GAP, k).iter().flatten().for_each(|&i| vib[i] = true);
+    let mut lj = vec![false; n];
+    crate::structure::column_runs(chart, rate, k.LJ_GAP, k).iter().flatten().for_each(|&i| lj[i] = !vib[i]);
     let mut rows = Vec::new();
     let mut i = 0;
     while i < n {
@@ -170,7 +160,7 @@ pub fn geometry(chart: &Chart, rate: f64, k: &Knobs) -> Geometry {
         run = if single { vec![r] } else { Vec::new() };
         run_step = None;
     }
-    Geometry { times, ends, columns, vib, rows, roll }
+    Geometry { times, ends, columns, vib, lj, rows, roll }
 }
 
 /// Row families for Pattern Tech switches.
@@ -338,11 +328,12 @@ pub fn demand(
 ) -> (Run, Option<Run>) {
     let keys = chart.keys;
     let wide = keys >= 5;
-    let v_fast = k.V_FAST * (keys as f64 / 7.0).powf(if keys >= 7 { k.V_FAST_KEYS } else { k.V_FAST_LOW });
+    let x = (keys as f64 / 7.0).ln(); // keymode curves: quadratics in ln(keys/7), 0 at 7K (plan 2026-11-11: no hinge at 7K)
+    let v_fast = k.V_FAST * (k.V_FAST_A * x + k.V_FAST_B * x * x).exp();
     // One curve over keymodes (user 2026-11-03: "gradients over the 4k-10k spectrum").
-    let w_jack = if keys == 7 && k.W_JACK_7K > 0.0 { k.W_JACK_7K } else { k.W_JACK * (7.0 / keys as f64).powf(k.W_JACK_KEYS) };
-    let w_group = k.W_GROUP * (keys.min(7) as f64 / 7.0).powf(k.GROUP_KEYS);
-    let jack_share = k.JACK_SHARE * (7.0 / keys.max(7) as f64).powf(k.JACK_SHARE_KEYS) * (keys.min(7) as f64 / 7.0).powf(k.JACK_SHARE_LOW);
+    let w_jack = k.W_JACK * (7.0 / keys as f64).powf(k.W_JACK_KEYS);
+    let w_group = k.W_GROUP * (k.GROUP_A * x + k.GROUP_B * x * x).exp();
+    let jack_share = k.JACK_SHARE * (k.JACK_SHARE_A * x + k.JACK_SHARE_B * x * x).exp();
     let jack_p = k.JACK_P * (keys as f64 / 4.0).powf(k.JACK_P_KEYS);
     // Per-row and per-note powers with few distinct inputs, computed once (same calls, same values).
     let by_count = |e: f64| -> Vec<f64> { (0..=keys).map(|c| (c as f64).powf(e)).collect() };
@@ -379,8 +370,7 @@ pub fn demand(
         hand_mask[hand_of[c] as usize] |= 1 << c;
     }
     let mut jrun = vec![0usize; keys];
-    let mut run_time = vec![0.0f64; keys];
-    let mut runs: Vec<Vec<usize>> = vec![Vec::new(); keys];
+    let mut lj_row = vec![0u32; keys]; // the row of each column's last hit
     let mut burst: Vec<usize> = Vec::new();
     let rows = &g.rows;
     let nr = rows.len();
@@ -559,7 +549,6 @@ pub fn demand(
             }
             burst.clear();
         }
-        let shared_count = (row_mask & prev_row_mask).count_ones();
         let mut n_hand = [0usize; 2];
         let mut n_jack = [0usize; 2];
         let row_hand = [row_mask & hand_mask[0], row_mask & hand_mask[1]];
@@ -574,17 +563,15 @@ pub fn demand(
         if n_jack[0] != 0 && n_jack[1] != 0 {
             let mh = if n_jack[0] <= n_jack[1] { 0 } else { 1 };
             mirror[mh] = k.MIRROR;
-            if keys == 7 || k.MIRROR_ALL > 0.0 {
-                // A partial mirror (some fingers of a hand jack, others move) on every keymode, not 7K alone.
-                let mut partial = false;
-                for h in 0..2 {
-                    let old_width = previous_mask[h].count_ones() as usize;
-                    partial = partial || !(n_jack[h] == n_hand[h] && n_hand[h] == old_width);
-                }
-                if partial {
-                    let speed = v(t - previous_hand[0], 0.07, 0.5).min(v(t - previous_hand[1], 0.07, 0.5));
-                    mirror[mh] += (1.0 - k.MIRROR) * smooth(speed, 7.0, 9.0);
-                }
+            // A partial mirror (some fingers of a hand jack, others move), on every keymode.
+            let mut partial = false;
+            for h in 0..2 {
+                let old_width = previous_mask[h].count_ones() as usize;
+                partial = partial || !(n_jack[h] == n_hand[h] && n_hand[h] == old_width);
+            }
+            if partial {
+                let speed = v(t - previous_hand[0], 0.07, 0.5).min(v(t - previous_hand[1], 0.07, 0.5));
+                mirror[mh] += (1.0 - k.MIRROR) * smooth(speed, 7.0, 9.0);
             }
         }
         let mut jack_effort = [0.0f64; 2];
@@ -702,23 +689,12 @@ pub fn demand(
             fine[h * nfine + fb] += rice + e_ln;
             comp[o(P::ln) + b] += e_ln;
             jrun[c] = if jacked { jrun[c] + 1 } else { 0 };
-            if jacked
-                && prev_row_mask >> c & 1 == 1
-                && shared_count == 1
-                && e - t <= 0.003
-                && last_end[c] - last_head[c] <= 0.003
-                && t - run_time[c] < 0.25
-            {
-                runs[c].push(b);
-            } else {
-                if runs[c].len() >= 3 {
-                    for &rb in &runs[c] {
-                        comp[o(P::lj) + rb] += 1.0;
-                    }
-                }
-                runs[c].clear();
+            // a Longjacks note: a tap in a column run whose row shares only this column with the run's previous row (more
+            // shared columns are a chordjack)
+            if g.lj[ni] && e - t <= 0.003 && last_end[c] - last_head[c] <= 0.003 && (row_mask & lj_row[c]).count_ones() == 1 {
+                comp[o(P::lj) + b] += 1.0;
             }
-            run_time[c] = t;
+            lj_row[c] = row_mask;
             if wide && e_jack != 0.0 && (jrun[c] >= 2 || n_hand[h] >= 2) {
                 jack_w += 1.0;
                 let part = if n_jack[h] >= 2 || n_hand[h] >= 2 { P::chordjack } else { P::jack };
@@ -882,7 +858,6 @@ pub fn demand(
         let lo = at.partition_point(|&x| x < e - 0.18);
         let hi = at.partition_point(|&x| x <= e + 0.18);
         let mut sync = 1usize;
-        let mut stag = 0.0f64;
         let mut prev_d = 0.0f64;
         for oi in lo..hi {
             if acts[h][oi].1 == c {
@@ -892,15 +867,13 @@ pub fn demand(
             let d = (ot - e).abs();
             if d <= 0.005 {
                 sync += 1;
-            } else {
-                stag += smooth(d, 0.005, 0.03) * (1.0 - smooth(d, 0.08, 0.18));
             }
             if ot < e - 0.005 {
                 prev_d = if prev_d == 0.0 { e - ot } else { prev_d.min(e - ot) };
             }
         }
         let base = k.W_REL * (k.LN_BASE + if prev_d != 0.0 { v(prev_d, flam, 2.0) } else { 0.0 });
-        let eff = (base * (sync as f64).powf(-k.ROW_SHARE) + k.W_STAG * 10.0 * stag.min(2.0)) * smooth(ln_len, 0.06, 0.25);
+        let eff = base * (sync as f64).powf(-k.ROW_SHARE) * smooth(ln_len, 0.06, 0.25);
         let b = (nbins - 1).min(((e - t0) / bin) as usize);
         let fb = (nfine - 1).min(((e - t0) * phases as f64 / bin) as usize);
         hands[h * nbins + b] += eff;
@@ -921,13 +894,6 @@ pub fn demand(
         for hb in first..=b {
             let (lo, hi) = (t0 + hb as f64 * bin, if hb == nbins - 1 { f64::INFINITY } else { t0 + (hb + 1) as f64 * bin });
             comp[o(P::cover) + hb] += 0f64.max(e.min(hi) - t.max(lo));
-        }
-    }
-    for c in 0..keys {
-        if runs[c].len() >= 3 {
-            for &rb in &runs[c] {
-                comp[o(P::lj) + rb] += 1.0;
-            }
         }
     }
     let part = if burst.len() <= k.MJ_BURST { P::mj } else { P::sus };

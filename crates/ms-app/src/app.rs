@@ -63,6 +63,7 @@ pub struct View {
     pub settings: bool,
     pub warmup: bool, // the list's phase: Skip warmup shows only then
     pub key_counts: std::collections::BTreeMap<i64, usize>, // your maps and converts per keymode in this tab
+    pub nps_pool: std::collections::BTreeMap<i64, Vec<f64>>, // NPS tab: eligible maps' NPS per keymode, sorted
     pub played: bool, // the target was finished: Next moves on instead of skipping it
 }
 
@@ -147,7 +148,7 @@ pub struct App {
 }
 
 fn view() -> View {
-    View { shown: Vec::new(), pending: None, ready: false, target: None, target_msg: String::new(), target_tip: None, note: String::new(), note_tip: String::new(), loaded: false, analysing: None, revision: 0, hover: false, settings: false, warmup: false, played: false, key_counts: Default::default() }
+    View { shown: Vec::new(), pending: None, ready: false, target: None, target_msg: String::new(), target_tip: None, note: String::new(), note_tip: String::new(), loaded: false, analysing: None, revision: 0, hover: false, settings: false, warmup: false, played: false, key_counts: Default::default(), nps_pool: Default::default() }
 }
 
 /// Only source/debug runs get the pause switch (user 2026-10-01). Release builds have no way back on, so an old pause is
@@ -391,8 +392,7 @@ impl App {
         let phase = match phase.as_str() { "warmup" => "Warming up", "build" => "Warmed up", "push" => "Strong form", "recover" => "Easing off", "fading" => "Fading", other => other };
         view.note = if note.is_empty() { phase.to_string() } else { format!("{phase} · {note}") };
         view.note_tip = [view.note.as_str(), summary.as_str()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n");
-        let (done, total) = progress.unwrap_or((0, 0));
-        view.analysing = (total > 0).then(|| (format!("Analysing maps · {} / {}", ms_rec::engine::commas(done), ms_rec::engine::commas(total)), done, total));
+        view.analysing = analysing(progress);
         view.ready = !shown.is_empty();
         view.shown = shown;
     }
@@ -411,6 +411,11 @@ impl App {
 
     pub(crate) fn on_rec(&mut self, msg: Out) {
         match msg {
+            Out::Progress { mode, progress } => {
+                if let Some(v) = MODES.into_iter().find(|m| *m == mode).and_then(|m| self.views.get_mut(m)) {
+                    v.analysing = analysing(progress);
+                }
+            }
             Out::Stats(data) => self.stats = Some(data),
             Out::Status { text, progress, blocking, learning } => {
                 if blocking {
@@ -426,7 +431,7 @@ impl App {
                     self.stats_wait = (on && total > 0).then(|| (format!("Learning your level from your plays · {} / {} charts analysed{eta} — your stats fill in as this runs", ms_rec::engine::commas(done), ms_rec::engine::commas(total)), done, total));
                 }
             }
-            Out::Pool { mode, revision, selection_id, phase, shown, note, summary, progress, key_counts } => {
+            Out::Pool { mode, revision, selection_id, phase, shown, note, summary, progress, key_counts, nps_pool } => {
                 if !self.profile_asked {
                     self.profile_asked = true;
                     self.q.put(Task::Profile); // a model is ready: the main window can compare maps with you
@@ -437,7 +442,10 @@ impl App {
                 }
                 let view = self.views.get_mut(m).expect("a tab");
                 view.key_counts.clone_from(&key_counts);
-                view.pending = Some(Out::Pool { mode, revision, selection_id, phase, shown, note, summary, progress, key_counts });
+                if mode == "nps" {
+                    view.nps_pool = nps_pool;
+                }
+                view.pending = Some(Out::Pool { mode, revision, selection_id, phase, shown, note, summary, progress, key_counts, nps_pool: Default::default() });
                 if !view.hover || !view.ready {
                     self.flush_pool(m);
                 }
@@ -623,7 +631,7 @@ impl App {
             let step = (a.timeline.len() / 120).max(1);
             let dan = self.s.display.info.then(|| ms_rec::dans::label(a.keys, a.overall, a.ln_notes / a.notes.max(1) as f64, Some(&a.dan_vibro))).flatten();
             state = json!({"title": a.title, "artist": a.artist, "version": format!("[{}]  {}", a.version, a.creator), "rating": ms_rec::shown::stars(a.keys, a.overall), "context": fmt::context(a, dan.as_deref(), ""), "nps": a.nps,
-                           "ln": (100. * a.ln_notes / a.notes.max(1) as f64).round(), "skills": a.entries.iter().take(self.s.display.skills).map(|e| json!({"name": e.name, "rating": ms_rec::shown::stars(a.keys, e.rating)})).collect::<Vec<_>>(),
+                           "ln": (100. * a.ln_notes / a.notes.max(1) as f64).round(), "skills": a.entries.iter().take(self.s.display.skills).map(|e| json!({"name": e.name, "tags": e.tags, "rating": ms_rec::shown::stars(a.keys, e.rating)})).collect::<Vec<_>>(),
                            "timeline": a.timeline.chunks(step).map(|c| c.iter().copied().fold(f64::MIN, f64::max)).collect::<Vec<_>>()});
         }
         if let Some(c) = &self.card {
@@ -714,4 +722,10 @@ impl App {
     pub fn you(&self, keys: i64) -> Option<&ms_rec::stats::Page> {
         self.stats.as_ref()?.pages.get(&keys)
     }
+}
+
+/// The tab's "Analysing maps" bar.
+fn analysing(progress: Option<(usize, usize)>) -> Option<(String, usize, usize)> {
+    let (done, total) = progress.unwrap_or((0, 0));
+    (total > 0).then(|| (format!("Analysing maps · {} / {}", ms_rec::engine::commas(done), ms_rec::engine::commas(total)), done, total))
 }

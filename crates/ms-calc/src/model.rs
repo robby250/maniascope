@@ -78,7 +78,7 @@ pub fn endurance(fines: &[&[Vec<f64>; 3]], bin_seconds: f64, phases: usize) -> (
     ((py::sum(per.iter().copied()) / per.len() as f64, peak), timeline)
 }
 
-/// The skills `vector` reads from physical_sk (compute rates only these before execution::attribute).
+/// The skills `vector` reads from physical_sk (rated first, after the slices, before the card's modifiers).
 pub const VECTOR_SKILLS: [&str; 8] = ["ln", "chordjack", "jackspeed", "delay", "dump", "minijack", "technical", "sv"];
 
 /// difficulty_model.vector.
@@ -147,23 +147,27 @@ fn final_from_base(base: f64, execution: Option<&Dict>) -> f64 {
 
 /// The joint stage: stages fitted one over another each kept its credit, so one refit over all their inputs corrects what they
 /// left (calib joint). Sparse: `columns` index `flow::joint_row`.
-const JOINT_LIMIT: f64 = 0.35;
-
 pub fn joint_shift(model: &Value, row: &[f64]) -> f64 {
-    let wide;
-    let row = if model["spec"].is_object() { wide = crate::flow::extended(row, &model["spec"]); &wide[..] } else { row };
     let (lo, hi, mean, sd, coeff) = (nums(&model["low"]), nums(&model["high"]), nums(&model["mean"]), nums(&model["sd"]), nums(&model["coeff"]));
     let at = model["columns"].as_array().map_or_else(Vec::new, |c| c.iter().filter_map(Value::as_u64).map(|c| c as usize).collect());
+    // Products read the level inside its fitted range: level² kept falling past level's edge while density sat at its own,
+    // so REFORM Iota (level 1.44 > 1.38) fell under Theta (round 27). Only the level, only in products: clamping every
+    // product input, or the arms' level weight too, cost 4K DevSelect +.0015; refitting with it pooled Theta/Iota again.
+    let mut pin = row.to_vec();
+    if let Some(i) = at.iter().position(|&c| c == crate::flow::LEVEL).filter(|_| row.len() > crate::flow::LEVEL) {
+        pin[crate::flow::LEVEL] = row[crate::flow::LEVEL].clamp(lo[i], hi[i]);
+    }
+    let wide;
+    let row = if model["spec"].is_object() { wide = crate::flow::extended_with(row, &pin, &model["spec"]); &wide[..] } else { row };
     let shift: f64 = (0..at.len()).filter(|&i| sd[i] >= 1e-9).map(|i| coeff[i] * (row[at[i]].clamp(lo[i], hi[i]) - mean[i]) / sd[i]).sum(); // a column flat in the fit reads 0
-    let limit = model["limit"].as_f64().unwrap_or(JOINT_LIMIT); // the families fit carries every stage's share, so it reaches further
-    shift.clamp(-limit, limit)
+    model["limit"].as_f64().map_or(shift, |l| shift.clamp(-l, l)) // the families fit writes its limit (calib joint FAMILY_LIMIT)
 }
 
 // ---- descriptors (the families fit reads them) ----
 
 pub const SR_SKILLS: [&str; 25] = [
     "stream", "jumpstream", "handstream", "delay", "chordstream", "bracket", "chordjack", "minijack", "longjack",
-    "jackspeed", "ln", "release", "inverse", "hybrid", "shield", "jumptrill", "splittrill", "trill1h", "anchor",
+    "jackspeed", "ln", "ln_release", "ln_inverse", "ln_tech", "shield", "jumptrill", "splittrill", "trill1h", "anchor",
     "technical", "patterntech", "rhythmtech", "vibro", "stamina", "sv",
 ];
 pub const SR_EXECUTION: [&str; 11] = [
@@ -174,12 +178,12 @@ pub const SR_NAMES_LEN: usize = 25 + 14 + 11 + 10;
 
 /// structural_residual.NAMES: the descriptors of `sr_vector`, in order.
 pub fn sr_names() -> Vec<String> {
-    let skills = ["stream", "jumpstream", "handstream", "delay", "chordstream", "bracket", "chordjack", "minijack", "longjack", "jackspeed", "ln", "release", "inverse", "hybrid", "shield",
+    let skills = ["stream", "jumpstream", "handstream", "delay", "chordstream", "bracket", "chordjack", "minijack", "longjack", "jackspeed", "ln", "ln_release", "ln_inverse", "ln_tech", "shield",
                   "jumptrill", "splittrill", "trill1h", "anchor", "technical", "patterntech", "rhythmtech", "vibro", "stamina", "sv"];
     let plain = ["hold_fraction", "sustain_ratio", "log_duration", "log_density_per_key", "chord_width", "overlap", "repeat", "burst", "active", "rhythm_variation", "all_columns",
                  "fatigue_load", "fatigue_peak", "wide_jack_pressure"];
     let execution = ["mash", "pseudo_mash", "ln_flow", "peak_pressure", "transition_pressure", "vibro_easy", "vibro_control", "jumptrill_easy", "roll_control", "roll_anchor", "jumptrill_sustain"];
-    let crossed = ["chordstream:bracket", "chordjack:overlap", "chordjack:width", "chordjack:sustain", "minijack:density", "ln:release", "ln:hybrid", "ln:flow", "rice:anchor", "trill:control"];
+    let crossed = ["chordstream:bracket", "chordjack:overlap", "chordjack:width", "chordjack:sustain", "minijack:density", "ln:release", "ln:tech", "ln:flow", "rice:anchor", "trill:control"];
     skills.iter().map(|s| format!("skill:{s}")).chain(plain.iter().map(|s| s.to_string())).chain(execution.iter().map(|s| format!("execution:{s}"))).chain(crossed.iter().map(|s| s.to_string())).collect()
 }
 
@@ -198,7 +202,9 @@ pub fn feature_vector(f: &Dict) -> Vec<f64> {
 
 pub fn sr_vector(sk_raw: &[(String, f64)], st: &Dict, ex: &Dict, en: &Dict, rate: f64, length: f64, notes: f64, keys: usize, ln_frac: f64, stam: f64, cf: &[f64]) -> Vec<f64> {
     let sk: Vec<(&str, f64)> = sk_raw.iter().map(|(k, v)| (k.as_str(), py::round_digits(0f64.max(1.5f64.min(*v)), 4))).collect();
-    let g = |k: &str| sk.iter().find(|(kk, _)| *kk == k).map_or(0.0, |x| x.1);
+    let own = |k: &str| sk.iter().find(|(kk, _)| *kk == k).map_or(0.0, |x| x.1);
+    // A base skill's column reads the strongest of its rows (the base keeps what its slices leave, plan 2026-11-11).
+    let g = |k: &str| crate::skills::Sk::from_name(k).filter(|s| crate::taxonomy::measured(*s, keys)).map_or(0.0, |s| crate::taxonomy::rows_of_base(s).map(|r| own(r.name())).fold(own(k), f64::max));
     let truthy = |k: &str| st.get(k).filter(|v| v.truthy()).map(|v| v.f());
     let seconds = 0.001f64.max(truthy("play_span").unwrap_or(length / 1000.0) / rate);
     let density = truthy("nps").unwrap_or(notes / seconds) / 1usize.max(keys) as f64;
@@ -231,8 +237,8 @@ pub fn sr_vector(sk_raw: &[(String, f64)], st: &Dict, ex: &Dict, en: &Dict, rate
         cj * width,
         cj * load,
         g("minijack") * density.ln_1p(),
-        ln * g("release"),
-        ln * g("hybrid"),
+        ln * g("ln_release"),
+        ln * g("ln_tech"),
         ln * ex.fget("ln_flow", 0.0),
         rice * g("anchor"),
         g("jumptrill") * ex.fget("roll_control", 0.0),
@@ -281,7 +287,6 @@ pub fn apply(prm: &Params, res: &mut Dict, od: f64, rate: f64) {
     res.set("baseline_overall", base);
     let multiplier = if raw != 0.0 { final_from_base(base, res.dict("execution")) / 0.000001f64.max(raw) } else { 1.0 };
     res.dict_mut("scores").unwrap().map_values(|v| v * multiplier);
-    scale_archetypes(res, multiplier);
     if let Some(Val::List(tl)) = res.get_mut("timeline") {
         for v in tl.iter_mut() {
             *v = Val::F(v.f() * multiplier);
@@ -292,13 +297,3 @@ pub fn apply(prm: &Params, res: &mut Dict, od: f64, rate: f64) {
     res.set("structural_correction", sc - res.f("baseline_overall"));
 }
 
-pub fn scale_archetypes(res: &mut Dict, k: f64) {
-    if let Some(Val::List(items)) = res.get_mut("archetypes") {
-        for a in items.iter_mut() {
-            if let Val::Dict(d) = a {
-                let r = d.f("rating");
-                d.set("rating", r * k);
-            }
-        }
-    }
-}
