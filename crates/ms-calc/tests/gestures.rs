@@ -10,7 +10,6 @@ use ms_calc::params::Params;
 use ms_calc::val::Dict;
 use serde_json::{json, Value};
 
-const BIN: f64 = 0.5;
 
 fn rolls(pattern: &[u8], gap: f64, n: usize, keys: usize, od: f64) -> Chart {
     rice((0..n).map(|i| (1000. + i as f64 * gap, pattern[i % pattern.len()])), keys, od)
@@ -25,7 +24,7 @@ fn repeated(pattern: &[&[u8]], gap: f64, n: usize) -> Chart {
 }
 
 fn g(c: &Chart) -> Analysis {
-    analyse(c, 1., BIN)
+    analyse(c, 1., &standard_params().k)
 }
 
 fn mean(a: &[f64]) -> f64 {
@@ -87,7 +86,7 @@ fn slow_rice_and_timing_infeasible_groups_do_not_become_jumptrills() {
 fn rate_is_applied_once_and_offsets_do_not_change_gestures() {
     let c = roll4(&[0, 1, 3, 2], 30.);
     let moved = |f: &dyn Fn(f64) -> f64| chart(notes(&c).into_iter().map(|(t, e, k)| (f(t), f(e), k)).collect(), 4, c.od);
-    let (a, b, z) = (analyse(&c, 1.5, BIN), g(&moved(&|x| x / 1.5)), analyse(&moved(&|x| x + 91234.), 1.5, BIN));
+    let (a, b, z) = (analyse(&c, 1.5, &standard_params().k), g(&moved(&|x| x / 1.5)), analyse(&moved(&|x| x + 91234.), 1.5, &standard_params().k));
     for i in 0..FEATURES.len() {
         assert!((a.features[i] - b.features[i]).abs() < 1e-8 && (a.features[i] - z.features[i]).abs() < 1e-8);
     }
@@ -113,11 +112,14 @@ fn literal_jumptrill_split_trill_and_vibro_remain_different() {
 const CHANGING: [&[u8]; 4] = [&[0, 1, 2], &[0, 1, 3], &[0, 1, 2, 3], &[1, 2, 3]];
 
 #[test]
-fn changing_chords_can_still_be_vibro_but_stability_is_not_control() {
+fn changing_chords_are_not_vibro_runs_and_stability_is_not_control() {
     let (stable, changing) = (g(&repeated(&[&[0, 1, 2, 3]], 80., 400)), g(&repeated(&CHANGING, 80., 400)));
     assert!(feature(&stable, "vibro_easy") > 2. * feature(&changing, "vibro_easy"));
     assert!(feature(&changing, "vibro_control") > feature(&stable, "vibro_control") + 0.2);
-    assert!(mean(&changing.series[s::VIBRO]) > 0.05);
+    // an anchor under changing chords is Longjacks even at vibro speed (user 2026-11-13: "chordjacks with constantly
+    // shifting patterns should show as chordjack at 360 bpm too not vibro")
+    let runs = ms_calc::structure::column_runs(&repeated(&CHANGING, 80., 400), 1., &standard_params().k);
+    assert!(!runs.is_empty() && runs.iter().all(|r| !r.vibro));
     assert_eq!(mean(&g(&repeated(&[&[0, 1, 2, 3]], 170., 400)).series[s::VIBRO]), 0.);
 }
 
@@ -150,7 +152,7 @@ fn bursts(gap_between: f64) -> Chart {
 #[test]
 fn vibro_support_does_not_jump_when_a_slower_gap_crosses_the_speed_gate() {
     let c = bursts(434.);
-    let (a, b) = (analyse(&c, 1.0259, BIN), analyse(&c, 1.0261, BIN));
+    let (a, b) = (analyse(&c, 1.0259, &standard_params().k), analyse(&c, 1.0261, &standard_params().k));
     for name in ["vibro_easy", "vibro_control", "vibro_sustain"] {
         assert!((feature(&a, name) - feature(&b, name)).abs() < 0.01);
     }

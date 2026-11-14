@@ -143,6 +143,16 @@ impl FeatureSource {
     }
 }
 
+/// Whether a score's mods leave it evidence: None when they don't, else whether Random moved its columns.
+pub fn evidence_mods(text: Option<&str>) -> Option<bool> {
+    let mods: Value = text.and_then(|m| serde_json::from_str(m).ok()).unwrap_or(Value::Array(Vec::new()));
+    if let Some(bits) = mods.as_i64() {
+        return (bits & !STABLE_MODS == 0).then_some(false);
+    }
+    let acronyms: Vec<String> = mods.as_array().map_or(&[][..], Vec::as_slice).iter().map(|m| m.get("acronym").and_then(Value::as_str).unwrap_or("").to_uppercase()).collect();
+    acronyms.iter().all(|a| EVIDENCE_MODS.contains(&a.as_str())).then(|| acronyms.iter().any(|a| a == "RD"))
+}
+
 /// recommend.evidence_rows.
 pub fn evidence_rows(db: &Db, source: &mut FeatureSource, c: &Consts) -> Result<Rows> {
     struct Raw { key: String, src: String, client: Option<String>, sha: Option<String>, md5: Option<String>, bid: Option<i64>, played: Option<String>,
@@ -156,22 +166,10 @@ pub fn evidence_rows(db: &Db, source: &mut FeatureSource, c: &Consts) -> Result<
     let mut out = Rows::default();
     let mut dedupe: HashMap<*const Dict, usize> = HashMap::default();
     for r in &scores {
-        let mods: Value = r.mods.as_deref().and_then(|m| serde_json::from_str(m).ok()).unwrap_or(Value::Array(Vec::new()));
-        let mut rd = false;
-        if let Some(bits) = mods.as_i64() {
-            if bits & !STABLE_MODS != 0 {
-                *out.skipped.entry("mods").or_default() += 1;
-                continue;
-            }
-        } else {
-            let acronyms: Vec<String> = mods.as_array().map_or(&[][..], Vec::as_slice).iter()
-                .map(|m| m.get("acronym").and_then(Value::as_str).unwrap_or("").to_uppercase()).collect();
-            rd = acronyms.iter().any(|a| a == "RD");
-            if acronyms.iter().any(|a| !EVIDENCE_MODS.contains(&a.as_str())) || r.rate.is_none() {
-                *out.skipped.entry("mods").or_default() += 1;
-                continue;
-            }
-        }
+        let Some(rd) = evidence_mods(r.mods.as_deref()).filter(|_| r.rate.is_some()) else {
+            *out.skipped.entry("mods").or_default() += 1;
+            continue;
+        };
         let acc = r.acc.unwrap_or(0.);
         if acc == 0. || acc < 0.5 || r.n.unwrap_or(0) < 100 {
             *out.skipped.entry("short/failed").or_default() += 1;
@@ -200,6 +198,7 @@ pub fn evidence_rows(db: &Db, source: &mut FeatureSource, c: &Consts) -> Result<
         });
         let notes = f.fget("notes", 0.);
         let stats = r.stats.as_deref().and_then(parse_stats);
+        let mods: Value = r.mods.as_deref().and_then(|m| serde_json::from_str(m).ok()).unwrap_or(Value::Array(Vec::new()));
         let stable = stable_judged(&r.key, r.client.as_deref(), &mods);
         let shift = if stable { ln } else { 0. };
         out.rows.push(Evidence {

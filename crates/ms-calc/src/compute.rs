@@ -58,6 +58,7 @@ fn series_dict_scores(sc: &mut Dict, series: &Series, judged: &skills::Judged, k
 }
 
 pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, prm: &Params) -> Result<Dict, String> {
+    let _runs = crate::structure::RunScope::open();
     let k = &prm.k;
     if !(rate > 0.0) || !rate.is_finite() {
         return Err(format!("invalid rate: {rate}"));
@@ -161,7 +162,7 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     };
     parts = changed;
     let quad: &[f64] = shared.quadstream.as_ref().map_or(&[], |q| &q.0);
-    let densities = skills::slice(&mut series, &parts, &total, &skills::Evidence { own: &own, quad, interleaved: interleaved(chart) }, keys, overall, k);
+    let densities = skills::slice(&mut series, &parts, &total, &skills::Evidence { own: &own, quad, shift: shared.gestures.as_ref().map_or(&[][..], |g| &g.series[crate::gestures::s::VIBRO_SHIFT]), interleaved: interleaved(chart) }, keys, overall, k);
     series_dict_scores(&mut sc, &series, &judged, keys, prm, &mut rated, Some(&model::VECTOR_SKILLS));
     let mut psk = Dict::new();
     for (key, v) in &sc.0 {

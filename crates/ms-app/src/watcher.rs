@@ -35,7 +35,7 @@ pub struct Obs {
 pub enum Event {
     Obs(Obs),
     Status(String),
-    Progress(Option<f64>), // playback ms while in gameplay
+    Progress(Option<f64>, bool), // playback ms while in gameplay; the game paused
     Score { score: Value, path: PathBuf, fresh: bool, attempt: Option<Value> },
 }
 
@@ -57,6 +57,8 @@ pub struct Tracker {
     last: Option<Obs>,
     live: Option<f64>,
     last_live: Option<f64>,
+    paused: bool,
+    last_paused: bool,
     needs_import: bool,
     disconnected: bool,
     stable_root: Option<PathBuf>,
@@ -70,7 +72,7 @@ fn file_is_mania(path: &Path) -> bool {
 
 impl Tracker {
     pub fn new(tx: Sender<Event>, q: Arc<Queue>, play: Arc<Mutex<Option<Value>>>) -> Tracker {
-        Tracker { tx, q, play, done: None, last_score: None, last: None, live: None, last_live: None, needs_import: false, disconnected: false, stable_root: None, stable_game: None, stable_files: HashMap::new() }
+        Tracker { tx, q, play, done: None, last_score: None, last: None, live: None, last_live: None, paused: false, last_paused: false, needs_import: false, disconnected: false, stable_root: None, stable_game: None, stable_files: HashMap::new() }
     }
 
     fn send(&self, e: Event) {
@@ -90,9 +92,9 @@ impl Tracker {
             self.last = Some(obs.clone());
             self.send(Event::Obs(obs));
         }
-        if self.live != self.last_live {
-            self.last_live = self.live;
-            self.send(Event::Progress(self.live));
+        if self.live != self.last_live || self.paused != self.last_paused {
+            (self.last_live, self.last_paused) = (self.live, self.paused);
+            self.send(Event::Progress(self.live, self.paused));
         }
     }
 
@@ -172,6 +174,7 @@ impl Tracker {
                 }
             }
             p["paused_now"] = json!(paused);
+            self.paused = paused && live > first;
             p["partial_stats"] = d["play"]["hits"].clone();
             p["pos"] = json!(live);
             p["progress"] = json!(((live - first) / (last - first).max(1.)).clamp(0., 1.));
@@ -226,7 +229,7 @@ impl Tracker {
 
     /// One frame in tosu's v2 shape.
     pub fn frame(&mut self, d: &Value) -> Obs {
-        self.live = None;
+        (self.live, self.paused) = (None, false);
         if d.get("error").is_some_and(|e| !e.is_null()) || d.get("beatmap").is_none() {
             return waiting();
         }
@@ -486,6 +489,8 @@ mod tests {
             let mut f = state("play", live, &c);
             f["game"]["paused"] = json!(paused);
             t.frame(&f);
+            // a pause after the first note frees the CPU for background analysis; the lead-in doesn't
+            assert_eq!(t.paused, paused && live > 0., "{live}");
         }
         assert_eq!(t.play.lock().unwrap().as_ref().unwrap()["pauses"], json!([2100, 5000]));
         t.frame(&state("resultScreen", 5000., &c));

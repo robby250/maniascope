@@ -122,7 +122,7 @@ pub const TABLE: [Row; 37] = {
         row(patterntech, "Pattern Tech", "technical", Some("patterntech"), Modifier, ALL, None, "technical", "Awkward finger control and genuinely difficult transitions."),
         row(rhythmtech, "Rhythm Tech", "technical", Some("rhythmtech"), Modifier, ALL, None, "technical", "Irregular execution timing, not merely changing global note gaps."),
         row(technical, "Technical", "technical", None, Modifier, ALL, None, "technical", ""),
-        row(mash, "Mash", "", None, Modifier, ALL, None, "", ""),
+        row(mash, "Mash", "", None, Modifier, ALL, None, "", "Dense chords hit as one smear rather than read note by note."),
         row(stamina, "Stamina", "stamina", None, Modifier, ALL, None, "", ""),
         row(overall, "", "", None, Internal, ALL, None, "", ""),
         row(switch, "", "", None, Internal, ALL, None, "", ""),

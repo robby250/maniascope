@@ -578,6 +578,22 @@ fn a_restart_keeps_the_saved_lists_converts() {
 }
 
 #[test]
+fn each_keymode_mixes_in_its_converts_by_its_own_maps() {
+    // user 2026-11-13: in a 4K–10K list "converts really far in the list … never end up in the front": the shown order
+    // took one convert share over every keymode's maps (0.3 against all 7K maps) instead of 10K's own (~2.5).
+    let mut l = live("convert-mix", 240, busy(false));
+    l.w.keys.insert("nps", vec![7, 10]);
+    l.w.stream_mix.insert("nps", ([0., 1.], [false, true]));
+    let pick = |i: usize, keys: i64, convert: bool| Pick { keys, installed: !convert, sha: Some(format!("{i:064}")), md5: Some(format!("{i:032}")), convert_of: convert.then(|| "src".into()), ..Pick::default() };
+    let mut fresh: Vec<Pick> = (0..30).map(|i| pick(i, 7, false)).collect(); // many 7K maps
+    fresh.extend((30..42).map(|i| pick(i, 10, false))); // 10K natives
+    fresh.extend((42..66).map(|i| pick(i, 10, true))); // twice as many 10K converts
+    let shown = l.w.prepared_playlist("nps", fresh).unwrap();
+    let tenk: Vec<bool> = shown.iter().filter(|p| p.keys == 10).map(|p| p.convert_of.is_some()).collect();
+    assert!(tenk.iter().filter(|c| **c).count() * 2 > tenk.len(), "10K rows, converts true: {tenk:?}");
+}
+
+#[test]
 fn a_filter_nothing_matches_offers_nothing() {
     let mut l = live("filter", 240, busy(false));
     l.w.practice_skills = vec!["sv".into()];
@@ -633,8 +649,9 @@ fn the_next_pick_is_offered_at_its_target_rate() {
 fn after_a_play_only_the_current_pick_re_aims_its_rate_at_the_target() {
     let mut l = live("reaim", 240, busy(false));
     let list = fresh_list(&mut l);
-    let mut pick = list.iter().find(|c| c.rate + 0.15 <= builder::DEFAULT_RATES.1).cloned().expect("a pick with room to speed up");
-    pick.rate = ((pick.rate + 0.15) * 100.).round() / 100.; // an offer the newest results no longer support
+    // 0.3× faster: the fixture's 1.0× picks sit above the target, so a smaller step can land on it
+    let mut pick = list.iter().find(|c| c.rate + 0.3 <= builder::DEFAULT_RATES.1).cloned().expect("a pick with room to speed up");
+    pick.rate = ((pick.rate + 0.3) * 100.).round() / 100.; // an offer the newest results no longer support
     pick.var = crate::catalog::rate_label(pick.rate);
     l.w.target = Some(Box::new(pick.clone()));
     l.w.targets.insert("nps".into(), Box::new(pick.clone()));

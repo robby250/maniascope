@@ -147,6 +147,14 @@ fn final_from_base(base: f64, execution: Option<&Dict>) -> f64 {
 
 /// The joint stage: stages fitted one over another each kept its credit, so one refit over all their inputs corrects what they
 /// left (calib joint). Sparse: `columns` index `flow::joint_row`.
+/// Share of the families correction a chart at `level` keeps: all of it up to `width` under its keymode's fitted `top`
+/// (99.5 % of the keymode's levels; a pooled top faded 10K's ordinary charts), none from the top on. The public scores hardly reach the top, so there the correction extrapolates and reordered the hardest
+/// charts (REFORM Iota under Theta, 2026-11-14; user: "at that difficulty … osu star rating rates them well"): above it the
+/// raw demand alone orders them. `width` 0: no fade.
+pub fn family_fade(level: f64, top: f64, width: f64) -> f64 {
+    if width <= 0. { 1. } else { ((top - level) / width).clamp(0., 1.) }
+}
+
 pub fn joint_shift(model: &Value, row: &[f64]) -> f64 {
     let (lo, hi, mean, sd, coeff) = (nums(&model["low"]), nums(&model["high"]), nums(&model["mean"]), nums(&model["sd"]), nums(&model["coeff"]));
     let at = model["columns"].as_array().map_or_else(Vec::new, |c| c.iter().filter_map(Value::as_u64).map(|c| c as usize).collect());
@@ -160,6 +168,8 @@ pub fn joint_shift(model: &Value, row: &[f64]) -> f64 {
     let wide;
     let row = if model["spec"].is_object() { wide = crate::flow::extended_with(row, &pin, &model["spec"]); &wide[..] } else { row };
     let shift: f64 = (0..at.len()).filter(|&i| sd[i] >= 1e-9).map(|i| coeff[i] * (row[at[i]].clamp(lo[i], hi[i]) - mean[i]) / sd[i]).sum(); // a column flat in the fit reads 0
+    let top = model["top"].as_f64(); // the keymode's own top level (the families fit writes it with `fade`)
+    let shift = shift * top.zip(model["fade"].as_f64()).map_or(1., |(top, w)| family_fade(row[crate::flow::LEVEL], top, w));
     model["limit"].as_f64().map_or(shift, |l| shift.clamp(-l, l)) // the families fit writes its limit (calib joint FAMILY_LIMIT)
 }
 

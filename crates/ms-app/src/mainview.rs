@@ -286,10 +286,13 @@ impl App {
     fn context_line(&self, ui: &mut Ui, a: &Arc<Analysis>) {
         let (_, _, known) = self.effective();
         let ln_share = a.ln_notes / a.notes.max(1) as f64;
-        let dan = ms_rec::dans::label(a.keys, a.overall, ln_share, Some(&a.dan_vibro));
+        let dan = ms_rec::dans::label(a.keys, a.overall, ln_share, Some(&a.dan_vibro), a.seconds());
         let mut parts: Vec<(String, String)> = vec![(format!("{}K", a.keys), "Keymode".into())];
         if let Some(d) = dan {
             parts.push((d, "The dan this map's difficulty matches. Tap dans under 22% LN, LN dans from 50%, both in between; a 4K map with 10% of its notes in fast same-column runs reads on the Vibro dans too.".into()));
+        }
+        if let Some(l) = a.o2jam.filter(|_| self.s.display.o2jam) {
+            parts.push((format!("O2Jam Lv. {l:.0}"), format!("O2Jam level {l:.1} at this rate: our calc's ratings mapped onto O2Jam levels, fitted on 4,400 O2Jam charts and osu! converts named with their level (typically off by 5–8 levels). Trained mostly on LN-heavy O2Jam charts: pure rice charts may read off.")));
         }
         parts.push((format!("{:.2}×{}", a.rate, if known { "" } else { " (osu! rate unknown)" }), if known { "Rate read from osu!'s mods.".into() } else { "osu! hasn't reported a rate yet: 1.00× assumed.".into() }));
         if a.sv_ignored {
@@ -404,7 +407,7 @@ impl App {
             self.extra = extra;
             let (w, h) = self.s.win;
             self.resized = Some((w, h + extra));
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(w, h + extra)));
+            crate::resize::inner(ui.ctx(), "ManiaScope", Vec2::new(w, h + extra));
         }
         if let Some(a) = &analysis {
             self.title(ui, a);
@@ -447,7 +450,23 @@ impl App {
         if !d.status {
             return;
         }
+        // The status line's row (`foot` above): while the library is analysed whole (first launch, calculator change) it
+        // reads the count over a thin bar (user 2026-11-13: "in the bottom in the empty space"); a few new maps show only
+        // in the playlist window ("its annoying if it keeps showing up on main window").
+        let tab = self.views.get(self.mode()).filter(|v| v.big).and_then(|v| v.analysing.clone());
+        let (note, done, total) = match self.bg_progress {
+            Some((d, t)) if self.bg_main => (self.status_text.lines().last().unwrap_or("").to_string(), d, t),
+            _ => tab.unwrap_or_default(),
+        };
+        let busy = total > 0 && done < total;
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            if busy {
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 3.), egui::Sense::hover());
+                let mut fill = rect;
+                fill.set_width(rect.width() * (done as f32 / total as f32).clamp(0., 1.));
+                ui.painter().rect_filled(rect, 1., theme::BUTTON);
+                ui.painter().rect_filled(fill, 1., theme::ACCENT);
+            }
             ui.horizontal(|ui| {
                 // Drawn here: the watcher replaces self.foot on every status, which erased a stored notice.
                 let continuing = self.web.continued && self.web.info.as_ref().is_some_and(|i| i.running);
@@ -455,7 +474,8 @@ impl App {
                 if let Some(f) = &self.flash {
                     ui.ctx().request_repaint_after(f.1.saturating_duration_since(Instant::now()));
                 }
-                let foot = [flash, self.foot.as_str(), if continuing { "website charts continuing" } else { "" }].iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join(" · ");
+                let progress = if busy { note.as_str() } else { "" };
+                let foot = [flash, progress, self.foot.as_str(), if continuing { "website charts continuing" } else { "" }].iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join(" · ");
                 ui.add(egui::Label::new(RichText::new(&foot).color(DIM).text_style(TextStyle::Small)).truncate()).on_hover_text(foot);
             });
         });

@@ -609,7 +609,7 @@ fn isolation(rows: &[(f64, u32)]) -> f64 {
 /// A note more than 2 s into a vibro run (`structure::column_runs`) counts (arm-tension vibro tires fast, user 2026-11-05:
 /// "very fatiguing and intense"; wrist vibro doesn't, so the fit's level arms decide who it costs).
 fn vibro_runs(chart: &Chart, rate: f64, k: &Knobs) -> f64 {
-    let long = crate::structure::column_runs(chart, rate, k.VIBRO_GAP, k).iter().flat_map(|r| r.iter().map(move |&i| chart.t[i] - chart.t[r[0]])).filter(|&d| d / 1000. / rate > 2.).count();
+    let long = crate::structure::vibro_notes(chart, rate, k).iter().flat_map(|r| r.iter().map(move |&i| chart.t[i] - chart.t[r[0]])).filter(|&d| d / 1000. / rate > 2.).count();
     long as f64 / chart.len().max(1) as f64
 }
 

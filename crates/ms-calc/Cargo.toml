@@ -8,6 +8,7 @@ rosu-pp = "4"
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 sha2 = "0.10"
 mimalloc = { version = "0.1", default-features = false }
+matrixmultiply = { version = "0.3", features = ["threading"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

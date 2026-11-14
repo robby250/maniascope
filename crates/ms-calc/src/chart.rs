@@ -88,7 +88,7 @@ pub fn parse(data: &[u8]) -> Result<Chart, ChartError> {
         }
         if section == "[HitObjects]" {
             let (mut p, mut len) = ([""; 6], 0); // fields 0–5 without a Vec per note
-            for (i, f) in line.split(',').enumerate() {
+            for (i, f) in line.splitn(7, ',').enumerate() { // fields 0–5; the hit sample after them is never read
                 if i < 6 {
                     p[i] = f;
                 }

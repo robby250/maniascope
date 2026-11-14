@@ -24,13 +24,13 @@ use std::sync::{Arc, Mutex};
 /// recommend.predictor_id of the model the Rust port reproduces: forecasts stay comparable across the port. A change to
 /// the prediction model takes a new id, so old forecasts are not read as this model's.
 pub const PREDICTOR_ID: &str = "532ce129f6fa"; // predictor families from the skill table (2026-11-11); was a6d61e058f5d
-pub const CALC_ID: &str = "2789b337ae54";
+pub const CALC_ID: &str = "29a02d72f4a7";
 /// Differ from CALC_ID in calibration only (calib/carry.json), newest first: a crawl still running holds the website rows back a whole
 /// calculator, so those can start older than the library's. Each carry keeps its source row.
 // Every shipped calculator, newest last: a ship that leaves its predecessor out drops the scores whose chart file is gone
 // (1.10.0: 7K evidence 8718 → 3959 plays on a copy without the files).
-pub const CARRIED_CALCS: [&str; 17] = ["2f01eca5e738", "7cee1dfdba7f", "a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f",
-                                       "4ccede2d49cf", "09639faa6673", "d3a86f7b014f", "f92680b7b136", "0f9f7da275f1", "a386c60fbb06", "a990d0ea0ada"];
+pub const CARRIED_CALCS: [&str; 21] = ["2f01eca5e738", "7cee1dfdba7f", "a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f",
+                                       "4ccede2d49cf", "09639faa6673", "d3a86f7b014f", "f92680b7b136", "0f9f7da275f1", "a386c60fbb06", "a990d0ea0ada", "2789b337ae54", "bc901ee5b05a", "4c42635f416e", "5f0c6b2fdd16"];
 const SURE_PLAYS: usize = 50; // of the player's own, on a keymode: fewer and the model is mostly the population's guess
 pub const ACTIVE_KEYS: std::ops::RangeInclusive<i64> = 4..=10;
 
@@ -70,6 +70,7 @@ pub struct Engine {
     pub observing: Arc<Mutex<Option<Vec<String>>>>, // results that land while a refit runs
     variants: Option<(Vec<i64>, Arc<Vec<Variant>>)>,
     transfer: Arc<Vec<Vec<f64>>>,
+    pub pernote: Option<Arc<crate::pernote::PerNote>>, // the per-note forecast (pernote)
 }
 
 /// Both targets of one prediction: `pp` (acc320) and what the player reads.
@@ -171,7 +172,7 @@ pub fn hashes(data: &[u8]) -> (String, String) {
 impl Engine {
     pub fn new(public: Arc<Public>, c: Arc<Consts>, r: Refit, settings: PpSettings) -> Engine {
         let source = FeatureSource { public: public.clone(), calc: CALC_ID.to_string(), cache: HashMap::default() };
-        Engine { transfer: Arc::new(family_transfer(&c)), public, c, prm: Arc::new(standard_params()), r, source, settings, observing: Arc::default(), variants: None }
+        Engine { transfer: Arc::new(family_transfer(&c)), public, c, prm: Arc::new(standard_params()), r, source, settings, observing: Arc::default(), variants: None, pernote: None }
     }
 
     /// A finished refit replaces the models; results that landed meanwhile are observed again.
@@ -314,7 +315,15 @@ impl Engine {
         let (f, b) = self.features(db, Some(sha), Some(md5), None, rate)?;
         let Some(f) = f else { return Ok(None) };
         let Ok(feats) = Feats::of(&f, &self.c) else { return Ok(None) };
-        Ok(self.predict(&feats, md5, b, rate, n).map(|e| (e, f, feats, b)))
+        let mut e = self.predict(&feats, md5, b, rate, n);
+        if let (Some(e), Some(p)) = (e.as_mut(), self.pernote.as_ref()) {
+            let stable = ms_data::store::kv_get(db, "client").is_some_and(|c| c == "stable");
+            if let Some(acc) = p.accuracy(db, sha, rate, stable, crate::pernote::today()) {
+                let model = self.r.fitted.display.as_ref().map_or(&self.r.fitted.pp.model, |d| &d.model);
+                model.blend(&mut e.shown, &feats, acc);
+            }
+        }
+        Ok(e.map(|e| (e, f, feats, b)))
     }
 
     fn own_plays(&self, keys: i64) -> usize {
@@ -434,16 +443,23 @@ mod tests {
 }
 
 /// Stored ratings of the past calculators moved to this one, without their charts. Rows already there stay.
-pub fn carry_rows(db: &ms_data::store::Db) -> std::result::Result<(), String> {
+/// `only`: the `sha@rate` names to carry (`played_names`); None: every stored row.
+pub fn carry_rows(db: &ms_data::store::Db, only: Option<&std::collections::HashSet<String>>) -> std::result::Result<(), String> {
     let charts = Charts::new(db).map_err(|e| e.to_string())?;
     for from in CARRIED_CALCS.iter().rev() { // newest first: the first source carried wins
-        ms_data::store::carry_feats(db, from, CALC_ID, &ms_calc::features::standard_params(), &|sha| charts.counted(sha)).map_err(|e| e.to_string())?;
+        ms_data::store::carry_feats(db, from, CALC_ID, &ms_calc::features::standard_params(), &|sha| charts.counted(sha), only).map_err(|e| e.to_string())?;
     }
     let missing = charts.missing.load(std::sync::atomic::Ordering::Relaxed);
     if missing > 0 {
         eprintln!("{missing} charts without a file kept their rating");
     }
     Ok(())
+}
+
+/// The `sha@rate` feature names of every score in the database (what a fit reads), as `evidence` keys them.
+pub fn played_names(db: &ms_data::store::Db) -> rusqlite::Result<std::collections::HashSet<String>> {
+    db.prepare("SELECT sha256, rate FROM scores WHERE sha256 IS NOT NULL")?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<f64>>(1)?.unwrap_or(1.))))?
+        .map(|x| x.map(|(sha, rate)| format!("{sha}@{:.3}", ms_calc::py::round_digits(rate.max(0.) + f64::from(u8::from(rate == 0.)), 3)))).collect()
 }
 
 /// Stored website features moved the same way.

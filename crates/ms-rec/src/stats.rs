@@ -19,10 +19,38 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub const TARGET: f64 = 0.96; // user 2026-11-10: "we should put this at like 96%" (was .94)
+// A dan is cleared on a good attempt: the player's top-30 % attempt (z of 0.70) on their own attempt-to-attempt spread
+// (user 2026-11-13: halfway between the average attempt and a tester's "top 15 %"). Average attempts read 7K Reg 10th
+// with the Gamma course predicted 94.9 % stable and played at 95.0–95.1 %.
+const GOOD_Z: f64 = 0.524;
+
+/// Per keymode, the sd of log lazer miss between completed attempts of one chart at one rate (pooled, degrees-of-freedom
+/// corrected): how much better than its average a good attempt goes. Keymodes with under 20 repeated charts take every
+/// keymode's pool.
+fn attempt_sd(rows: &[&Evidence]) -> HashMap<i64, f64> {
+    let mut groups: HashMap<(i64, &str, u64), Vec<f64>> = HashMap::default();
+    for r in rows.iter().filter(|r| r.completed && r.y_lazer < 0.) {
+        groups.entry((r.keys, r.chart.as_str(), r.rate.to_bits())).or_default().push(r.y_lazer);
+    }
+    let mut by: HashMap<i64, (f64, f64, usize)> = HashMap::default(); // squares, degrees of freedom, charts
+    for ((k, _, _), v) in groups.iter().filter(|g| g.1.len() >= 2) {
+        let m = v.iter().sum::<f64>() / v.len() as f64;
+        for key in [*k, 0] {
+            let e = by.entry(key).or_default();
+            e.0 += v.iter().map(|y| (y - m).powi(2)).sum::<f64>();
+            e.1 += v.len() as f64 - 1.;
+            e.2 += 1;
+        }
+    }
+    let sd = |e: &(f64, f64, usize)| (e.0 / e.1).sqrt();
+    let all = by.get(&0).filter(|e| e.2 >= 20).map_or(0., sd);
+    by.iter().filter(|(k, _)| **k != 0).map(|(k, e)| (*k, if e.2 >= 20 { sd(e) } else { all })).collect()
+}
+
 const FORM_SESSIONS: usize = 12;
 const BINS: usize = 10;                 // rating deciles of the keymode's charts a ★ level reads
 const HISTORY_BW: f64 = 1.;            // months: Gaussian smoothing of the monthly history (a peak month stays visible)
-const VIBRO: &str = "jackspeed/vibro";
+const VIBRO: &str = "vibro";
 
 #[derive(Clone, Default)]
 pub struct Group {
@@ -40,7 +68,6 @@ pub struct Group {
     pub extrapolated: bool,
     pub activation: f64,
     pub dan: Option<String>, // Vibro: its dan from the vibro dan songs (vibro tiers are in vibro speed, not ★)
-    pub rusty: bool,         // the skill's charts unplayed long enough that rust shifts results past the noise (the level stays)
 }
 
 #[derive(Clone, Default)]
@@ -170,6 +197,8 @@ struct Ctx<'a> {
     rec: &'a Engine,
     dicts: HashMap<(String, u64), Arc<Dict>>,
     shown: (f64, f64), // displayed log miss = a + b · the model's
+    attempt_sd: HashMap<i64, f64>, // attempt_sd
+    stable_ratio: Vec<(f64, f64)>, // (pass mark, the player's stable/lazer miss ratio there) of every stable dan mark
 }
 
 impl Ctx<'_> {
@@ -179,6 +208,10 @@ impl Ctx<'_> {
 
     fn dict(&self, r: &Evidence) -> Option<&Arc<Dict>> {
         self.dicts.get(&(r.chart.clone(), r.rate.to_bits()))
+    }
+
+    fn stable_ratio(&self, mark: f64) -> f64 {
+        self.stable_ratio.iter().find(|r| (r.0 - mark).abs() < 1e-9).map_or(0.88, |r| r.1)
     }
 
     /// Predicted lazer miss of a chart as the playlist predicts an unseen one: rested, warm, neutral form, no rust, practised
@@ -198,31 +231,36 @@ impl Ctx<'_> {
     /// song of a tier (the course's accuracy), a skill only the songs demanding it. Predicted as the playlist predicts an
     /// unseen chart, rested, warm and in neutral form, practised once (the model's retry gain): own scores on dan charts
     /// get no say, old ones would drag it (user 2026-11-11). None below two tiers with such songs.
-    fn dan_value(&self, series: &str, group: &str, miss_ratio: f64) -> Option<f64> {
-        let at = self.dan_position(series, group, miss_ratio)?;
+    fn dan_value(&self, series: &str, group: &str) -> Option<f64> {
+        let at = self.dan_position(series, group)?;
         // Off the ladder the songs measure nothing: the own-charts reading stays, and the dan reads "below 0th" or "Stellium+".
         (-0.5..=dans::tiers(series)?.len() as f64 - 0.5).contains(&at).then_some(())?;
         dans::rating_at(series, at)
     }
 
     /// The fractional tier where the player's predicted accuracy on the series' songs for `group` crosses each tier's pass mark.
-    fn dan_position(&self, series: &str, group: &str, miss_ratio: f64) -> Option<f64> {
+    fn dan_position(&self, series: &str, group: &str) -> Option<f64> {
         let tiers = dans::tiers(series)?;
-        // Each tier's own pass mark, y = log miss against it (crossing at 0). A stable mark judges holds as stable does: each
-        // song's lazer miss × miss_ratio × e^(STABLE_LN_Y × LN share), as the playlist shows a stable client.
+        // Each tier's own pass mark, y = log miss against it (crossing at 0). A stable mark is met in stable units: each song's
+        // lazer miss × the player's stable/lazer miss ratio at that accuracy × e^(STABLE_LN_Y × LN share) (user 2026-11-13:
+        // "doing the acc targets for all dans for stable then converting the acc to lazer").
         let pass = |tier: &str| dans::pass(series, tier);
         let songs = dans::songs(series, &self.rec.c);
         let mut y = Vec::new();
+        // Each song counts by its standing in the skill (user 2026-11-13: every 7K skill read the same 7.7): dan songs hold every
+        // skill above the card's cut, so counting each counted song fully made every skill's songs the same set.
+        let weight = |skills: &[(&str, f64)]| if group == "overall" { 1. } else { skills.iter().find(|s| s.0 == group).map_or(0., |s| s.1).powi(2) };
+        let floor = skills::cut().powi(2);
         for (tier, _) in tiers {
-            let picked: Vec<(String, &Feats)> = songs.get(tier).into_iter().flatten().enumerate()
-                .filter(|(_, (_, skills))| group == "overall" || skills.contains(&group))
-                .map(|(i, (f, _))| (format!("dan:{series}:{tier}:{i}"), f)).collect();
+            let picked: Vec<(String, &Feats, f64)> = songs.get(tier).into_iter().flatten().enumerate()
+                .map(|(i, (f, skills))| (format!("dan:{series}:{tier}:{i}"), f, weight(skills))).filter(|p| p.2 >= floor).collect();
             let Some((mark, stable)) = pass(tier) else { y.push(None); continue };
-            let misses: Vec<f64> = picked.iter().filter_map(|(id, f)| {
-                let lazer = self.miss(f, id, 1.)?;
-                Some(if stable { lazer * miss_ratio * (crate::evidence::STABLE_LN_Y * f.z_tail[0]).exp() } else { lazer })
+            let misses: Vec<(f64, f64)> = picked.iter().filter_map(|(id, f, w)| {
+                let lazer = self.miss(f, id, 1.)? * (-GOOD_Z * self.attempt_sd.get(&f.keys).copied().unwrap_or(0.)).exp();
+                Some((if stable { lazer * self.stable_ratio(mark) * (crate::evidence::STABLE_LN_Y * f.z_tail[0]).exp() } else { lazer }, *w))
             }).collect();
-            y.push((!misses.is_empty()).then(|| ((misses.iter().sum::<f64>() / misses.len() as f64).max(1e-6).ln() - (1. - mark).ln(), misses.len() as f64)));
+            let mass: f64 = misses.iter().map(|m| m.1).sum();
+            y.push((mass > 0.).then(|| ((misses.iter().map(|m| m.0 * m.1).sum::<f64>() / mass).max(1e-6).ln() - (1. - mark).ln(), mass)));
         }
         dan_crossing(&y)
     }
@@ -324,15 +362,14 @@ pub fn build(rec: &Engine, db: &Db) -> Result<Profile> {
             }
         }
     }
-    let ctx = Ctx { model: &target.model, fit: &target.fit, warmup: &target.warmup, rec, dicts, shown };
-    let miss_ratio = ms_data::store::stable_miss_ratio(db)?;
+    let stable_ratio = dans::stable_marks().into_iter().map(|m| Ok((m, ms_data::store::stable_miss_ratio_at(db, Some(m))?))).collect::<Result<Vec<_>>>()?;
+    let ctx = Ctx { model: &target.model, fit: &target.fit, warmup: &target.warmup, rec, dicts, shown, stable_ratio, attempt_sd: attempt_sd(&usable) };
     let month = crate::evidence::now_months();
     let mut pages = BTreeMap::new();
     // Vibro charts are mashed: only the Vibro skill reads them (Consts::vibro_chart).
     let vibro = |r: &Evidence| rec.c.vibro_chart(&f.rows.feats[r.f]);
     let of_keys = |keys: i64| usable.iter().filter(|r| r.keys == keys && !vibro(r)).copied().collect::<Vec<&Evidence>>();
     let vibro_of = |keys: i64| usable.iter().filter(|r| r.keys == keys && vibro(r)).copied().collect::<Vec<&Evidence>>();
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0., |d| d.as_secs_f64());
     for keys in SUPPORTED_KEYS {
         let rows = of_keys(keys);
         let known = ctx.fit.keys.contains(&keys);
@@ -359,8 +396,7 @@ pub fn build(rec: &Engine, db: &Db) -> Result<Profile> {
             let newest = played.iter().map(|r| r.ts.unwrap_or(0.)).fold(0., f64::max);
             let count = relevant.len();
             let read = reading(&rating_bins(relevant.iter().filter_map(|(k, _)| predicted.get(*k).copied()).collect()));
-            let rust = ctx.warmup.rust.of_plays(keys, &played.iter().filter(|r| r.completed).filter_map(|r| Some((r.ts?, ctx.feats(r).length / 1000. / r.rate.max(0.01) / 60.))).collect::<Vec<_>>(), now);
-            let mut g = Group { maps: count, plays: played.len(), newest, references: count.min(BINS), rusty: rust > ms_model::session::FORM_NOTICE,
+            let mut g = Group { maps: count, plays: played.len(), newest, references: count.min(BINS),
                                 tested_to: relevant.iter().map(|(_, r)| shown(r)).fold(0., f64::max), ..Group::default() };
             match read {
                 Some((x, slope, spread)) if slope > 0. => {
@@ -381,7 +417,7 @@ pub fn build(rec: &Engine, db: &Db) -> Result<Profile> {
         let overall_slope = groups.get("overall").map_or(1., |g| if g.slope > 0. { g.slope } else { 1. });
         for (name, g) in groups.iter_mut().filter(|(n, _)| known && !n.ends_with("vibro")) {
             let Some(series) = dans::series(keys, dans::ability_kind(name)) else { continue };
-            let Some(v) = ctx.dan_value(series, name, miss_ratio) else { continue };
+            let Some(v) = ctx.dan_value(series, name) else { continue };
             (g.low, g.high) = match g.value { Some(old) => (g.low * v / old, g.high * v / old), None => (v, v) };
             if g.value.is_none() {
                 (g.confidence, g.slope, g.extrapolated) = ("From the dan songs", overall_slope, false);
@@ -389,7 +425,7 @@ pub fn build(rec: &Engine, db: &Db) -> Result<Profile> {
             g.value = Some(v);
         }
         if let Some(g) = groups.get_mut(VIBRO).filter(|g| g.value.is_some()) {
-            g.dan = ctx.dan_position("4K Vibro", "overall", miss_ratio).and_then(|at| dans::named("4K Vibro", at)).filter(|_| keys == 4);
+            g.dan = ctx.dan_position("4K Vibro", "overall").and_then(|at| dans::named("4K Vibro", at)).filter(|_| keys == 4);
         }
         let local: Vec<&Evidence> = rows.iter().filter(|r| r.src != "public").copied().collect();
         let form = ctx.form_history(keys, &local);

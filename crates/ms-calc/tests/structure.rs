@@ -73,3 +73,23 @@ fn the_calculator_applies_the_calibration_its_rows_are_fitted_on() {
         assert!(again.is_none_or(|g| (g.f("overall") / f.f("overall")).ln().abs() < 1e-9), "{keys}K OD {od}");
     }
 }
+
+#[test]
+fn a_column_run_is_vibro_when_simple_and_fast_and_longjacks_when_its_chords_change() {
+    // user 2026-11-13: jacks are sustained strain on one column/hand; "super hard chordjacks with constantly shifting
+    // patterns should show as chordjack at 360 bpm too not vibro"; simple repetition is vibro down to ~160 BPM
+    use ms_calc::structure::column_runs;
+    let k = &standard_params().k;
+    let runs = |notes: Vec<(f64, u8)>| column_runs(&rice(notes, 4, 8.), 1., k).into_iter().map(|r| (r.notes.len(), r.vibro)).collect::<Vec<_>>();
+    let jack = |n: usize, gap: f64| (0..n).map(|i| (gap * i as f64, 0)).collect::<Vec<_>>();
+    assert_eq!((runs(jack(6, 150.)), runs(jack(7, 150.))), (vec![], vec![(7, false)]), "six hits are a burst, seven slow ones Longjacks");
+    assert_eq!(runs(jack(20, 80.)), [(20, true)], "one column at 80 ms is vibro");
+    // column 0 every 160 ms with column 1 (same hand) between: a stream through the hand, never a run
+    assert!(runs((0..80).map(|i| (80. * i as f64, (i % 2) as u8)).collect()).is_empty());
+    // the same alternation at 40 ms (each column every 80 ms): the hand vibrates over both columns
+    assert_eq!(runs((0..80).map(|i| (40. * i as f64, (i % 2) as u8)).collect()), [(40, true), (40, true)]);
+    // an anchor at 80 ms under a changing chord of its hand: Longjacks; the same chord struck again: vibro
+    let anchored = |change: bool| (0..30).flat_map(|i| [(80. * i as f64, 0)].into_iter().chain((change && i % 2 == 0 || !change).then_some((80. * i as f64, 1)))).collect::<Vec<_>>();
+    assert_eq!(runs(anchored(true)).iter().find(|r| r.0 == 30), Some(&(30, false)));
+    assert!(runs(anchored(false)).iter().all(|r| r.1));
+}

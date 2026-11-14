@@ -49,9 +49,17 @@ pub struct Analysis {
     pub tech: Vec<Tech>,
     pub sv_ignored: bool,
     pub dan_vibro: ms_rec::dans::Vibro,
+    pub o2jam: Option<f64>, // O2Jam level (7K), from the scores above
 }
 
 /// recdata.raw_nps: chord-inclusive heads over first-to-last head seconds.
+impl Analysis {
+    /// Played length: first note to last release, at the rate.
+    pub fn seconds(&self) -> f64 {
+        self.span.map_or(0., |(a, b)| (b - a) / 1000. / self.rate.max(0.01))
+    }
+}
+
 pub fn raw_nps(c: &Chart, rate: f64) -> Option<f64> {
     let span = c.t.last()? - c.t.first()?;
     (rate.is_finite() && rate > 0. && span > 0.).then(|| c.len() as f64 * rate * 1000. / span)
@@ -120,6 +128,7 @@ pub fn analyse(path: &Path, rate: f64, sv: bool, prm: &Params) -> Result<Analysi
         span: (chart.len() >= 2).then(|| (chart.t[0], chart.last_end())), timeline: res.get("timeline").map_or_else(Vec::new, Val::list_f), entries, tags: describe(&res, &prm.k).1,
         bars: bars(&names, sc), names, tech, sv_ignored: matches!(res.get("sv"), Some(Val::Str(s)) if s == "ignored"),
         dan_vibro: ms_rec::dans::vibro_runs(&chart, rate, &prm.k), title: chart.title.clone(), artist: chart.artist.clone(), version: chart.version.clone(), creator: chart.creator.clone(),
+        o2jam: ms_rec::o2jam::level(keys, |k| sc.fget(k, 0.), res.fget("ln_notes", 0.) / res.fget("notes", 1.).max(1.), (chart.len() >= 2).then(|| (chart.last_end() - chart.t[0]) / 1000. / rate).unwrap_or(0.), res.fget("notes", 0.)),
     })
 }
 

@@ -41,11 +41,13 @@ pub static CARRIED: [std::sync::atomic::AtomicUsize; 2] = [std::sync::atomic::At
 
 /// Stored chart features moved to the calculator `to`, so a calibration change doesn't re-analyse the library. Charts it doesn't
 /// move keep their bytes. Rows are copied, as every older calculator's were left; a stopped run resumes.
-pub fn carry_feats(db: &Db, from: &str, to: &str, after: &ms_calc::params::Params, chart: &(dyn Fn(&str) -> Option<ms_calc::chart::Chart> + Sync)) -> Result<usize> {
+/// `only`: the `sha@rate` names to carry (a fit reads only the played ones: 6,363 of 164,773 rows, plan 2026-11-13b S3); None: all.
+pub fn carry_feats(db: &Db, from: &str, to: &str, after: &ms_calc::params::Params, chart: &(dyn Fn(&str) -> Option<ms_calc::chart::Chart> + Sync), only: Option<&std::collections::HashSet<String>>) -> Result<usize> {
     let there: std::collections::HashSet<String> = db.prepare("SELECT key FROM feats WHERE key LIKE ?")?.query_map([format!("%|{to}")], |r| r.get(0))?.collect::<Result<_>>()?;
     let all: Vec<String> = db.prepare("SELECT key FROM feats WHERE key LIKE ? ORDER BY key")?.query_map([format!("%|{from}")], |r| r.get(0))?.collect::<Result<_>>()?;
     // A launch during a crawl repeats the carry, and a second source calculator repeats most rows: only the missing cost anything.
-    let keys: Vec<String> = all.into_iter().filter(|k| !there.contains(&format!("{}|{to}", k.rsplit_once('|').map_or("", |n| n.0)))).collect();
+    let name = |k: &str| k.rsplit_once('|').map_or("", |n| n.0).to_string();
+    let keys: Vec<String> = all.into_iter().filter(|k| !there.contains(&format!("{}|{to}", name(k))) && only.is_none_or(|o| o.contains(&name(k)))).collect();
     // A chart's rates sit together in key order, so its file is read and its convert remade once. Half the cores: the game may be up.
     // MS_CARRY_THREADS: calibration boxes with no game use every core (the knob screens spend ~85 % of each run here).
     let threads = std::env::var("MS_CARRY_THREADS").ok().and_then(|v| v.parse().ok())
@@ -356,12 +358,22 @@ pub fn parse_stats(text: &str) -> Option<Stats> {
 /// (1 − stable accuracy) / (1 − lazer accuracy) of the same judgements: predictions stay in lazer units, stable shows
 /// MAX as 300 (≈0.88 for a 95 % player). The player's own median when they have lazer plays.
 pub fn stable_miss_ratio(db: &Db) -> Result<f64> {
+    stable_miss_ratio_at(db, None)
+}
+
+/// stable_miss_ratio among plays whose stable accuracy is within half a point of `at` (the ratio falls with accuracy:
+/// 0.87 at 96 %, 0.80 at 98 % on the user's plays, 2026-11-13); all plays when fewer than 20 are there.
+pub fn stable_miss_ratio_at(db: &Db, at: Option<f64>) -> Result<f64> {
     let mut statement = db.prepare("SELECT stats FROM scores WHERE stats IS NOT NULL ORDER BY played DESC LIMIT 2000")?;
     let stats = statement.query_map([], |r| r.get::<_, String>(0))?;
-    let mut ratios: Vec<f64> = stats.filter_map(|s| parse_stats(&s.ok()?)).filter(|s| s.iter().sum::<i64>() >= 100 && acc_lazer(s) < 0.995)
-        .map(|s| (1. - acc_stable(&s)) / (1. - acc_lazer(&s))).collect();
-    ratios.sort_by(f64::total_cmp);
-    Ok(if ratios.len() >= 20 { ratios[ratios.len() / 2] } else { 0.88 })
+    let all: Vec<Stats> = stats.filter_map(|s| parse_stats(&s.ok()?)).filter(|s| s.iter().sum::<i64>() >= 100 && acc_lazer(s) < 0.995).collect();
+    let median = |near: bool| {
+        let mut ratios: Vec<f64> = all.iter().filter(|s| !near || at.is_some_and(|a| (acc_stable(s) - a).abs() <= 0.005))
+            .map(|s| (1. - acc_stable(s)) / (1. - acc_lazer(s))).collect();
+        ratios.sort_by(f64::total_cmp);
+        (ratios.len() >= 20).then(|| ratios[ratios.len() / 2])
+    };
+    Ok(median(at.is_some()).or_else(|| median(false)).unwrap_or(0.88))
 }
 
 fn stats_text(stats: &Stats) -> String {
@@ -494,8 +506,8 @@ mod tests {
         for (key, data) in [("a@1.000", chart(10, 0.95)), ("c@1.000", chart(7, 0.95))] {
             db.execute("INSERT INTO feats VALUES (?,?)", params![format!("{key}|old"), data]).unwrap();
         }
-        assert_eq!(carry_feats(&db, "old", "new", &after, &|_| None).unwrap(), 2);
-        assert_eq!(carry_feats(&db, "old", "new", &after, &|_| None).unwrap(), 0, "a stopped run can repeat");
+        assert_eq!(carry_feats(&db, "old", "new", &after, &|_| None, None).unwrap(), 2);
+        assert_eq!(carry_feats(&db, "old", "new", &after, &|_| None, None).unwrap(), 0, "a stopped run can repeat");
         let at = |key: &str| db.query_row("SELECT data FROM feats WHERE key=?", [key], |r| r.get::<_, Vec<u8>>(0)).unwrap();
         for (key, keys) in [("a@1.000", 10), ("c@1.000", 7)] {
             let Val::Dict(moved) = crate::codec::decode(&at(&format!("{key}|new"))).unwrap() else { panic!() };
@@ -512,7 +524,7 @@ mod tests {
         let mut old = Dict::new();
         (old.set("keys", 7i64), old.set("overall", 5.), old.set("stars", 4.2));
         db.execute("INSERT INTO feats VALUES (?,?)", params!["b@1.000|old", crate::codec::encode(&Val::Dict(old))]).unwrap();
-        carry_feats(&db, "old", "new", &after, &|_| Some(c.clone())).unwrap();
+        carry_feats(&db, "old", "new", &after, &|_| Some(c.clone()), None).unwrap();
         let Val::Dict(moved) = crate::codec::decode(&at("b@1.000|new")).unwrap() else { panic!() };
         let fresh = ms_calc::features::features_of(&ms_calc::compute::compute(&c, 1., true, &after).unwrap(), &after);
         assert_eq!((moved.f("overall"), moved.f("stam"), moved.f("stars")), (fresh.f("overall"), fresh.f("stam"), 4.2));
@@ -520,7 +532,7 @@ mod tests {
         let mut current = fresh.clone();
         (current.set("overall", 5.), current.set("stam", 0.123));
         db.execute("INSERT INTO feats VALUES (?,?)", params!["d@1.000|old", crate::codec::encode(&Val::Dict(current))]).unwrap();
-        carry_feats(&db, "old", "new", &after, &|_| Some(c.clone())).unwrap();
+        carry_feats(&db, "old", "new", &after, &|_| Some(c.clone()), None).unwrap();
         let Val::Dict(moved) = crate::codec::decode(&at("d@1.000|new")).unwrap() else { panic!() };
         assert_eq!(moved.f("stam"), 0.123, "same rules: the stored analysis stays");
     }

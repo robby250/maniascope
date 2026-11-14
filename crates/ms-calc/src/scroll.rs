@@ -2,7 +2,6 @@
 use crate::chart::Chart;
 use crate::params::Params;
 use crate::py;
-use std::collections::HashMap;
 
 pub const FEATURES: [&str; 4] = ["preview", "crowding", "motion", "stutter"];
 pub const DEFAULT_WEIGHTS: [f64; 4] = [0.8, 0.7, 0.8, 1.6];
@@ -87,15 +86,16 @@ pub fn geometry(chart: &Chart, rate: f64) -> Geometry {
         }
         previous[c] = Some(i);
     }
-    let mut by_time: HashMap<u64, (f64, f64, f64, bool, f64)> = HashMap::new();
+    // notes are sorted by time: a chord's notes share one reading, the last time's (was a map keyed by time, 2 % of analysis)
+    let mut by_time: Option<(u64, (f64, f64, f64, bool, f64))> = None;
     let mut history: std::collections::VecDeque<(f64, [f64; 4])> = std::collections::VecDeque::with_capacity(12);
     let mut vectors = Vec::with_capacity(n);
     let mut kinds = Vec::with_capacity(n);
     for i in 0..n {
         let t = chart.t[i];
         let ti = (t + 0.0).to_bits();
-        let current = match by_time.get(&ti) {
-            Some(&c) => c,
+        let current = match by_time.filter(|b| b.0 == ti) {
+            Some((_, c)) => c,
             None => {
                 let p = positions[i];
                 let entry = at(p - nominal);
@@ -187,7 +187,7 @@ pub fn geometry(chart: &Chart, rate: f64) -> Geometry {
                     let accel = thirds[2] > thirds[0];
                     cur = (preview, motion, fine, accel, 1f64.min(nominal / seen));
                 }
-                by_time.insert(ti, cur);
+                by_time = Some((ti, cur));
                 if history.len() == 12 {
                     history.pop_front();
                 }

@@ -30,7 +30,7 @@ fn pick(sha: char) -> Pick {
 }
 
 fn pool(a: &App, mode: &str, revision: u64, shown: Vec<Pick>) -> Out {
-    Out::Pool { mode: mode.into(), revision, selection_id: a.selection_id, phase: "warmup".into(), shown, note: "Synthetic UI check · target ~94%".into(), summary: "No actual prediction".into(), progress: None, key_counts: Default::default(), nps_pool: Default::default() }
+    Out::Pool { mode: mode.into(), revision, selection_id: a.selection_id, phase: "warmup".into(), shown, note: "Synthetic UI check · target ~94%".into(), summary: "No actual prediction".into(), progress: None, key_counts: Default::default(), skill_counts: Default::default(), nps_pool: Default::default() }
 }
 
 fn tasks(a: &App) -> Vec<Task> {
@@ -159,8 +159,8 @@ fn skip_warmup_shows_only_while_the_tab_warms_up() {
     h.get_by_label("Skip warmup").click();
     h.step();
     assert!(tasks(h.state()).iter().any(|t| matches!(t, Task::SkipWarmup)));
-    let Out::Pool { mode, revision, selection_id, shown, note, summary, progress, key_counts, nps_pool, .. } = pool(h.state(), "nps", h.state().revision, vec![pick('a')]) else { unreachable!() };
-    h.state_mut().on_rec(Out::Pool { mode, revision, selection_id, phase: "build".into(), shown, note, summary, progress, key_counts, nps_pool });
+    let Out::Pool { mode, revision, selection_id, shown, note, summary, progress, key_counts, skill_counts, nps_pool, .. } = pool(h.state(), "nps", h.state().revision, vec![pick('a')]) else { unreachable!() };
+    h.state_mut().on_rec(Out::Pool { mode, revision, selection_id, phase: "build".into(), shown, note, summary, progress, key_counts, skill_counts, nps_pool });
     h.step();
     assert!(h.query_by_label("Skip warmup").is_none());
 }
@@ -243,6 +243,47 @@ fn one_status_line_and_bar_the_workers_progress_first_else_this_tabs_analysis() 
     let done = pool(&a, "nps", revision, vec![pick('a')]);
     a.on_rec(done);
     assert!(a.views["nps"].analysing.is_none());
+}
+
+#[test]
+fn missing_population_data_is_explained_in_the_playlist_and_only_noted_in_the_main_window() {
+    let ctx = egui::Context::default();
+    let mut a = app(prefs(), &ctx);
+    a.on_rec(Out::Status { text: "Recommendations unavailable: could not download the population data".into(), progress: None, blocking: true, learning: None });
+    a.on_rec(Out::Card { c: None, note: None, path: None, rate: None });
+    assert!(a.status_text.contains("could not download"), "the playlist status line carries the reason");
+    assert!(a.flash.as_ref().is_some_and(|f| f.0.contains("playlist window") && f.1 > Instant::now()), "the main window notes it for a while");
+    assert!(a.card_note.is_none(), "no prediction line stuck on the error");
+}
+
+#[test]
+fn the_main_window_shows_the_analysis_bar_in_its_status_row_until_the_library_is_done() {
+    // user 2026-11-13: the bar and its count belong in the empty status row at the bottom, never over the card's graph
+    let ctx = egui::Context::default();
+    let mut a = app(prefs(), &ctx);
+    let analysis = crate::viewer::Analysis {
+        path: "x.osu".into(), rate: 1., sv: true, keys: 7, title: "Black Lotus".into(), artist: "wa.".into(), version: "Another".into(), creator: "Blocko".into(),
+        overall: 7.05, notes: 2400, ln_notes: 0., nps: Some(28.1), span: Some((0., 105_000.)), timeline: (0..60).map(|i| 4. + (i as f64 / 6.).sin()).collect(),
+        entries: Vec::new(), tags: Vec::new(), bars: Vec::new(), peak_nps: None, bid: None, names: Vec::new(), tech: Vec::new(), sv_ignored: false, dan_vibro: Default::default(), o2jam: None,
+    };
+    a.shown = Some(crate::app::Selected { path: "x.osu".into(), rate: 1., sv: true, result: Ok(std::sync::Arc::new(analysis)) });
+    a.on_rec(Out::Status { text: "Analysing maps · 104,075 / 104,226".into(), progress: Some((104_075, 104_226)), blocking: false, learning: None });
+    let (w, ht) = (430., 250.);
+    let mut h = Harness::builder().with_size(egui::vec2(w, ht)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.main_ui(ui), a);
+    h.step();
+    if let Ok(path) = std::env::var("MS_SHOT") {
+        h.render().expect("render").save(path).expect("save");
+    }
+    let r = h.get_by_label_contains("Analysing maps").rect();
+    // the status row: 22 px reserved under the graph, the 8 px window margin, the 3 px bar under the text
+    assert!(r.top() >= ht - 22. - 8. - 5. && r.bottom() <= ht - 8., "in the status row: {r:?}");
+    h.state_mut().on_rec(Out::Status { text: String::new(), progress: None, blocking: false, learning: None });
+    h.step();
+    assert!(h.query_by_label_contains("Analysing").is_none(), "gone once done");
+    // a few new maps later: the playlist window's bar only (user 2026-11-13: "annoying if it keeps showing up")
+    h.state_mut().on_rec(Out::Status { text: "Analysing 3 new or updated maps in the background · 1 done".into(), progress: Some((1, 3)), blocking: false, learning: Some(false) });
+    h.step();
+    assert!(h.query_by_label_contains("Analysing 3 new").is_none(), "not in the main window");
 }
 
 #[test]
@@ -332,7 +373,7 @@ fn a_row_from_an_older_skill_filter_opens_nothing_and_stale_lists_stay_out() {
 }
 
 #[test]
-fn stats_is_not_a_fourth_mode_and_its_skill_opens_practice() {
+fn stats_is_not_a_fourth_mode() {
     let ctx = egui::Context::default();
     let mut a = app(prefs(), &ctx);
     a.set_mode("skills");
@@ -340,8 +381,6 @@ fn stats_is_not_a_fourth_mode_and_its_skill_opens_practice() {
     a.set_stats(true);
     assert!(matches!(tasks(&a).last(), Some(Task::Stats(true))));
     assert_eq!(a.mode(), "skills");
-    a.practice_from_stats(7, "ln");
-    assert!(!a.stats_open && a.mode() == "skills" && a.s.practice == ["ln"] && a.s.keys["skills"] == [7]);
 }
 
 #[test]
@@ -415,17 +454,21 @@ fn chip_rows_wrap_inside_the_width() {
 
 #[test]
 fn every_skill_chip_stays_inside_the_settings_page() {
-    for width in [430., 320.] {
+    for width in [430., 320., 900.] {
         let ctx = egui::Context::default();
         let mut a = app(json!({"recommendation_mode": "skills", "skills_keys": [7]}), &ctx);
         a.views.get_mut("skills").unwrap().settings = true;
         let mut h = Harness::builder().with_size(egui::vec2(width, 760.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.playlist_ui(ui), a);
-        h.step();
+        h.run(); // the second frame cuts rows from the drawn widths
         h.get_by_label("Any");
-        for chip in ["Stream", "Chordstream", "Trills", "Chordjack", "Jacks", "LN", "Technical", "Stamina", "SV"] {
+        for chip in ["Stream", "Chordstream", "Trills", "Chordjack", "Jacks", "LN", "Technical", "Stamina", "SV", "Vibro", "Mash"] {
             let right = h.get_by_label(chip).rect().right() as f32;
             assert!(right <= width, "{chip} ends at {right} of {width}");
         }
+        if width > 800. {
+            assert_eq!(h.get_by_label("Vibro").rect().top(), h.get_by_label("Any").rect().top(), "the first row fills a wide window");
+        }
+        if let Ok(path) = std::env::var("MS_SHOT") { h.render().expect("render").save(format!("{path}-{width}.png")).expect("save"); }
     }
 }
 
@@ -716,12 +759,14 @@ fn a_card_row_carries_its_modifier_tags_beside_the_name() {
         path: "x.osu".into(), rate: 1., sv: true, keys: 7, title: "Cyber Shaman".into(), artist: "Cosmo".into(), version: "Local difficulty".into(), creator: "someone".into(),
         overall: 6.1, notes: 2400, ln_notes: 900., nps: Some(14.2), span: Some((0., 150_000.)), timeline: (0..60).map(|i| 4. + (i as f64 / 6.).sin()).collect(),
         entries: vec![entry("LN Release", 6.0, &["Tech"]), entry("Stream", 5.6, &["Stamina"]), entry("Chordjack", 4.9, &[])], tags: Vec::new(), bars: Vec::new(),
-        peak_nps: None, bid: None, names: Vec::new(), tech: Vec::new(), sv_ignored: false, dan_vibro: Default::default(),
+        peak_nps: None, bid: None, names: Vec::new(), tech: Vec::new(), sv_ignored: false, dan_vibro: Default::default(), o2jam: Some(84.4),
     };
+    a.s.display.o2jam = true;
     a.shown = Some(crate::app::Selected { path: "x.osu".into(), rate: 1., sv: true, result: Ok(std::sync::Arc::new(analysis)) });
     a.s.display.skills = 3;
     let mut h = Harness::builder().with_size(egui::vec2(460., 260.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.main_ui(ui), a);
     h.step();
+    h.get_by_label_contains("O2Jam Lv. 84"); // beside the dan, off by default (user 2026-11-13)
     h.get_by_label_contains("Tech LN Release"); // Tech before the name (user 2026-11-12); the second row is one painted galley, seen in the screenshot
     // MS_SHOT=path: a themed screenshot of this card (software Vulkan is enough).
     if let Ok(path) = std::env::var("MS_SHOT") {
@@ -768,4 +813,41 @@ fn no_text_or_button_runs_past_any_settings_page() {
             assert!(past.is_empty(), "{mode} at {width}: {past:?}");
         }
     }
+}
+
+#[test]
+fn closing_details_returns_the_window_to_its_compact_size() {
+    // user 2026-11-14: closing Details still grew the window downwards. The compositor applies our resizes a few frames late.
+    let ctx = egui::Context::default();
+    let mut a = app(prefs(), &ctx);
+    a.s.win = (430., 240.);
+    let analysis = crate::viewer::Analysis {
+        path: "x.osu".into(), rate: 1., sv: true, keys: 7, title: "T".into(), artist: "A".into(), version: "V".into(), creator: "C".into(),
+        overall: 5., notes: 2400, ln_notes: 0., nps: Some(20.), span: Some((0., 105_000.)), timeline: vec![4.; 60],
+        entries: Vec::new(), tags: Vec::new(), bars: (0..4).map(|i| (format!("s{i}"), format!("S{i}"), 0.5)).collect(), peak_nps: None, bid: None, names: Vec::new(), tech: Vec::new(), sv_ignored: false, dan_vibro: Default::default(), o2jam: None,
+    };
+    a.shown = Some(crate::app::Selected { path: "x.osu".into(), rate: 1., sv: true, result: Ok(std::sync::Arc::new(analysis)) });
+    let mut h = Harness::builder().with_size(egui::vec2(430., 240.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| {
+        a.main_ui(ui);
+        a.track_window(&ui.ctx().clone());
+    }, a);
+    let mut want = egui::vec2(430., 240.);
+    let settle = |h: &mut Harness<'static, App>, want: &mut egui::Vec2| for i in 0..8 {
+        h.step();
+        if let Some((w, ht)) = h.state().resized { *want = egui::vec2(w, ht) }
+        if i == 3 { h.set_size(*want); }
+    };
+    settle(&mut h, &mut want);
+    let mut heights = Vec::new();
+    for _ in 0..3 {
+        h.get_by_label_contains("Details").click();
+        settle(&mut h, &mut want);
+        heights.push(want.y);
+        h.get_by_label_contains("Details").click();
+        settle(&mut h, &mut want);
+        heights.push(want.y);
+    }
+    eprintln!("{heights:?} {:?}", h.state().s.win);
+    assert!(heights.iter().skip(1).step_by(2).all(|&y| y == 240.), "closed back to 240: {heights:?}");
+    assert!(heights.iter().step_by(2).all(|&y| y > 240. && y == heights[0]), "open grows by the rows each time: {heights:?}");
 }

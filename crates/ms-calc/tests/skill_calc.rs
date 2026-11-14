@@ -190,10 +190,11 @@ fn hand_patterns() {
     // a long single-column run is Longjack, the slice of Jacks it fills; repeated chords are chordjack
     assert_eq!(top(&col(2, 150, 400), 7, 1), ["longjack"]);
     assert_eq!(top(&col(2, 150, 400), 4, 1), ["longjack"]);
-    // an anchor with the other hand in between is still a jack in 7K (the hand repeats); 200 ms repeats: since 21660e31a4f6
+    // an anchor with the other hand in between is a Longjacks run in 7K (the hand repeats); 200 ms repeats: since 21660e31a4f6
     // slower 7K jacks cost less (JACK_P curve), and at 240 ms stamina of the 800-note run ranks above it
     let anchor: Vec<Note> = (0..800i64).map(|i| (1000 + 100 * i, if i % 2 == 1 { 1 } else { (5 + (i / 2) % 2) as usize }, None)).collect();
-    assert!(top(&anchor, 7, 2).contains(&"jack"));
+    let t = top(&anchor, 7, 2);
+    assert!(t.contains(&"longjack"), "{t:?}"); // one column 400 times in a row: the other hand between doesn't end the run (plan 2026-11-13b S4)
     let cj = rows(&[&[0, 3, 4, 5], &[0, 2, 4, 6]], 160, 400);
     assert_eq!(top(&cj, 7, 1), ["chordjack"]);
     assert!(!top(&cj, 7, 3).contains(&"bracket"));

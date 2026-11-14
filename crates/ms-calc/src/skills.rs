@@ -164,6 +164,8 @@ pub const EVIDENCE_WIN: usize = 2;
 pub struct Evidence<'a> {
     pub own: &'a [f64],
     pub quad: &'a [f64],
+    /// gestures VIBRO_SHIFT per bin: fast runs under changing chords
+    pub shift: &'a [f64],
     /// compute::interleaved: the chart's share of interleaving disjoint chord-group moves.
     pub interleaved: f64,
 }
@@ -226,7 +228,12 @@ pub fn slice(series: &mut Series, parts: &Parts, total: &[f64], ev: &Evidence, k
     }).collect();
     let slices: Vec<(Sk, &[Sk], bool, Vec<f64>)> = slices.into_iter().map(|(s, of, d, x)| {
         let r = k.ramp(s);
-        (s, of, within(d), x.into_iter().map(|x| ramp(x, r, keys, level)).collect())
+        let mut share: Vec<f64> = x.into_iter().map(|x| ramp(x, r, keys, level)).collect();
+        if s == Sk::vibro {
+            // anchored jacks at vibro speed: at most VIBRO_SHIFT of the bin, the chordjack keeps the rest (shown 2nd, not 1st)
+            share.iter_mut().zip(ev.shift).for_each(|(v, &x)| *v = v.max(k.VIBRO_SHIFT * 1f64.min(x / 0.8)));
+        }
+        (s, of, within(d), share)
     }).collect();
     for (s, _, _, r) in slices.iter().filter(|s| !s.2) {
         let v: Vec<f64> = (0..series.get(*s).len()).map(|b| total.get(b).copied().unwrap_or(0.0) * r[b]).collect();

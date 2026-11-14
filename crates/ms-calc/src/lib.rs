@@ -10,6 +10,8 @@ pub mod flow;
 pub mod gestures;
 pub mod kern;
 pub mod model;
+pub mod notefeat;
+pub mod notenet;
 pub mod params;
 pub mod pattern;
 pub mod py;
@@ -24,4 +26,4 @@ pub mod val;
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // A refit takes the sha256 of calib/difficulty.json; a rules-only change (labels, same stars) that of it plus the rule commit.
-pub const CALC_ID: &str = "2789b337ae54";
+pub const CALC_ID: &str = "29a02d72f4a7";

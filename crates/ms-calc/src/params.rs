@@ -181,8 +181,12 @@ knobs! {
     TRILL_GAP: f64 = 0.2,
     MJ_BURST: usize = 2,
     VIBRO_GAP: f64 = 0.095,
-    VIBRO_MIN: usize = 5,
-    LJ_GAP: f64 = 0.25, // Longjacks: column runs (structure::column_runs) slower than VIBRO_GAP up to this
+    VIBRO_MIN: usize = 7, // column_runs: 7 hits (2026-11-13: 5–6 read DESTRUCTION 3,2,1 stream bursts as vibro)
+    VIBRO_P: f64 = 2.0, // column_runs: a run is vibro under VIBRO_GAP × (chord repeat share)^VIBRO_P
+    VIBRO_RUN: f64 = 11.0, // gestures::vibro: a fast same-chord run counts as vibro from 4 rows, fully at this many
+    VIBRO_SHIFT: f64 = 0.45, // gestures::vibro: share of a fast run's vibro kept while its chords keep changing (anchored jacks)
+    HS_SAT: f64 = 5.0, // demand: 4K stream work is all handstream once hands are 1/HS_SAT of its rows
+    LJ_GAP: f64 = 0.3, // Longjacks: column runs (structure::column_runs) slower than VIBRO_GAP up to this
     RAMPS: [f64; 4 * crate::taxonomy::SLICES] = crate::taxonomy::fitted_ramps(), // each slice's [lo, hi, e, g] (skills::ramp), calib/taxonomy.json
     STAMINA_WINDOW: f64 = 60.0, // seconds of demand the stamina rating averages (skills::local_levels)
     BURST_TAG: f64 = 1.5,   // card tag "short burst": the 2 s timeline peaks this far above the overall

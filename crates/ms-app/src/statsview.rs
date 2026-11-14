@@ -341,17 +341,9 @@ impl App {
                             if let Some(d) = &dan {
                                 theme::dim_small(ui, format!("≈ {d}"));
                             }
-                            if row.is_some_and(|g| g.rusty) {
-                                theme::dim_small(ui, "rusty").on_hover_text("Not played for a while: expect worse results until you are back in practice. The level is what you reach once warmed up again.");
-                            }
                         }
                         None => { ui.label("—"); }
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(egui::Button::new("Practice").frame(false)).on_hover_text(format!("Skills tab · {} · {keys}K · target {:.0}%", node.name, 100. * self.s.targets["skills"])).clicked() {
-                            self.practice_from_stats(keys, &node.key);
-                        }
-                    });
                 });
             });
         });
@@ -434,13 +426,17 @@ impl App {
         let scale = Scale { lo, hi: hi.max(lo + 0.5), dan: rice };
         // Every row's bar starts and ends at the same x, under the dan axis.
         let width = ui.available_width();
-        let l = Layout { name: 135., tail: 150., bar: (width - 135. - 150. - 16.).max(80.) };
+        let parents = skills::tree(keys);
+        // name column = widest name on screen (children only of open families, indented 22 px), so bars start right after it
+        let text = |t: String| egui::WidgetText::from(t).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body).size().x;
+        let open = |p: &Skill| self.s.expanded.contains(&(keys, p.key.clone()));
+        let name = parents.iter().flat_map(|p| std::iter::once(text(format!("▸ {}", p.name)) + 2. * ui.spacing().button_padding.x).chain(p.children.iter().filter(|_| open(p)).map(|c| 22. + text(c.name.to_string())))).fold(60., f32::max) + 8.;
+        let l = Layout { name, tail: 150., bar: (width - name - 150. - 16.).max(80.) };
         theme::dim(ui, format!("● level   band: uncertainty{}", if page.session { "   ○ this session" } else { "" }));
         ui.horizontal(|ui| {
             ui.add_space(l.name + 8.);
             dan_axis(ui, keys, scale, l.bar);
         });
-        let parents = skills::tree(keys);
         // One line across every bar at the hovered level: drawn from the last frame's pointer, rows above included.
         let line_id = ui.scope_id().with(("skill-line", keys));
         let line = ui.data(|d| d.get_temp::<f64>(line_id));

@@ -12,6 +12,7 @@ pub mod public;
 pub mod pyjson;
 pub mod realm;
 pub mod replays;
+pub mod share;
 pub mod stable;
 pub mod store;
 pub mod tools;

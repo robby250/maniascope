@@ -1,0 +1,133 @@
+{
+  "note": "Slice ramps (ms_calc::skills::ramp): [lo, hi, e, g] at 7K and chart level 5, both × (keys/7)^e × (level/5)^g. `calib ramps` refits them; card: TAG (`calib labels --fit`).",
+  "card": {
+    "tag": 0.83,
+    "name": 0.63
+  },
+  "ramps": {
+    "bracket": [
+      0.0773,
+      0.3272,
+      1.0419,
+      0.0
+    ],
+    "dump": [
+      0.1351,
+      0.5373,
+      0.0,
+      0.0
+    ],
+    "quadstream": [
+      0.0,
+      0.4286,
+      0.0,
+      0.0
+    ],
+    "minijack": [
+      0.0696,
+      0.3709,
+      -0.222,
+      0.4376
+    ],
+    "longjack": [
+      0.0,
+      0.307,
+      0.0,
+      0.0
+    ],
+    "vibro": [
+      0.0,
+      0.0547,
+      0.0,
+      0.0
+    ],
+    "ln_tech": [
+      0.1389,
+      0.9524,
+      0.0,
+      0.1711
+    ],
+    "ln_inverse": [
+      0.2905,
+      0.8658,
+      0.0,
+      0.0
+    ],
+    "ln_release": [
+      0.043,
+      0.3346,
+      0.0,
+      1.4428
+    ],
+    "shield": [
+      0.0,
+      0.0788,
+      0.0,
+      2.8813
+    ],
+    "sv_fast": [
+      1.0,
+      3.2716,
+      0.0,
+      0.0
+    ],
+    "sv_slow": [
+      0.0,
+      0.2544,
+      0.0,
+      0.0
+    ],
+    "sv_accel": [
+      0.2714,
+      3.0764,
+      0.0,
+      0.0
+    ],
+    "sv_stutter": [
+      0.007,
+      1.8407,
+      0.0,
+      0.0
+    ],
+    "sv_brake": [
+      0.3336,
+      6.9734,
+      0.0,
+      0.0
+    ],
+    "trill1h": [
+      0.0247,
+      0.6396,
+      0.0,
+      0.6351
+    ],
+    "anchor": [
+      0.0,
+      0.9256,
+      0.0,
+      0.0
+    ]
+  },
+  "quantiles": {
+    "ql": 0.8,
+    "qh": {
+      "anchor": 0.998,
+      "bracket": 0.998,
+      "dump": 0.998,
+      "ln_inverse": 0.998,
+      "ln_release": 0.98,
+      "ln_tech": 0.98,
+      "longjack": 0.95,
+      "minijack": 0.99,
+      "quadstream": 0.95,
+      "shield": 0.998,
+      "sv_accel": 0.998,
+      "sv_brake": 0.998,
+      "sv_fast": 0.998,
+      "sv_slow": 0.998,
+      "sv_stutter": 0.998,
+      "trill1h": 0.998,
+      "vibro": 0.998
+    }
+  }
+}

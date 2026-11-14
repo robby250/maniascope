@@ -13,7 +13,7 @@ use ms_data::imports::{self, add_live_score, import_library, Imported};
 use ms_data::public::Public;
 use ms_data::store::{acc_lazer, acc320, connect, kv_get, kv_set, log_event, now, parse_stats, predictable_context, stable_miss_ratio, timestamp, tracking_allowed, Db, Result, Stats, SUPPORTED_KEYS};
 use ms_data::{replays, webmaps};
-use ms_model::choices::{key_shares, keymode_order, ChoiceList, Prepared, CONVERT, REAL, WEB};
+use ms_model::choices::{key_shares, keymode_order, stream_odds, ChoiceList, Prepared, CONVERT, REAL, WEB};
 use crate::converts::{self, Setting};
 use ms_model::predict::{Consts, FeatStore, HashMap};
 use ms_model::session::SESSION_GAP;
@@ -130,7 +130,7 @@ pub struct Verdict {
 
 pub enum Out {
     Status { text: String, progress: Option<(usize, usize)>, blocking: bool, learning: Option<bool> },
-    Pool { mode: String, revision: u64, selection_id: u64, phase: String, shown: Vec<Pick>, note: String, summary: String, progress: Option<(usize, usize)>, key_counts: BTreeMap<i64, usize>, nps_pool: BTreeMap<i64, Vec<f64>> },
+    Pool { mode: String, revision: u64, selection_id: u64, phase: String, shown: Vec<Pick>, note: String, summary: String, progress: Option<(usize, usize)>, key_counts: BTreeMap<i64, usize>, skill_counts: BTreeMap<String, usize>, nps_pool: BTreeMap<i64, Vec<f64>> },
     Progress { mode: String, progress: Option<(usize, usize)> }, // analysis between publications: the list stays as it is
     Target { mode: String, revision: u64, selection_id: u64, c: Option<Box<Pick>>, msg: String, copy: Option<String> },
     Copy { text: String, msg: String },
@@ -254,7 +254,8 @@ pub struct Worker {
     key_weights: std::collections::HashMap<&'static str, BTreeMap<i64, f64>>,
     by_count: std::collections::HashMap<&'static str, bool>,
     converts: std::collections::HashMap<&'static str, BTreeMap<i64, Setting>>,
-    odds: std::collections::HashMap<&'static str, [f64; 3]>,
+    stream_mix: std::collections::HashMap<&'static str, ([f64; 2], [bool; 2])>, // the tab's website/convert sliders and per-map switches: each keymode's odds come from its own maps (choices::stream_odds)
+    mix_logged: HashMap<&'static str, String>, // the last list mix written to the log, per tab
     convert_turn: Arc<AtomicU64>, // the newest convert to deliver: a skipped one never reaches the game
     skill_weights: std::collections::HashMap<String, f64>,
     skill_tuning: skills::Tuning,
@@ -269,7 +270,7 @@ pub struct Worker {
     shown: Shown,
     session_cache: Option<((Option<i64>, i64), f64, Arc<Now>)>,
     taste_cache: (Option<i64>, HashMap<(i64, String), f64>),
-    nps_pool: BTreeMap<i64, Vec<f64>>, // the NPS tab's eligible maps' NPS per keymode, sorted (choices::nps_eligible)
+    nps_pool: HashMap<&'static str, BTreeMap<i64, Vec<f64>>>, // per tab: eligible maps' NPS per keymode, sorted (choices::nps_eligible)
     sel: (Option<PathBuf>, Option<f64>, Option<Vec<Value>>),
     loading: Option<String>,
     learning: Arc<Mutex<Option<String>>>,
@@ -298,6 +299,7 @@ struct Jobs {
     importing: AtomicBool,
     archiving: AtomicBool,
     filling: AtomicBool,
+    solving: AtomicBool,
 }
 
 /// "0.75–1.50×", or "1.00× only" when HT/DT is off.
@@ -374,10 +376,10 @@ impl Worker {
             mode: "pp".into(), action: "auto".into(), revision: 0, selection_id: 0,
             keys: [("pp", SUPPORTED_KEYS.collect()), ("nps", vec![7]), ("skills", vec![7])].into_iter().collect(),
             target: None, targets: Default::default(), playlists: empty(), consumed: VecDeque::new(), nps_focus: 0.5, skills_focus: 0., skills_mix: PpMix { on: false, ..PpMix::default() }, web_bias: [("nps", 0.5), ("skills", 0.5)].into_iter().collect(), skill_weights: Default::default(), skill_tuning: Default::default(), web_weighted: [("nps", true), ("skills", true)].into_iter().collect(), key_weights: Default::default(), by_count: Default::default(),
-            converts: [("nps", BTreeMap::new()), ("skills", BTreeMap::new())].into_iter().collect(), odds: [("nps", [1., 1., 0.]), ("skills", [1., 1., 0.])].into_iter().collect(), convert_turn: Arc::new(AtomicU64::new(0)),
+            converts: [("nps", BTreeMap::new()), ("skills", BTreeMap::new())].into_iter().collect(), stream_mix: [("nps", ([0., 0.], [false; 2])), ("skills", ([0., 0.], [false; 2]))].into_iter().collect(), mix_logged: HashMap::default(), convert_turn: Arc::new(AtomicU64::new(0)),
             acc_targets: [("nps", DEFAULT_TARGET), ("skills", DEFAULT_TARGET)].into_iter().collect(), rates: [("nps", builder::DEFAULT_RATES), ("skills", builder::DEFAULT_RATES)].into_iter().collect(), pp_mix: PpMix::default(), settings: PpSettings::default(), practice_skills: Vec::new(),
             states: [("nps", ListState::default()), ("skills", ListState::default())].into_iter().collect(), credible: Default::default(), restored: HashSet::new(),
-            shown: Shown { client, miss_ratio }, session_cache: None, taste_cache: (None, HashMap::default()), nps_pool: BTreeMap::new(), sel: (None, None, None), loading: None, learning: Arc::default(), first_import, refresh_queued: false,
+            shown: Shown { client, miss_ratio }, session_cache: None, taste_cache: (None, HashMap::default()), nps_pool: HashMap::default(), sel: (None, None, None), loading: None, learning: Arc::default(), first_import, refresh_queued: false,
             refit_due: false, refit_running: false, refit_again: false, last_refit: now(), last_idle_check: Instant::now(), nps_requested: Instant::now(), clock_due: true, replay_due: Some(Instant::now() + Duration::from_secs(10)),
             replay_retries: 0, jobs: Arc::default(), feature_errors: Arc::default(), feature_pending: Arc::default(), stats_visible: false, stats_cache: None, current: None, yielding: false,
         }
@@ -404,7 +406,12 @@ impl Worker {
         }
         match self.startup(public) {
             Ok(()) => self.stage(None, false),
-            Err(e) => self.stage(Some(format!("Recommendations unavailable: {}", e.chars().take(240).collect::<String>())), true),
+            Err(e) => {
+                self.stage(Some(format!("Recommendations unavailable: {}", e.chars().take(240).collect::<String>())), true);
+                // the playlist window shows why; the main window drops the prediction line and keeps the map's own ratings
+                self.loading = None;
+                self.card();
+            }
         }
         self.begin_import();
         while !self.halt.load(Ordering::Relaxed) {
@@ -463,6 +470,8 @@ impl Worker {
         let r = refit(&self.db, &public, &self.c).map_err(|e| e.to_string())?;
         self.public = Some(public.clone());
         self.rec = Some(Engine::new(public, self.c.clone(), r, self.settings.clone()));
+        self.rec.as_mut().unwrap().pernote = crate::pernote::PerNote::load().map(Arc::new);
+        self.solve_abilities();
         self.save_pp_floor();
         self.generation += 1;
         self.spawn_builder();
@@ -493,7 +502,8 @@ impl Worker {
                 let [d, t] = ms_data::store::CARRIED.each_ref().map(|a| a.load(Ordering::Relaxed));
                 if t > 0 {
                     let text = format!("Updating stored ratings (once) · {} / {} charts", crate::engine::commas(d.min(t)), crate::engine::commas(t));
-                    emit(Out::Status { text, progress: None, blocking: false, learning: None });
+                    // counted, so both windows draw it as their progress bar (user 2026-11-13), gone with the next status
+                    emit(Out::Status { text, progress: Some((d.min(t), t)), blocking: false, learning: None });
                 }
                 std::thread::sleep(Duration::from_millis(500));
             });
@@ -507,7 +517,7 @@ impl Worker {
 
     /// Ok(true) once both stores carried. The own rows' error stops the launch; the website's waits for the next launch.
     fn carry_all(db: &Db) -> std::result::Result<bool, String> {
-        crate::engine::carry_rows(db)?;
+        crate::engine::carry_rows(db, None)?;
         // A crawl from before the update can still hold it.
         if ms_data::webmaps::running() {
             return Ok(false);
@@ -676,7 +686,7 @@ impl Worker {
             self.playlists.insert(mode, shown.clone());
         }
         let progress = st.as_ref().and_then(ListState::progress);
-        (self.h.emit)(Out::Pool { mode: mode.to_string(), revision: self.revision, selection_id: self.selection_id, phase, shown, note, summary: self.summary(), progress, key_counts: self.key_counts(mode), nps_pool: if mode == "nps" { self.nps_pool.clone() } else { BTreeMap::new() } });
+        (self.h.emit)(Out::Pool { mode: mode.to_string(), revision: self.revision, selection_id: self.selection_id, phase, shown, note, summary: self.summary(), progress, key_counts: self.key_counts(mode), skill_counts: if mode == "skills" { self.skill_counts(mode) } else { BTreeMap::new() }, nps_pool: self.nps_pool.get(mode).cloned().unwrap_or_default() });
         Ok(())
     }
 
@@ -698,6 +708,15 @@ impl Worker {
         let mut counts: BTreeMap<i64, usize> = BTreeMap::new();
         for i in self.states.get(mode).map(|s| s.catalog.values()).into_iter().flatten().filter(|i| i.installed || i.convert_of.is_some()) {
             *counts.entry(i.keys).or_default() += 1;
+        }
+        counts
+    }
+
+    /// Your maps and converts per leading included skill ("" for none) in the Skills catalogue: the skill sliders' counts.
+    fn skill_counts(&self, mode: &str) -> BTreeMap<String, usize> {
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for c in self.states.get(mode).map(|s| s.candidates.items.iter()).into_iter().flatten().filter(|c| (c.installed || c.convert) && self.keys[mode].contains(&c.keys)) {
+            *counts.entry(c.matched.first().cloned().unwrap_or_default()).or_default() += 1;
         }
         counts
     }
@@ -768,25 +787,29 @@ impl Worker {
             }
         }
         self.yield_urgent(); // a selected map's card goes before the library-wide weighting
-        let shares = (mode == "skills").then(|| skills::shares(&self.practice_skills, &self.skill_weights, self.skill_tuning.other)).flatten();
+        let shares = (mode == "skills").then(|| skills::sliders(&self.practice_skills, &self.skill_weights, self.skill_tuning.other)).flatten().map(|sl| {
+            let counts = self.skill_counts(mode);
+            let entries: Vec<(String, f64, usize)> = sl.into_iter().map(|(k, w)| { let n = counts.get(&k).copied().unwrap_or(0); (k, w, n) }).collect();
+            ms_model::choices::mix_shares(&entries, self.skill_tuning.by_count).into_iter().collect::<std::collections::HashMap<_, _>>()
+        });
         let seed = n.session.all.iter().filter(|e| matches!(e.kind.as_str(), "offer" | "finish" | "abort" | "reset")).map(|e| e.id).max().unwrap_or(0);
-        let seed = (mode == "nps" || shares.is_some()).then(|| seed.to_string());
+        let seed = Some(seed.to_string()); // the custom playlist's slider at off drops it (builder::rank)
         let consumed: HashSet<String> = self.consumed.iter().cloned().collect();
         let active: Vec<&Setting> = self.keys[mode].iter().filter_map(|k| self.converts[mode].get(k)).filter(|s| s.on && !s.sources.is_empty()).collect();
         let convert = if active.is_empty() { 0. } else { web_factor(active.iter().map(|s| s.often).sum::<f64>() / active.len() as f64) }; // several keymodes share one list
         let (recent_sets, recent_convert_sets) = if active.is_empty() { Default::default() } else { self.recent_sets(&n)? };
-        if mode == "nps" {
-            // the slider counts the maps its floor keeps from this, while dragging, without asking the worker
-            self.nps_pool = prepared.nps_pool(&prepared.family_best(&self.keys[mode], web_factor(self.web_bias[mode]), convert));
-        }
+        // the slider counts the maps its floor keeps from this, while dragging, without asking the worker
+        self.nps_pool.insert(mode, prepared.nps_pool(&prepared.family_best(&self.keys[mode], web_factor(self.web_bias[mode]), convert)));
+        let mix = ([web_factor(self.web_bias[mode]), convert], [self.web_weighted[mode], active.iter().any(|s| s.weighted)]);
         let store = self.store.read().unwrap();
-        let (ranked, odds) = rank(&prepared, &st.catalog, &n.session, &store, RankInputs {
-            keys: self.keys[mode].clone(), mode, web: web_factor(self.web_bias[mode]), convert, weighted: [self.web_weighted[mode], active.iter().any(|s| s.weighted)], recent_sets: &recent_sets, recent_convert_sets: &recent_convert_sets, taste: if mode == "nps" { &self.taste_cache.1 } else { &none }, consumed: &consumed, seed, focus: if mode == "nps" { self.nps_focus } else { self.skills_focus }, count: 60,
+        let (ranked, _) = rank(&prepared, &st.catalog, &n.session, &store, RankInputs {
+            keys: self.keys[mode].clone(), mode, web: mix.0[0], convert: mix.0[1], weighted: mix.1, recent_sets: &recent_sets, recent_convert_sets: &recent_convert_sets, taste: if mode == "nps" { &self.taste_cache.1 } else { &none }, consumed: &consumed, seed, focus: if mode == "nps" { self.nps_focus } else { self.skills_focus }, count: 60,
             recent: Self::recent(&n, mode), key_shares: self.key_shares(mode), skill_weights: shares, selected_skills: &self.practice_skills, miss_ratio: (self.shown.client == "stable").then_some(self.shown.miss_ratio),
         });
         drop(store);
-        self.odds.insert(mode, odds);
+        self.stream_mix.insert(mode, mix);
         let shown: Vec<Pick> = ranked.iter().take(20).cloned().collect();
+        self.log_mix(mode, &prepared, &shown, convert);
         // A queued map outside the current top 60 was queued under another state (cold start, restart list): G835LX
         // 2026-10-22 offered dEKA, 6 NPS, ranked 2242 of 2245, after seven such maps.
         self.credible.insert(mode.to_string(), ranked.iter().filter_map(Pick::identity).collect());
@@ -820,6 +843,36 @@ impl Worker {
             note += " · showing the last list while it updates";
         }
         Ok((n.session.phase().to_string(), shown, note))
+    }
+
+    /// One log line per changed list (user 2026-11-13: lists stuck on one skill, "add debugging"): each pattern group's
+    /// eligible maps, its picks among the 20 shown with their mean value and weight, and its NPS taste factor.
+    fn log_mix(&mut self, mode: &'static str, prepared: &ms_model::choices::Prepared, shown: &[Pick], convert: f64) {
+        let mut eligible: BTreeMap<(i64, String), (usize, usize)> = BTreeMap::new(); // maps, of them converts
+        for i in prepared.family_best(&self.keys[mode], web_factor(self.web_bias[mode]), convert) {
+            let c = &prepared.list.items[i];
+            let e = eligible.entry((c.keys, c.group.clone())).or_default();
+            (e.0, e.1) = (e.0 + 1, e.1 + usize::from(c.convert));
+        }
+        let mut picked: BTreeMap<(i64, String), (usize, f64, f64, usize)> = BTreeMap::new();
+        for p in shown {
+            let e = picked.entry((p.keys, p.group.clone().unwrap_or_default())).or_default();
+            (e.0, e.1, e.2, e.3) = (e.0 + 1, e.1 + p.value, e.2 + p.weight, e.3 + usize::from(p.convert_of.is_some()));
+        }
+        let groups: Vec<String> = eligible.iter().map(|(k, &(n, nc))| {
+            let (c, v, w, cc) = picked.get(k).copied().unwrap_or_default();
+            let taste = if mode == "nps" { self.taste_cache.1.get(k).map_or(String::new(), |t| format!(" taste {:.2}", (0.65 * t).exp())) } else { String::new() };
+            let shown = if c > 0 { format!(" shown {c} ({cc} converts) value {:.2} weight {:.3}", v / c as f64, w / c as f64) } else { String::new() };
+            format!("{}K {} {n} ({nc} converts){shown}{taste}", k.0, k.1)
+        }).collect();
+        let (sliders, _) = self.stream_mix.get(mode).copied().unwrap_or_default();
+        // the shown order, which Next takes from the top: keymode, `c` a convert, `w` a website chart
+        let order: Vec<String> = shown.iter().map(|p| format!("{}{}", p.keys, if p.convert_of.is_some() { if p.source_web { "cw" } else { "c" } } else if p.stream() == WEB { "w" } else { "" })).collect();
+        let line = format!("list {mode} focus {:.2} sliders web/convert {:.2}/{:.2} order {}: {}", if mode == "nps" { self.nps_focus } else { self.skills_focus }, sliders[0], sliders[1], order.join(" "), groups.join(" | "));
+        if self.mix_logged.get(mode) != Some(&line) {
+            eprintln!("{line}");
+            self.mix_logged.insert(mode, line);
+        }
     }
 
     fn mix_of(&self, mode: &str) -> &PpMix {
@@ -941,8 +994,11 @@ impl Worker {
             // Kept maps you don't have outlive the played ones and piled up at the top (user 2026-10-26).
             let streams: Vec<u8> = shown.iter().map(Pick::stream).collect();
             let keys: Vec<i64> = shown.iter().map(|p| p.keys).collect();
-            let odds = self.odds[mode];
-            let order = keymode_order(&keys, &streams, |_| odds, &Self::recent(&n, mode), &self.key_shares(mode));
+            // each keymode's website/convert odds from its own maps, as the ranking ordered them (one odds over every
+            // keymode put 10K converts at 0.3 against all 4K–10K maps instead of ~2 against 10K's own: user 2026-11-13,
+            // "converts really far in the list … never end up in the front")
+            let (sliders, weighted) = self.stream_mix[mode];
+            let order = keymode_order(&keys, &streams, |s| stream_odds(sliders, weighted, s), &Self::recent(&n, mode), &self.key_shares(mode));
             shown = order.into_iter().map(|i| shown[i].clone()).collect();
         }
         let kept = head.as_deref().is_some_and(|h| to_front(&mut shown, h));
@@ -1402,6 +1458,7 @@ impl Worker {
             if !fresh && new {
                 self.t_refit(); // a newly viewed old score is historical evidence, unlike a live result handled by form
             }
+            self.solve_abilities();
             self.card();
             if fresh {
                 self.retarget(Some((&sha, md5.as_deref(), bid)))?;
@@ -1467,7 +1524,7 @@ impl Worker {
     fn card(&mut self) {
         let (path, rate, mods) = self.sel.clone();
         let Some(path) = path.filter(|_| self.rec.is_some()) else {
-            let note = self.sel.0.as_ref().map(|_| self.loading.clone().unwrap_or_else(|| "Loading prediction model…".to_string()));
+            let note = self.sel.0.as_ref().and(self.loading.clone());
             (self.h.emit)(Out::Card { c: None, note, path: self.sel.0.clone(), rate });
             return;
         };
@@ -1630,13 +1687,19 @@ impl Worker {
             let Some((f, e)) = at(self, next)? else { break };
             tried.push((next, f, e));
         }
-        if let Some(best) = tried.iter().min_by(|a, b| off(&a.2).total_cmp(&off(&b.2))).map(|t| t.0) {
+        // Step 0.01 at a time until both neighbours of the best are no nearer the target.
+        while let Some(best) = tried.iter().min_by(|a, b| off(&a.2).total_cmp(&off(&b.2))).map(|t| t.0) {
+            let mut grew = false;
             for next in [best - 0.01, best + 0.01].map(|r| ms_calc::py::round_digits(r, 2)) {
                 if (lo - 1e-9..=hi + 1e-9).contains(&next) && !tried.iter().any(|t| t.0 == next) {
                     if let Some((f, e)) = at(self, next)? {
                         tried.push((next, f, e));
+                        grew = true;
                     }
                 }
+            }
+            if !grew {
+                break;
             }
         }
         if let Some((rate, f, e)) = tried.into_iter().min_by(|a, b| off(&a.2).total_cmp(&off(&b.2))) {
@@ -2113,6 +2176,21 @@ impl Worker {
             jobs.archiving.store(false, Ordering::SeqCst);
             q.put(task);
         }).expect("replay thread");
+    }
+
+    /// The per-note forecast's ability history (pernote::PerNote::fill) off the queue: a chart parse and a net pass per new play.
+    fn solve_abilities(&self) {
+        let Some(p) = self.rec.as_ref().and_then(|r| r.pernote.clone()) else { return };
+        if self.jobs.solving.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (jobs, path) = (self.jobs.clone(), self.db_path.clone());
+        std::thread::Builder::new().name("abilities".into()).spawn(move || {
+            if let Err(e) = connect(&path).and_then(|db| p.fill(&db, crate::pernote::today() - crate::pernote::WINDOW)) {
+                eprintln!("per-note abilities: {e}");
+            }
+            jobs.solving.store(false, Ordering::SeqCst);
+        }).expect("abilities thread");
     }
 
     fn t_replay_done(&mut self, pending: bool, error: Option<String>, fresh: Vec<String>) -> Result<()> {

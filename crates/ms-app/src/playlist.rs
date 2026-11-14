@@ -24,8 +24,6 @@ pub fn focus_label(v: f64) -> String {
 const GEAR: f32 = 19.; // the tab cog's glyph; 11 was "way too small" (user 2026-11-01)
 const NAME: f32 = 134.; // the longest row name fits
 const VALUE: f32 = 106.; // "95.0% (default)" fits
-const WEIGHTS: [f64; 6] = [0.25, 0.5, 0.75, 1., 1.5, 2.]; // multiplies a skill's share of the list (user 2026-11-01: "0.25x-2x")
-const OTHER: [f64; 7] = [0., 0.25, 0.5, 0.75, 1., 1.5, 2.];
 const CHIP_GAP: f32 = 4.;
 
 fn row(ui: &mut Ui, name: &str, tip: Option<&str>, add: impl FnOnce(&mut Ui) -> bool) -> bool {
@@ -73,25 +71,41 @@ pub(crate) fn slider(ui: &mut Ui, name: &str, value: &mut f64, range: (f64, f64,
     })
 }
 
-/// 0.1×–10× on a log scale in 0.01 steps (user 2026-11-09: finer than the 0.25× notches); arrow keys over it or focused
-/// move it by 0.01, double-click resets to 1×.
+/// Off, then 0.1×–10× on a log scale in 0.01 steps (user 2026-11-09: finer than the 0.25× notches; 2026-11-14: from
+/// Off, so a skill or keymode can be dropped); arrow keys over it or focused move it by 0.01, double-click resets to 1×.
 fn fine_slider(ui: &mut Ui, name: &str, value: &mut f64, show: impl Fn(f64) -> String, tip: Option<&str>) -> bool {
     let tip = format!("{}Double-click: 1×. Arrow keys: 0.01.", tip.map_or(String::new(), |t| format!("{t}\n")));
     row(ui, name, Some(&tip), |ui| {
-        ui.spacing_mut().slider_width = track(ui, &[show(0.1), show(10.), show(*value)]);
-        let r = ui.add(egui::Slider::new(value, 0.1..=10.).logarithmic(true).step_by(0.01).show_value(false)).on_hover_text(name);
+        ui.spacing_mut().slider_width = track(ui, &[show(0.), show(10.), show(*value)]);
+        let r = ui.add(egui::Slider::new(value, 0.0..=10.).logarithmic(true).smallest_positive(0.1).step_by(0.01).show_value(false)).on_hover_text(name);
         let mut changed = r.changed() | nudge(&r, value, 1.);
         if r.hovered() && !r.has_focus() {
             let step = ui.input(|i| i.num_presses(egui::Key::ArrowRight) as f64 + i.num_presses(egui::Key::ArrowUp) as f64 - i.num_presses(egui::Key::ArrowLeft) as f64 - i.num_presses(egui::Key::ArrowDown) as f64);
             if step != 0. {
-                *value = (*value + 0.01 * step).clamp(0.1, 10.);
+                *value = (*value + 0.01 * step).clamp(0., 10.);
                 changed = true;
             }
         }
         *value = (*value * 100.).round() / 100.;
+        if *value < 0.1 {
+            *value = if *value < 0.05 { 0. } else { 0.1 }; // between Off and the log range's foot
+        }
         ui.add(egui::Label::new(show(*value)).wrap());
         changed
     })
+}
+
+/// The Variety ↔ NPS slider's text with the maps its NPS floor keeps.
+fn nps_label(pool: &std::collections::BTreeMap<i64, Vec<f64>>, v: f64) -> String {
+    match pool.values().map(|ns| ms_model::choices::nps_eligible(ns, v)).sum::<usize>() {
+        0 => focus_label(v),
+        n => format!("{} · {n} maps", focus_label(v)),
+    }
+}
+
+/// A weight slider's text: Off, or the multiplier and the share it gives now.
+fn weight_share(x: f64, share: Option<f64>) -> String {
+    if x == 0. { "Off".into() } else { format!("{x:.2}×{}", share.map_or(String::new(), |s| format!(" · {:.0}%", 100. * s))) }
 }
 
 /// The slider steps through a list.
@@ -139,10 +153,6 @@ pub fn wrap_rows(widths: &[f32], available: f32, gap: f32) -> Vec<Vec<usize>> {
         }
     }
     rows
-}
-
-fn weight_text(value: f64, rest: f64) -> String {
-    format!("{value}× · {:.0}%", 100. * value / (value + rest))
 }
 
 fn switch(ui: &mut Ui, name: &str, value: &mut bool, tip: Option<&str>) -> bool {
@@ -286,8 +296,8 @@ impl App {
             let shares = ms_model::choices::key_shares(&keys, &self.s.key_weights.get(mode).cloned().unwrap_or_default(), &counts, on);
             for &k in &keys {
                 let mut v = at(&self.s, k);
-                let share = shares.get(&k).map_or(String::new(), |s| format!(" · {:.0}%", 100. * s));
-                if fine_slider(ui, &format!("{k}K"), &mut v, |x| format!("{x:.2}×{share}"), Some("Multiplies this keymode's share of the list; the % is its share now.")) {
+                let share = shares.get(&k).copied();
+                if fine_slider(ui, &format!("{k}K"), &mut v, |x| weight_share(x, share), Some("Multiplies this keymode's share of the list; the % is its share now. Off: none of it.")) {
                     self.s.key_weights.entry(mode.to_string()).or_default().insert(k, v);
                     self.sync_rec();
                 }
@@ -409,13 +419,17 @@ impl App {
     }
 
     /// The wrapped units of a chip row: a unit is drawn by `add`.
+    /// Rows are cut from each unit's width drawn last frame (user 2026-11-14: the estimate's padding wrapped at ~60 % of
+    /// the window); `width` is the first frame's upper bound.
     fn chip_rows<T>(&mut self, ui: &mut Ui, units: &[T], width: impl Fn(&Ui, &T) -> f32, mut add: impl FnMut(&mut Self, &mut Ui, &T)) {
-        let widths: Vec<f32> = units.iter().map(|u| width(ui, u)).collect();
+        let ids: Vec<egui::Id> = units.iter().enumerate().map(|(i, u)| ui.scope_id().with(("chip", i, width(ui, u).to_bits()))).collect();
+        let widths: Vec<f32> = units.iter().zip(&ids).map(|(u, id)| ui.ctx().data(|d| d.get_temp::<f32>(*id)).unwrap_or_else(|| width(ui, u))).collect();
         for row in wrap_rows(&widths, ui.available_width(), CHIP_GAP) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(CHIP_GAP, CHIP_GAP);
                 for i in row {
-                    add(self, ui, &units[i]);
+                    let drawn = ui.scope(|ui| add(self, ui, &units[i])).response.rect.width();
+                    ui.ctx().data_mut(|d| d.insert_temp(ids[i], drawn));
                 }
             });
         }
@@ -478,17 +492,27 @@ impl App {
         let (included, avoided): (Vec<String>, Vec<String>) = self.s.practice.iter().cloned().partition(|k| !k.starts_with('!'));
         if !included.is_empty() {
             theme::section(ui, "HOW MUCH OF EACH");
-            let total = included.iter().map(|k| self.s.skill_weights.get(k).copied().unwrap_or(1.)).sum::<f64>() + self.s.skill_other;
+            // One rule with the keymodes (user 2026-11-14): share = slider × eligible maps when following counts, else slider.
+            let mut on = self.s.skill_by_count;
+            if switch(ui, "Shares follow map counts", &mut on, Some("On: each skill gets the list in proportion to its maps here, × its slider. Off: shares follow the sliders alone.")) {
+                self.s.skill_by_count = on;
+                self.sync_rec();
+            }
+            let counts = self.views.get("skills").map(|v| v.skill_counts.clone()).unwrap_or_default();
+            let entries: Vec<(String, f64, usize)> = skills::sliders(&self.s.practice, &self.s.skill_weights, self.s.skill_other)
+                .unwrap_or_default().into_iter().map(|(k, w)| { let n = counts.get(&k).copied().unwrap_or(0); (k, w, n) }).collect();
+            let shares = ms_model::choices::mix_shares(&entries, on);
             for key in included {
                 let mut v = self.s.skill_weights.get(&key).copied().unwrap_or(1.);
-                let before = v;
-                if stepped(ui, &format!("✓ {}", skills::name(&key)), &mut v, &WEIGHTS, 1., |x| weight_text(x, total - before), Some("How much of the list this skill gets, against the others here.")) {
+                let share = shares.get(&key).copied();
+                if fine_slider(ui, &format!("✓ {}", skills::name(&key)), &mut v, |x| weight_share(x, share), Some("Multiplies this skill's share of the list; the % is its share now. Off: none of it.")) {
                     self.s.skill_weights.insert(key, v);
                     self.sync_rec();
                 }
             }
             let mut v = self.s.skill_other;
-            if stepped(ui, "Other maps", &mut v, &OTHER, 0., |x| if x == 0. { "Off".to_string() } else { weight_text(x, total - self.s.skill_other) }, Some("Off: only the skills above. On: maps without them join the list at this share.")) {
+            let share = shares.get("").copied();
+            if fine_slider(ui, "Other maps", &mut v, |x| weight_share(x, share), Some("Off: only the skills above. On: maps without them join the list at this share.")) {
                 self.s.skill_other = v;
                 self.sync_rec();
             }
@@ -521,10 +545,7 @@ impl App {
                     theme::section(ui, "MIX");
                     let mut focus = self.s.nps_focus;
                     let pool = self.views.get(mode).map(|v| v.nps_pool.clone()).unwrap_or_default();
-                    let label = |v: f64| match pool.values().map(|ns| ms_model::choices::nps_eligible(ns, v)).sum::<usize>() {
-                        0 => focus_label(v),
-                        n => format!("{} · {n} maps", focus_label(v)),
-                    };
+                    let label = |v: f64| nps_label(&pool, v);
                     if slider(ui, "Variety to high NPS", &mut focus, (0., 1., 0.05), 0.5, label, Some("Left: pattern types (jacks, streams, LN…) get an even share of the list. Right: the highest NPS maps, mostly chordstreams and brackets; the lowest NPS a map may have rises with it. Both aim at the accuracy target.")) {
                         self.s.nps_focus = normalize_focus(focus);
                         self.sync_rec();
@@ -568,7 +589,8 @@ impl App {
                     self.rate_range(ui, mode);
                     theme::section(ui, "MIX");
                     let mut focus = self.s.skills_focus;
-                    let show = |v: f64| if v < 0. { "off".to_string() } else { focus_label(v) };
+                    let pool = self.views.get(mode).map(|v| v.nps_pool.clone()).unwrap_or_default();
+                    let show = |v: f64| if v < 0. { "off".to_string() } else { nps_label(&pool, v) };
                     if slider(ui, "Variety to high NPS", &mut focus, (crate::settings::FOCUS_OFF, 1., 0.05), 0., show, Some("Leftmost: off, the best skill match at your accuracy target first (with any skill: accuracy alone). Then from an even share of pattern types to the highest NPS maps.")) {
                         self.s.skills_focus = if focus < 0. { crate::settings::FOCUS_OFF } else { focus.min(1.) };
                         self.sync_rec();
@@ -1017,8 +1039,9 @@ impl App {
         ui.separator();
         // The one status line and bar for the whole window, at the bottom (user 2026-10-30: "Analysing" three times).
         let analysing = if self.stats_open || self.bg_progress.is_some() { None } else { self.views[mode].analysing.clone() };
-        let paused = analysing.as_ref().filter(|_| self.live.is_some()).map_or("", |_| "paused while you play");
-        let flash = self.flash.as_ref().filter(|f| f.1 > std::time::Instant::now()).map_or(String::new(), |f| f.0.clone());
+        let paused = analysing.as_ref().filter(|_| self.busy.load(std::sync::atomic::Ordering::Relaxed)).map_or("", |_| "paused while you play");
+        // the main window's "see the playlist window" note: here the status line already says why
+        let flash = self.flash.as_ref().filter(|f| f.1 > std::time::Instant::now() && self.blocker.is_none()).map_or(String::new(), |f| f.0.clone());
         let text: Vec<&str> = [flash.as_str(), self.status_text.as_str(), analysing.as_ref().map_or("", |a| a.0.as_str()), paused].into_iter().filter(|t| !t.is_empty()).collect();
         let text = text.join(" · ").replace('\n', " · ");
         let (done, total) = self.bg_progress.or(analysing.as_ref().map(|a| (a.1, a.2))).unwrap_or((0, 0));

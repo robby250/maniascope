@@ -5,6 +5,7 @@ mod fmt;
 mod mainview;
 mod playlist;
 mod public;
+mod resize;
 mod settings;
 mod statsview;
 mod theme;

@@ -15,16 +15,23 @@ pub struct Skill {
 
 /// One keymode's tree from the skill table (ms_calc::taxonomy): each family label a parent whose members are its rows, each
 /// row with a child key a child of its own.
+/// Vibro and Mash are rows of their own, as on the card (user 2026-11-14: "add vibro and mash here").
 fn tree_of(keys: usize) -> Vec<Skill> {
-    use ms_calc::taxonomy::{family, FAMILIES};
-    let on = |r: &&ms_calc::taxonomy::Row| (r.keys.0..=r.keys.1).contains(&keys) && ms_calc::taxonomy::shown(r.sk);
-    FAMILIES.iter().filter_map(|&(key, name, _, tip)| {
+    use ms_calc::taxonomy::{family, measured, of, FAMILIES};
+    use ms_calc::skills::Sk;
+    let on = |r: &&ms_calc::taxonomy::Row| (r.keys.0..=r.keys.1).contains(&keys) && ms_calc::taxonomy::shown(r.sk) && r.sk != Sk::vibro;
+    let mut out: Vec<Skill> = FAMILIES.iter().filter_map(|&(key, name, _, tip)| {
         let rows: Vec<&ms_calc::taxonomy::Row> = family(key).filter(on).collect();
         (!rows.is_empty()).then(|| Skill {
             key: key.to_string(), name, tip, members: rows.iter().map(|r| r.sk.name()).collect(),
             children: rows.iter().filter_map(|r| Some(Skill { key: format!("{key}/{}", r.child?), name: r.name, members: vec![r.sk.name()], children: Vec::new(), tip: r.tip })).collect(),
         })
-    }).collect()
+    }).collect();
+    for sk in [Sk::vibro, Sk::mash].into_iter().filter(|&s| measured(s, keys)) {
+        let r = of(sk);
+        out.push(Skill { key: sk.name().to_string(), name: r.name, members: vec![sk.name()], children: Vec::new(), tip: r.tip });
+    }
+    out
 }
 
 struct Trees {
@@ -145,7 +152,7 @@ pub fn feat_trees() -> Vec<Vec<(String, Vec<String>)>> {
 }
 
 /// Saved keys of older trees → their place now. Exclusions keep their "!".
-const LEGACY: [(&str, &[&str]); 16] = [
+const LEGACY: [(&str, &[&str]); 17] = [
     ("rice", &["stream", "jumpstream", "handstream"]),
     ("chords", &["jumpstream", "handstream", "chordstream"]),
     ("jack", &["jackspeed"]),
@@ -164,6 +171,8 @@ const LEGACY: [(&str, &[&str]); 16] = [
     ("splittrill", &["trills/splittrill"]),
     // 2026-11-04 (a player): Hybrid LN deleted; its closest skill is LN Tech.
     ("ln/hybrid", &["ln/tech"]),
+    // 2026-11-14: Vibro its own row
+    ("jackspeed/vibro", &["vibro"]),
 ];
 
 /// A saved key's current keys (settings keep weights and avoid levels under these too).
@@ -292,6 +301,7 @@ pub fn avoid_percentile(hold: f64) -> f64 {
 pub struct Tuning {
     pub avoid: HashMap<String, f64>, // avoided skill: see AVOID
     pub other: f64,                  // slider of maps with no included skill; 0 keeps only included skills
+    pub by_count: bool,              // shares follow each skill's map counts (`choices::mix_shares`), as keymodes can
 }
 
 impl Tuning {
@@ -300,23 +310,17 @@ impl Tuning {
     }
 }
 
-/// {included skill: how-often slider, "": other maps} once something differs, else None (plain best-first list).
-pub fn shares(selected: &[String], weights: &HashMap<String, f64>, other: f64) -> Option<HashMap<String, f64>> {
-    let mut out: HashMap<String, f64> = normalize(selected).into_iter().filter(|k| !k.starts_with('!'))
-        .map(|k| { let w = weights.get(&k).copied().unwrap_or(1.); (k, w) }).collect();
-    if out.is_empty() {
-        return None; // Any: nothing to weigh against
+/// {included skill: slider, "": other maps' slider} (the share inputs of `choices::mix_shares`); None for Any.
+pub fn sliders(selected: &[String], weights: &HashMap<String, f64>, other: f64) -> Option<Vec<(String, f64)>> {
+    let mut out: Vec<(String, f64)> = normalize(selected).into_iter().filter(|k| !k.starts_with('!')).map(|k| { let w = weights.get(&k).copied().unwrap_or(1.); (k, w) }).collect();
+    if other > 0. && !out.is_empty() {
+        out.push((String::new(), other));
     }
-    let first = out.values().next().copied();
-    let differ = out.values().any(|v| Some(*v) != first);
-    if other > 0. {
-        out.insert(String::new(), other);
-    }
-    (differ || other > 0.).then_some(out)
+    (out.len() > 1).then_some(out) // Any or one skill alone: nothing to mix
 }
 
 pub fn wants_vibro(selected: &[String]) -> bool {
-    normalize(selected).iter().any(|k| k == "jackspeed/vibro")
+    normalize(selected).iter().any(|k| k == "vibro")
 }
 
 #[cfg(test)]
@@ -400,14 +404,15 @@ mod tests {
     #[test]
     fn the_trees_follow_the_model_families_and_old_keys_move_with_their_sign() {
         let parents = |k: i64| tree(k).iter().map(|n| n.name).collect::<Vec<_>>();
-        assert_eq!(parents(7), ["Stream", "Chordstream", "Trills", "Jacks", "Chordjack", "LN", "Technical", "Stamina", "SV"]);
-        assert_eq!(parents(4), ["Stream", "Jumpstream", "Handstream", "Trills", "Jacks", "Chordjack", "LN", "Technical", "Stamina", "SV"]);
+        assert_eq!(parents(7), ["Stream", "Chordstream", "Trills", "Jacks", "Chordjack", "LN", "Technical", "Stamina", "SV", "Vibro", "Mash"]);
+        assert_eq!(parents(4), ["Stream", "Jumpstream", "Handstream", "Trills", "Jacks", "Chordjack", "LN", "Technical", "Stamina", "SV", "Vibro", "Mash"]);
         let children = |k: i64, p: &str| tree(k).iter().find(|n| n.key == p).unwrap().children.iter().map(|c| c.key.as_str()).collect::<Vec<_>>();
         assert_eq!(children(7, "stream"), ["stream/anchor"]);
         assert_eq!(children(7, "trills"), ["trills/jumptrill", "trills/trill1h"]);
         assert_eq!(children(4, "trills"), ["trills/jumptrill", "trills/splittrill", "trills/trill1h"]);
         for (old, new) in [("delay", "stream"), ("delay/stream", "stream"), ("delay/anchor", "stream/anchor"), ("delay/trill1h", "trills/trill1h"),
-                           ("stream/trill1h", "trills/trill1h"), ("bracket", "chordstream/bracket"), ("jumptrill", "trills/jumptrill"), ("splittrill", "trills/splittrill")] {
+                           ("stream/trill1h", "trills/trill1h"), ("bracket", "chordstream/bracket"), ("jumptrill", "trills/jumptrill"), ("splittrill", "trills/splittrill"),
+                           ("jackspeed/vibro", "vibro")] {
             assert_eq!(normalize(&v(&[old])), v(&[new]), "{old}");
             assert_eq!(normalize(&v(&[&format!("!{old}")])), v(&[&format!("!{new}")]), "!{old}");
         }

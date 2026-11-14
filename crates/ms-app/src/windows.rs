@@ -48,7 +48,7 @@ fn window(ctx: &egui::Context, id: &str, title: &str, size: [f32; 2], above: boo
         let (r, monitor) = ui.ctx().input(|i| (i.content_rect(), i.viewport().monitor_size));
         let want = used.to_vec2().max(r.size()).min(monitor.unwrap_or(egui::vec2(f32::MAX, f32::MAX)) * 0.9);
         if want.x > r.width() + 1. || want.y > r.height() + 1. {
-            ui.ctx().send_viewport_cmd(ViewportCommand::InnerSize(want));
+            crate::resize::inner(ui.ctx(), title, want);
         }
         ui.ctx().input(|i| i.viewport().close_requested())
     })
@@ -178,7 +178,12 @@ impl App {
         let busy = self.game.load(std::sync::atomic::Ordering::Relaxed) || self.web.alive() || webmaps::running();
         let Some(floor) = kv_get(&self.db, ms_rec::worker::PP_FLOOR).and_then(|v| v.as_f64()).filter(|_| !busy && !self.s.keys["pp"].is_empty()) else { return };
         let (Ok(exe), Ok(log)) = (std::env::current_exe(), log()) else { return };
-        let list = self.s.keys["pp"].iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        // keymodes without a play of the player's are left out: nothing says which of their maps could enter the top 100 (user 2026-11-13)
+        let played = ms_data::store::played_keys(&self.db, i64::MAX, 0.).unwrap_or_default();
+        let list = self.s.keys["pp"].iter().filter(|k| played.contains(k)).map(i64::to_string).collect::<Vec<_>>().join(",");
+        if list.is_empty() {
+            return;
+        }
         let mut c = Command::new(exe);
         c.args(["--webmaps", "crawl", "--keys", &list, "--pp-floor", &format!("{floor:.2}")]);
         c.stdin(Stdio::null()).stderr(log.try_clone().map_or(Stdio::null(), Stdio::from)).stdout(log);
@@ -282,7 +287,7 @@ impl App {
             let _ = ms_data::store::kv_set(&self.db, ms_rec::worker::AUTO_DOWNLOAD, &Value::Bool(auto));
         }
         let mut ranked = kv_get(&self.db, ms_rec::worker::AUTO_RANKED).and_then(|v| v.as_bool()).unwrap_or(false);
-        if ui.checkbox(&mut ranked, "Fetch new ranked PP maps").on_hover_text("By itself, at start and every 24 hours, never while you play: ranked maps newer than the population data, on your PP tab's keymodes, from the star rating where a perfect play enters your top 100. No Start needed.").changed() {
+        if ui.checkbox(&mut ranked, "Fetch new ranked PP maps").on_hover_text("By itself, at start and every 24 hours, never while you play: ranked maps newer than the population data, on your PP tab's keymodes you have played, from the star rating where a perfect play enters your top 100. No Start needed.").changed() {
             let _ = ms_data::store::kv_set(&self.db, ms_rec::worker::AUTO_RANKED, &Value::Bool(ranked));
             self.web.pp_due = None;
         }
@@ -437,6 +442,11 @@ impl App {
                 self.open.web = true;
             }
         });
+        let tip = "Saves your own osu!mania replays and the charts they were played on in one zip, for improving the difficulty calculator. Replays include your player name. Nothing is uploaded: send the zip yourself if you want to.";
+        if ui.button("Share replays for calibration…").on_hover_text(tip).clicked() {
+            self.share_replays();
+            close = true;
+        }
         if self.open.profile == Some(false) {
             self.profile_ui(ui);
         }
@@ -476,6 +486,7 @@ impl App {
         changed |= ui.checkbox(&mut d.title, "Title and artist").changed();
         changed |= ui.checkbox(&mut d.version, "Difficulty and mapper").changed();
         changed |= ui.checkbox(&mut d.info, "Keys, dan, rate, length, LN %").changed();
+        changed |= ui.checkbox(&mut d.o2jam, "O2Jam level (7K)").on_hover_text("Right after the dan: the map's O2Jam level at the rate you play, read off this calculator's ratings (no extra calculation).").changed();
         changed |= ui.checkbox(&mut d.prediction, "Expected accuracy, form, PP gain").on_hover_text("Shown once you have 50 plays in the keymode. PP gain on the PP tab, or for a PP map the NPS list mixed in.").changed();
         changed |= ui.checkbox(&mut d.rating, "Difficulty rating").changed();
         ui.horizontal(|ui| {

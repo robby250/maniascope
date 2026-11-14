@@ -30,6 +30,7 @@ pub struct Display {
     pub title: bool,
     pub version: bool,
     pub info: bool, // keys, dan, rate, length, LN %
+    pub o2jam: bool, // O2Jam level beside the dan (7K), off by default
     pub prediction: bool, // expected accuracy, form, PP gain
     pub rating: bool,
     pub skills: usize,
@@ -53,6 +54,7 @@ pub struct Ui {
     pub skill_weights: HashMap<String, f64>,
     pub skill_avoid: HashMap<String, f64>,
     pub skill_other: f64,
+    pub skill_by_count: bool, // skill shares follow map counts (else the sliders alone)
     pub nps_focus: f64,
     pub web_bias: HashMap<String, f64>,
     pub web_weighted: HashMap<String, bool>,
@@ -98,7 +100,9 @@ fn file() -> PathBuf {
 }
 
 fn pair(v: &Value, a: &str, b: &str, default: (f32, f32)) -> (f32, f32) {
-    (v[a].as_f64().map_or(default.0, |x| x as f32), v[b].as_f64().map_or(default.1, |x| x as f32))
+    // a window under 100 px was never the player's (2026-11-14: h -38 saved by a resize bug kept the window shut)
+    let at = |k: &str, d: f32| v[k].as_f64().filter(|x| *x >= 100.).map_or(d, |x| x as f32);
+    (at(a, default.0), at(b, default.1))
 }
 
 fn point(v: &Value) -> Option<(f32, f32)> {
@@ -117,7 +121,7 @@ fn pp_settings(v: &Value) -> PpSettings {
 }
 
 // ui.json keys a playlist owns, top-level and per tab.
-const PRESET: [&str; 9] = ["skills_keys", "practice_skills", "skill_weights", "skill_avoid", "skill_other", "skills_focus", "skills_acc_target", "skills_rates", "skills_mix"];
+const PRESET: [&str; 10] = ["skills_keys", "practice_skills", "skill_weights", "skill_avoid", "skill_other", "skill_by_count", "skills_focus", "skills_acc_target", "skills_rates", "skills_mix"];
 const PRESET_TABS: [&str; 5] = ["web_bias", "web_weighted", "converts", "key_weights", "by_count"];
 pub const FOCUS_OFF: f64 = -0.05; // the slider's leftmost notch
 
@@ -133,7 +137,7 @@ fn pp_mix(v: &Value) -> PpMix {
 
 impl Ui {
     pub fn skill_tuning(&self) -> ms_model::skills::Tuning {
-        ms_model::skills::Tuning { avoid: self.skill_avoid.clone(), other: self.skill_other }
+        ms_model::skills::Tuning { avoid: self.skill_avoid.clone(), other: self.skill_other, by_count: self.skill_by_count }
     }
 
     pub fn load() -> Ui {
@@ -246,7 +250,7 @@ impl Ui {
         let selected: Vec<String> = v["practice_skills"].as_array().map_or_else(Vec::new, |a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect());
         let mut ui = Ui {
             mode, keys, keys_auto, practice: skills::normalize(&selected), skill_weights: per_skill(&v["skill_weights"]),
-            skill_avoid: per_skill(&v["skill_avoid"]), skill_other: v["skill_other"].as_f64().unwrap_or(0.),
+            skill_avoid: per_skill(&v["skill_avoid"]), skill_other: v["skill_other"].as_f64().unwrap_or(0.), skill_by_count: v["skill_by_count"].as_bool().unwrap_or(false),
             nps_focus: normalize_focus(v["nps_focus"].as_f64().unwrap_or(0.5)), web_bias: ["nps", "skills"].into_iter().map(|m| (m.to_string(), normalize_focus(v["web_bias"][m].as_f64().unwrap_or(0.5)))).collect(),
             web_weighted: ["nps", "skills"].into_iter().map(|m| (m.to_string(), v["web_weighted"][m].as_bool().unwrap_or(true))).collect(),
             by_count: ["nps", "skills"].into_iter().map(|m| (m.to_string(), v["by_count"][m].as_bool().unwrap_or(false))).collect(),
@@ -264,7 +268,7 @@ impl Ui {
             strip: v["tab_strip"].as_array().map_or_else(Vec::new, |a| a.iter().filter_map(|t| ["pp", "nps", "list"].into_iter().find(|m| t.as_str() == Some(*m))).collect()),
             skills_focus: v["skills_focus"].as_f64().filter(|f| f.is_finite()).map_or(0., |f| f.clamp(FOCUS_OFF, 1.)),
             skills_mix: v.get("skills_mix").map_or(PpMix { on: false, ..PpMix::default() }, pp_mix),
-            display: Display { title: flag("title"), version: flag("version"), info: flag("info"), prediction: flag("prediction"), rating: flag("rating"), nps: flag("nps"), timeline: flag("timeline"), status: flag("status"), skills: d["skills"].as_u64().map_or(3, |x| x as usize) },
+            display: Display { title: flag("title"), version: flag("version"), info: flag("info"), o2jam: d["o2jam"].as_bool().unwrap_or(false), prediction: flag("prediction"), rating: flag("rating"), nps: flag("nps"), timeline: flag("timeline"), status: flag("status"), skills: d["skills"].as_u64().map_or(3, |x| x as usize) },
             next_action: "auto".to_string(), auto_next: v["auto_next"].as_bool().unwrap_or(true), keep_above: v["keep_above"].as_bool().unwrap_or(false), overlay: cfg!(windows) && v["overlay"].as_bool().unwrap_or(false),
             details: v["details"].as_bool().unwrap_or(false),
             // Defaults: the user's own sizes on G835LX (2026-10-30; main window measured on screen 2026-11-02).
@@ -311,11 +315,12 @@ impl Ui {
                "pp_mix": {"on": m.on, "every": m.every, "min_gain": m.min_gain, "chance": m.chance, "ht_chance": m.ht_chance},
                "skills_focus": self.skills_focus, "skills_mix": mix_json(&self.skills_mix), "playlist": self.playlist,
                "playlists": self.playlists.iter().map(|(n, p)| json!({"name": n, "preset": p})).collect::<Vec<_>>(), "tab_strip": self.strip,
-               "display": {"title": d.title, "version": d.version, "info": d.info, "prediction": d.prediction, "rating": d.rating, "nps": d.nps, "timeline": d.timeline, "status": d.status, "skills": d.skills}, "details": self.details,
+               "display": {"title": d.title, "version": d.version, "info": d.info, "o2jam": d.o2jam, "prediction": d.prediction, "rating": d.rating, "nps": d.nps, "timeline": d.timeline, "status": d.status, "skills": d.skills}, "details": self.details,
                "w": self.win.0, "h": self.win.1, "recs_w": self.recs_win.0, "recs_h": self.recs_win.1,
                "recs_pos": self.recs_pos.map(|p| [p.0, p.1]), "pos": self.win_pos.map(|p| [p.0, p.1]), "recs_open": self.recs_open,
                "stats_keys": self.stats_keys.map_or(json!("all"), |k| json!(k)), "stats_expanded": self.expanded.iter().map(|(k, g)| format!("{k}:{g}")).collect::<Vec<_>>(), "chart_hints": self.chart_hints});
         v["by_count"] = json!(self.by_count); // past json!'s recursion limit
+        v["skill_by_count"] = json!(self.skill_by_count);
         v
     }
 

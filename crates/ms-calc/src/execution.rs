@@ -213,7 +213,7 @@ pub fn column_runs(chart: &Chart, rate: f64, bins: usize, k: &Knobs) -> Vec<f64>
     let first = chart.t.first().copied().unwrap_or(0.0);
     let bin = |i: usize| (bins - 1).min(((chart.t[i] - first) * 0.001 / rate / k.BIN) as usize);
     (0..chart.len()).for_each(|i| count[bin(i)] += 1.0);
-    crate::structure::column_runs(chart, rate, k.VIBRO_GAP, k).iter().flatten().for_each(|&i| inrun[bin(i)] += 1.0);
+    crate::structure::vibro_notes(chart, rate, k).iter().flatten().for_each(|&i| inrun[bin(i)] += 1.0);
     inrun.iter().zip(&count).map(|(&i, &c)| if c != 0.0 { i / c } else { 0.0 }).collect()
 }
 

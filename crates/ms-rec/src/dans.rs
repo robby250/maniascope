@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 
 const TABLE: &str = include_str!("../../../calib/dans.json");
 const COURSES: &str = include_str!("../../../calib/dan_courses.tsv");
-pub const VIBRO_SHARE: f64 = 0.10; // share of notes in vibro runs: 117/120 vibro dan charts, 0.5% of ranked 4K (2026-10-01)
+pub const VIBRO_SHARE: f64 = 0.06; // share of notes in vibro runs: 119/132 vibro dan charts, 4/139 other 4K dan charts (2026-11-13 run rule)
 const LN_SHARE: f64 = 0.22;   // LN dans' charts hold >= 25% LN notes, rice dans' <= 19% (2026-10-01)
 const LN_MAJORITY: f64 = 0.5; // from here holds are most notes: the LN dan alone
 
@@ -49,6 +49,7 @@ type Tiers = Vec<(String, f64)>;
 struct Data {
     series: HashMap<String, Tiers>,
     weights: (f64, f64),
+    length: (f64, f64), // (seconds, weight): length_scaled
 }
 
 fn data() -> &'static Data {
@@ -60,7 +61,8 @@ fn data() -> &'static Data {
         let series = v["series"].as_object().map_or_else(HashMap::new, |o| o.iter().map(|(k, tiers)| {
             (k.clone(), tiers.as_array().map_or_else(Vec::new, |t| t.iter().filter_map(|x| Some((x["tier"].as_str()?.to_string(), x["value"].as_f64()?))).collect()))
         }).collect());
-        Data { series, weights: (v["vibro_weights"][0].as_f64().unwrap_or(1.), v["vibro_weights"][1].as_f64().unwrap_or(0.)) }
+        Data { series, weights: (v["vibro_weights"][0].as_f64().unwrap_or(1.), v["vibro_weights"][1].as_f64().unwrap_or(0.)),
+               length: (v["length"]["seconds"].as_f64().unwrap_or(1.), v["length"]["weight"].as_f64().unwrap_or(0.)) }
     })
 }
 
@@ -77,18 +79,27 @@ pub fn pass(series: &str, tier: &str) -> Option<(f64, bool)> {
     Some((number.parse::<f64>().ok()? / 100., !v2))
 }
 
+/// Every distinct stable pass mark of the courses.
+pub fn stable_marks() -> Vec<f64> {
+    let mut marks: Vec<f64> = data().series.iter().flat_map(|(s, t)| t.iter().filter_map(|(tier, _)| pass(s, tier).filter(|p| p.1).map(|p| p.0))).collect();
+    marks.sort_by(f64::total_cmp);
+    marks.dedup();
+    marks
+}
+
 pub fn tiers(series: &str) -> Option<&'static Tiers> {
     data().series.get(series)
 }
 
 /// {tier: [(features at 1.0×, the skills it demands)]} of the series' dan songs (a course without songs of its own split at
 /// its song boundaries), in tier order of the table.
-pub fn songs(series: &str, c: &Consts) -> HashMap<String, Vec<(Feats, Vec<&'static str>)>> {
+/// Per tier: each song and its standing in every skill (`skills::standing`, 0–1 of its strongest).
+pub fn songs(series: &str, c: &Consts) -> HashMap<String, Vec<(Feats, Vec<(&'static str, f64)>)>> {
     // Read for Stats only: held for the app's life the parsed songs were 12 MB.
     let table: Value = serde_json::from_str(TABLE).unwrap_or(Value::Null);
     table["songs"][series].as_object().map_or_else(HashMap::new, |o| o.iter().map(|(tier, list)| {
         let feats = list.as_array().map_or_else(Vec::new, |l| l.iter().filter_map(|f| match from_json(f) {
-            Val::Dict(d) => Some((Feats::of(&d, c).ok()?, ms_model::skills::demanded(&d))),
+            Val::Dict(d) => Some((Feats::of(&d, c).ok()?, ms_model::skills::standing(&d).into_iter().map(|v| (v.0, v.2)).collect())),
             _ => None,
         }).collect());
         (tier.clone(), feats)
@@ -106,6 +117,14 @@ pub fn rating_at(series: &str, p: f64) -> Option<f64> {
 }
 
 pub use ms_calc::structure::{vibro_only, vibro_runs, Vibro};
+
+/// The rating a dan is read from: a chart longer than `length.0` seconds counts (secs / length.0)^−length.1 of its rating.
+/// The calculator charges a 4-song course its stamina, so a course rates above one song of its tier; the tiers sit where
+/// the reference places single maps (user 2026-11-13: maps like mania-tracker AND courses on their own tier). The weight is
+/// fitted by `calib dan_table` so courses land on their tier.
+pub fn length_scaled(length: (f64, f64), rating: f64, secs: f64) -> f64 {
+    rating * (secs / length.0).max(1.).powf(-length.1)
+}
 
 fn value(series: &str, rating: f64, vibro: Option<&Vibro>) -> f64 {
     value_with(data().weights, series, rating, vibro)
@@ -153,7 +172,8 @@ pub fn kind(ln_share: f64) -> &'static str {
     if ln_share >= LN_SHARE { "ln" } else { "rice" }
 }
 
-pub fn label(keys: i64, rating: f64, ln_share: f64, vibro: Option<&Vibro>) -> Option<String> {
+pub fn label(keys: i64, rating: f64, ln_share: f64, vibro: Option<&Vibro>, secs: f64) -> Option<String> {
+    let rating = length_scaled(data().length, rating, secs);
     // Vibro last: the rice/LN dan is the main reading (user 2026-10-01).
     let vibro = vibro.filter(|_| keys == 4);
     // Mixed charts (LN dan share but mostly taps) read on both, the tap dans first (user 2026-10-01: a 29 % LN rice
@@ -207,7 +227,7 @@ mod tests {
         let k = ms_calc::params::Knobs::default();
         let run = |n: usize| ms_calc::chart::Chart { keys: 4, t: (0..n).map(|i| i as f64 * 50.).collect(), end: (0..n).map(|i| i as f64 * 50.).collect(), col: vec![0; n], ..Default::default() };
         assert_eq!(vibro_runs(&run(10), 1., &k).share, 1.);
-        assert_eq!(vibro_runs(&run(4), 1., &k).share, 0.);
+        assert_eq!(vibro_runs(&run(6), 1., &k).share, 0.);
     }
 }
 

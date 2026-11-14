@@ -105,7 +105,7 @@ pub struct Geometry {
     pub ends: Vec<f64>,
     pub columns: Vec<u8>,
     pub vib: Vec<bool>,
-    /// in a Longjacks run: `structure::column_runs` at LJ_GAP, not in a vibro run
+    /// in a Longjacks run (`structure::column_runs`)
     pub lj: Vec<bool>,
     pub rows: Vec<Row>,
     pub roll: Vec<bool>,
@@ -118,9 +118,10 @@ pub fn geometry(chart: &Chart, rate: f64, k: &Knobs) -> Geometry {
     let ends: Vec<f64> = chart.end.iter().map(|&e| e * inv).collect();
     let columns = chart.col.clone();
     let mut vib = vec![false; n];
-    crate::structure::column_runs(chart, rate, k.VIBRO_GAP, k).iter().flatten().for_each(|&i| vib[i] = true);
     let mut lj = vec![false; n];
-    crate::structure::column_runs(chart, rate, k.LJ_GAP, k).iter().flatten().for_each(|&i| lj[i] = !vib[i]);
+    for r in crate::structure::column_runs(chart, rate, k) {
+        r.notes.iter().for_each(|&i| if r.vibro { vib[i] = true } else { lj[i] = true });
+    }
     let mut rows = Vec::new();
     let mut i = 0;
     while i < n {
@@ -909,7 +910,7 @@ pub fn demand(
             let chords: usize = rows_by_size[2][low..high].iter().sum();
             let count = singles + jumps + chords;
             if count != 0 && comp[o(P::stream) + b] != 0.0 {
-                let hs = 1f64.min(3.0 * chords as f64 / count as f64);
+                let hs = 1f64.min(k.HS_SAT * chords as f64 / count as f64);
                 let js = (1.0 - hs) * 1f64.min(3.0 * jumps as f64 / count as f64);
                 let work = comp[o(P::stream) + b];
                 comp[o(P::handstream) + b] = work * hs;

@@ -234,7 +234,7 @@ pub struct Ranking<'a> {
     pub count: Option<usize>,
     pub recent: Vec<(u8, i64)>, // this tab's last offers, oldest first: (REAL, WEB or CONVERT, keymode)
     pub key_shares: std::collections::BTreeMap<i64, f64>, // keymode → its share of the list (`key_shares`; equal when empty)
-    pub skill_weights: Option<std::collections::HashMap<String, f64>>, // {included skill: how often} when the sliders differ
+    pub skill_weights: Option<std::collections::HashMap<String, f64>>, // {included skill or "" other maps: its share of the list} (`mix_shares`)
 }
 
 impl Prepared {
@@ -295,7 +295,8 @@ impl Prepared {
         // The floor follows each keymode's eligible pool and the Variety ↔ NPS slider: far below it is not NPS practice
         // (user 2026-10-22: a 6 NPS map "should never appear"; 2026-11-13: "minimum nps should move with the nps/variety slider").
         let mut floor: HashMap<i64, f64> = HashMap::default();
-        if r.nps {
+        // One floor for both tabs' slider (user 2026-11-14: the custom playlist's shows its map count too); off has none.
+        if r.nps || r.shuffle.is_some() {
             let focus = r.shuffle.as_ref().map_or(0.5, |s| s.1);
             for (k, ns) in self.nps_pool(&rows) {
                 floor.insert(k, nps_floor(&ns, focus));
@@ -358,12 +359,16 @@ impl Prepared {
             available = ranked;
         }
         if let Some((seed, focus)) = &r.shuffle {
+            let slots: Vec<((i64, &str), f64)> = available.iter().map(|x| slot(&items[x.0], r.skill_weights.as_ref())).collect();
+            let weights = balanced(&available.iter().map(|x| x.2).collect::<Vec<_>>(), &slots, *focus, r.skill_weights.is_some());
+            // a skill at Off leaves the list (unless nothing else is left)
+            let kept: Vec<usize> = (0..available.len()).filter(|&i| weights[i] > 0.).collect();
+            let (available_kept, weights): (Vec<_>, Vec<f64>) = if kept.is_empty() { (available.clone(), vec![1.; available.len()]) } else { (kept.iter().map(|&i| available[i]).collect(), kept.iter().map(|&i| weights[i]).collect()) };
+            available = available_kept;
             let ids: Vec<&str> = available.iter().map(|x| {
                 let c = &items[x.0];
                 if c.md5.is_empty() { c.sha.as_str() } else { c.md5.as_str() }
             }).collect();
-            let slots: Vec<((i64, &str), f64)> = available.iter().map(|x| slot(&items[x.0], r.skill_weights.as_ref())).collect();
-            let weights = balanced(&available.iter().map(|x| x.2).collect::<Vec<_>>(), &slots, *focus);
             let order = shuffle_order(&ids, &weights, seed, *focus);
             available = order.into_iter().map(|i| available[i]).collect();
         }
@@ -419,24 +424,25 @@ fn shuffle_order(ids: &[&str], weights: &[f64], seed: &str, focus: f64) -> Vec<u
     order
 }
 
-/// What a chart's weight is balanced by: its (keys, pattern group) on NPS; on Skills with how-often sliders its
-/// most wanted matched skill, across keymodes, with that slider as the skill's share.
+/// What a chart's weight is balanced by: its (keys, pattern group) on NPS; on Skills its leading included skill (the
+/// strongest it matches, "" for none), across keymodes, with that skill's share of the list (`mix_shares`).
 fn slot<'a>(c: &'a Choice, skills: Option<&std::collections::HashMap<String, f64>>) -> ((i64, &'a str), f64) {
     let Some(skills) = skills else { return ((c.keys, c.group.as_str()), 1.) };
-    let at = |k: &String| skills.get(k).copied().unwrap_or(1.);
-    c.matched.iter().max_by(|a, b| at(a).total_cmp(&at(b))).map_or(((0, ""), skills.get("").copied().unwrap_or(1.)), |k| ((0, k.as_str()), at(k)))
+    let lead = c.matched.first().map_or("", String::as_str);
+    ((0, lead), skills.get(lead).copied().unwrap_or(0.))
 }
 
 /// Weights with each slot's total mass divided out as focus falls, then its share applied. At focus 0 every slot has
 /// its share of the sampled list; at 1 the weights are untouched. Library proportions alone made low variety
 /// "doar chordstreams si brackets" (a player, 2026-10-31): those own the top of NPS, so a harder shuffle changed nothing.
-fn balanced(weights: &[f64], slots: &[((i64, &str), f64)], focus: f64) -> Vec<f64> {
+/// Skill slots always get exactly their share (as keymodes do): the share already says whether map counts count.
+fn balanced(weights: &[f64], slots: &[((i64, &str), f64)], focus: f64, exact: bool) -> Vec<f64> {
     let mut mass: HashMap<(i64, &str), f64> = HashMap::default();
     for (w, s) in weights.iter().zip(slots) {
         *mass.entry(s.0).or_insert(0.) += w;
     }
-    let evening = (1. - focus).powi(2);     // squared: the slider's middle keeps most of the library's mix
-    weights.iter().zip(slots).map(|(w, s)| w * s.1 / mass[&s.0].powf(evening)).collect()
+    let evening = if exact { 1. } else { (1. - focus).powi(2) }; // squared: the slider's middle keeps most of the library's mix
+    weights.iter().zip(slots).map(|(w, s)| if s.1 > 0. { w * s.1 / mass[&s.0].max(1e-300).powf(evening) } else { 0. }).collect()
 }
 
 /// The odds of each stream against your own maps. Weighted, the sliders set a chance per map: at the middle every map
@@ -458,9 +464,15 @@ fn credit(recent: &[u8], stream: u8, share: f64) -> f64 {
 /// Each keymode's share of a list over several keymodes: its slider, × its maps and converts here when `by_count` (user
 /// 2026-11-09: even turns by default, map counts as a switch). Shares sum to 1 over `modes`.
 pub fn key_shares(modes: &[i64], weights: &std::collections::BTreeMap<i64, f64>, counts: &std::collections::BTreeMap<i64, usize>, by_count: bool) -> std::collections::BTreeMap<i64, f64> {
-    let weight = |k: &i64| weights.get(k).copied().unwrap_or(1.).max(0.01) * if by_count { counts.get(k).copied().unwrap_or(0).max(1) as f64 } else { 1. };
-    let total: f64 = modes.iter().map(weight).sum();
-    modes.iter().map(|k| (*k, weight(k) / total)).collect()
+    mix_shares(&modes.iter().map(|k| (*k, weights.get(k).copied().unwrap_or(1.), counts.get(k).copied().unwrap_or(0))).collect::<Vec<_>>(), by_count)
+}
+
+/// One mixing rule for keymodes and skills (user 2026-11-14): each entry's share of the list is its slider × (its eligible
+/// maps when shares follow map counts, else 1), over all entries. A slider at 0 (Off) gets none; all Off: even.
+pub fn mix_shares<K: Ord + Clone>(entries: &[(K, f64, usize)], by_count: bool) -> std::collections::BTreeMap<K, f64> {
+    let weight = |e: &(K, f64, usize)| e.1.max(0.) * if by_count { e.2.max(1) as f64 } else { 1. };
+    let total: f64 = entries.iter().map(weight).sum();
+    entries.iter().map(|e| (e.0.clone(), if total > 0. { weight(e) / total } else { 1. / entries.len() as f64 })).collect()
 }
 
 /// Indices interleaved by keymode, each keymode owed its share (`key_shares`; equal when missing) after its recent offers
@@ -469,9 +481,9 @@ pub fn keymode_order(keys: &[i64], streams: &[u8], odds: impl Fn(&[u8]) -> [f64;
     let mut modes: Vec<i64> = keys.to_vec();
     modes.sort_unstable();
     modes.dedup();
-    let weight = |k: &i64| shares.get(k).copied().unwrap_or(1. / modes.len() as f64).max(1e-3);
+    let weight = |k: &i64| shares.get(k).copied().unwrap_or(1. / modes.len() as f64).max(0.); // Off: only once the others run out
     let total: f64 = modes.iter().map(weight).sum();
-    let shares: Vec<f64> = modes.iter().map(|k| weight(k) / total).collect();
+    let shares: Vec<f64> = modes.iter().map(|k| if total > 0. { weight(k) / total } else { 1. / modes.len() as f64 }).collect();
     let mut queues: Vec<std::collections::VecDeque<usize>> = modes.iter().map(|&k| {
         let at: Vec<usize> = (0..keys.len()).filter(|&i| keys[i] == k).collect();
         let s: Vec<u8> = at.iter().map(|&i| streams[i]).collect();
@@ -835,8 +847,8 @@ mod list_tests {
         let rows: Vec<Choice> = (0..40).map(|i| choice(&format!("a{i}"), 20. + i as f64, "chords")).collect();
         let p = prepared(rows, &[7]);
         let order = |weights: Option<std::collections::HashMap<String, f64>>| ranked(&p, Ask { nps: false, weights, ..Ask::default() }).iter().map(|x| x.0.sha.clone()).collect::<Vec<_>>();
-        assert!(crate::skills::shares(&[], &Default::default(), 0.).is_none(), "no settings ask for no shares");
-        assert!(crate::skills::shares(&["chordjack".to_string(), "delay".to_string()], &Default::default(), 0.).is_none(), "equal sliders neither");
+        assert!(crate::skills::sliders(&[], &Default::default(), 0.).is_none(), "no settings ask for no shares");
+        assert!(crate::skills::sliders(&["chordjack".to_string()], &Default::default(), 0.).is_none(), "one skill alone neither");
         assert_eq!(order(None).len(), 40);
     }
 
@@ -848,9 +860,20 @@ mod list_tests {
             c
         }).collect();
         let p = prepared(rows, &[7]);
-        let weights = crate::skills::shares(&["chordjack".to_string()], &[("chordjack".to_string(), 2.)].into(), 0.5).unwrap();
+        let sliders = crate::skills::sliders(&["chordjack".to_string()], &[("chordjack".to_string(), 2.)].into(), 0.5).unwrap();
+        let entries: Vec<(String, f64, usize)> = sliders.into_iter().map(|(k, w)| (k, w, 50)).collect();
+        assert_eq!(mix_shares(&entries, true), mix_shares(&entries, false), "equal counts: the same shares either way");
+        let weights: std::collections::HashMap<String, f64> = mix_shares(&entries, false).into_iter().collect();
         let share = (0..300).filter(|seed| ranked(&p, Ask { nps: false, shuffle: Some((seed.to_string(), 0.)), weights: Some(weights.clone()), ..Ask::default() })[0].0.matched.len() == 1).count() as f64 / 300.;
         assert!((share - 0.8).abs() < 0.08, "{share}");
-        assert!(crate::skills::shares(&["chordjack".to_string()], &Default::default(), 0.).is_none());
+    }
+
+    #[test]
+    fn mix_shares_weigh_sliders_by_counts_and_drop_off() {
+        let e = [("a", 1., 30), ("b", 2., 10), ("c", 0., 50)];
+        let by = mix_shares(&e, true);
+        assert!((by["a"] - 0.6).abs() < 1e-9 && (by["b"] - 0.4).abs() < 1e-9 && by["c"] == 0.);
+        let even = mix_shares(&e, false);
+        assert!((even["a"] - 1. / 3.).abs() < 1e-9 && even["c"] == 0.);
     }
 }

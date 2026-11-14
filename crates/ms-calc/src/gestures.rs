@@ -7,9 +7,9 @@ pub const FEATURES: [&str; 8] = [
     "vibro_easy", "vibro_control", "vibro_sustain", "jumptrill_easy", "roll_control", "roll_anchor",
     "jumptrill_sustain", "vibro_locked",
 ];
-pub const SERIES: [&str; 13] = [
+pub const SERIES: [&str; 14] = [
     "rolled", "jumptrill", "control", "anchor", "vibro", "vibro_easy", "vibro_control", "vibro_sustain",
-    "jumptrill_easy", "roll_control", "roll_anchor", "jumptrill_sustain", "vibro_locked",
+    "jumptrill_easy", "roll_control", "roll_anchor", "jumptrill_sustain", "vibro_locked", "vibro_shift",
 ];
 pub mod s {
     pub const ROLLED: usize = 0;
@@ -25,6 +25,7 @@ pub mod s {
     pub const ROLL_ANCHOR: usize = 10;
     pub const JUMPTRILL_SUSTAIN: usize = 11;
     pub const VIBRO_LOCKED: usize = 12;
+    pub const VIBRO_SHIFT: usize = 13;
 }
 
 pub fn great_window(od: f64) -> f64 {
@@ -295,11 +296,11 @@ fn same_chord(rows: &Rows, masks: &[u32], clean: &[bool]) -> Vec<f64> {
     left.iter().zip(&right).map(|(a, b)| 1.0 + a + b).collect()
 }
 
-/// [vibro, vibro_easy, vibro_control, vibro_sustain, vibro_locked] per note.
-fn vibro(notes: &Notes, rows: &Rows) -> [Vec<f64>; 5] {
+/// [vibro, vibro_easy, vibro_control, vibro_sustain, vibro_locked, vibro_shift] per note.
+fn vibro(notes: &Notes, rows: &Rows, run_full: f64) -> [Vec<f64>; 6] {
     let n = rows.len();
     let nn = notes.t.len();
-    let mut res: [Vec<f64>; 5] = std::array::from_fn(|_| vec![0.0; nn]);
+    let mut res: [Vec<f64>; 6] = std::array::from_fn(|_| vec![0.0; nn]);
     let masks: Vec<u32> = rows.iter().map(|&(_, a, z)| (a..z).fold(0u32, |m, i| m | 1 << notes.c[i])).collect();
     let clean: Vec<bool> = rows
         .iter()
@@ -340,6 +341,10 @@ fn vibro(notes: &Notes, rows: &Rows) -> [Vec<f64>; 5] {
         }
         // the run's sameness: a vibro section re-strikes one chord; a chordjack section keeps changing it
         let same = similarity[start..end].iter().filter(|&&x| x == 1.0).count() as f64 / (end - start) as f64;
+        // vibro is sustained: the dans' fast runs hold 19–500 rows (median), short bursts of 4–5 are chordjack (user 2026-11-14:
+        // Megaburn, Go Bananas "kinda slow and too short bursts for vibro")
+        let fast = speed[start..end].iter().filter(|&&x| x > 0.0).count();
+        let sustained = smooth((fast + 1) as f64, 4.0, run_full);
         for r in start..end {
             if speed[r] == 0.0 {
                 continue;
@@ -362,7 +367,9 @@ fn vibro(notes: &Notes, rows: &Rows) -> [Vec<f64>; 5] {
             let (_, a, z) = rows[r];
             for i in a..z {
                 // changing chords at speed are chordjack, not vibro (user 2026-11-13: Gengaozo [A O], Cyberstorm [Extinction (Jacks of All)])
-                res[0][i] = v * (0.25 + 0.75 * easy) * same;
+                res[0][i] = v * (0.25 + 0.75 * easy) * same * sustained;
+                // the same speed under changing chords (an anchored jack): vibro beside the chordjack (user 2026-11-14, Rip Me Apart)
+                res[5][i] = v * (0.25 + 0.75 * easy) * (1.0 - same) * sustained;
                 res[1][i] = v * easy;
                 res[2][i] = v * (1.0 - easy);
                 res[4][i] = v * easy * locked[r];
@@ -385,7 +392,7 @@ fn vibro(notes: &Notes, rows: &Rows) -> [Vec<f64>; 5] {
 
 #[derive(Default)]
 pub struct Analysis {
-    pub series: [Vec<f64>; 13],
+    pub series: [Vec<f64>; 14],
     pub features: [f64; 8],
     pub notes: Notes,
     pub rows: Rows,
@@ -430,19 +437,19 @@ pub fn analyse(chart: &Chart, rate: f64, k: &crate::params::Knobs) -> Analysis {
     } else {
         js.pop().unwrap()
     };
-    let vib = vibro(&notes, &rows);
+    let vib = vibro(&notes, &rows, k.VIBRO_RUN);
     let zeros = vec![0.0f64; nn];
     // per-note values in SERIES order
-    let per_note: [&Vec<f64>; 13] = [
+    let per_note: [&Vec<f64>; 14] = [
         &point[0], &point[1], &point[2], &point[3], &vib[0], &vib[1], &vib[2], &vib[3], &point[4], &point[2],
-        &point[3], &zeros, &vib[4],
+        &point[3], &zeros, &vib[4], &vib[5],
     ];
     let mut counts = vec![0usize; bins];
     let note_bins: Vec<usize> = notes.t.iter().map(|&t| (bins - 1).min(((t - first) / bin_seconds + 1e-9) as usize)).collect();
     for &b in &note_bins {
         counts[b] += 1;
     }
-    let mut series: [Vec<f64>; 13] = std::array::from_fn(|_| vec![0.0; bins]);
+    let mut series: [Vec<f64>; 14] = std::array::from_fn(|_| vec![0.0; bins]);
     for (k, values) in series.iter_mut().enumerate() {
         for (&b, &v) in note_bins.iter().zip(per_note[k].iter()) {
             values[b] += v;

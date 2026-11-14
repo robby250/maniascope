@@ -588,8 +588,11 @@ impl SkillValues {
     }
 
     /// skill_practice.match(f, selected)[1], as indices into the included skills.
+    /// Strongest first: the first is the chart's leading included skill (its share slot, `choices::slot`).
     fn matched(&self, s: &Selection) -> Vec<usize> {
-        s.positive.iter().enumerate().filter(|(_, k)| k.is_some_and(|i| self.counts(i, s.cut))).map(|(j, _)| j).collect()
+        let mut m: Vec<(usize, usize)> = s.positive.iter().enumerate().filter_map(|(j, k)| k.filter(|&i| self.counts(i, s.cut)).map(|i| (j, i))).collect();
+        m.sort_by(|a, b| self.values[b.1].total_cmp(&self.values[a.1]));
+        m.into_iter().map(|x| x.0).collect()
     }
 }
 
@@ -939,7 +942,25 @@ pub fn mash_floor(acc: f64) -> f64 {
     1. - miss / (1. + (miss / MASH_MISS).powf(MASH_P)).powf(1. / MASH_P)
 }
 
+/// The model accuracy whose mash floor gives `acc` (mash_floor's inverse; a miss rate at or above the floor's ceiling stays it).
+fn unmash(acc: f64) -> f64 {
+    let miss = (1. - acc).clamp(1e-9, MASH_MISS * 0.999);
+    1. - (miss.powf(-MASH_P) - MASH_MISS.powf(-MASH_P)).powf(-1. / MASH_P)
+}
+
 impl PredModel {
+    /// `p` moved halfway towards another forecast's accuracy `acc` (the personal per-note forecast, plan 2026-11-13b S7: the
+    /// average of both beat either on the walk-forward audit), every shown accuracy moved by the same step on the model scale.
+    pub fn blend(&self, p: &mut Prediction, f: &Feats, acc: f64) {
+        let (a, bb, judged) = (self.shown.0, self.shown.1, self.judged_ln * f.z_tail[0]);
+        let y = |acc: f64| ((1. - unmash(acc)).max(1e-9).ln() - a - judged) / bb;
+        let shown = |y: f64| mash_floor(0f64.max(1f64.min(1. - (20f64.min(a + bb * y + judged)).exp())));
+        let step = 0.5 * (y(acc) - y(p.acc_mid));
+        (p.mu, p.shift) = (p.mu + step, p.shift + step);
+        for v in [&mut p.acc_mid, &mut p.acc_lo, &mut p.acc_hi, &mut p.opening_acc] {
+            *v = shown(y(*v) + step);
+        }
+    }
 
     /// score_into for one chart: None (nothing rateable) or (best (rate, value), proposal (quality, rate, group),
     /// the best rate's prediction).
@@ -1348,6 +1369,13 @@ fn text(v: &Val) -> String {
 mod model_tests {
     use super::*;
 
+    #[test]
+    fn unmash_inverts_the_mash_floor() {
+        for acc in [0.99, 0.95, 0.85, 0.7, 0.65] {
+            assert!((mash_floor(unmash(acc)) - acc).abs() < 1e-9, "{acc}");
+        }
+    }
+
     fn feats(keys: i64, overall: f64, skills: serde_json::Value, c: &Consts) -> Feats {
         let mut f = Feats::skills(&skills, c);
         (f.keys, f.overall, f.od) = (keys, overall, 8.);
@@ -1372,7 +1400,7 @@ mod model_tests {
         let with = |share: f64, rest: f64| Feats { vibro: (share, rest), ..Feats::bare(4, 15., 8., &c) };
         assert!(c.vibro_chart(&with(0.6, 9.)), "a vibro dan song");
         assert!(!c.vibro_chart(&with(0.26, 27.6)), "REFORM Iota: a quarter vibro, dense rice besides");
-        assert!(!c.vibro_chart(&with(0.1, 5.)), "a few runs");
+        assert!(!c.vibro_chart(&with(0.01, 5.)), "almost no runs"); // VIBRO_ONLY .02 since calc bc901ee5b05a
     }
 
     #[test]
@@ -1566,7 +1594,7 @@ mod model_tests {
 #[cfg(test)]
 mod skill_tests {
     use super::*;
-    use crate::skills::{demanded, dimensions, feat_trees, normalize, shares, tree, wants_vibro};
+    use crate::skills::{demanded, dimensions, feat_trees, normalize, sliders, tree, wants_vibro};
 
     fn feature(keys: i64, sk: &[(&str, f64)]) -> Dict {
         let mut d = Dict::new();
@@ -1603,8 +1631,9 @@ mod skill_tests {
     #[test]
     fn avoid_steps_nest_and_the_middle_is_the_old_filter() {
         let sv = |p: f64| feature(7, &[("chordstream", 1.), ("sv", rank("sv", p))]);
-        let (lead, some, little) = (sv(0.95), sv(0.7), sv(0.4));
-        let hold = |h: f64| crate::skills::Tuning { avoid: [("sv".to_string(), h)].into(), other: 0. };
+        let c = crate::skills::cut(); // steps at (1 + c) / 2, c, c / 2: one chart between each pair
+        let (lead, some, little) = (sv(0.95), sv((c + (1. + c) / 2.) / 2.), sv(0.75 * c));
+        let hold = |h: f64| crate::skills::Tuning { avoid: [("sv".to_string(), h)].into(), ..Default::default() };
         let kept = |h: f64| [&lead, &some, &little].map(|f| tuned(f, &["!sv"], &hold(h)) > 0.);
         assert_eq!(kept(0.9), [false, true, true]);
         assert_eq!(kept(0.6), [false, false, true]);
@@ -1632,7 +1661,7 @@ mod skill_tests {
         let hard = feature(7, &[("chordstream", 1.), ("sv", 0.8)]);
         assert_eq!(strength(&hard, &["!sv"]), 0.);
         assert_eq!(strength(&hard, &["chordstream", "!sv"]), 0.);
-        assert_eq!(strength(&feature(7, &[("vibro", 1.)]), &["!jackspeed"]), 0.);
+        assert_eq!(strength(&feature(7, &[("vibro", 1.)]), &["!vibro"]), 0.); // Vibro its own row since 2026-11-14
         assert!(!wants_vibro(&strings(&["jackspeed"])));
     }
 
@@ -1692,7 +1721,7 @@ mod skill_tests {
             assert!(wide.contains(&n), "{n}");
         }
         assert!(!["Chords", "Delay", "Bracket"].iter().any(|n| four.contains(n) || wide.contains(n)));
-        assert!(wants_vibro(&strings(&["jackspeed/vibro"])) && !wants_vibro(&strings(&["jackspeed"])));
+        assert!(wants_vibro(&strings(&["vibro"])) && wants_vibro(&strings(&["jackspeed/vibro"])) && !wants_vibro(&strings(&["jackspeed"])));
         assert!(!normalize(&strings(&["trill"])).is_empty() && !normalize(&strings(&["trill"])).contains(&"trill".to_string()));
     }
 
@@ -1738,9 +1767,10 @@ mod skill_tests {
     #[test]
     fn skill_shares() {
         let w = |v: &[(&str, f64)]| v.iter().map(|(k, x)| (k.to_string(), *x)).collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(shares(&strings(&["stream", "jackspeed", "!sv"]), &w(&[("stream", 2.)]), 0.), Some(w(&[("stream", 2.), ("jackspeed", 1.)])));
-        assert_eq!(shares(&strings(&["stream", "jackspeed"]), &w(&[]), 0.), None);
-        assert_eq!(shares(&strings(&["stream"]), &w(&[("stream", 3.)]), 0.), None);
+        let v = |v: &[(&str, f64)]| v.iter().map(|(k, x)| (k.to_string(), *x)).collect::<Vec<_>>();
+        assert_eq!(sliders(&strings(&["stream", "jackspeed", "!sv"]), &w(&[("stream", 2.)]), 0.), Some(v(&[("stream", 2.), ("jackspeed", 1.)])));
+        assert_eq!(sliders(&strings(&["stream"]), &w(&[("stream", 3.)]), 0.5), Some(v(&[("stream", 3.), ("", 0.5)])));
+        assert_eq!(sliders(&strings(&["stream"]), &w(&[("stream", 3.)]), 0.), None);
     }
 }
 
