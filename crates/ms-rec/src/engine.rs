@@ -24,13 +24,14 @@ use std::sync::{Arc, Mutex};
 /// recommend.predictor_id of the model the Rust port reproduces: forecasts stay comparable across the port. A change to
 /// the prediction model takes a new id, so old forecasts are not read as this model's.
 pub const PREDICTOR_ID: &str = "532ce129f6fa"; // predictor families from the skill table (2026-11-11); was a6d61e058f5d
-pub const CALC_ID: &str = "29a02d72f4a7";
+pub const CALC_ID: &str = "eea12425de4c";
 /// Differ from CALC_ID in calibration only (calib/carry.json), newest first: a crawl still running holds the website rows back a whole
 /// calculator, so those can start older than the library's. Each carry keeps its source row.
 // Every shipped calculator, newest last: a ship that leaves its predecessor out drops the scores whose chart file is gone
 // (1.10.0: 7K evidence 8718 → 3959 plays on a copy without the files).
-pub const CARRIED_CALCS: [&str; 21] = ["2f01eca5e738", "7cee1dfdba7f", "a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f",
-                                       "4ccede2d49cf", "09639faa6673", "d3a86f7b014f", "f92680b7b136", "0f9f7da275f1", "a386c60fbb06", "a990d0ea0ada", "2789b337ae54", "bc901ee5b05a", "4c42635f416e", "5f0c6b2fdd16"];
+pub const CARRIED_CALCS: [&str; 22] = ["2f01eca5e738", "7cee1dfdba7f", "a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f",
+                                       "4ccede2d49cf", "09639faa6673", "d3a86f7b014f", "f92680b7b136", "0f9f7da275f1", "a386c60fbb06", "a990d0ea0ada", "2789b337ae54", "bc901ee5b05a", "4c42635f416e", "5f0c6b2fdd16",
+                                       "29a02d72f4a7"];
 const SURE_PLAYS: usize = 50; // of the player's own, on a keymode: fewer and the model is mostly the population's guess
 pub const ACTIVE_KEYS: std::ops::RangeInclusive<i64> = 4..=10;
 
@@ -297,7 +298,7 @@ impl Engine {
                 rows = warmups(&f, &list, &n.session, k0, &n.tables, &n.view_tables, &by_chart, &typ);
             }
         }
-        let seed = n.session.all.iter().filter(|e| matches!(e.kind.as_str(), "offer" | "finish" | "abort" | "reset")).map(|e| e.id).max().unwrap_or(0);
+        let seed = n.session.all.iter().filter(|e| matches!(e.kind.as_str(), "offer" | "reset")).map(|e| e.id).max().unwrap_or(0);
         let ids: Vec<(String, f64)> = rows.iter().map(|c| (c.md5.clone().or_else(|| c.sha.clone()).or_else(|| c.bid.map(|b| b.to_string())).unwrap_or_else(|| c.title.clone()), c.weight)).collect();
         let order = preview_order(&ids, &seed.to_string(), 0.);
         let shown: Vec<Pick> = order.into_iter().take(n_show).map(|i| rows[i].clone()).collect();
@@ -315,15 +316,22 @@ impl Engine {
         let (f, b) = self.features(db, Some(sha), Some(md5), None, rate)?;
         let Some(f) = f else { return Ok(None) };
         let Ok(feats) = Feats::of(&f, &self.c) else { return Ok(None) };
-        let mut e = self.predict(&feats, md5, b, rate, n);
-        if let (Some(e), Some(p)) = (e.as_mut(), self.pernote.as_ref()) {
+        let e = self.expected(db, &feats, sha, md5, b, rate, n, None);
+        Ok(e.map(|e| (e, f, feats, b)))
+    }
+
+    /// The shown Expected: the prediction blended with the personal per-note forecast when the chart's file is found. The
+    /// card and the playlist's aimed offer both read it (user 2026-11-14: offer ~96.2 % while the card showed 95.7 %).
+    #[allow(clippy::too_many_arguments)]
+    pub fn expected(&self, db: &Db, feats: &Feats, sha: &str, chart: &str, bid: Option<i64>, rate: f64, n: &Now, data: Option<&[u8]>) -> Option<Expected> {
+        let mut e = self.predict(feats, chart, bid, rate, n)?;
+        if let Some(p) = self.pernote.as_ref() {
             let stable = ms_data::store::kv_get(db, "client").is_some_and(|c| c == "stable");
-            if let Some(acc) = p.accuracy(db, sha, rate, stable, crate::pernote::today()) {
-                let model = self.r.fitted.display.as_ref().map_or(&self.r.fitted.pp.model, |d| &d.model);
-                model.blend(&mut e.shown, &feats, acc);
+            if let Some(acc) = p.accuracy(db, sha, data, round_digits(rate, 3), stable, crate::pernote::today()) {
+                self.model().blend(&mut e.shown, feats, acc);
             }
         }
-        Ok(e.map(|e| (e, f, feats, b)))
+        Some(e)
     }
 
     fn own_plays(&self, keys: i64) -> usize {

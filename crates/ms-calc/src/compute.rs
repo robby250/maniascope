@@ -94,10 +94,17 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
         let g = demand::geometry(chart, rate, k);
         let mut rs = Vec::new();
         let mut plains = Vec::new();
-        for cl in if keys % 2 == 1 { vec![true, false] } else { vec![true] } {
-            let (run, plain) = demand::demand(
-                chart, &g, cl, read.as_ref().map(|r| &r.0[..]), read.as_ref().map(|r| &r.1[..]), want_plain, k,
-            );
+        let one = |cl: bool| demand::demand(chart, &g, cl, read.as_ref().map(|r| &r.0[..]), read.as_ref().map(|r| &r.1[..]), want_plain, k);
+        // odd keymodes: the middle key with each hand, two independent passes on two threads (a fifth of a 7K chart's time)
+        let both = if keys % 2 == 1 {
+            std::thread::scope(|s| {
+                let right = s.spawn(|| one(false));
+                vec![one(true), right.join().expect("demand pass")]
+            })
+        } else {
+            vec![one(true)]
+        };
+        for (run, plain) in both {
             rs.push(run);
             if let Some(p) = plain {
                 plains.push(p);

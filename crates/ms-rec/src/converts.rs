@@ -160,18 +160,77 @@ fn source_path(source: &str, web: bool, root: &Path) -> Option<PathBuf> {
     if web { Some(web_dir().join("osu").join(format!("{source}.osu"))) } else { paths::local_file(source, root) }
 }
 
-/// The convert's chart, made again: a rate the index has no analysis of.
+/// The convert's chart, made again (a rate the index has no analysis of, a new calculator's re-rating) or read back from
+/// `kept`: rebuilding converts was 61 % of a calculator update's re-rating (~24 ms each, ~49k on the main PC, 2026-11-15).
 pub fn bytes(i: &Inst, root: &Path) -> Option<Vec<u8>> {
+    bytes_kept(i, root, &kept_dir())
+}
+
+fn bytes_kept(i: &Inst, root: &Path, dir: &Path) -> Option<Vec<u8>> {
+    let path = dir.join(format!("{}.osu.z", i.sha256));
+    let back = std::fs::read(&path).ok().and_then(|z| {
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut flate2::read::DeflateDecoder::new(&z[..]), &mut out).ok()?;
+        Some(out)
+    });
+    // a convert's sha is the hash of its bytes: a kept file is right or it is made again
+    if let Some(data) = back.filter(|d| hashes(d).0 == i.sha256) {
+        return Some(data);
+    }
     let data = std::fs::read(source_path(i.convert_of.as_ref()?, i.source_web, root)?).ok()?;
-    ms_convert::convert(&data, i.keys as usize).ok().map(|o| o.osu)
+    let osu = ms_convert::convert(&data, i.keys as usize).ok()?.osu;
+    if hashes(&osu).0 == i.sha256 {
+        let mut z = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+        let part = path.with_extension("part");
+        let written = std::io::Write::write_all(&mut z, &osu).ok().and_then(|_| z.finish().ok())
+            .and_then(|z| std::fs::create_dir_all(path.parent()?).and_then(|_| std::fs::write(&part, z)).and_then(|_| std::fs::rename(&part, &path)).ok());
+        if written.is_none() {
+            let _ = std::fs::remove_file(&part);
+        }
+    }
+    Some(osu)
+}
+
+/// Where converts' bytes are kept, deflated, by their sha.
+fn kept_dir() -> PathBuf {
+    paths::cache().join("converts")
+}
+
+/// Kept converts no row names any more go (after a calculator's re-rating, with its old rows).
+pub fn prune_kept(db: &Db) -> rusqlite::Result<usize> {
+    let names: std::collections::HashSet<String> = db.prepare("SELECT sha FROM converts WHERE sha IS NOT NULL")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let Ok(dir) = std::fs::read_dir(kept_dir()) else { return Ok(0) };
+    let gone: Vec<PathBuf> = dir.flatten().map(|e| e.path()).filter(|p| p.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".osu.z")).is_none_or(|sha| !names.contains(sha))).collect();
+    gone.iter().for_each(|p| { let _ = std::fs::remove_file(p); });
+    Ok(gone.len())
 }
 
 fn is_chart(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(".osu")
 }
 
-fn download(set: i64, to: &Path) -> std::result::Result<(), String> {
-    first_ok(&MIRRORS, |m| fetch(&format!("{m}{set}"), to))
+/// Called while a delivery runs: (what it does, share done when known); false = the player moved on, stop.
+pub type Report<'a> = &'a dyn Fn(&str, Option<f32>) -> bool;
+pub const CANCELLED: &str = "cancelled";
+
+fn download(set: i64, to: &Path, report: Report) -> std::result::Result<(), String> {
+    let got = first_ok(&MIRRORS, |m| fetch(&format!("{m}{set}"), to, report));
+    if got.is_ok() {
+        let _ = ms_data::webmaps::delivered(set);
+    }
+    got.map_err(|e| {
+        match ms_data::webmaps::strike(set, refused(&e)) {
+            Ok(true) => format!("{e} · gone from the mirrors, removed from your lists"),
+            _ => e,
+        }
+    })
+}
+
+/// A mirror answered and refused this set (403, 404, 410, 451): the map, not the server. 429, 5xx, timeouts and dropped
+/// connections are the server's.
+fn refused(errors: &str) -> bool {
+    errors.split(" · ").any(|e| e.rsplit("status code ").next().filter(|_| e.contains("status code ")).and_then(|c| c.trim().parse::<u16>().ok())
+        .is_some_and(|c| matches!(c, 403 | 404 | 410 | 451)))
 }
 
 /// The first mirror that delivers; every mirror's error when none does.
@@ -180,16 +239,38 @@ fn first_ok(mirrors: &[&str], mut get: impl FnMut(&str) -> std::result::Result<(
     for m in mirrors {
         match get(m) {
             Ok(()) => return Ok(()),
+            Err(e) if e == CANCELLED => return Err(e),
             Err(e) => errors.push(e),
         }
     }
     Err(errors.join(" · "))
 }
 
-fn fetch(url: &str, to: &Path) -> std::result::Result<(), String> {
+fn fetch(url: &str, to: &Path, report: Report) -> std::result::Result<(), String> {
+    use std::io::{Read, Write};
+    let host = url.split('/').nth(2).unwrap_or(url);
+    if !report(&format!("Downloading from {host}…"), None) {
+        return Err(CANCELLED.into());
+    }
     let response = ureq::get(url).set("User-Agent", UA).timeout(Duration::from_secs(120)).call().map_err(|e| e.to_string())?;
+    let total = response.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).filter(|&t| t > 0);
     let part = to.with_extension("osz.part");
-    std::io::copy(&mut response.into_reader(), &mut std::fs::File::create(&part).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let (mut reader, mut file) = (response.into_reader(), std::fs::File::create(&part).map_err(|e| e.to_string())?);
+    let (mut buf, mut got) = (vec![0u8; 1 << 16], 0u64);
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        got += n as u64;
+        let text = format!("Downloading from {host}… {:.1} MB{}", got as f64 / 1e6, total.map_or(String::new(), |t| format!(" of {:.1}", t as f64 / 1e6)));
+        if !report(&text, total.map(|t| (got as f64 / t as f64).min(1.) as f32)) {
+            drop(file);
+            let _ = std::fs::remove_file(&part);
+            return Err(CANCELLED.into());
+        }
+    }
     std::fs::rename(&part, to).map_err(|e| e.to_string())
 }
 
@@ -242,10 +323,10 @@ fn needs_original(p: &Pick, db: &Db, stable: bool) -> bool {
 /// a convert is its own set there; its audio and images are stored once by hash (one extra file, 36 KB, same test).
 /// For a website map on lazer the original goes first: the whole set is imported beside the convert, which reuses its
 /// audio and images (user 2026-11-02: "fine if it also imports the set").
-pub fn deliver(p: &Pick, db: &Db, client: &str, root: &Path, picked: Instant) -> std::result::Result<(), String> {
+pub fn deliver(p: &Pick, db: &Db, client: &str, root: &Path, picked: Instant, report: Report) -> std::result::Result<(), String> {
     let stage = |what: &str| eprintln!("convert {}: {what} at {} ms", p.title, picked.elapsed().as_millis()); // where the wait after Next goes
     stage("start");
-    let Some(source) = p.convert_of.as_deref() else { return deliver_website(p, client) };
+    let Some(source) = p.convert_of.as_deref() else { return deliver_website(p, client, report) };
     let set = p.set_id.unwrap_or(0);
     let data = std::fs::read(source_path(source, p.source_web, root).ok_or("the source chart is gone")?).map_err(|e| e.to_string())?;
     let out = ms_convert::convert(&data, p.keys as usize).map_err(|e| e.to_string())?;
@@ -269,7 +350,7 @@ pub fn deliver(p: &Pick, db: &Db, client: &str, root: &Path, picked: Instant) ->
         let holder = if stable { paths::cache() } else { dir.clone() }; // stable would take the original from Songs by itself
         std::fs::create_dir_all(&holder).map_err(|e| e.to_string())?;
         let original = holder.join(format!("{set}.osz"));
-        download(set, &original)?;
+        download(set, &original, report)?;
         stage("website set downloaded");
         owned = archive_files(&original, stable)?;
         if stable {
@@ -292,14 +373,7 @@ pub fn deliver(p: &Pick, db: &Db, client: &str, root: &Path, picked: Instant) ->
     if client == "stable" {
         return Ok(()); // stable writes its database when it closes: nothing to confirm against
     }
-    // lazer stores a chart under its hash, and that hash is the output's: the import landed when the file is there.
-    let (wanted, start) = (paths::local_file(p.sha.as_deref().unwrap_or(""), &paths::lazer_data()).ok_or("no sha")?, Instant::now());
-    while !wanted.is_file() {
-        if start.elapsed() > CONFIRM {
-            return Err("osu! didn't import the convert (is it running?)".to_string());
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    imported(p, "osu! didn't import the convert (is it running?)", report)?;
     stage("in osu!'s store");
     let _ = std::fs::remove_file(&path);
     Ok(())
@@ -307,23 +381,32 @@ pub fn deliver(p: &Pick, db: &Db, client: &str, root: &Path, picked: Instant) ->
 
 /// A website chart that isn't a convert: its set from the mirror into the client, as a convert's original arrives
 /// (user 2026-11-06: natives opened osu://b for the in-game download while converts arrived by themselves).
-fn deliver_website(p: &Pick, client: &str) -> std::result::Result<(), String> {
+fn deliver_website(p: &Pick, client: &str, report: Report) -> std::result::Result<(), String> {
     let set = p.set_id.filter(|s| *s > 0).ok_or("no beatmap set id")?;
     let path = import_dir(client)?.join(format!("{set}.osz"));
-    download(set, &path)?;
+    download(set, &path, report)?;
     crate::navigation::hand_over(&path, client)?;
     if client == "stable" {
         return Ok(()); // stable imports the .osz from Songs on entering song select
     }
     // The website chart's sha is its .osu's: the set landed when lazer stores that file (an updated map never does).
+    imported(p, "osu! didn't import the map (is it running, or was it updated on the website?)", report)?;
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+/// lazer stores a chart under its hash: the import landed when the pick's file is there.
+fn imported(p: &Pick, timeout: &str, report: Report) -> std::result::Result<(), String> {
     let (wanted, start) = (paths::local_file(p.sha.as_deref().unwrap_or(""), &paths::lazer_data()).ok_or("no sha")?, Instant::now());
     while !wanted.is_file() {
         if start.elapsed() > CONFIRM {
-            return Err("osu! didn't import the map (is it running, or was it updated on the website?)".to_string());
+            return Err(timeout.to_string());
+        }
+        if !report("Importing into osu!…", None) {
+            return Err(CANCELLED.into());
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    let _ = std::fs::remove_file(&path);
     Ok(())
 }
 
@@ -340,6 +423,13 @@ mod tests {
             osu.push_str(&format!("{},192,{},1,0,0:0:0:0:\n", (step * 3 % 7) * 512 / 7 + 36, step * 125));
         }
         osu
+    }
+
+    #[test]
+    fn only_a_mirror_refusing_the_set_counts_against_the_map() {
+        assert!(refused("https://catboy.best/d/1: status code 403 · https://osu.direct/api/d/1: status code 503"));
+        assert!(!refused("https://catboy.best/d/1: status code 503 · https://osu.direct/api/d/1: status code 429"));
+        assert!(!refused("https://catboy.best/d/1: Connection Failed: tls connection init failed · x: timed out"));
     }
 
     #[test]
@@ -366,6 +456,24 @@ mod tests {
         assert_eq!(jobs(6.), "abc", "the same chart once they improve");
         assert_eq!(jobs(40.), "bc", "1.5 stars can't fit a level 40 player");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_convert_is_made_once_and_read_back_by_its_sha() {
+        let dir = std::env::temp_dir().join(format!("ms-kept-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let osu = ms_convert::convert(chart().as_bytes(), 10).unwrap().osu;
+        let sha = hashes(&osu).0;
+        let i = Inst { sha256: sha.clone(), keys: 10, convert_of: Some("x".into()), source_web: true, ..Inst::default() };
+        let kept = dir.join("kept");
+        std::fs::create_dir_all(&kept).unwrap();
+        let mut z = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut z, &osu).unwrap();
+        std::fs::write(kept.join(format!("{sha}.osu.z")), z.finish().unwrap()).unwrap();
+        assert_eq!(bytes_kept(&i, &dir, &kept).unwrap(), osu, "read back without its source");
+        std::fs::write(kept.join(format!("{sha}.osu.z")), b"garbage").unwrap();
+        assert!(bytes_kept(&i, &dir, &kept).is_none(), "a wrong kept file is never used (no source here to make it again)");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -400,7 +508,7 @@ mod tests {
         db.execute("INSERT INTO stable_files VALUES (?,0,0,?)", rusqlite::params![folder.join("a.osu").to_str().unwrap(), source]).unwrap();
         let out = ms_convert::convert(chart().as_bytes(), 10).unwrap();
         let p = Pick { convert_of: Some(source), keys: 10, sha: Some(hashes(&out.osu).0), set_id: Some(1), title: "T".into(), ..Pick::default() };
-        deliver(&p, &db, "stable", &store, Instant::now()).unwrap();
+        deliver(&p, &db, "stable", &store, Instant::now(), &|_, _| true).unwrap();
         assert_eq!(std::fs::read(folder.join(&out.file_name)).unwrap(), out.osu);
         assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 1, "no archive beside it");
         let _ = std::fs::remove_dir_all(dir);

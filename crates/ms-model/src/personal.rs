@@ -178,17 +178,9 @@ fn fit_shape(z: &[f64], p: usize, target: &[f64], w: &[f64], groups: &[&str]) ->
     }
     grouped.iter_mut().zip(&mass).for_each(|(r, m)| r.iter_mut().for_each(|x| *x /= m));
     let risk: Vec<f64> = (0..4).map(|j| grouped.iter().map(|r| r[j]).sum::<f64>() / g as f64).collect();
-    let mut best = 0;
-    for j in 1..4 {
-        if risk[j] < risk[best] {
-            best = j;
-        }
-    }
-    let chosen = (0..4).filter(|&j| {
-        let difference: Vec<f64> = grouped.iter().map(|r| r[j] - r[best]).collect();
-        let se = var(&difference, 0).sqrt() / (g.max(1) as f64).sqrt();
-        risk[j] - risk[best] <= se + 1e-12
-    }).max_by(|&a, &b| GRID[a].total_cmp(&GRID[b])).unwrap();
+    // The ridge with the least cross-validated risk. The one-SE rule (the largest within a standard error) shrank the shape
+    // further: walk-forward audit .8397 -> .8384 pp, RMSE 1.278 -> 1.276 without it (2026-11-15).
+    let chosen = (0..4).min_by(|&a, &b| risk[a].total_cmp(&risk[b])).unwrap();
     let total: f64 = w.iter().sum();
     Shape { beta: fit(&all_a, &all_b, GRID[chosen] * total), ridge: Some(GRID[chosen]), families: g, cv: risk }
 }
@@ -1014,6 +1006,7 @@ pub struct Fit {
     pub zmean: HashMap<i64, Vec<f64>>,
     pub zscale: HashMap<i64, Vec<f64>>,
     pub shape_validation: HashMap<i64, ShapeReport>,
+    pub steep: HashMap<i64, (f64, f64)>,
     pub recent: HashMap<i64, (Vec<f64>, Vec<f64>, Vec<f64>)>,
     pub session_validation: SessionReport,
     pub aff: HashMap<String, (f64, f64)>,
@@ -1030,6 +1023,20 @@ pub struct Fit {
     pub retry: f64,
     pub n_rows: usize,
     pub warmup: WarmModels,
+}
+
+/// The steepness ridge, in ln-rating variance per unit weight: a keymode whose ratings spread less than this keeps under half its slope.
+pub const STEEP_RIDGE: f64 = 0.005; // walk-forward audit 2026-11-14: MAE .9836 (none) → .9728 (0.005), .9773 (0.02), .9756 (0.08)
+
+/// (centre, slope) of a ridge of `u` on ln rating `lr` around its weighted mean; None without weight or with ridge = ∞.
+fn steepness(lr: &[f64], u: &[f64], w: &[f64], ridge: f64) -> Option<(f64, f64)> {
+    let sw: f64 = w.iter().sum();
+    if !(ridge.is_finite() && sw > 0.) {
+        return None;
+    }
+    let centre = lr.iter().zip(w).map(|(l, x)| x * l).sum::<f64>() / sw;
+    let (sxy, sxx) = lr.iter().zip(u).zip(w).fold((0., 0.), |(a, b), ((l, u), x)| (a + x * (l - centre) * u, b + x * (l - centre).powi(2)));
+    Some((centre, sxy / (sxx + ridge * sw)))
 }
 
 /// recommend.Personal.__init__ on the kept evidence rows.
@@ -1104,8 +1111,23 @@ pub fn personal_fit(c: &Consts, mut rows: Vec<Row>, feats: &[Feats], now: f64, l
         out.monthly.insert(k, (g0, own_e, own_w, own_n));
     }
 
-    // Skill mix: ridge on what the level leaves, per keymode with enough rows.
+    // Personal steepness (user 2026-11-14, 4K offers at 9★+ landing 2–6 pp under while lower ones hit): how much faster or
+    // slower than the population curve the player's accuracy falls with the chart's rating, per keymode, by a ridge on what
+    // the level leaves, shrunk to the population's slope (0).
     let mut u: Vec<f64> = (0..n).map(|i| e[i] - l_at[i]).collect();
+    let mut steep_at = vec![0.; n];
+    let ridge = std::env::var("MS_STEEP").ok().and_then(|v| v.parse().ok()).unwrap_or(STEEP_RIDGE);
+    for &k in &keys {
+        let s = of_keys(k);
+        let pick = |v: &[f64]| s.iter().map(|&i| v[i]).collect::<Vec<f64>>();
+        let ww: Vec<f64> = s.iter().map(|&i| w[i] * w_rec[i]).collect();
+        let Some((centre, beta)) = steepness(&pick(&lr), &pick(&u), &ww, ridge) else { continue };
+        for &i in &s {
+            steep_at[i] = beta * (lr[i] - centre);
+            u[i] -= steep_at[i];
+        }
+        out.steep.insert(k, (centre, beta));
+    }
     let rust = fit_rust(&rows, feats, &u, &w);
     let shape_report = |s: &Shape, zc: &[f64], p: usize| -> ShapeReport {
         let column = |j: usize| zc.iter().skip(j).step_by(p).copied();
@@ -1125,7 +1147,7 @@ pub fn personal_fit(c: &Consts, mut rows: Vec<Row>, feats: &[Feats], now: f64, l
         if s.len() < 200 || k == 10 {
             continue;
         }
-        let z: Vec<f64> = s.iter().flat_map(|&i| c.zvec(fe(i), rows[i].base + l_at[i])).collect();
+        let z: Vec<f64> = s.iter().flat_map(|&i| c.zvec(fe(i), rows[i].base + l_at[i] + steep_at[i])).collect();
         let p = z.len() / s.len();
         let ww: Vec<f64> = s.iter().map(|&i| w[i] * w_rec[i]).collect();
         let (zm, scale) = standardise(&z, p, &ww);
@@ -1250,6 +1272,18 @@ mod tests {
     fn row(chart: &str, rate: f64, ts: f64, rd: bool) -> Row {
         Row { keys: 7, y: 0., base: 0., t: 300., ts, public: false, local: true, rd, completed: true, chart: chart.into(),
               rate, rate3: round_digits(rate, 3), best: Best::None, family: chart.into(), f: 0 }
+    }
+
+    #[test]
+    fn steepness_follows_a_player_who_falls_off_faster_than_the_population() {
+        let lr: Vec<f64> = (0..40).map(|i| (5. + i as f64 * 0.125).ln()).collect();
+        let steep: Vec<f64> = lr.iter().map(|l| 0.8 * (l - 2.)).collect();
+        let (centre, beta) = steepness(&lr, &steep, &vec![1.; 40], 0.).unwrap();
+        assert!((beta - 0.8).abs() < 1e-9 && centre > 1.6 && centre < 2.3);
+        let shrunk = steepness(&lr, &steep, &vec![1.; 40], STEEP_RIDGE).unwrap().1;
+        assert!(shrunk > 0.3 && shrunk < 0.8, "{shrunk}");
+        assert!(steepness(&lr, &vec![0.; 40], &vec![1.; 40], STEEP_RIDGE).unwrap().1.abs() < 1e-12);
+        assert!(steepness(&lr, &steep, &vec![1.; 40], f64::INFINITY).is_none());
     }
 
     #[test]

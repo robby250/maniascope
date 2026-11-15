@@ -426,7 +426,9 @@ impl App {
         let scale = Scale { lo, hi: hi.max(lo + 0.5), dan: rice };
         // Every row's bar starts and ends at the same x, under the dan axis.
         let width = ui.available_width();
-        let parents = skills::tree(keys);
+        // SV: nothing measures it (no dan songs, few own charts; it showed "Reg 6th", user 2026-11-11). Mash is a practice/avoid
+        // choice, not a level; Vibro waits for better predictions (user 2026-11-14).
+        let parents: Vec<&Skill> = skills::tree(keys).iter().filter(|p| !["sv", "vibro", "mash"].contains(&p.key.as_str())).collect();
         // name column = widest name on screen (children only of open families, indented 22 px), so bars start right after it
         let text = |t: String| egui::WidgetText::from(t).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body).size().x;
         let open = |p: &Skill| self.s.expanded.contains(&(keys, p.key.clone()));
@@ -441,8 +443,7 @@ impl App {
         let line_id = ui.scope_id().with(("skill-line", keys));
         let line = ui.data(|d| d.get_temp::<f64>(line_id));
         let mut pointed = None;
-        // SV is not read from anything that measures it (no dan songs, few own charts): it showed "Reg 6th" (user 2026-11-11).
-        for parent in parents.iter().filter(|p| p.key != "sv") {
+        for parent in &parents {
             if parent.children.is_empty() {
                 pointed = pointed.or(self.skill_row(ui, keys, parent, page, scale, &l, false, None, line));
                 continue;
@@ -487,9 +488,6 @@ impl App {
             messages.push("These are model diagnostics, not proof of a personal weakness. Mixed patterns, session form and older predictor versions may contribute.".to_string());
             theme::dim(ui, messages.join("\n\n"));
         });
-        if page.mash_maps > 0 {
-            theme::dim(ui, format!("Special-pattern evidence: Mash appears materially in {} charts. It is an execution/difficulty correction, not a separate practice goal.", page.mash_maps));
-        }
     }
 
     pub fn stats_ui(&mut self, ui: &mut Ui) {

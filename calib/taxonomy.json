@@ -1,7 +1,7 @@
 {
   "note": "Slice ramps (ms_calc::skills::ramp): [lo, hi, e, g] at 7K and chart level 5, both × (keys/7)^e × (level/5)^g. `calib ramps` refits them; card: TAG (`calib labels --fit`).",
   "card": {
-    "tag": 0.83,
+    "tag": 0.84,
     "name": 0.63
   },
   "ramps": {
@@ -12,8 +12,8 @@
       0.0
     ],
     "dump": [
-      0.1351,
-      0.5373,
+      0.0111,
+      0.2188,
       0.0,
       0.0
     ],

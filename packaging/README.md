@@ -5,6 +5,9 @@ Everything lands in `dist/` (gitignored). Nothing here uploads.
 1. Linux: `cargo build --release -p ms-app`, copy `target/release/maniascope` to `dist/maniascope-linux-x86_64`.
 2. Windows: `cargo build --release -p ms-app --target x86_64-pc-windows-gnu` (needs `gcc-mingw-w64-x86-64`), copy the exe
    to `dist/ManiaScope.exe`. CI does the same: `packaging/windows-workflow.yml`, exported as `.github/workflows/windows.yml`.
+   Check it under Wine in a throwaway prefix; `wineserver -k` ends explorer/services, which otherwise outlive the test:
+   `P=$(mktemp -d); export WINEPREFIX=$P WINEARCH=win64; wine64 wineboot -u && xvfb-run -a wine64 dist/ManiaScope.exe
+   --self-test; wineserver -k; wineserver -w; rm -rf "$P"` → `Self-test OK <calc>`.
 3. Population data: `cargo run --release -p ms-tools --bin release_public -- <public.msp> dist` writes
    `dist/public-<calc>.msp` without the builder's own scores.
 4. Public source: `cargo run --release -p ms-tools --bin export_public -- <a clone of the public repo>`.

@@ -180,7 +180,10 @@ knobs! {
     DELAY_GAP: f64 = 0.07,
     TRILL_GAP: f64 = 0.2,
     MJ_BURST: usize = 2,
-    VIBRO_GAP: f64 = 0.095,
+    VIBRO_GAP: f64 = 0.098, // structure::vibro_gap: a VIBRO_LEN_REF-hit run is vibro under this re-hit gap (≈153 BPM 1/4; 16 hits ≈165, user 2026-11-14)
+    VIBRO_LEN_REF: f64 = 32.0, // structure::vibro_gap: the run length VIBRO_GAP is stated at
+    VIBRO_GAP_LONG: f64 = 0.1, // structure::vibro_gap: never slower than this however long the run (150 BPM 1/4: Windows Vs.AGK's long quads and a 157 BPM chord spam are vibro, user 2026-11-14)
+    VIBRO_LEN_P: f64 = 0.12, // structure::vibro_gap: × (hits / VIBRO_LEN_REF)^this (short bursts need more speed, long runs less)
     VIBRO_MIN: usize = 7, // column_runs: 7 hits (2026-11-13: 5–6 read DESTRUCTION 3,2,1 stream bursts as vibro)
     VIBRO_P: f64 = 2.0, // column_runs: a run is vibro under VIBRO_GAP × (chord repeat share)^VIBRO_P
     VIBRO_RUN: f64 = 11.0, // gestures::vibro: a fast same-chord run counts as vibro from 4 rows, fully at this many

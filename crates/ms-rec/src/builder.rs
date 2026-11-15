@@ -237,7 +237,7 @@ impl Builder {
         let selected = skills::normalize(&r.selected_skills);
         let mut memo = Choices::new(order.clone(), Forecast { calc: r.calc.clone(), predictor: r.predictor.clone(), band_z: ms_model::predict::BAND_Z });
         let jobs: Vec<ScoreJob> = order.iter().map(|s| publish_job(s, &catalog[s], &r.public)).collect();
-        r.model.score_into(&mut memo, &tables, &store, &jobs, &selected, &r.tuning, r.target, r.rates, r.mode == "skills", skills::wants_vibro(&selected), !selected.is_empty(), r.nps_weight, ms_data::store::now())
+        r.model.score_into(&mut memo, &tables, &store, &jobs, &selected, &r.tuning, r.target, r.rates, r.mode == "skills", !selected.is_empty(), r.nps_weight, ms_data::store::now())
             .map_err(rusqlite::Error::InvalidParameterName)?;
         *self.store.write().unwrap() = store;
         Ok((Arc::new(memo.snapshot()), Arc::new(catalog)))
@@ -494,7 +494,7 @@ impl Builder {
         let forecast = Forecast { calc: r.calc.clone(), predictor: r.predictor.clone(), band_z: ms_model::predict::BAND_Z };
         let score = |choices: &mut Choices, shas: &[String], catalog: &HashMap<String, Arc<Inst>>, store: &FeatStore, now: f64| -> std::result::Result<(), String> {
             let jobs: Vec<ScoreJob> = shas.iter().filter_map(|s| catalog.get(s).map(|i| publish_job(s, i, &r.public))).collect();
-            r.model.score_into(choices, &tables, store, &jobs, &selected, &r.tuning, r.target, r.rates, skills_mode, skills::wants_vibro(&selected), !selected.is_empty(), r.nps_weight, now)
+            r.model.score_into(choices, &tables, store, &jobs, &selected, &r.tuning, r.target, r.rates, skills_mode, !selected.is_empty(), r.nps_weight, now)
         };
         // Deterministic per-chart order spreads unplayed coverage across collections.
         let (mut unknown, mut enrich): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
@@ -534,7 +534,7 @@ impl Builder {
         let mut memo = Choices::new(self.order.clone(), forecast);
         // `shown`: the request's list is out. Only an empty one (nothing analysed yet) is replaced by the first that isn't.
         let (mut bad, mut count, mut emitted, mut shown) = (HashMap::<String, String>::default(), 0usize, false, false);
-        let mut told = std::time::Instant::now(); // last progress note
+        let (mut told, mut unreported) = (std::time::Instant::now(), false); // last progress note, work since it
         let (mut refined, mut refined_counts, mut groups_done): (Vec<(String, f64)>, HashMap<String, u32>, BTreeMap<(i64, String), u32>) = Default::default();
         let mut pending_unknown: VecDeque<String> = unknown.into();
         let mut pending_enrich: VecDeque<String> = enrich.into();
@@ -609,6 +609,13 @@ impl Builder {
             // A useful exact shortlist needs no endless refinement, but unanalysed maps keep going until the library is
             // done: a calculator change left ~10k waiting for two weeks at 160 per update (user 2026-10-25).
             if jobs.is_empty() {
+                // the last throttled note can be ~2 s of work behind: the bar stood at 104,146 / 104,257 with nothing left
+                // to analyse (user 2026-11-14: "maps aren't analysing")
+                if unreported {
+                    unreported = false;
+                    let analyzed = { let store = self.store.read().unwrap(); self.catalog.keys().filter(|s| store.current(s)).count() };
+                    (self.emit)(Update::Progress { mode: r.mode.clone(), revision: r.revision, generation: r.generation, total: self.catalog.len(), analyzed, failed: bad.len() });
+                }
                 if !self.wait_idle() || !self.index_converts(db, r, web.as_ref(), reaches.as_ref())? {
                     return Ok(());
                 }
@@ -646,13 +653,14 @@ impl Builder {
                                 }
                                 memo.drop_chart(sha);
                                 count += 1;
+                                unreported = true;
                             }
                         }
                     }
                 }
                 tx.commit()?;
                 if told.elapsed().as_secs() >= 2 {
-                    told = std::time::Instant::now();
+                    (told, unreported) = (std::time::Instant::now(), false);
                     let store = self.store.read().unwrap();
                     let analyzed = self.catalog.keys().filter(|s| store.current(s)).count();
                     (self.emit)(Update::Progress { mode: r.mode.clone(), revision: r.revision, generation: r.generation, total: self.catalog.len(), analyzed, failed: bad.len() });
@@ -700,6 +708,7 @@ pub struct RankInputs<'a> {
     pub focus: f64,
     pub count: usize,
     pub recent: Vec<(u8, i64)>,
+    pub recent_skills: Vec<(String, i64)>,
     pub key_shares: std::collections::BTreeMap<i64, f64>,
     pub skill_weights: Option<std::collections::HashMap<String, f64>>,
     pub selected_skills: &'a [String],
@@ -725,7 +734,7 @@ pub fn rank(prepared: &ms_model::choices::Prepared, catalog: &HashMap<String, Ar
         recent_profiles: recent.iter().filter_map(|a| a.a.get("profile")?.as_array().map(|p| p.iter().filter_map(Value::as_f64).collect())).collect(),
         current_keys: session.current_keys(), consumed: &consumed,
         // A custom playlist's slider at "off" (< 0): no shuffle, the best skill match first.
-        shuffle: inputs.seed.filter(|_| inputs.focus >= 0.).map(|s| (s, inputs.focus)), count: Some(inputs.count), recent: inputs.recent, key_shares: inputs.key_shares, skill_weights: inputs.skill_weights,
+        shuffle: inputs.seed.filter(|_| inputs.focus >= 0.).map(|s| (s, inputs.focus)), count: Some(inputs.count), recent: inputs.recent, recent_skills: inputs.recent_skills, key_shares: inputs.key_shares, skill_weights: inputs.skill_weights,
     });
     let picks = rows.into_iter().filter_map(|(i, value, weight, share)| {
         let mut p = prepared_pick(prepared, i, catalog, mode, inputs.selected_skills, store)?;

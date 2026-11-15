@@ -15,20 +15,22 @@ pub fn same_map(p: &Pick, sha: Option<&str>, md5: Option<&str>, bid: Option<i64>
 }
 
 fn field(name: &str, value: &str) -> String {
-    let value = value.trim();
-    // The lazer parser has no quoted-string escape convention. A literal safe fragment is preferable to a
-    // syntactically broken 'escaped' exact match.
-    let fragments: Vec<&str> = value.split(['"', '\r', '\n', '\t']).collect();
-    let fragment = fragments.iter().copied().max_by_key(|f| f.chars().count()).unwrap_or("").trim();
-    if fragment.is_empty() {
+    // lazer (FilterQueryParser, FilterCriteria): a quoted value ends at the next `"` (no escape); `"x"!` must equal the
+    // whole field; `"x"` matches `(^|\b)x($|\b)`, so a part cut at a quote is trimmed to word characters at both ends
+    // (user 2026-11-14: title `Lowermost revolt ("Jeremiad" Long ver.)` searched as `Lowermost revolt (`, never found).
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let parts: Vec<&str> = value.split(['"', '\r', '\n', '\t']).collect();
+    let exact = parts.len() == 1 && !value.is_empty() && value.trim() == value;
+    let part = if exact { value } else { parts.iter().map(|f| f.trim_matches(|c: char| !word(c))).max_by_key(|f| f.chars().count()).unwrap_or("") };
+    if part.is_empty() {
         return String::new();
     }
-    format!("{name}=\"{fragment}\"{}", if fragments.len() == 1 { "!" } else { "" })
+    format!("{name}=\"{part}\"{}", if exact { "!" } else { "" })
 }
 
 /// Search the local difficulty; intended playback rate is deliberately absent.
 pub fn song_search(p: &Pick, client: &str) -> String {
-    let (artist, title, version, creator) = (p.artist.as_deref().unwrap_or(""), p.song.as_deref().unwrap_or(""), p.version.as_deref().unwrap_or(""), p.creator.as_deref().unwrap_or(""));
+    let (artist, title, version) = (p.artist.as_deref().unwrap_or(""), p.song.as_deref().unwrap_or(""), p.version.as_deref().unwrap_or(""));
     if client == "stable" {
         // stable has no quoted field values: its words match artist/title/difficulty/creator/tags, keys= filters
         // (osu! wiki, Beatmap search)
@@ -36,7 +38,8 @@ pub fn song_search(p: &Pick, client: &str) -> String {
         let query = words.split_whitespace().collect::<Vec<_>>().join(" ");
         return if query.is_empty() { query } else if p.keys != 0 { format!("{query} keys={}", p.keys) } else { query };
     }
-    let fields = [field("artist", artist), field("title", title), field("diff", version), field("creator", creator)];
+    // No creator: a renamed mapper's website name isn't the one in the file lazer imported.
+    let fields = [field("artist", artist), field("title", title), field("diff", version)];
     let query = fields.iter().filter(|f| !f.is_empty()).cloned().collect::<Vec<_>>().join(" ");
     if !query.is_empty() {
         return if p.keys != 0 { format!("{query} cs={}", p.keys) } else { query };
@@ -253,6 +256,9 @@ mod tests {
         assert_eq!(field("title", "plain"), "title=\"plain\"!");
         assert_eq!(field("title", "a \"long part\" b"), "title=\"long part\"");
         assert_eq!(field("title", "  "), "");
+        assert_eq!(field("title", "Lowermost revolt (\"Jeremiad\" Long ver.)"), "title=\"Lowermost revolt\"");
+        assert_eq!(field("title", "x_ \"a\""), "title=\"x_\"");
+        assert_eq!(field("diff", "Hard "), "diff=\"Hard\""); // a trailing space can't be an exact match after trimming
     }
 
     #[test]
@@ -270,5 +276,7 @@ mod tests {
         let p = Pick { artist: Some("A=B".into()), song: Some("T!".into()), version: Some("V".into()), keys: 7, ..Pick::default() };
         assert_eq!(song_search(&p, "stable"), "A B T V keys=7");
         assert_eq!(song_search(&p, "lazer"), "artist=\"A=B\"! title=\"T!\"! diff=\"V\"! cs=7");
+        // submitted maps too (user 2026-11-15: no beatmap id search)
+        assert_eq!(song_search(&Pick { bid: Some(42), ..p.clone() }, "lazer"), "artist=\"A=B\"! title=\"T!\"! diff=\"V\"! cs=7");
     }
 }

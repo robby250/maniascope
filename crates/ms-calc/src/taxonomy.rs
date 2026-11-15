@@ -101,7 +101,7 @@ pub const TABLE: [Row; 37] = {
         row(jackspeed, "Jacks", "jackspeed", None, Base, FOUR, None, "jack", ""),
         row(jack, "Jacks", "jackspeed", None, Base, WIDE, None, "jack", ""),
         row(chordjack, "Chordjack", "chordjack", None, Base, ALL, None, "chordjack", ""),
-        row(quadstream, "Quadstream", "handstream", Some("quadstream"), Slice(&[handstream]), FOUR, Some(Quad), "", "Single → quad → single stream texture with embedded minijacks; not every quad or chordjack."),
+        row(quadstream, "Quadstream", "jackspeed", Some("quadstream"), Slice(JACKS), FOUR, Some(Quad), "", "Single → quad → single stream texture with embedded minijacks; not every quad or chordjack."),
         row(minijack, "Minijacks", "jackspeed", Some("minijack"), Slice(JACKS), ALL, Some(PerRow(P::mj)), "jack", "Short repeated-column bursts inside other patterns."),
         row(longjack, "Longjacks", "jackspeed", Some("longjack"), Slice(JACKS), ALL, Some(PerRow(P::lj)), "jack", "Sustained single-column repetition."),
         row(vibro, "Vibro", "jackspeed", Some("vibro"), Slice(VIBRO_OF), ALL, Some(VibroRuns), "jack", "Specialist ultra-fast repetition. Only explicitly selecting Vibro includes pure vibro drills."),

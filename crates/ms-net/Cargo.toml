@@ -1,0 +1,10 @@
+# Per-note net trainer (plan 2026-11-13b S7, was /tmp/maniascope-s7/net "s7net"): notefit trains calib/notenet.json, thetafc the forecast coefficients
+[package]
+name = "ms-net"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+burn = { version = "0.22.1", default-features = false, features = ["std", "wgpu", "autodiff", "optim"] }
+serde_json = "1"
+memmap2 = "0.9"

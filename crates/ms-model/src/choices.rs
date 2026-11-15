@@ -234,6 +234,7 @@ pub struct Ranking<'a> {
     pub count: Option<usize>,
     pub recent: Vec<(u8, i64)>, // this tab's last offers, oldest first: (REAL, WEB or CONVERT, keymode)
     pub key_shares: std::collections::BTreeMap<i64, f64>, // keymode → its share of the list (`key_shares`; equal when empty)
+    pub recent_skills: Vec<(String, i64)>, // this tab's last offers' leading skill ("" for none) and keymode, oldest first
     pub skill_weights: Option<std::collections::HashMap<String, f64>>, // {included skill or "" other maps: its share of the list} (`mix_shares`)
 }
 
@@ -371,6 +372,10 @@ impl Prepared {
             }).collect();
             let order = shuffle_order(&ids, &weights, seed, *focus);
             available = order.into_iter().map(|i| available[i]).collect();
+            if let Some(shares) = &r.skill_weights {
+                let at: Vec<(i64, &str)> = available.iter().map(|x| (items[x.0].keys, slot(&items[x.0], Some(shares)).0 .1)).collect();
+                available = skill_order(&at, shares, &r.key_shares, &r.recent_skills).into_iter().map(|i| available[i]).collect();
+            }
         }
         let streams: Vec<u8> = available.iter().map(|x| items[x.0].stream()).collect();
         let odds = stream_odds([r.web, r.convert], r.weighted, &streams);
@@ -441,8 +446,59 @@ fn balanced(weights: &[f64], slots: &[((i64, &str), f64)], focus: f64, exact: bo
     for (w, s) in weights.iter().zip(slots) {
         *mass.entry(s.0).or_insert(0.) += w;
     }
-    let evening = if exact { 1. } else { (1. - focus).powi(2) }; // squared: the slider's middle keeps most of the library's mix
+    if exact {
+        // skill slots get their shares by turns (`skill_order`): dividing by the slot's mass sorted the smaller slot first
+        // at a high focus (user 2026-11-14: Vibro at 0.15 of 1.15 filled the list)
+        return weights.iter().zip(slots).map(|(w, s)| if s.1 > 0. { *w } else { 0. }).collect();
+    }
+    let evening = (1. - focus).powi(2); // squared: the slider's middle keeps most of the library's mix
     weights.iter().zip(slots).map(|(w, s)| if s.1 > 0. { w * s.1 / mass[&s.0].max(1e-300).powf(evening) } else { 0. }).collect()
+}
+
+/// Each keymode's maps, in their order, taking turns by leading skill. A skill's share of the whole list (`mix_shares`) is
+/// spread over the keymodes by where its maps are: a keymode with few of them gives it few turns (user 2026-11-15: 10K
+/// offered its handful of chance-vibro maps as often as 4K its vibro packs); maps without a picked skill ("") fill the rest.
+/// The turns go on from the tab's recent offers (as `keymode_order`): a list rebuilt after every pick that drew its first
+/// turn afresh offered Vibro at 0.13 on 3 of 5 picks (user 2026-11-15).
+fn skill_order(at: &[(i64, &str)], shares: &std::collections::HashMap<String, f64>, key_shares: &std::collections::BTreeMap<i64, f64>, recent: &[(String, i64)]) -> Vec<usize> {
+    let mut modes: Vec<i64> = at.iter().map(|a| a.0).collect();
+    modes.sort_unstable();
+    modes.dedup();
+    // each keymode's share of the list, as keymode_order deals it
+    let weight = |k: &i64| key_shares.get(k).copied().unwrap_or(1. / modes.len() as f64).max(0.);
+    let total_keys: f64 = modes.iter().map(weight).sum();
+    let mut maps: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
+    for a in at {
+        *maps.entry(a.1).or_default() += 1.;
+    }
+    let mut out = Vec::with_capacity(at.len());
+    for m in modes.iter().copied() {
+        let mut queues: Vec<(&str, std::collections::VecDeque<usize>)> = Vec::new();
+        for (i, a) in at.iter().enumerate().filter(|(_, a)| a.0 == m) {
+            match queues.iter_mut().find(|q| q.0 == a.1) {
+                Some(q) => q.1.push_back(i),
+                None => queues.push((a.1, std::iter::once(i).collect())),
+            }
+        }
+        let key_share = if total_keys > 0. { weight(&m) / total_keys } else { 1. / modes.len() as f64 };
+        // a picked skill: its share × this keymode's part of its maps ÷ this keymode's part of the list
+        let raw: Vec<f64> = queues.iter().map(|q| {
+            let s = shares.get(q.0).copied().unwrap_or(0.);
+            if q.0.is_empty() || key_share <= 0. { s } else { s * q.1.len() as f64 / maps[q.0] / key_share }
+        }).collect();
+        let skills: f64 = queues.iter().zip(&raw).filter(|(q, _)| !q.0.is_empty()).map(|(_, r)| r).sum();
+        let raw: Vec<f64> = queues.iter().zip(&raw).map(|(q, r)| if q.0.is_empty() && shares.get("").copied().unwrap_or(0.) > 0. { (1. - skills).max(0.) } else { *r }).collect();
+        let total: f64 = raw.iter().sum();
+        let share: Vec<f64> = raw.iter().map(|r| if total > 0. { r / total } else { 1. / queues.len() as f64 }).collect();
+        let mut owed: Vec<f64> = queues.iter().zip(&share).map(|(q, s)| recent.iter().filter(|r| r.1 == m).fold(0., |c: f64, r| (c + s - if r.0 == q.0 { 1. } else { 0. }).clamp(-1., 1.))).collect();
+        while queues.iter().any(|q| !q.1.is_empty()) {
+            owed.iter_mut().zip(&share).for_each(|(o, x)| *o += x);
+            let k = (0..queues.len()).filter(|&k| !queues[k].1.is_empty()).max_by(|&a, &b| owed[a].total_cmp(&owed[b]).then(b.cmp(&a))).unwrap();
+            owed[k] -= 1.;
+            out.extend(queues[k].1.pop_front());
+        }
+    }
+    out
 }
 
 /// The odds of each stream against your own maps. Weighted, the sliders set a chance per map: at the middle every map
@@ -701,11 +757,13 @@ mod list_tests {
         shuffle: Option<(String, f64)>,
         count: Option<usize>,
         weights: Option<std::collections::HashMap<String, f64>>,
+        recent_skills: Vec<(String, i64)>,
+        recent: Vec<(u8, i64)>,
     }
 
     impl Default for Ask {
         fn default() -> Ask {
-            Ask { keys: vec![7], nps: true, web: 1., shuffle: None, count: None, weights: None }
+            Ask { keys: vec![7], nps: true, web: 1., shuffle: None, count: None, weights: None, recent_skills: Vec::new(), recent: Vec::new() }
         }
     }
 
@@ -714,7 +772,7 @@ mod list_tests {
         let taste = HashMap::default();
         let (rows, _, _) = p.rank(Ranking { keys: a.keys, nps: a.nps, web: a.web, convert: 0., weighted: [false, false], taste: &taste, eventful: &|_| false, freshness: &|_, _, _| 1.,
                                             recent_families: Vec::new(), recent_profiles: Vec::new(), current_keys: None, consumed: &|_| false, shuffle: a.shuffle, count: a.count,
-                                            recent: Vec::new(), key_shares: Default::default(), skill_weights: a.weights });
+                                            recent: a.recent, key_shares: Default::default(), recent_skills: a.recent_skills, skill_weights: a.weights });
         rows.into_iter().map(|(i, _, weight, _)| (p.list.items[i].clone(), weight)).collect()
     }
 
@@ -842,6 +900,56 @@ mod list_tests {
         assert!(share(4.) > 0.7 && share(0.25) < 0.3);
     }
 
+    /// User 2026-11-14: Vibro at 0.15 against other maps at 1 filled the list at focus 0.8 (its maps' weights were divided by a
+    /// far smaller mass, so the near-sorted shuffle put them all first).
+    #[test]
+    fn a_small_skill_keeps_its_share_at_a_high_focus() {
+        let rows: Vec<Choice> = (0..420).map(|i| {
+            let mut c = choice(&format!("a{i}"), 30., "chords");
+            c.matched = if i < 20 { vec!["vibro".to_string()] } else { Vec::new() };
+            c
+        }).collect();
+        let p = prepared(rows, &[7]);
+        let weights: std::collections::HashMap<String, f64> = [("vibro".to_string(), 0.13), (String::new(), 0.87)].into();
+        let vibro = (0..20).map(|seed| ranked(&p, Ask { nps: false, shuffle: Some((seed.to_string(), 0.8)), weights: Some(weights.clone()), ..Ask::default() })
+            .iter().take(16).filter(|c| !c.0.matched.is_empty()).count()).sum::<usize>() as f64 / 320.;
+        assert!((vibro - 0.13).abs() < 0.04, "{vibro}");
+        // Next takes the first row of a list rebuilt after every pick: the share holds across picks (user 2026-11-15: 3 of 5)
+        let mut recent: Vec<(String, i64)> = Vec::new();
+        for seed in 0..80 {
+            let top = ranked(&p, Ask { nps: false, shuffle: Some((seed.to_string(), 0.8)), weights: Some(weights.clone()), recent_skills: recent.clone(), ..Ask::default() });
+            recent.push((top[0].0.matched.first().cloned().unwrap_or_default(), top[0].0.keys));
+        }
+        let picked = recent.iter().filter(|s| s.0 == "vibro").count();
+        assert!((9..=12).contains(&picked), "{picked} of 80");
+    }
+
+    /// User 2026-11-15: Vibro landed on 10K's few chance-vibro maps as often as on 4K's packs.
+    #[test]
+    fn a_skill_goes_where_its_maps_are() {
+        let rows: Vec<Choice> = (0..400).map(|i| {
+            let mut c = choice(&format!("a{i}"), 30., "chords");
+            c.keys = if i < 200 { 4 } else { 10 };
+            c.matched = if i < 40 || (200..202).contains(&i) { vec!["vibro".to_string()] } else { Vec::new() };
+            c
+        }).collect();
+        let p = prepared(rows, &[4, 10]);
+        let weights: std::collections::HashMap<String, f64> = [("vibro".to_string(), 0.13), (String::new(), 0.87)].into();
+        let (mut recent, mut keymodes): (Vec<(String, i64)>, Vec<(u8, i64)>) = Default::default();
+        let mut tens = (0, 0);
+        for seed in 0..120 {
+            let top = ranked(&p, Ask { keys: vec![4, 10], nps: false, shuffle: Some((seed.to_string(), 0.8)), weights: Some(weights.clone()), recent_skills: recent.clone(), recent: keymodes.clone(), ..Ask::default() });
+            let c = &top[0].0;
+            keymodes.push((REAL, c.keys));
+            if c.keys == 10 {
+                tens = (tens.0 + 1, tens.1 + usize::from(!c.matched.is_empty()));
+            }
+            recent.push((c.matched.first().cloned().unwrap_or_default(), c.keys));
+        }
+        let vibro = recent.iter().filter(|s| s.0 == "vibro").count();
+        assert!((10..=21).contains(&vibro) && tens.1 <= 2, "{vibro} of 120 vibro, {} of {} 10K picks", tens.1, tens.0);
+    }
+
     #[test]
     fn a_list_without_skill_settings_keeps_its_order() {
         let rows: Vec<Choice> = (0..40).map(|i| choice(&format!("a{i}"), 20. + i as f64, "chords")).collect();
@@ -864,8 +972,14 @@ mod list_tests {
         let entries: Vec<(String, f64, usize)> = sliders.into_iter().map(|(k, w)| (k, w, 50)).collect();
         assert_eq!(mix_shares(&entries, true), mix_shares(&entries, false), "equal counts: the same shares either way");
         let weights: std::collections::HashMap<String, f64> = mix_shares(&entries, false).into_iter().collect();
-        let share = (0..300).filter(|seed| ranked(&p, Ask { nps: false, shuffle: Some((seed.to_string(), 0.)), weights: Some(weights.clone()), ..Ask::default() })[0].0.matched.len() == 1).count() as f64 / 300.;
-        assert!((share - 0.8).abs() < 0.08, "{share}");
+        // Next takes the first row of each rebuilt list
+        let mut recent: Vec<(String, i64)> = Vec::new();
+        for seed in 0..100 {
+            let top = ranked(&p, Ask { nps: false, shuffle: Some((seed.to_string(), 0.)), weights: Some(weights.clone()), recent_skills: recent.clone(), ..Ask::default() });
+            recent.push((top[0].0.matched.first().cloned().unwrap_or_default(), top[0].0.keys));
+        }
+        let share = recent.iter().filter(|s| s.0 == "chordjack").count() as f64 / 100.;
+        assert!((share - 0.8).abs() < 0.03, "{share}");
     }
 
     #[test]

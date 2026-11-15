@@ -42,6 +42,7 @@ pub struct Analysis {
     pub timeline: Vec<f64>,
     pub entries: Vec<Entry>,
     pub tags: Vec<String>,
+    pub also: Vec<(&'static str, Vec<&'static str>)>, // "also" families; the card names those off its shown rows
     pub bars: Vec<(String, String, f64)>, // skill key, display name, value: this keymode's skills
     pub peak_nps: Option<(f64, f64)>, // the densest 2 s at this rate: NPS, where it starts (ms of chart time)
     pub bid: Option<i64>, // the chart's BeatmapID, for its website page
@@ -125,7 +126,7 @@ pub fn analyse(path: &Path, rate: f64, sv: bool, prm: &Params) -> Result<Analysi
     };
     Ok(Analysis {
         path: path.to_path_buf(), rate, sv, keys, overall: sc.f("overall"), notes: res.fget("notes", 0.) as usize, ln_notes: res.fget("ln_notes", 0.), nps: raw_nps(&chart, rate), peak_nps: peak_nps(&chart, rate), bid: beatmap_id(&data),
-        span: (chart.len() >= 2).then(|| (chart.t[0], chart.last_end())), timeline: res.get("timeline").map_or_else(Vec::new, Val::list_f), entries, tags: describe(&res, &prm.k).1,
+        span: (chart.len() >= 2).then(|| (chart.t[0], chart.last_end())), timeline: res.get("timeline").map_or_else(Vec::new, Val::list_f), entries, tags: describe(&res, &prm.k).1.into_iter().filter(|t| !t.starts_with("also ")).collect(), also: ms_calc::card::also(&res),
         bars: bars(&names, sc), names, tech, sv_ignored: matches!(res.get("sv"), Some(Val::Str(s)) if s == "ignored"),
         dan_vibro: ms_rec::dans::vibro_runs(&chart, rate, &prm.k), title: chart.title.clone(), artist: chart.artist.clone(), version: chart.version.clone(), creator: chart.creator.clone(),
         o2jam: ms_rec::o2jam::level(keys, |k| sc.fget(k, 0.), res.fget("ln_notes", 0.) / res.fget("notes", 1.).max(1.), (chart.len() >= 2).then(|| (chart.last_end() - chart.t[0]) / 1000. / rate).unwrap_or(0.), res.fget("notes", 0.)),

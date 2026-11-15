@@ -61,6 +61,7 @@ pub struct Net {
     mu: Vec<f32>,
     sd: Vec<f32>,
     session: bool,
+    others: usize, // inputs flagging the other players it was trained on: the app asks as its own player (zeros)
     l1: Layer,
     l2: Layer,
     l3: Layer,
@@ -75,11 +76,12 @@ impl Net {
         let (mu, sd) = (nums("mu")?, nums("sd")?);
         let session = v["session"].as_bool().unwrap_or(false);
         let (l1, l2, l3) = (Layer::of(&v["l1"])?, Layer::of(&v["l2"])?, Layer::of(&v["l3"])?);
-        let want = cols.len() + 1 + if session { 2 } else { 0 };
+        let others = v["others"].as_u64().unwrap_or(0) as usize;
+        let want = cols.len() + 1 + if session { 2 } else { 0 } + others;
         if mu.len() != cols.len() || sd.len() != cols.len() || l1.i != want || l2.i != l1.o || l2.o != l1.o || l3.i != l1.o || l3.o != 1 {
             return Err("notenet shape".into());
         }
-        Ok(Net { cols, mu, sd, session, l1, l2, l3 })
+        Ok(Net { cols, mu, sd, session, others, l1, l2, l3 })
     }
 
     /// d of every judgement: each record's head, then (records with `ln` set, when `releases`: lazer judges them, stable doesn't)
@@ -99,6 +101,7 @@ impl Net {
                 if self.session {
                     x.extend_from_slice(&session);
                 }
+                x.extend(std::iter::repeat_n(0., self.others));
             }
         }
         let n = x.len() / k;

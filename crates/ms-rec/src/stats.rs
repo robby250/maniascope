@@ -97,7 +97,6 @@ pub struct Page {
     pub peak: Option<(i64, f64)>,
     pub maps: usize,
     pub plays: usize,
-    pub mash_maps: usize,
     pub diagnostics: Vec<(String, f64, usize)>, // skill, delta, maps
     pub session: bool,
 }
@@ -149,12 +148,47 @@ fn crossing(y: &[Option<f64>], goal: f64) -> Option<f64> {
 /// Fractional tier where per-tier (log miss vs mark, songs) crosses the mark. Past the group's own songs inside the ladder
 /// the songs measure nothing: LN General has songs to 4th only (hard LN songs all read a specialty), so a Gamma player
 /// read 6th from the low tiers' slope. Off the ladder's ends it stays (below 0th, Stellium+).
-fn dan_crossing(y: &[Option<(f64, f64)>]) -> Option<f64> {
+/// Inside the ladder the crossing is read off a local-linear fit over the tiers (songs as weights, DAN_BANDWIDTH tiers): where
+/// several tiers sit at the mark, the first one past it decided alone, and 0.1 log miss (~0.5 % accuracy) moved a reading
+/// by five tiers (user 2026-11-15, an LN player's Inverse: 5th–9th all within ±0.17 of their mark, read 4.8 or 9+).
+/// → (tier, the fit's slope there in log miss per tier; None off the ladder's ends).
+fn dan_crossing(y: &[Option<(f64, f64)>]) -> Option<(f64, Option<f64>)> {
     (y.iter().flatten().count() >= 2).then_some(())?;
     let at = crossing(&pooled(y), 0.)?;
     let (first, last) = (y.iter().position(Option::is_some)?, y.iter().rposition(Option::is_some)?);
-    (!(at > last as f64 && last + 1 < y.len()) && !(at < first as f64 && first > 0)).then_some(at)
+    (!(at > last as f64 && last + 1 < y.len()) && !(at < first as f64 && first > 0)).then_some(())?;
+    if at < first as f64 || at > last as f64 {
+        return Some((at, None));
+    }
+    let mut prev = (first as f64, local_line(y, first as f64));
+    if prev.1 .0 >= 0. {
+        return Some((at, Some(prev.1 .1)));
+    }
+    for i in 1..=(last - first) * 100 {
+        let x = first as f64 + i as f64 / 100.;
+        let v = local_line(y, x);
+        if v.0 >= 0. {
+            let t = (0. - prev.1 .0) / (v.0 - prev.1 .0);
+            return Some((prev.0 + (x - prev.0) * t, Some(prev.1 .1 + t * (v.1 - prev.1 .1))));
+        }
+        prev = (x, v);
+    }
+    Some((at, Some(prev.1 .1)))
 }
+
+/// The tiers' weighted local-linear fit at tier `x` → (value, slope per tier).
+fn local_line(y: &[Option<(f64, f64)>], x: f64) -> (f64, f64) {
+    let (mut s, mut sx, mut sy, mut sxx, mut sxy) = (0., 0., 0., 0., 0.);
+    for (j, (v, m)) in y.iter().enumerate().filter_map(|(j, v)| v.map(|v| (j as f64 - x, v))) {
+        let w = m * (-0.5 * (j / DAN_BANDWIDTH).powi(2)).exp();
+        (s, sx, sy, sxx, sxy) = (s + w, sx + w * j, sy + w * v, sxx + w * j * j, sxy + w * j * v);
+    }
+    let d = s * sxx - sx * sx;
+    if d.abs() < 1e-12 { (sy / s, 0.) } else { ((sy * sxx - sx * sxy) / d, (s * sxy - sx * sy) / d) }
+}
+
+/// Tiers each side whose songs shape a dan reading's local fit.
+const DAN_BANDWIDTH: f64 = 1.5;
 
 /// One reading for every Stats row (plan 2026-11-11 P5): bins of charts in difficulty order, each bin's (log of its mean
 /// predicted miss against its mark, charts, ln rating); where the pooled curve crosses the mark. → (ln rating there, the
@@ -231,15 +265,19 @@ impl Ctx<'_> {
     /// song of a tier (the course's accuracy), a skill only the songs demanding it. Predicted as the playlist predicts an
     /// unseen chart, rested, warm and in neutral form, practised once (the model's retry gain): own scores on dan charts
     /// get no say, old ones would drag it (user 2026-11-11). None below two tiers with such songs.
-    fn dan_value(&self, series: &str, group: &str) -> Option<f64> {
-        let at = self.dan_position(series, group)?;
+    fn dan_value(&self, series: &str, group: &str) -> Option<(f64, Option<f64>)> {
+        let (at, slope) = self.dan_position(series, group)?;
         // Off the ladder the songs measure nothing: the own-charts reading stays, and the dan reads "below 0th" or "Stellium+".
-        (-0.5..=dans::tiers(series)?.len() as f64 - 0.5).contains(&at).then_some(())?;
-        dans::rating_at(series, at)
+        let tiers = dans::tiers(series)?;
+        (-0.5..=tiers.len() as f64 - 0.5).contains(&at).then_some(())?;
+        // log miss per ln rating: per tier over the ladder's ln rating per tier there
+        let j = (at.floor().max(0.) as usize).min(tiers.len().saturating_sub(2));
+        let step = tiers.get(j + 1).map_or(0., |t| t.1 - tiers[j].1);
+        Some((dans::rating_at(series, at)?, slope.filter(|s| *s > 0. && step > 0.).map(|s| s / step)))
     }
 
     /// The fractional tier where the player's predicted accuracy on the series' songs for `group` crosses each tier's pass mark.
-    fn dan_position(&self, series: &str, group: &str) -> Option<f64> {
+    fn dan_position(&self, series: &str, group: &str) -> Option<(f64, Option<f64>)> {
         let tiers = dans::tiers(series)?;
         // Each tier's own pass mark, y = log miss against it (crossing at 0). A stable mark is met in stable units: each song's
         // lazer miss × the player's stable/lazer miss ratio at that accuracy × e^(STABLE_LN_Y × LN share) (user 2026-11-13:
@@ -417,15 +455,18 @@ pub fn build(rec: &Engine, db: &Db) -> Result<Profile> {
         let overall_slope = groups.get("overall").map_or(1., |g| if g.slope > 0. { g.slope } else { 1. });
         for (name, g) in groups.iter_mut().filter(|(n, _)| known && !n.ends_with("vibro")) {
             let Some(series) = dans::series(keys, dans::ability_kind(name)) else { continue };
-            let Some(v) = ctx.dan_value(series, name) else { continue };
+            let Some((v, slope)) = ctx.dan_value(series, name) else { continue };
             (g.low, g.high) = match g.value { Some(old) => (g.low * v / old, g.high * v / old), None => (v, v) };
             if g.value.is_none() {
-                (g.confidence, g.slope, g.extrapolated) = ("From the dan songs", overall_slope, false);
+                (g.confidence, g.extrapolated) = ("From the dan songs", false);
             }
+            // the value is the ladder's: so is its slope (the charts' slope, near 0 on a flat set, made today's form move
+            // an LN player's Inverse 9.1 → 14.7, 2026-11-15)
+            g.slope = slope.unwrap_or(overall_slope);
             g.value = Some(v);
         }
         if let Some(g) = groups.get_mut(VIBRO).filter(|g| g.value.is_some()) {
-            g.dan = ctx.dan_position("4K Vibro", "overall").and_then(|at| dans::named("4K Vibro", at)).filter(|_| keys == 4);
+            g.dan = ctx.dan_position("4K Vibro", "overall").and_then(|(at, _)| dans::named("4K Vibro", at)).filter(|_| keys == 4);
         }
         let local: Vec<&Evidence> = rows.iter().filter(|r| r.src != "public").copied().collect();
         let form = ctx.form_history(keys, &local);
@@ -437,8 +478,7 @@ pub fn build(rec: &Engine, db: &Db) -> Result<Profile> {
         }
         let history = ctx.history(keys, groups.get("overall"));
         pages.insert(keys, Page { keys, order: names, history: history.clone(), now: month, form, evidence: (local.len(), rows.len() - local.len(), rows.iter().map(|r| r.ts.unwrap_or(0.)).fold(0., f64::max)),
-                                  peak: history.iter().map(|&(m, v, _)| (m, v)).max_by(|a, b| a.1.total_cmp(&b.1)), maps: charts.len(), plays: rows.len(),
-                                  mash_maps: charts.values().filter(|r| ctx.dict(r).is_some_and(|d| skills::relative(d, d.dict("sk").map_or(0., |sk| sk.fget("mash", 0.))) >= skills::cut())).count(), groups, ..Page::default() });
+                                  peak: history.iter().map(|&(m, v, _)| (m, v)).max_by(|a, b| a.1.total_cmp(&b.1)), maps: charts.len(), plays: rows.len(), groups, ..Page::default() });
     }
     // Only frozen pre-play predictions can support a model-error diagnosis. Collapse retries by exact chart, and require
     // several charts before a label.
@@ -554,11 +594,15 @@ mod tests {
         assert_eq!(dan_crossing(&y), None);
         // every tier passed: Stellium+ stays readable (off the top)
         let all: Vec<_> = (0..15).map(|i| under(-2. + 0.1 * i as f64)).collect();
-        assert_eq!(dan_crossing(&all), Some(15.));
+        assert_eq!(dan_crossing(&all).map(|x| x.0), Some(15.));
         // a bracketed crossing reads as before
         let mut mid = vec![under(-1.), under(-0.5), under(0.5)];
         mid.resize(15, None);
-        assert!((dan_crossing(&mid).unwrap() - 1.5).abs() < 1e-9);
+        assert!((dan_crossing(&mid).unwrap().0 - 1.5).abs() < 0.2);
+        // a flat stretch at the mark reads in its middle, and 0.1 log miss moves it by about a tier, not five (an LN player's Inverse)
+        let flat = |shift: f64| -> Vec<_> { [-1.4, -1.38, -1.16, -0.47, -0.2, 0.1, -0.02, 0.1, 0.17, 0.03, 0.46, 0.71, 1.13, 1.6, 1.79].iter().map(|v| under(v + shift)).collect() };
+        let (low, mid, high) = (dan_crossing(&flat(0.05)).unwrap().0, dan_crossing(&flat(0.)).unwrap().0, dan_crossing(&flat(-0.05)).unwrap().0);
+        assert!((4.5..9.).contains(&mid) && high - low < 1.5, "{low} {mid} {high}");
     }
 
     #[test]

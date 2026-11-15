@@ -39,15 +39,18 @@ impl Chart {
 /// Python text mode: utf-8 with errors="ignore", universal newlines. Slices of `text`: no copy per line. A lone \r also
 /// ends a line; the empty pieces this split leaves are blank lines, which the parser skips.
 fn lines(text: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    for l in text.split('\n') {
-        let l = l.strip_suffix('\r').unwrap_or(l);
-        if l.contains('\r') {
-            out.extend(l.split('\r'));
+    // One byte scan: \r\n, \n and a lone \r each end a line (same pieces as split('\n') then split('\r')).
+    let (b, mut out, mut s, mut i) = (text.as_bytes(), Vec::new(), 0, 0);
+    while i < b.len() {
+        if b[i] == b'\n' || b[i] == b'\r' {
+            out.push(&text[s..i]);
+            i += if b[i] == b'\r' && b.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+            s = i;
         } else {
-            out.push(l);
+            i += 1;
         }
     }
+    out.push(&text[s..]);
     if text.ends_with('\n') {
         out.pop(); // "a\n" is one line, as before
     }
@@ -87,12 +90,17 @@ pub fn parse(data: &[u8]) -> Result<Chart, ChartError> {
             continue;
         }
         if section == "[HitObjects]" {
-            let (mut p, mut len) = ([""; 6], 0); // fields 0–5 without a Vec per note
-            for (i, f) in line.splitn(7, ',').enumerate() { // fields 0–5; the hit sample after them is never read
-                if i < 6 {
-                    p[i] = f;
+            // fields 0–5 by one byte scan, no Vec per note; the hit sample after them is never read
+            let (mut p, mut len, mut s) = ([""; 6], 0, 0);
+            for (i, &c) in line.as_bytes().iter().chain([&b',']).enumerate() {
+                if c == b',' {
+                    p[len] = &line[s..i];
+                    len += 1;
+                    s = i + 1;
+                    if len == 6 {
+                        break;
+                    }
                 }
-                len = i + 1;
             }
             if len < 4 {
                 continue;
@@ -115,7 +123,7 @@ pub fn parse(data: &[u8]) -> Result<Chart, ChartError> {
                 if len < 6 {
                     continue;
                 }
-                match py::int_float(p[5].split(':').next().unwrap()) {
+                match py::int_float(&p[5][..p[5].bytes().position(|c| c == b':').unwrap_or(p[5].len())]) {
                     Ok(v) => v,
                     Err(true) => return Err(ChartError::Value("cannot convert float infinity to integer".into())),
                     Err(false) => continue,
@@ -264,5 +272,15 @@ fn order_key(x: f64) -> u64 {
         !b
     } else {
         b | (1 << 63)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn line_endings() {
+        assert_eq!(super::lines("a\r\nb\rc\n\nd\r\r\ne\n"), ["a", "b", "c", "", "d", "", "e"]);
+        assert_eq!(super::lines("a\r"), ["a", ""]);
+        assert_eq!(super::lines(""), [""]);
     }
 }

@@ -180,8 +180,56 @@ pub fn migrate(key: &str) -> Vec<&str> {
     LEGACY.iter().find(|l| l.0 == key).map_or_else(|| vec![key], |l| l.1.to_vec())
 }
 
-/// Canonical signed choices. Opposite child overrides survive; positive-only preferences migrate.
+/// The skill trees' scopes: 4K and 5K–10K pick skills apart (user 2026-11-15: "vibro checked only for 4k"). A token
+/// without a scope is picked on both; `4k:vibro` on 4K only.
+pub const SCOPES: [&str; 2] = ["4k:", "wide:"];
+
+/// The tree a keymode's charts use (`SCOPES`, `tree`).
+pub fn tree_index(keys: i64) -> usize {
+    usize::from(keys != 4)
+}
+
+/// One tree's choices, canonical and unscoped.
+pub fn for_tree(selected: &[String], t: usize) -> Vec<String> {
+    let mine: Vec<String> = selected.iter().filter_map(|k| match k.strip_prefix(SCOPES[t]) {
+        Some(k) => Some(k.to_string()),
+        None => (!SCOPES.iter().any(|s| k.starts_with(s))).then(|| k.clone()),
+    }).collect();
+    normalize_plain(&mine)
+}
+
+/// Both trees' choices as one list: what both share unscoped, the rest under its tree's scope.
+fn join(views: [Vec<String>; 2]) -> Vec<String> {
+    let shared: Vec<String> = views[0].iter().filter(|k| views[1].contains(k)).cloned().collect();
+    let own = |t: usize| views[t].iter().filter(|k| !shared.contains(k)).map(|k| format!("{}{k}", SCOPES[t])).collect::<Vec<_>>();
+    shared.iter().cloned().chain(own(0)).chain(own(1)).collect()
+}
+
+/// `selected` with tree `t`'s choices replaced by `view`.
+pub fn with_tree(selected: &[String], t: usize, view: Vec<String>) -> Vec<String> {
+    let mut views = [for_tree(selected, 0), for_tree(selected, 1)];
+    views[t] = normalize_plain(&view);
+    join(views)
+}
+
+/// Canonical signed choices of both trees (`SCOPES`).
 pub fn normalize(selected: &[String]) -> Vec<String> {
+    join([for_tree(selected, 0), for_tree(selected, 1)])
+}
+
+/// The included skills of either tree, once each.
+fn included(selected: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for k in for_tree(selected, 0).into_iter().chain(for_tree(selected, 1)) {
+        if !k.starts_with('!') && !out.contains(&k) {
+            out.push(k);
+        }
+    }
+    out
+}
+
+/// Canonical signed choices of one tree. Opposite child overrides survive; positive-only preferences migrate.
+fn normalize_plain(selected: &[String]) -> Vec<String> {
     let mut states: HashMap<String, i8> = HashMap::new();
     for token in selected {
         let (negative, key) = token.strip_prefix('!').map_or((false, token.as_str()), |k| (true, k));
@@ -211,8 +259,9 @@ pub fn normalize(selected: &[String]) -> Vec<String> {
     }).map(|n| format!("{}{}", if states[&n.key] < 0 { "!" } else { "" }, n.key)).collect()
 }
 
+/// A tree view's (`for_tree`) state of `key`.
 pub fn state(selected: &[String], key: &str) -> i8 {
-    let values = normalize(selected);
+    let values = normalize_plain(selected);
     let has = |k: String| values.contains(&k);
     if has(format!("!{key}")) {
         return -1;
@@ -235,9 +284,9 @@ pub fn mixed(selected: &[String], key: &str) -> bool {
 /// Parent operates on the whole family; a child can override or narrow it.
 pub fn set_state(selected: &[String], key: &str, new: i8) -> Vec<String> {
     if node(key).is_none() || !(-1..=1).contains(&new) {
-        return normalize(selected);
+        return normalize_plain(selected);
     }
-    let mut values: BTreeSet<String> = normalize(selected).into_iter().collect();
+    let mut values: BTreeSet<String> = normalize_plain(selected).into_iter().collect();
     let as_list = |v: &BTreeSet<String>| v.iter().cloned().collect::<Vec<_>>();
     if let Some((parent, _)) = key.split_once('/') {
         // Expand inherited state before editing a child: neutral really means untargeted, not re-included by its parent.
@@ -263,7 +312,7 @@ pub fn set_state(selected: &[String], key: &str, new: i8) -> Vec<String> {
     if new != 0 {
         values.insert(format!("{}{key}", if new < 0 { "!" } else { "" }));
     }
-    normalize(&as_list(&values))
+    normalize_plain(&as_list(&values))
 }
 
 /// none → ✓ → ✕ → none
@@ -273,7 +322,7 @@ pub fn cycle(selected: &[String], key: &str) -> Vec<String> {
 }
 
 pub fn label(selected: &[String]) -> String {
-    let keys = normalize(selected);
+    let keys: Vec<String> = for_tree(selected, 0).into_iter().chain(for_tree(selected, 1)).collect();
     let mut positive: Vec<&str> = keys.iter().filter(|k| !k.starts_with('!')).map(|k| name(k)).collect();
     let mut negative: Vec<&str> = keys.iter().filter_map(|k| k.strip_prefix('!')).map(name).collect();
     let once = |v: &mut Vec<&str>| {
@@ -312,15 +361,18 @@ impl Tuning {
 
 /// {included skill: slider, "": other maps' slider} (the share inputs of `choices::mix_shares`); None for Any.
 pub fn sliders(selected: &[String], weights: &HashMap<String, f64>, other: f64) -> Option<Vec<(String, f64)>> {
-    let mut out: Vec<(String, f64)> = normalize(selected).into_iter().filter(|k| !k.starts_with('!')).map(|k| { let w = weights.get(&k).copied().unwrap_or(1.); (k, w) }).collect();
+    let mut out: Vec<(String, f64)> = included(selected).into_iter().map(|k| { let w = weights.get(&k).copied().unwrap_or(1.); (k, w) }).collect();
     if other > 0. && !out.is_empty() {
         out.push((String::new(), other));
     }
     (out.len() > 1).then_some(out) // Any or one skill alone: nothing to mix
 }
 
-pub fn wants_vibro(selected: &[String]) -> bool {
-    normalize(selected).iter().any(|k| k == "vibro")
+/// [Vibro, Mash] picked: charts led by one are offered only to a Skills playlist that picks it (user 2026-11-14: "not a
+/// real map … unless you want to play the mash skill"); per tree (`for_tree`).
+pub fn wants_special(selected: &[String], t: usize) -> [bool; 2] {
+    let keys = for_tree(selected, t);
+    ["vibro", "mash"].map(|s| keys.iter().any(|k| k == s))
 }
 
 #[cfg(test)]
@@ -332,6 +384,19 @@ mod tests {
     }
 
     /// One rule for every skill, the card's: a skill counts at SHOW of the chart's strongest family (Technical aside).
+    #[test]
+    fn each_tree_picks_its_own_skills() {
+        let both = normalize(&v(&["vibro", "stream"]));
+        assert_eq!(normalize(&both), both, "unscoped picks stay as they were");
+        let four = with_tree(&both, 1, set_state(&for_tree(&both, 1), "vibro", 0));
+        assert_eq!(for_tree(&four, 0), for_tree(&both, 0));
+        assert!(for_tree(&four, 0).contains(&"vibro".to_string()) && !for_tree(&four, 1).contains(&"vibro".to_string()));
+        assert!(four.contains(&"4k:vibro".to_string()) && four.contains(&"stream".to_string()), "{four:?}");
+        assert_eq!(normalize(&four), four);
+        assert!(wants_special(&four, 0)[0] && !wants_special(&four, 1)[0]);
+        assert_eq!(sliders(&four, &HashMap::new(), 1.).unwrap().len(), 3, "vibro, stream, other");
+    }
+
     #[test]
     fn a_skill_counts_against_the_charts_top_family() {
         let mut sk = ms_calc::val::Dict::new();

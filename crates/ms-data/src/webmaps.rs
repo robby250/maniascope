@@ -635,14 +635,57 @@ pub fn carry(from: &str, to: &str, after: &Params, chart: &(dyn Fn(&str) -> Opti
     Ok(())
 }
 
-/// The calculator the website list (web.msp) was published for.
+/// A website set's download failed. `refused` (a mirror answered and refused the set) is a strike; two strikes at least
+/// STRIKE_GAP apart drop the set: its rows leave the list as 'unavailable' and its .osu files go. A server down (5xx,
+/// timeouts) never strikes (user 2026-11-15: "if osu server is down … it won't delete good web maps"). True when dropped.
+pub fn strike(set: i64, refused: bool) -> Result<bool, String> {
+    if !refused || set <= 0 {
+        return Ok(false);
+    }
+    let db = state_db().map_err(|e| e.to_string())?;
+    let key = format!("strike:{set}");
+    let first = kv_get(&db, &key).and_then(|v| v.as_f64());
+    let t = now();
+    match first {
+        Some(f) if t - f >= STRIKE_GAP => {}
+        Some(_) => return Ok(false),
+        None => {
+            kv_set(&db, &key, &json!(t)).map_err(|e| e.to_string())?;
+            return Ok(false);
+        }
+    }
+    let shas: Vec<String> = db.prepare("SELECT sha FROM diffs WHERE set_id=? AND sha IS NOT NULL").and_then(|mut q| q.query_map([set], |r| r.get(0))?.collect())
+        .map_err(|e| e.to_string())?;
+    db.execute("UPDATE diffs SET error='unavailable' WHERE set_id=?", [set]).map_err(|e| e.to_string())?;
+    db.execute("DELETE FROM kv WHERE k=?", [&key]).map_err(|e| e.to_string())?;
+    for sha in &shas {
+        let _ = std::fs::remove_file(web_dir().join("osu").join(format!("{sha}.osu")));
+    }
+    // the list without it now; a running crawl publishes when it ends
+    if let Some(calc) = published_calc().filter(|c| !c.is_empty() && !running()) {
+        publish(&db, &calc, &wants(&db)).map_err(|e| format!("{e:?}"))?;
+    }
+    Ok(true)
+}
+
+/// A set that downloaded: its old strike no longer counts.
+pub fn delivered(set: i64) -> Result<(), String> {
+    state_db().and_then(|db| db.execute("DELETE FROM kv WHERE k=?", [format!("strike:{set}")])).map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Seconds between a set's two strikes: one bad hour on a mirror isn't the map gone.
+const STRIKE_GAP: f64 = 3600.;
+
+/// The calculator the website list (web.msp) was published for; "" for a list with the website's names, so it is rebuilt.
 pub fn published_calc() -> Option<String> {
-    Web::open(&web_dir().join("web.msp")).ok().map(|w| w.calc)
+    Web::open(&web_dir().join("web.msp")).ok().map(|w| if w.file_names { w.calc } else { String::new() })
 }
 
 #[derive(Serialize, Deserialize)]
 struct WebMeta {
     calc: String,
+    #[serde(default)]
+    file_names: bool, // names from the downloaded files (`file_names`): a list from before is rebuilt
     built: f64,
     maps: Vec<WebMap>,
 }
@@ -664,16 +707,36 @@ fn publish(db: &Connection, calc: &str, wants: &[Want]) -> Result<(), CrawlError
         }
         let Ok(fs) = read_cell(&r.get::<_, Vec<u8>>(12)?) else { continue };
         let at = maps.len() as i64;
+        let [artist, title, version] = file_names(&sha).unwrap_or([text(r, 7)?, text(r, 8)?, text(r, 9)?]);
         maps.push(WebMap { sha, bid: r.get(1)?, set_id: r.get::<_, Option<i64>>(2)?.unwrap_or(0), status: r.get(3)?, keys: r.get(4)?, file_md5: text(r, 5)?,
-                           playcount: r.get::<_, Option<i64>>(6)?.unwrap_or(0), artist: text(r, 7)?, title: text(r, 8)?, version: text(r, 9)?, creator: text(r, 10)?,
+                           playcount: r.get::<_, Option<i64>>(6)?.unwrap_or(0), artist, title, version, creator: text(r, 10)?,
                            overall: fs.iter().map(|(rate, f)| (*rate, f.f("overall"))).collect() });
         let mut sorted: Vec<_> = fs.iter().map(|(rate, f)| (at, *rate, codec::encode(&Val::Dict(compact(f))))).collect();
         sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
         records.extend(sorted);
     }
-    write_file(&web_dir().join("web.msp"), &WebMeta { calc: calc.to_string(), built: now(), maps }, &records)?;
+    write_file(&web_dir().join("web.msp"), &WebMeta { calc: calc.to_string(), file_names: true, built: now(), maps }, &records)?;
     progress(db, json!({"ready": seen.len()}))?;
     Ok(())
+}
+
+/// The downloaded file's [Metadata] artist, title and difficulty: what lazer imports and searches. The website's names can
+/// differ (user 2026-11-15: Kuutyu Sanpo's website difficulty "[7K] 0", its file's "0", so the search found nothing).
+fn file_names(sha: &str) -> Option<[String; 3]> {
+    names_of(&std::fs::read_to_string(web_dir().join("osu").join(format!("{sha}.osu"))).ok()?)
+}
+
+fn names_of(text: &str) -> Option<[String; 3]> {
+    let mut out: [Option<String>; 3] = Default::default();
+    for line in text.lines().skip_while(|l| l.trim() != "[Metadata]").skip(1).take_while(|l| !l.trim_start().starts_with('[')) {
+        if let Some((k, v)) = line.split_once(':') {
+            if let Some(i) = ["Artist", "Title", "Version"].iter().position(|f| *f == k.trim()) {
+                out[i] = Some(v.trim().to_string());
+            }
+        }
+    }
+    let [a, t, v] = out;
+    Some([a?, t?, v?])
 }
 
 fn write_file(path: &Path, meta: &WebMeta, records: &[(i64, f64, Vec<u8>)]) -> Result<(), String> {
@@ -705,13 +768,14 @@ pub fn convert_pickle(from: &Path, to: &Path) -> Result<(), String> {
                            file_md5: text("file_md5"), playcount: num("playcount").unwrap_or(0), artist: text("artist"), title: text("title"), version: text("version"),
                            creator: text("creator"), overall: m.get("overall").map_or(&[][..], P::items).iter().filter_map(|(r, o)| Some((r.f()?, o.f()?))).collect() });
     }
-    let meta = WebMeta { calc: root.get("calc").and_then(P::s).unwrap_or("").to_string(), built: root.get("built").and_then(P::f).unwrap_or(0.), maps };
+    let meta = WebMeta { calc: root.get("calc").and_then(P::s).unwrap_or("").to_string(), file_names: false, built: root.get("built").and_then(P::f).unwrap_or(0.), maps };
     write_file(to, &meta, &records)
 }
 
 pub struct Web {
     pub maps: Vec<WebMap>,
     pub calc: String,
+    file_names: bool,
     blobs: Blobs,
 }
 
@@ -719,7 +783,7 @@ impl Web {
     pub fn open(path: &Path) -> Result<Web, String> {
         let (blobs, header) = Blobs::open(path, MAGIC)?;
         let meta: WebMeta = serde_json::from_slice(blobs.header(header)).map_err(|e| e.to_string())?;
-        Ok(Web { maps: meta.maps, calc: meta.calc, blobs })
+        Ok(Web { maps: meta.maps, calc: meta.calc, file_names: meta.file_names, blobs })
     }
 
     pub fn feature(&self, map: usize, rate: f64) -> Option<Val> {
@@ -816,6 +880,13 @@ pub fn state(db: &Connection) -> BTreeMap<String, Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn web_names_come_from_the_file() {
+        let osu = "osu file format v14\n[General]\nMode: 3\n[Metadata]\nTitle:Kuutyu Sanpo\nArtist:CIEL\nVersion:0\nCreator:Aaki_\n[Difficulty]\nCircleSize:7\n";
+        assert_eq!(super::names_of(osu), Some(["CIEL".to_string(), "Kuutyu Sanpo".to_string(), "0".to_string()]));
+        assert_eq!(super::names_of("[Metadata]\nTitle:T\n"), None);
+    }
+
     use super::*;
 
     #[test]

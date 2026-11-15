@@ -190,7 +190,7 @@ pub struct Run {
 thread_local! {
     // column_runs of the chart-rate being computed: structure, demand, flow and execution each read it (5–6 passes per
     // chart-rate, 7 % of analysis time). Only while a `RunScope` is open, so a freed chart's address can't hit.
-    static RUNS: std::cell::RefCell<(u32, Option<(usize, usize, u64, [u64; 4], Vec<Run>)>)> = const { std::cell::RefCell::new((0, None)) };
+    static RUNS: std::cell::RefCell<(u32, Option<(usize, usize, u64, [u64; 7], Vec<Run>)>)> = const { std::cell::RefCell::new((0, None)) };
 }
 
 /// Keeps `column_runs` results for the chart-rate being computed until dropped (compute_inner holds one).
@@ -216,8 +216,8 @@ impl Drop for RunScope {
 }
 
 /// The one column run (user 2026-11-13): a column re-struck under LJ_GAP s apart at `rate`, VIBRO_MIN hits or more; a
-/// re-hit slower than VIBRO_GAP with another column of its hand struck between ends it (a stream or roll through the hand),
-/// faster the hand vibrates over its columns as one (the 4K vibro dans' 45 notes/s rolls). Chords on the hit rows never end
+/// re-hit slower than VIBRO_GAP with a row without it struck between ends it (a stream or roll through the hand, or a trill
+/// with the other hand: user 2026-11-14, NANO DEATH!!!!!'s 1-2 trill read Longjacks), faster the hand vibrates over its columns as one (the 4K vibro dans' 45 notes/s rolls). Chords on the hit rows never end
 /// it. A run is Vibro when its median re-hit gap is under VIBRO_GAP × r^VIBRO_P, r = the share of its hits where the hand
 /// strikes the same chord as at the hit before: simple repetition reads vibro down to VIBRO_GAP (≈158 BPM 1/4, user: "never
 /// slower than like 160 bpm"), an anchor under changing chords reads Longjacks even at vibro speed ("the threshold should vary
@@ -225,7 +225,7 @@ impl Drop for RunScope {
 /// Labelled runs (2026-11-13): vibro dans' run notes 62 % vibro, REFORM jack songs 12 %, 7K jack practice and DESTRUCTION
 /// 3,2,1 [Absolute Zero] 0 %. Execution, demand, structure, flow and the dans all read it.
 pub fn column_runs(chart: &Chart, rate: f64, k: &Knobs) -> Vec<Run> {
-    let key = (chart.t.as_ptr() as usize, chart.len(), rate.to_bits(), [k.LJ_GAP.to_bits(), k.VIBRO_GAP.to_bits(), k.VIBRO_MIN as u64, k.VIBRO_P.to_bits()]);
+    let key = (chart.t.as_ptr() as usize, chart.len(), rate.to_bits(), [k.LJ_GAP.to_bits(), k.VIBRO_GAP.to_bits(), k.VIBRO_MIN as u64, k.VIBRO_P.to_bits(), k.VIBRO_LEN_REF.to_bits(), k.VIBRO_LEN_P.to_bits(), k.VIBRO_GAP_LONG.to_bits()]);
     let hit = RUNS.with(|r| r.borrow().1.as_ref().filter(|c| (c.0, c.1, c.2, c.3) == key).map(|c| c.4.clone()));
     if let Some(runs) = hit {
         return runs;
@@ -245,7 +245,7 @@ fn column_runs_of(chart: &Chart, rate: f64, k: &Knobs) -> Vec<Run> {
     let hand: Vec<usize> = (0..chart.keys).map(|c| crate::flow::hand(c, chart.keys, true).0).collect();
     let mut open: Vec<Vec<usize>> = vec![Vec::new(); chart.keys];
     let mut chord: Vec<Vec<u32>> = vec![Vec::new(); chart.keys]; // the hand's chord at each hit of the open run
-    let mut left = vec![false; chart.keys]; // another column of its hand was struck since this column's last hit
+    let mut left = vec![false; chart.keys]; // a row without this column was struck since this column's last hit
     let mut out = Vec::new();
     let close = |notes: Vec<usize>, chords: Vec<u32>, out: &mut Vec<Run>| {
         if notes.len() < k.VIBRO_MIN {
@@ -254,7 +254,7 @@ fn column_runs_of(chart: &Chart, rate: f64, k: &Knobs) -> Vec<Run> {
         let mut gaps: Vec<f64> = notes.windows(2).map(|w| chart.t[w[1]] - chart.t[w[0]]).collect();
         gaps.sort_by(f64::total_cmp);
         let r = chords.windows(2).filter(|w| w[0] == w[1]).count() as f64 / (chords.len() - 1) as f64;
-        out.push(Run { vibro: gaps[gaps.len() / 2] < hand_gap * r.powf(k.VIBRO_P), notes });
+        out.push(Run { vibro: gaps[gaps.len() / 2] < 1000.0 * rate * vibro_gap(notes.len() as f64, k) * r.powf(k.VIBRO_P), notes });
     };
     let mut i = 0;
     while i < chart.len() {
@@ -273,7 +273,7 @@ fn column_runs_of(chart: &Chart, rate: f64, k: &Knobs) -> Vec<Run> {
             left[c] = false;
         }
         for c in 0..chart.keys {
-            if row >> c & 1 == 0 && chart.col[i..m].iter().any(|&x| hand[x as usize] == hand[c]) {
+            if row >> c & 1 == 0 {
                 left[c] = true;
             }
         }
@@ -283,6 +283,14 @@ fn column_runs_of(chart: &Chart, rate: f64, k: &Knobs) -> Vec<Run> {
         close(std::mem::take(&mut open[c]), std::mem::take(&mut chord[c]), &mut out);
     }
     out
+}
+
+/// The re-hit gap (s, played) under which a run of `len` hits is vibro: VIBRO_GAP at VIBRO_LEN_REF hits, × (len/ref)^VIBRO_LEN_P
+/// up to VIBRO_GAP_LONG (150 BPM: long full-chord runs at 155–157 BPM are vibro, user 2026-11-14)
+/// (user 2026-11-14: "for shorter runs the bpm needs to be higher …, for longer continuous jacks it needs to be lower"; their
+/// vibro ~170–180 BPM, above ~165 generally vibro). Column runs and the same-chord gesture both read it.
+pub fn vibro_gap(len: f64, k: &Knobs) -> f64 {
+    (k.VIBRO_GAP * (len.max(1.0) / k.VIBRO_LEN_REF).powf(k.VIBRO_LEN_P)).min(k.VIBRO_GAP_LONG)
 }
 
 /// The notes of the chart's vibro runs (`column_runs`).

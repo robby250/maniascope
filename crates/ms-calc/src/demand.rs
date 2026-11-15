@@ -158,7 +158,10 @@ pub fn geometry(chart: &Chart, rate: f64, k: &Knobs) -> Geometry {
                 roll[x] = true;
             }
         }
-        run = if single { vec![r] } else { Vec::new() };
+        run.clear();
+        if single {
+            run.push(r);
+        }
         run_step = None;
     }
     Geometry { times, ends, columns, vib, lj, rows, roll }
@@ -216,17 +219,19 @@ fn mixed_trills(rows: &[Row], hand_mask: [u32; 2], oht: &mut [bool]) {
     for (h, &hm) in hand_mask.iter().enumerate() {
         let other = hand_mask[1 - h];
         let mine: Vec<usize> = (0..rows.len()).filter(|&r| rows[r].mask & hm != 0).collect();
+        let mut between: Vec<u32> = Vec::new();
         for w in mine.windows(4) {
-            let m: Vec<u32> = w.iter().map(|&r| rows[r].mask & hm).collect();
+            let m = [0, 1, 2, 3].map(|x| rows[w[x]].mask & hm);
             if m.iter().any(|x| x & (x - 1) != 0) || m[0] == m[1] || m[0] != m[2] || m[1] != m[3] {
                 continue;
             }
-            let gaps: Vec<f64> = w.windows(2).map(|p| rows[p[1]].t - rows[p[0]].t).collect();
+            let gaps = [0, 1, 2].map(|x| rows[w[x + 1]].t - rows[w[x]].t);
             let (mx, mn) = gaps.iter().fold((f64::MIN, f64::MAX), |a, &g| (a.0.max(g), a.1.min(g)));
             if mx > 0.2 || mx > 1.6 * mn {
                 continue;
             }
-            let between: Vec<u32> = (w[0]..=w[3]).map(|r| rows[r].mask & other).filter(|&x| x != 0).collect();
+            between.clear();
+            between.extend((w[0]..=w[3]).map(|r| rows[r].mask & other).filter(|&x| x != 0));
             let alternating = between.len() >= 3 && between.windows(3).all(|t| t[0] == t[2] && t[0] != t[1] && t[0] & (t[0] - 1) == 0);
             if between.len() <= 3 && !alternating {
                 w.iter().for_each(|&r| oht[r] = true);
@@ -300,7 +305,8 @@ fn hand_patterns(rows: &[Row], hand_mask: [u32; 2], keys: usize) -> (Vec<bool>, 
                     }
                 }
             }
-            run = z.into_iter().collect();
+            run.clear();
+            run.extend(z);
         }
     }
     (oht, anc)
@@ -431,6 +437,7 @@ pub fn demand(
     let mut prev_row_mask = 0u32;
     let mut pending: Vec<(f64, usize)> = Vec::with_capacity(16);
     let mut shapes_seen: [Vec<(f64, u32)>; 2] = [Vec::new(), Vec::new()];
+    let mut distinct: Vec<u32> = Vec::new();
     let w_cross = if wide { k.W_CROSS_WIDE } else { k.W_CROSS };
     let flam = k.FLAM;
     for (ri, row) in rows.iter().enumerate() {
@@ -593,16 +600,17 @@ pub fn demand(
                 if n_hand[h] >= 2 {
                     shapes_seen[h].push((t, row_hand[h]));
                 }
-                shapes_seen[h].retain(|x| x.0 >= t - 2.0);
+                // rows come in time order: the expired shapes are a prefix
+                let gone = shapes_seen[h].partition_point(|x| x.0 < t - 2.0);
+                shapes_seen[h].drain(..gone);
                 if n_hand[h] >= 2 {
-                    let mut count = 0.0f64;
-                    let mut wide_all: Vec<u32> = Vec::new();
+                    distinct.clear();
                     for x in &shapes_seen[h] {
-                        if !wide_all.contains(&x.1) {
-                            wide_all.push(x.1);
-                            count += 1.0;
+                        if !distinct.contains(&x.1) {
+                            distinct.push(x.1);
                         }
                     }
+                    let count = distinct.len() as f64;
                     many[h] = k.W_SHAPES * (count / shapes_t).max(1.0).log2();
                 }
             }
@@ -794,7 +802,10 @@ pub fn demand(
                     }
                 }
                 ds_sum += if size < 3 { cross + split } else { 0.0 };
-                comp[o(P::dump) + b] += ds_sum * (1.0 - jf) * fast;
+                // dumps are fast rice off an even grid (bursts, mixed snaps: 769 4K charts tagged "dump" against 900 others,
+                // user 2026-11-14: FREEDOM DiVE [Black Another]'s even 1/4 jumpstream read Dump)
+                let uneven = if gap != 0.0 && prev_gap != 0.0 { smooth((gap / prev_gap).ln().abs(), 0.1, 0.3) } else { 0.0 };
+                comp[o(P::dump) + b] += ds_sum * (1.0 - jf) * fast * uneven;
             }
         }
         for ni in i..j {

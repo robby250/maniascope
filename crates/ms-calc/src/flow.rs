@@ -166,30 +166,28 @@ pub fn flow(chart: &Chart, rate: f64, k: &Knobs) -> Flow {
     let rows = rows(chart, rate);
     let splits: &[bool] = if chart.keys % 2 == 1 { &[true, false] } else { &[true] };
     let (mut broken, mut skip, mut split, mut imbalance, mut ohj, mut ring, mut polyrate, mut variety, mut chaos) = (0., 0., 0., 0., 0., 0., 0., 0., 0.);
+    let holds = held(chart);
+    let (mut gaps, mut hold_tap, mut shape_load) = ([0.; 4], [0.; 2], 0.);
     for &centre_left in splits {
         let (b, s) = order(chart, scale, centre_left, k);
         let part = splits.len() as f64;
+        let h = hand_pass(&rows, &holds, chart.keys, centre_left, k);
         broken += b / part;
         skip += s / part;
-        split += gapped(&rows, chart.keys, centre_left, k) / part;
-        imbalance += hand_imbalance(&rows, chart.keys, centre_left) / part;
-        ohj += jump_chains(&rows, chart.keys, centre_left, k) / part;
-        ring += ring_conflicts(&rows, chart.keys, centre_left) / part;
-        polyrate += hand_rates(&rows, chart.keys, centre_left) / part;
-        variety += rhythm_variety(&rows, chart.keys, centre_left, k) / part;
-        chaos += gap_chaos(&rows, chart.keys, centre_left, k) / part;
+        split += h.split / part;
+        imbalance += h.imbalance / part;
+        ohj += h.ohj / part;
+        ring += h.ring / part;
+        polyrate += h.polyrate / part;
+        variety += h.variety / part;
+        chaos += h.chaos / part;
+        shape_load += shape_loads(&rows, chart.keys, centre_left) / part;
+        (0..4).for_each(|i| gaps[i] += h.gaps[i] / part);
+        (0..2).for_each(|i| hold_tap[i] += h.hold_tap[i] / part);
     }
     let even = evenness(chart, scale, k);
     let (coupling, roll, flam) = (coupling(chart, scale, k), rolls(chart, scale, k), flams(chart, scale, k));
     let (isolated, vibro_run, jack_comp) = (isolation(&rows), vibro_runs(chart, rate, k), jack_compensation(chart, scale, k));
-    let (mut gaps, mut hold_tap, holds, mut shape_load) = ([0.; 4], [0.; 2], held(chart), 0.);
-    for &centre_left in splits {
-        shape_load += shape_loads(&rows, chart.keys, centre_left) / splits.len() as f64;
-        let g = gap_profile(&rows, chart.keys, centre_left);
-        (0..4).for_each(|i| gaps[i] += g[i] / splits.len() as f64);
-        let h = hold_taps(&rows, &holds, chart.keys, centre_left);
-        (0..2).for_each(|i| hold_tap[i] += h[i] / splits.len() as f64);
-    }
     let (mut changed, mut seen) = (0usize, Vec::with_capacity(k.FLOW_MEMORY));
     for pair in rows.windows(2) {
         let p = (pair[0].1, pair[1].1);
@@ -221,25 +219,143 @@ pub fn held(chart: &Chart) -> Vec<u32> {
     out
 }
 
-/// Presses on a hand that holds a long note at the time (round 3, `calib motifs`: 7K taps under a same-hand hold play
-/// harder than rated at 180 ms and slower, TRAIN t up to +11, where a speed-weighted demand is near zero): shares of all
-/// hand presses, [gap ≥ 180 ms, faster].
-fn hold_taps(rows: &[(f64, u32)], held: &[u32], keys: usize, centre_left: bool) -> [f64; 2] {
-    let (mut out, mut n, mut last) = ([0.; 2], 0., [f64::NEG_INFINITY; 2]);
+/// The per-hand descriptors of one hand split, in one pass over the rows (each was its own pass; values unchanged).
+struct HandPass {
+    split: f64,
+    imbalance: f64,
+    ohj: f64,
+    ring: f64,
+    polyrate: f64,
+    variety: f64,
+    chaos: f64,
+    gaps: [f64; 4],
+    hold_tap: [f64; 2],
+}
+
+/// - split: split hand chords, the hand holding a finger up between two pressing ones (finger enslaving). Replays, 7K and
+///   10K alike: about +1 pp lost on each such note against an adjacent chord at the same speed and size (2026-11-04). A
+///   chart-level hand-shape entropy (2 s, Hick–Hyman) beside it didn't help the fit.
+/// - imbalance: one hand carrying a 1 s stretch, |L − R| / (L + R) weighted by the stretch's notes squared.
+/// - ohj: one-hand jump chains, a hand's ≥ 2-note row right after (≤ FLOW_LINK) another sharing a column.
+/// - ring: the ring finger (6K+, second column from each hand's outer edge) pressed with a neighbour finger within 0.15 s,
+///   a share of its notes; the least independent finger (PMC5167409).
+/// - polyrate: bimanual interference, per 1 s stretch where both hands play ≥ 2 rows at different rates the slower hand's
+///   rows by 1 − rate ratio (Panzer 2021).
+/// - variety: Interlude's variety on rhythm, each hand's gap in quarter-octave buckets, distinct (hand, bucket) in ±0.75 s.
+/// - chaos: MinaCalc's Chaos, the longer of two consecutive hand gaps over the shorter, distance from a whole ratio.
+/// - gaps: each hand's presses by the gap since that hand's last press (GAP_EDGES), shares of all presses.
+/// - hold_tap: presses on a hand holding a long note (round 3 `calib motifs`: 7K taps under a same-hand hold play harder,
+///   TRAIN t up to +11), shares of all hand presses [gap ≥ 180 ms, faster].
+fn hand_pass(rows: &[(f64, u32)], held: &[u32], keys: usize, centre_left: bool, k: &Knobs) -> HandPass {
     let hm = hand_masks(keys, centre_left);
-    let side = |m: u32| [m & hm[0], m & hm[1]];
-    for (&(t, mask), &hold) in rows.iter().zip(held) {
-        let (hands, holding) = (side(mask), side(hold));
-        for h in (0..2).filter(|&h| hands[h] != 0) {
-            n += 1.;
-            if holding[h] != 0 {
-                let fast = under(t - last[h], 0.18);
-                (out[0], out[1]) = (out[0] + 1. - fast, out[1] + fast);
+    let rings: Option<[usize; 2]> = (keys >= 6).then(|| {
+        let cols: [Vec<usize>; 2] = [0, 1].map(|h| (0..keys).filter(|&c| hand(c, keys, centre_left).0 == h).collect());
+        [cols[0][1], cols[1][cols[1].len() - 2]]
+    });
+    let start = rows.first().map_or(0., |r| r.0); // bins from the first note: the chart's offset can't move them
+    let mut bins = vec![[0.; 4]; rows.iter().map(|r| r.0 - start).fold(0., f64::max).div_euclid(1.) as usize + 1]; // notes L R, rows L R
+    let mut last = [f64::NEG_INFINITY; 2];
+    let (mut prev, mut gap) = ([0u32; 2], [f64::INFINITY; 2]);
+    let mut last_col = vec![f64::NEG_INFINITY; keys];
+    let (mut s_total, mut s_split, mut j_total, mut j_chain, mut r_total, mut r_hit, mut c_total, mut c_chaos) = (0., 0., 0., 0., 0., 0., 0., 0.);
+    let (mut gaps, mut hold, mut presses) = ([0.; 4], [0.; 2], 0.);
+    let mut marks: Vec<(f64, i32)> = Vec::new();
+    for (&(t, mask), &held) in rows.iter().zip(held) {
+        let hands = [mask & hm[0], mask & hm[1]];
+        let holding = [held & hm[0], held & hm[1]];
+        let bin = &mut bins[(t - start).floor() as usize];
+        for h in 0..2 {
+            bin[h] += hands[h].count_ones() as f64;
+        }
+        if let Some(rings) = rings {
+            for h in 0..2 {
+                let r = rings[h];
+                if mask >> r & 1 == 1 {
+                    r_total += 1.;
+                    let near = [r.wrapping_sub(1), r + 1].into_iter().filter(|&o| o < keys && hand(o, keys, centre_left).0 == h);
+                    if near.into_iter().any(|o| t - last_col[o] <= 0.15) { // a chord with the neighbour is one motion, not a conflict
+                        r_hit += 1.;
+                    }
+                }
             }
-            last[h] = t;
+            (0..keys).filter(|&c| mask >> c & 1 == 1).for_each(|c| last_col[c] = t);
+        }
+        for h in 0..2 {
+            if hands[h] == 0 {
+                continue;
+            }
+            bin[2 + h] += 1.;
+            let g = t - last[h];
+            let weight = 1. / g.max(k.FLOW_FLOOR);
+            s_total += weight;
+            if (hands[h] & !(hands[h] << 1)).count_ones() > 1 {
+                s_split += weight;
+            }
+            j_total += weight;
+            if g <= k.FLOW_LINK && hands[h].count_ones() > 1 && prev[h].count_ones() > 1 && hands[h] & prev[h] != 0 {
+                j_chain += weight;
+            }
+            let bucket = if g > k.FLOW_LINK { -1 } else { ((g.max(k.FLOW_FLOOR) * 1000.).log2() * 4.).round() as i32 };
+            marks.push((t, bucket * 2 + h as i32));
+            if g <= k.FLOW_LINK && gap[h] <= k.FLOW_LINK {
+                let ratio = g.max(gap[h]) / g.min(gap[h]).max(1e-3);
+                let frac = ratio.fract();
+                c_total += weight;
+                c_chaos += weight * frac.min(1. - frac);
+            }
+            presses += 1.;
+            let mut below = 0.;
+            for (b, &e) in GAP_EDGES.iter().enumerate() {
+                let s = under(g, e);
+                gaps[b] += s - below;
+                below = s;
+            }
+            if holding[h] != 0 {
+                let fast = under(g, 0.18);
+                (hold[0], hold[1]) = (hold[0] + 1. - fast, hold[1] + fast);
+            }
+            (last[h], prev[h], gap[h]) = (t, hands[h], g);
         }
     }
-    out.map(|v| if n > 0. { v / n } else { 0. })
+    let (mut num, mut den, mut rows_all, mut slow) = (0., 0., 0., 0.);
+    for [l, r, lr, rr] in bins {
+        let n = l + r;
+        num += n * (l - r).abs();
+        den += n * n;
+        rows_all += lr + rr;
+        if lr >= 2. && rr >= 2. {
+            slow += lr.min(rr) * (1. - lr.min(rr) / lr.max(rr));
+        }
+    }
+    let share = |a: f64, b: f64| if b > 0. { a / b } else { 0. };
+    HandPass {
+        split: share(s_split, s_total), imbalance: share(num, den), ohj: share(j_chain, j_total), ring: share(r_hit, r_total),
+        polyrate: share(slow, rows_all), variety: variety(&marks), chaos: share(c_chaos, c_total),
+        gaps: gaps.map(|v| share(v, presses)), hold_tap: hold.map(|v| share(v, presses)),
+    }
+}
+
+/// Per mark, the distinct (hand, bucket) pairs within ±0.75 s, averaged, /10; counts dense from the smallest key.
+fn variety(marks: &[(f64, i32)]) -> f64 {
+    let base = marks.iter().map(|m| m.1).min().unwrap_or(0);
+    let mut count = vec![0usize; marks.iter().map(|m| (m.1 - base) as usize + 1).max().unwrap_or(0)];
+    let (mut distinct, mut lo, mut hi, mut total) = (0usize, 0, 0, 0.);
+    for i in 0..marks.len() {
+        while hi < marks.len() && marks[hi].0 <= marks[i].0 + 0.75 {
+            let e = &mut count[(marks[hi].1 - base) as usize];
+            distinct += usize::from(*e == 0);
+            *e += 1;
+            hi += 1;
+        }
+        while marks[lo].0 < marks[i].0 - 0.75 {
+            let e = &mut count[(marks[lo].1 - base) as usize];
+            *e -= 1;
+            distinct -= usize::from(*e == 0);
+            lo += 1;
+        }
+        total += distinct as f64;
+    }
+    total / marks.len().max(1) as f64 / 10.
 }
 
 /// Chord shapes a hand must be ready for while it has been busy (round 3 R22, own 10K replays, `calib rows`: at equal local
@@ -272,67 +388,9 @@ fn shape_loads(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
     if n > 0. { total / n } else { 0. }
 }
 
-/// Each hand's presses by the gap since that hand's last press; shares of all presses.
-fn gap_profile(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> [f64; 4] {
-    let (mut out, mut n, mut last, hm) = ([0.; 4], 0., [f64::NEG_INFINITY; 2], hand_masks(keys, centre_left));
-    for &(t, mask) in rows {
-        for h in (0..2).filter(|&h| mask & hm[h] != 0) {
-            n += 1.;
-            let mut below = 0.;
-            for (b, &e) in GAP_EDGES.iter().enumerate() {
-                let s = under(t - last[h], e);
-                out[b] += s - below;
-                below = s;
-            }
-            last[h] = t;
-        }
-    }
-    out.map(|v| if n > 0. { v / n } else { 0. })
-}
-
-/// Split hand chords: the hand must hold a finger up between two pressing ones (finger enslaving). Replays, 7K and 10K alike:
-/// about +1 pp of accuracy lost on each such note against an adjacent chord at the same speed and size (2026-11-04).
-/// A chart-level hand-shape entropy (2 s, Hick–Hyman) was tried beside it and didn't help the fit (2026-11-04).
-fn gapped(rows: &[(f64, u32)], keys: usize, centre_left: bool, k: &Knobs) -> f64 {
-    let (mut total, mut split, mut last, hm) = (0., 0., [f64::NEG_INFINITY; 2], hand_masks(keys, centre_left));
-    for &(t, mask) in rows {
-        let hands = [mask & hm[0], mask & hm[1]];
-        for h in 0..2 {
-            if hands[h] == 0 {
-                continue;
-            }
-            let weight = 1. / (t - last[h]).max(k.FLOW_FLOOR);
-            last[h] = t;
-            total += weight;
-            if (hands[h] & !(hands[h] << 1)).count_ones() > 1 {
-                split += weight;
-            }
-        }
-    }
-    if total > 0. { split / total } else { 0. }
-}
-
 /// One `[f64; 2]` bin per `width` seconds from 0 up to the last offset (empty bins add exact zeros where a map skipped them).
 fn dense_bins(offsets: impl Iterator<Item = f64>, width: f64) -> Vec<[f64; 2]> {
     vec![[0.; 2]; offsets.fold(0., f64::max).div_euclid(width) as usize + 1]
-}
-
-/// One hand carrying a 1 s stretch: |L − R| / (L + R), weighted by the stretch's notes squared so dense parts decide.
-fn hand_imbalance(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
-    let start = rows.first().map_or(0., |r| r.0); // bins from the first note: the chart's offset can't move them
-    let hm = hand_masks(keys, centre_left);
-    let mut bins = dense_bins(rows.iter().map(|r| r.0 - start), 1.);
-    for &(t, mask) in rows {
-        let bin = &mut bins[(t - start).floor() as usize];
-        (0..2).for_each(|h| bin[h] += (mask & hm[h]).count_ones() as f64);
-    }
-    let (mut num, mut den) = (0., 0.);
-    for [l, r] in bins {
-        let n = l + r;
-        num += n * (l - r).abs();
-        den += n * n;
-    }
-    if den > 0. { num / den } else { 0. }
 }
 
 /// Sunny's unevenness, inverted: a note whose neighbouring finger on the same hand is repeating at the same interval
@@ -387,67 +445,6 @@ fn coupling(chart: &Chart, scale: f64, k: &Knobs) -> f64 {
         den += s.sqrt();
     }
     if den > 0. { num / den } else { 0. }
-}
-
-/// Interlude's variety, on rhythm: each hand's gap to its previous row in quarter-octave buckets; per row, the distinct
-/// (hand, bucket) pairs within ±0.75 s, averaged, /10.
-fn rhythm_variety(rows: &[(f64, u32)], keys: usize, centre_left: bool, k: &Knobs) -> f64 {
-    let mut marks: Vec<(f64, i32)> = Vec::new();
-    let (mut last, hm) = ([f64::NEG_INFINITY; 2], hand_masks(keys, centre_left));
-    for &(t, mask) in rows {
-        for h in 0..2 {
-            if mask & hm[h] != 0 {
-                let gap = t - last[h];
-                let bucket = if gap > k.FLOW_LINK { -1 } else { ((gap.max(k.FLOW_FLOOR) * 1000.).log2() * 4.).round() as i32 };
-                marks.push((t, bucket * 2 + h as i32));
-                last[h] = t;
-            }
-        }
-    }
-    // (hand, bucket) counts in the ±0.75 s window, dense from the smallest key: no hashing per mark
-    let base = marks.iter().map(|m| m.1).min().unwrap_or(0);
-    let mut count = vec![0usize; marks.iter().map(|m| (m.1 - base) as usize + 1).max().unwrap_or(0)];
-    let (mut distinct, mut lo, mut hi, mut total) = (0usize, 0, 0, 0.);
-    for i in 0..marks.len() {
-        while hi < marks.len() && marks[hi].0 <= marks[i].0 + 0.75 {
-            let e = &mut count[(marks[hi].1 - base) as usize];
-            distinct += usize::from(*e == 0);
-            *e += 1;
-            hi += 1;
-        }
-        while marks[lo].0 < marks[i].0 - 0.75 {
-            let e = &mut count[(marks[lo].1 - base) as usize];
-            *e -= 1;
-            distinct -= usize::from(*e == 0);
-            lo += 1;
-        }
-        total += distinct as f64;
-    }
-    total / marks.len().max(1) as f64 / 10.
-}
-
-/// MinaCalc's Chaos: on each hand, the longer of two consecutive gaps over the shorter; how far it sits from a whole number
-/// (1:1, 2:1 read clean, 3:2 or 4:3 poly-ish), speed-weighted.
-fn gap_chaos(rows: &[(f64, u32)], keys: usize, centre_left: bool, k: &Knobs) -> f64 {
-    let (mut last, mut gap, hm) = ([f64::NEG_INFINITY; 2], [f64::INFINITY; 2], hand_masks(keys, centre_left));
-    let (mut total, mut chaos) = (0., 0.);
-    for &(t, mask) in rows {
-        for h in 0..2 {
-            if mask & hm[h] == 0 {
-                continue;
-            }
-            let g = t - last[h];
-            if g <= k.FLOW_LINK && gap[h] <= k.FLOW_LINK {
-                let ratio = g.max(gap[h]) / g.min(gap[h]).max(1e-3);
-                let frac = ratio.fract();
-                let weight = 1. / g.max(k.FLOW_FLOOR);
-                total += weight;
-                chaos += weight * frac.min(1. - frac);
-            }
-            (last[h], gap[h]) = (t, g);
-        }
-    }
-    if total > 0. { chaos / total } else { 0. }
 }
 
 /// Interlude's jack compensation: a re-tap of a column through a same-hand neighbour (c·o·c); its jack gap over its stream
@@ -523,80 +520,6 @@ fn flams(chart: &Chart, scale: f64, k: &Knobs) -> f64 {
         }
     }
     if total > 0. { flam / total } else { 0. }
-}
-
-/// One-hand jump chains: a hand's row of ≥ 2 notes right after (≤ k.FLOW_LINK) another ≥ 2-note row of that hand sharing a column.
-fn jump_chains(rows: &[(f64, u32)], keys: usize, centre_left: bool, k: &Knobs) -> f64 {
-    let (mut last, mut prev, hm) = ([f64::NEG_INFINITY; 2], [0u32; 2], hand_masks(keys, centre_left));
-    let (mut total, mut chain) = (0., 0.);
-    for &(t, mask) in rows {
-        let hands = [mask & hm[0], mask & hm[1]];
-        for h in 0..2 {
-            if hands[h] == 0 {
-                continue;
-            }
-            let gap = t - last[h];
-            let weight = 1. / gap.max(k.FLOW_FLOOR);
-            total += weight;
-            if gap <= k.FLOW_LINK && hands[h].count_ones() > 1 && prev[h].count_ones() > 1 && hands[h] & prev[h] != 0 {
-                chain += weight;
-            }
-            (last[h], prev[h]) = (t, hands[h]);
-        }
-    }
-    if total > 0. { chain / total } else { 0. }
-}
-
-/// The ring finger of each hand on 6K and up (second column from the hand's outer edge; 4K and 5K hands have none): its notes
-/// with a neighbour finger (middle or little) pressing within 0.15 s, a share of its notes. Enslaving is strongest between
-/// adjacent fingers and the ring finger is the least independent (PMC5167409).
-fn ring_conflicts(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
-    if keys < 6 {
-        return 0.;
-    }
-    let cols: [Vec<usize>; 2] = [0, 1].map(|h| (0..keys).filter(|&c| hand(c, keys, centre_left).0 == h).collect());
-    let rings: [usize; 2] = [cols[0][1], cols[1][cols[1].len() - 2]];
-    let mut last = vec![f64::NEG_INFINITY; keys];
-    let (mut total, mut hit) = (0., 0.);
-    for &(t, mask) in rows {
-        for h in 0..2 {
-            let r = rings[h];
-            if mask >> r & 1 == 1 {
-                total += 1.;
-                let near = [r.wrapping_sub(1), r + 1].into_iter().filter(|&o| o < keys && hand(o, keys, centre_left).0 == h);
-                if near.into_iter().any(|o| t - last[o] <= 0.15) { // a chord with the neighbour is one motion, not a conflict
-                    hit += 1.;
-                }
-            }
-        }
-        (0..keys).filter(|&c| mask >> c & 1 == 1).for_each(|c| last[c] = t);
-    }
-    if total > 0. { hit / total } else { 0. }
-}
-
-/// Bimanual interference: per 1 s stretch (from the first note) each hand's row rate; where both hands play (≥ 2/s) at different
-/// rates, the slower hand's rows count by 1 − rate ratio. Share of all hand rows. The faster limb degrades the slower one
-/// (Panzer 2021).
-fn hand_rates(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
-    let start = rows.first().map_or(0., |r| r.0);
-    let hm = hand_masks(keys, centre_left);
-    let mut bins = dense_bins(rows.iter().map(|r| r.0 - start), 1.);
-    for &(t, mask) in rows {
-        let bin = &mut bins[(t - start).floor() as usize];
-        for h in 0..2 {
-            if mask & hm[h] != 0 {
-                bin[h] += 1.;
-            }
-        }
-    }
-    let (mut total, mut slow) = (0., 0.);
-    for [l, r] in bins {
-        total += l + r;
-        if l >= 2. && r >= 2. {
-            slow += l.min(r) * (1. - l.min(r) / l.max(r));
-        }
-    }
-    if total > 0. { slow / total } else { 0. }
 }
 
 /// Notes more than 0.4 s after the previous row: timed alone, the timing spread grows with the interval (scalar timing).

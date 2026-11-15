@@ -218,7 +218,9 @@ impl App {
             let mut rest = row(rest_range.clone());
             rest.wrap.max_rows = rows_for(d.skills); // past 3 skills the second row wraps once
             rest.wrap.break_anywhere = false;
-            let tags = (!a.tags.is_empty()).then(|| a.tags.join(" · "));
+            let shown: Vec<String> = a.entries[..d.skills.min(n)].iter().flat_map(|e| e.parts.clone()).collect();
+            let tags: Vec<String> = a.tags.iter().cloned().chain(ms_calc::card::also_line(&a.also, &shown)).collect();
+            let tags = (!tags.is_empty()).then(|| tags.join(" · "));
             let lines = ui.fonts_mut(|f| {
                 let mut h = top.clone().map_or(BODY * 1.2, |j| f.layout_job(j).size().y);
                 h += f.layout_job(rest.clone()).size().y;
@@ -336,7 +338,7 @@ impl App {
         ui.menu_button("Convert to", |ui| {
             for k in SUPPORTED_KEYS.filter(|k| *k != a.keys) {
                 if ui.button(format!("{k}K")).on_hover_text("Adds it to osu! as its own difficulty, without the playlist").clicked() {
-                    self.q.put(Task::ConvertSelected(k));
+                    self.q.put(Task::ConvertSelected { path: a.path.clone(), keys: k });
                     ui.close();
                 }
             }

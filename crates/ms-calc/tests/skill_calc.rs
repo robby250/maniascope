@@ -190,11 +190,11 @@ fn hand_patterns() {
     // a long single-column run is Longjack, the slice of Jacks it fills; repeated chords are chordjack
     assert_eq!(top(&col(2, 150, 400), 7, 1), ["longjack"]);
     assert_eq!(top(&col(2, 150, 400), 4, 1), ["longjack"]);
-    // an anchor with the other hand in between is a Longjacks run in 7K (the hand repeats); 200 ms repeats: since 21660e31a4f6
-    // slower 7K jacks cost less (JACK_P curve), and at 240 ms stamina of the 800-note run ranks above it
+    // an anchor with notes of the other hand between is not a Longjacks run: any row without the column ends it (NANO DEATH
+    // read Longjacks, user 2026-11-14: Jumptrill)
     let anchor: Vec<Note> = (0..800i64).map(|i| (1000 + 100 * i, if i % 2 == 1 { 1 } else { (5 + (i / 2) % 2) as usize }, None)).collect();
     let t = top(&anchor, 7, 2);
-    assert!(t.contains(&"longjack"), "{t:?}"); // one column 400 times in a row: the other hand between doesn't end the run (plan 2026-11-13b S4)
+    assert!(!t.contains(&"longjack"), "{t:?}");
     let cj = rows(&[&[0, 3, 4, 5], &[0, 2, 4, 6]], 160, 400);
     assert_eq!(top(&cj, 7, 1), ["chordjack"]);
     assert!(!top(&cj, 7, 3).contains(&"bracket"));
@@ -325,9 +325,11 @@ fn chord_trills_and_dump() {
     // A B A inside jumpstream is not a trill; A B A B is
     let js = rows(&[&[0, 2], &[1, 3], &[0, 2], &[1], &[3], &[0, 1], &[2], &[3]], 90, 800);
     assert_eq!(sc(&js, 4).f("splittrill"), 0.);
-    // 4K Dump: fast one-finger-per-hand rice, overlapping the stream family (Delay's rule)
-    let (fast, slow) = (sc(&stream(1200, 45, 4), 4), sc(&stream(1200, 110, 4), 4));
-    assert!(fast.f("dump") >= 0.9 * fast.f("stream") && slow.f("dump") == 0.);
+    // 4K Dump: fast rice on an uneven rhythm (mapper-tagged dumps, 2026-11-14); an even 1/4 stream is Stream, not Dump
+    let uneven = |g: &[i64]| sc(&dump(g, 1200, &[0, 2, 1, 3, 1, 0, 3, 2]), 4);
+    let (fast, slow) = (uneven(&[35, 60]), uneven(&[85, 140]));
+    let even = sc(&stream(1200, 45, 4), 4);
+    assert!(fast.f("dump") >= 0.5 * fast.f("stream") && slow.f("dump") < 0.1 * fast.f("dump") && even.f("dump") < 0.2 * fast.f("dump"), "{} {} {} {}", fast.f("dump"), fast.f("stream"), slow.f("dump"), even.f("dump"));
 }
 
 #[test]

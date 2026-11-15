@@ -406,12 +406,14 @@ impl App {
 
     pub fn menu_ui(&mut self, ui: &mut Ui) {
         let mut close = false;
-        let selected = self.analysis().map(|a| a.keys);
+        let selected = self.analysis().map(|a| (a.keys, a.path.clone()));
         ui.horizontal(|ui| {
             ui.label("Convert this map to");
-            for k in SUPPORTED_KEYS.filter(|k| Some(*k) != selected) {
+            for k in SUPPORTED_KEYS.filter(|k| selected.as_ref().map(|s| s.0) != Some(*k)) {
                 if ui.add_enabled(selected.is_some(), egui::Button::new(format!("{k}K"))).on_hover_text("Adds it to osu! as its own difficulty, without the playlist").clicked() {
-                    self.q.put(Task::ConvertSelected(k));
+                    if let Some((_, path)) = &selected {
+                        self.q.put(Task::ConvertSelected { path: path.clone(), keys: k });
+                    }
                     close = true;
                 }
             }

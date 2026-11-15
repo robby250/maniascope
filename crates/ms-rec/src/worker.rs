@@ -77,7 +77,7 @@ const SELECTED: &str = "selected"; // a convert's mode when it comes from the se
 
 pub enum Task {
     ConvertDone { pick: Box<Pick>, mode: String, error: Option<String> },
-    ConvertSelected(i64),
+    ConvertSelected { path: PathBuf, keys: i64 }, // the shown map: needs no worker state, so it runs during the startup carry too
     Configure(Box<Config>),
     Selected { path: Option<PathBuf>, rate: Option<f64>, mods: Option<Vec<Value>> },
     FeatureReady { sha: String, features: Option<Vec<(f64, ms_calc::val::Dict)>>, refit: bool },
@@ -132,6 +132,9 @@ pub enum Out {
     Status { text: String, progress: Option<(usize, usize)>, blocking: bool, learning: Option<bool> },
     Pool { mode: String, revision: u64, selection_id: u64, phase: String, shown: Vec<Pick>, note: String, summary: String, progress: Option<(usize, usize)>, key_counts: BTreeMap<i64, usize>, skill_counts: BTreeMap<String, usize>, nps_pool: BTreeMap<i64, Vec<f64>> },
     Progress { mode: String, progress: Option<(usize, usize)> }, // analysis between publications: the list stays as it is
+    /// The picked map on its way into the game, under its row (user 2026-11-14: "put some downloading bar"): what runs, share
+    /// done when known; empty text = done.
+    Delivery { identity: String, text: String, progress: Option<f32>, failed: bool },
     Target { mode: String, revision: u64, selection_id: u64, c: Option<Box<Pick>>, msg: String, copy: Option<String> },
     Copy { text: String, msg: String },
     Card { c: Option<Box<Card>>, note: Option<String>, path: Option<PathBuf>, rate: Option<f64> },
@@ -181,11 +184,12 @@ impl Queue {
         self.lanes.lock().unwrap()[0].pop_front()
     }
 
-    fn take_configures(&self) -> Vec<Task> {
+    /// The queued tasks `pick` takes, in order; the rest keep their places.
+    fn take(&self, pick: impl Fn(&Task) -> bool) -> Vec<Task> {
         let mut lanes = self.lanes.lock().unwrap();
-        let (configs, rest): (VecDeque<Task>, VecDeque<Task>) = std::mem::take(&mut lanes[1]).into_iter().partition(|t| matches!(t, Task::Configure(_)));
+        let (taken, rest): (VecDeque<Task>, VecDeque<Task>) = std::mem::take(&mut lanes[1]).into_iter().partition(|t| pick(t));
         lanes[1] = rest;
-        configs.into()
+        taken.into()
     }
 }
 
@@ -401,7 +405,7 @@ impl Worker {
     fn run(&mut self, public: impl FnOnce(&Hooks) -> std::result::Result<Arc<Public>, String>) {
         self.stage(Some("Opening your saved plays and recommendations…".into()), false);
         // The UI queues its real tab and filters before start: honoured before any invisible local-playlist work.
-        for task in self.q.take_configures() {
+        for task in self.q.take(|t| matches!(t, Task::Configure(_))) {
             self.run_task(task);
         }
         match self.startup(public) {
@@ -495,24 +499,27 @@ impl Worker {
             return Ok(());
         }
         self.stage(Some("Updating stored ratings (once)…".into()), false);
-        // A new analysis rule re-analyses every stored chart, which takes minutes: the line counts them so it doesn't look stuck.
-        let (stop, emit, db) = (AtomicBool::new(false), self.h.emit.clone(), &self.db);
-        std::thread::scope(|s| {
-            s.spawn(|| while !stop.load(Ordering::Relaxed) {
+        // A new analysis rule re-analyses every stored chart, which takes minutes: it runs on its own connection while this
+        // thread counts them (so it doesn't look stuck) and serves the map menu's converts, which need no fitted model (user
+        // 2026-11-15: a convert waited behind 102,840 charts).
+        let path = self.db_path.clone();
+        let carried = std::thread::scope(|s| {
+            let carry = s.spawn(|| connect(&path).map_err(|e| e.to_string()).and_then(|db| Self::carry_all(&db)));
+            while !carry.is_finished() {
+                for task in self.q.take(|t| matches!(t, Task::ConvertSelected { .. })) {
+                    self.run_task(task);
+                }
                 let [d, t] = ms_data::store::CARRIED.each_ref().map(|a| a.load(Ordering::Relaxed));
                 if t > 0 {
                     let text = format!("Updating stored ratings (once) · {} / {} charts", crate::engine::commas(d.min(t)), crate::engine::commas(t));
                     // counted, so both windows draw it as their progress bar (user 2026-11-13), gone with the next status
-                    emit(Out::Status { text, progress: Some((d.min(t), t)), blocking: false, learning: None });
+                    (self.h.emit)(Out::Status { text, progress: Some((d.min(t), t)), blocking: false, learning: None });
                 }
-                std::thread::sleep(Duration::from_millis(500));
-            });
-            let carried = Self::carry_all(db);
-            stop.store(true, Ordering::Relaxed);
-            carried
-        })?
-        .then(|| kv_set(&self.db, &done, &json!(true)).map_err(|e| e.to_string()))
-        .unwrap_or(Ok(()))
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            carry.join().map_err(|_| "stored ratings not updated: the update stopped".to_string())?
+        })?;
+        carried.then(|| kv_set(&self.db, &done, &json!(true)).map_err(|e| e.to_string())).unwrap_or(Ok(()))
     }
 
     /// Ok(true) once both stores carried. The own rows' error stops the launch; the website's waits for the next launch.
@@ -538,7 +545,12 @@ impl Worker {
         self.stage(Some("Compacting stored ratings (once)…".into()), false);
         match ms_data::store::prune_feats(&self.db, CALC_ID) {
             Ok(None) => {} // an older database re-analyses instead of carrying: its old rows go next launch
-            Ok(Some(_)) => { let _ = kv_set(&self.db, &done, &json!(true)); }
+            Ok(Some(_)) => {
+                let _ = kv_set(&self.db, &done, &json!(true));
+                if let Err(e) = crate::converts::prune_kept(&self.db) {
+                    eprintln!("kept converts not pruned: {e}");
+                }
+            }
             Err(e) => eprintln!("old ratings kept for now: {e}"),
         }
     }
@@ -612,7 +624,7 @@ impl Worker {
                     self.request_nps();
                 }
             }
-            Task::ConvertSelected(target) => self.t_convert_selected(target),
+            Task::ConvertSelected { path, keys } => self.t_convert_selected(path, keys),
             Task::Stats(v) => self.t_stats(v)?,
             Task::Profile => self.emit_stats()?,
             Task::Snooze { pick, mode } => self.t_snooze(&pick, mode)?,
@@ -727,6 +739,13 @@ impl Worker {
         all[all.len().saturating_sub(40)..].to_vec()
     }
 
+    /// This tab's last offers' leading practice skill ("" for none) and keymode, oldest first: the skills' turns go on from them.
+    fn recent_skills(n: &Now, mode: &str) -> Vec<(String, i64)> {
+        let all: Vec<(String, i64)> = n.session.all.iter().filter(|e| e.kind == "offer" && e.info["mode"].as_str() == Some(mode))
+            .map(|e| (e.info["matched_skills"].get(0).and_then(Value::as_str).unwrap_or("").to_string(), e.info["keys"].as_i64().unwrap_or(0))).collect();
+        all[all.len().saturating_sub(40)..].to_vec()
+    }
+
     /// The sets of what was just played or offered, and of the converts among them: one song, whichever side came first.
     fn recent_sets(&self, n: &Now) -> Result<(HashSet<i64>, HashSet<i64>)> {
         let played = n.session.attempts.iter().rev().take(20).filter_map(|a| a.beatmap.clone());
@@ -792,7 +811,7 @@ impl Worker {
             let entries: Vec<(String, f64, usize)> = sl.into_iter().map(|(k, w)| { let n = counts.get(&k).copied().unwrap_or(0); (k, w, n) }).collect();
             ms_model::choices::mix_shares(&entries, self.skill_tuning.by_count).into_iter().collect::<std::collections::HashMap<_, _>>()
         });
-        let seed = n.session.all.iter().filter(|e| matches!(e.kind.as_str(), "offer" | "finish" | "abort" | "reset")).map(|e| e.id).max().unwrap_or(0);
+        let seed = n.session.all.iter().filter(|e| matches!(e.kind.as_str(), "offer" | "reset")).map(|e| e.id).max().unwrap_or(0); // the list holds until the next offer: a quit reshuffled it (user 2026-11-15)
         let seed = Some(seed.to_string()); // the custom playlist's slider at off drops it (builder::rank)
         let consumed: HashSet<String> = self.consumed.iter().cloned().collect();
         let active: Vec<&Setting> = self.keys[mode].iter().filter_map(|k| self.converts[mode].get(k)).filter(|s| s.on && !s.sources.is_empty()).collect();
@@ -804,7 +823,7 @@ impl Worker {
         let store = self.store.read().unwrap();
         let (ranked, _) = rank(&prepared, &st.catalog, &n.session, &store, RankInputs {
             keys: self.keys[mode].clone(), mode, web: mix.0[0], convert: mix.0[1], weighted: mix.1, recent_sets: &recent_sets, recent_convert_sets: &recent_convert_sets, taste: if mode == "nps" { &self.taste_cache.1 } else { &none }, consumed: &consumed, seed, focus: if mode == "nps" { self.nps_focus } else { self.skills_focus }, count: 60,
-            recent: Self::recent(&n, mode), key_shares: self.key_shares(mode), skill_weights: shares, selected_skills: &self.practice_skills, miss_ratio: (self.shown.client == "stable").then_some(self.shown.miss_ratio),
+            recent: Self::recent(&n, mode), recent_skills: Self::recent_skills(&n, mode), key_shares: self.key_shares(mode), skill_weights: shares, selected_skills: &self.practice_skills, miss_ratio: (self.shown.client == "stable").then_some(self.shown.miss_ratio),
         });
         drop(store);
         self.stream_mix.insert(mode, mix);
@@ -957,7 +976,7 @@ impl Worker {
             let chart = c.md5.clone().unwrap_or_else(|| sha.clone());
             let Some(mut expected) = rec.predict(&f, &chart, c.bid, c.rate, &n) else { continue };
             if let Some(a) = alternative.as_ref().filter(|a| a.rate != c.rate && !pinned) {
-                let central = rec.model().central_target(target, warm);
+                let central = rec.model().central_target(rec.model().target_for(&f, target), warm);
                 if (a.pred.acc_mid - central).abs() < (expected.shown.acc_mid - central).abs() {
                     if let (Some(af), Some(e)) = (a.f.clone(), a.f.as_ref().and_then(|af| rec.predict(af, &chart, c.bid, a.rate, &n))) {
                         let _ = af;
@@ -969,7 +988,7 @@ impl Worker {
             if mode == "skills" && alternative.is_none() {
                 continue; // no longer matches the selection: the kernel left it out
             }
-            if local && !pinned && !rec.model().eligible(&expected.shown, target, warm) {
+            if local && !pinned && !rec.model().eligible(&expected.shown, rec.model().target_for(&f, target), warm) {
                 continue;
             }
             c.pred = expected.shown.clone();
@@ -982,6 +1001,7 @@ impl Worker {
             }
             shown.push(c);
         }
+        let listed = shown.len();
         let mut seen: HashSet<String> = shown.iter().filter_map(Pick::identity).chain(self.consumed.iter().cloned()).collect();
         for c in &fresh {
             if let Some(key) = c.identity() {
@@ -991,15 +1011,20 @@ impl Worker {
             }
         }
         if local {
-            // Kept maps you don't have outlive the played ones and piled up at the top (user 2026-10-26).
-            let streams: Vec<u8> = shown.iter().map(Pick::stream).collect();
-            let keys: Vec<i64> = shown.iter().map(|p| p.keys).collect();
+            // Website and convert rows are owed their share among the new rows (user 2026-10-26: kept ones piled up at the top).
+            // Rows already listed keep their order (user 2026-11-14: "why does the playlist update when i press next … the order of
+            // songs changes"): only the new ones are interleaved, after them, as if the listed ones had been offered.
+            let new = shown.split_off(listed);
+            let streams: Vec<u8> = new.iter().map(Pick::stream).collect();
+            let keys: Vec<i64> = new.iter().map(|p| p.keys).collect();
+            let mut recent = Self::recent(&n, mode);
+            recent.extend(shown.iter().map(|p| (p.stream(), p.keys)));
             // each keymode's website/convert odds from its own maps, as the ranking ordered them (one odds over every
             // keymode put 10K converts at 0.3 against all 4K–10K maps instead of ~2 against 10K's own: user 2026-11-13,
             // "converts really far in the list … never end up in the front")
             let (sliders, weighted) = self.stream_mix[mode];
-            let order = keymode_order(&keys, &streams, |s| stream_odds(sliders, weighted, s), &Self::recent(&n, mode), &self.key_shares(mode));
-            shown = order.into_iter().map(|i| shown[i].clone()).collect();
+            let order = keymode_order(&keys, &streams, |s| stream_odds(sliders, weighted, s), &recent, &self.key_shares(mode));
+            shown.extend(order.into_iter().map(|i| new[i].clone()));
         }
         let kept = head.as_deref().is_some_and(|h| to_front(&mut shown, h));
         shown.truncate(20);
@@ -1639,17 +1664,23 @@ impl Worker {
             return Ok(()); // stable has HT/NM/DT only; PP and warm-up picks aren't aimed at the target
         }
         let n = self.session()?;
-        let target = self.rec.as_ref().unwrap().model().central_target(n.target, n.view.warm_flag);
+        let model = self.rec.as_ref().unwrap().model();
+        let target = model.central_target(c.f.as_ref().map_or(n.target, |f| model.target_for(f, n.target)), n.view.warm_flag);
         let (lo, hi) = self.rate_range(mode);
         let root = crate::catalog::local_origin(&self.shown.client).1;
         let chart = c.md5.clone().unwrap_or_else(|| sha.clone());
         let mut data = None;
+        // A chart not yet in the game's store (a convert built here, a website download) is read here: the per-note blend
+        // reads it too, as the card does once it's imported (user 2026-11-14: convert SET ~96.0 % while the card showed
+        // 93.5 %; 2026-11-15: website SET 1.05× ~96.2 % while the card showed 96.4 %, 1.06× 96.0 %).
+        let local = (!inst.installed).then(|| match inst.convert_of {
+            Some(_) => crate::converts::bytes(&inst, &root),
+            None => inst.path.as_ref().and_then(|p| std::fs::read(p).ok()),
+        }).flatten();
         // The prediction at `rate` with its features, analysing the chart there first if needed.
         let mut at = |w: &mut Self, rate: f64| -> Result<Option<(Arc<ms_model::predict::Feats>, crate::engine::Expected)>> {
             if !w.store.read().unwrap().has_rate(&sha, rate) {
-                let bytes = data.get_or_insert_with(|| if inst.convert_of.is_some() && !inst.installed { crate::converts::bytes(&inst, &root) } else {
-                    inst.path.clone().or_else(|| ms_data::paths::local_file(&sha, &root)).and_then(|p| std::fs::read(p).ok())
-                });
+                let bytes = data.get_or_insert_with(|| local.clone().or_else(|| inst.path.clone().or_else(|| ms_data::paths::local_file(&sha, &root)).and_then(|p| std::fs::read(p).ok())));
                 let Some(bytes) = bytes.as_ref() else { return Ok(None) };
                 let Ok(fs) = ms_calc::features::chart_features(bytes, &[rate], &w.rec.as_ref().unwrap().prm) else { return Ok(None) };
                 let mut store = w.store.write().unwrap();
@@ -1659,7 +1690,7 @@ impl Worker {
                 }
             }
             let Some(f) = w.store.read().unwrap().feats(&sha, rate).cloned() else { return Ok(None) };
-            Ok(w.rec.as_ref().unwrap().predict(&f, &chart, c.bid, rate, &n).map(|e| (Arc::new(f), e)))
+            Ok(w.rec.as_ref().unwrap().expected(&w.db, &f, &sha, &chart, c.bid, rate, &n, local.as_deref()).map(|e| (Arc::new(f), e)))
         };
         let gap = |acc: f64| (1. - acc).max(1e-6).ln() - (1. - target).ln();
         let off = |e: &crate::engine::Expected| (e.shown.acc_mid - target).abs();
@@ -1756,6 +1787,7 @@ impl Worker {
         let boxed = Box::new(c);
         self.target = Some(boxed.clone());
         self.targets.insert(mode.to_string(), boxed.clone());
+        self.convert_turn.fetch_add(1, Ordering::SeqCst); // a delivery still running for the previous pick stops
         if crate::navigation::delivers(&boxed, auto) {
             self.deliver(boxed.clone(), mode.to_string(), skipped);
         }
@@ -1784,18 +1816,33 @@ impl Worker {
                 return;
             }
             let root = crate::catalog::local_origin(&client).1;
+            let identity = pick.identity().unwrap_or_default();
+            // Next while it runs moves the turn on: the download stops and its line goes (user 2026-11-14).
+            let last = std::cell::RefCell::new((Instant::now() - Duration::from_secs(1), String::new()));
+            let report = |text: &str, progress: Option<f32>| {
+                let mut last = last.borrow_mut();
+                let step = text.split('…').next().unwrap_or("");
+                if last.0.elapsed() >= Duration::from_millis(200) || last.1 != step { // a few lines a second, every new step at once
+                    (h.emit)(Out::Delivery { identity: identity.clone(), text: text.to_string(), progress, failed: false });
+                    *last = (Instant::now(), step.to_string());
+                }
+                turns.load(Ordering::SeqCst) == turn && !halt.load(Ordering::Relaxed)
+            };
             let error = if crate::navigation::game_running(&client) {
-                connect(&path).map_err(|e| e.to_string()).and_then(|db| converts::deliver(&pick, &db, &client, &root, picked)).err()
+                connect(&path).map_err(|e| e.to_string()).and_then(|db| converts::deliver(&pick, &db, &client, &root, picked, &report)).err()
             } else {
                 Some(NOT_RUNNING.to_string())
             };
+            if error.as_deref() == Some(converts::CANCELLED) {
+                return;
+            }
+            (h.emit)(Out::Delivery { identity, text: error.clone().map_or_else(String::new, |e| format!("Couldn't get it into osu!: {e} — Next skips it")), progress: None, failed: error.is_some() });
             q.put(Task::ConvertDone { pick, mode, error });
         });
     }
 
     /// The map selected in osu! as a convert, on request and outside any list: delivered like a list's.
-    fn t_convert_selected(&mut self, target: i64) {
-        let Some(path) = self.sel.0.clone() else { return self.status("Select a map in osu! first") };
+    fn t_convert_selected(&mut self, path: PathBuf, target: i64) {
         let converted = std::fs::read(&path).map_err(|e| e.to_string()).and_then(|data| Ok((hashes(&data).0, ms_convert::convert(&data, target as usize).map_err(|e| e.to_string())?)));
         let (source, out) = match converted {
             Ok(done) => done,
@@ -1819,6 +1866,7 @@ impl Worker {
             }
             None if current => {
                 let mut c = pick;
+                c.source_web |= !c.installed; // a downloaded website map keeps its WEB badge (user 2026-11-15)
                 c.installed = true;
                 let copy = Some(crate::navigation::song_search(&c, &self.shown.client));
                 let first = if self.shown.client == "stable" { "press F5 in song select, then Ctrl+V" } else { "press Ctrl+V in song select" };

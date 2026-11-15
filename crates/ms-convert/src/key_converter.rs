@@ -412,7 +412,8 @@ struct Ctx<'a> {
 
 /// What a state costs in a row's search, kept across its candidates.
 struct RowMemo {
-    hand: Vec<f64>,   // hand_cost per mask of target keys, NaN: not worked out
+    hand: Vec<(u32, f64)>, // hand_cost per mask of target keys, valid when stamped with `generation` (no wipe per state: 8 KB on 10K)
+    generation: u32,
     alternating: bool,
     best: [f64; BEAM_WIDTH], // the lowest totals of the row so far, across states: anything above can't enter the beam
     parent: f64,             // the state's cost
@@ -518,11 +519,12 @@ impl Ctx<'_> {
         if !self.wide {
             return 0.0;
         }
+        let generation = memo.generation;
         let slot = &mut memo.hand[mask as usize];
-        if slot.is_nan() {
-            *slot = self.hand_cost(state, row, mask);
+        if slot.0 != generation {
+            *slot = (generation, self.hand_cost(state, row, mask));
         }
-        *slot
+        slot.1
     }
 
     /// Cost of each source note of the row in each target key, `INFINITY`
@@ -767,7 +769,7 @@ impl Ctx<'_> {
 
         let costs = self.note_costs(state, row);
         let extra_costs = self.extra_costs(state, row);
-        memo.hand.fill(f64::NAN);
+        memo.generation += 1;
         memo.alternating = self.alternating(state, row);
 
         // Going up, fewer notes are only tried when they do not all fit. Going
@@ -942,7 +944,7 @@ fn search(ctx: &Ctx, rows: &[Row]) -> Vec<Decision> {
     let mut beam: Vec<(f64, State, u32)> = vec![(0.0, State::new(), u32::MAX)];
     let mut candidates: Vec<(f64, usize, Decision)> = Vec::new();
     let mut scratch: Vec<(f64, Decision)> = Vec::new();
-    let mut memo = RowMemo { hand: vec![f64::NAN; 1 << ctx.dst_keys], alternating: false, best: [f64::INFINITY; BEAM_WIDTH], parent: 0.0 };
+    let mut memo = RowMemo { hand: vec![(0, f64::NAN); 1 << ctx.dst_keys], generation: 0, alternating: false, best: [f64::INFINITY; BEAM_WIDTH], parent: 0.0 };
 
     for (ri, row) in rows.iter().enumerate() {
         candidates.clear();

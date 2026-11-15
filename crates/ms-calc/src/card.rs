@@ -182,18 +182,34 @@ pub fn describe(res: &Dict, k: &Knobs) -> (String, Vec<String>) {
     if peak >= k.BURST_TAG * sc.f("overall") && sc.f("overall") > 0.0 {
         tags.push("short burst".to_string());
     }
-    let shown: Vec<String> = entries.iter().flat_map(|e| match e.get("parts") { Some(Val::List(l) | Val::Tuple(l)) => l.iter().filter_map(|x| if let Val::Str(s) = x { Some(s.clone()) } else { None }).collect(), _ => Vec::new() }).collect();
+    let shown: Vec<String> = entries.iter().flat_map(parts).collect();
+    tags.extend(also_line(&also(res), &shown));
+    (dom, tags)
+}
+
+/// The families the "also" line may name, each with its member skills: the line drops a family whose member is on the
+/// rows the reader sees (`also_line`), so the app filters by its own row count (user 2026-11-15: "also LN" beside LN General).
+pub fn also(res: &Dict) -> Vec<(&'static str, Vec<&'static str>)> {
+    let sc = res.dict("scores").unwrap();
+    let Some(top) = card(res).first().and_then(|e| if let Val::Dict(d) = e { Some(d.f("rating")) } else { None }) else { return Vec::new() };
     let fam = |s: &str| Sk::from_name(s).map_or("", |s| if s == Sk::vibro { "vibro" } else { taxonomy::of(s).family });
     let keys = res.f("keys") as usize;
-    let extra: Vec<&str> = ALSO.iter().filter(|(_, key, share)| {
-        let members: Vec<Sk> = taxonomy::TABLE.iter().filter(|r| fam(r.sk.name()) == *key || r.sk.name() == *key).map(|r| r.sk).filter(|s| taxonomy::measured(*s, keys)).collect();
-        let best = members.iter().map(|s| sc.f(s.name())).fold(0.0, f64::max);
-        !shown.iter().any(|p| members.iter().any(|m| m.name() == p)) && best > 0.0 && best >= share * first.f("rating")
-    }).map(|a| a.0).collect();
-    if !extra.is_empty() {
-        tags.push(format!("also {}", extra.join(" · ")));
-    }
-    (dom, tags)
+    ALSO.iter().filter_map(|(label, key, share)| {
+        let members: Vec<&'static str> = taxonomy::TABLE.iter().filter(|r| fam(r.sk.name()) == *key || r.sk.name() == *key).map(|r| r.sk).filter(|s| taxonomy::measured(*s, keys)).map(|s| s.name()).collect();
+        let best = members.iter().map(|s| sc.f(s)).fold(0.0, f64::max);
+        (best > 0.0 && best >= share * top).then_some((*label, members))
+    }).collect()
+}
+
+/// "also X · Y" for the families in `also` none of whose members is among the `shown` parts.
+pub fn also_line(also: &[(&str, Vec<&str>)], shown: &[String]) -> Option<String> {
+    let extra: Vec<&str> = also.iter().filter(|(_, m)| !shown.iter().any(|p| m.contains(&p.as_str()))).map(|a| a.0).collect();
+    (!extra.is_empty()).then(|| format!("also {}", extra.join(" · ")))
+}
+
+/// A card row's `parts` (skill names).
+pub fn parts(e: &Dict) -> Vec<String> {
+    match e.get("parts") { Some(Val::List(l) | Val::Tuple(l)) => l.iter().filter_map(|x| if let Val::Str(s) = x { Some(s.clone()) } else { None }).collect(), _ => Vec::new() }
 }
 
 fn str_of(e: &Dict, k: &str) -> Option<String> {

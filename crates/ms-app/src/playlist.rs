@@ -220,7 +220,7 @@ fn pp_tip(c: &Pick) -> String {
 /// read"): a website map not installed yet, a keymode convert, or a convert of a website map.
 fn badges(c: &Pick) -> Vec<(String, Color32, &'static str)> {
     let mut out = Vec::new();
-    if c.convert_of.as_ref().map_or(!c.installed, |_| c.source_web) {
+    if c.source_web || (c.convert_of.is_none() && !c.installed) {
         out.push(("WEB".to_string(), theme::ACCENT, "From the website, not installed yet"));
     }
     if c.convert_of.is_some() {
@@ -393,8 +393,10 @@ impl App {
         }
     }
 
-    fn chip(&mut self, ui: &mut Ui, key: &str, name: &str, tip: &str) {
-        let (state, mixed) = (skills::state(&self.s.practice, key), skills::mixed(&self.s.practice, key));
+    /// A skill chip of tree `t` (4K or 5K–10K): each group picks its own (user 2026-11-15: "vibro checked only for 4k").
+    fn chip(&mut self, ui: &mut Ui, t: usize, key: &str, name: &str, tip: &str) {
+        let view = skills::for_tree(&self.s.practice, t);
+        let (state, mixed) = (skills::state(&view, key), skills::mixed(&view, key));
         let word = if mixed { "mixed" } else { match state { 1 => "included", -1 => "excluded", _ => "off" } };
         let (mark, colour) = if mixed { ("– ", DIM) } else { match state { 1 => ("✓ ", CHIP_ON), -1 => ("✕ ", CHIP_OFF), _ => ("", BORDER) } };
         let mut text = egui::text::LayoutJob::default();
@@ -408,12 +410,12 @@ impl App {
         let tip = if tip.is_empty() { "Broad practice for this family; ▾ opens its subskills.".to_string() } else { tip.to_string() };
         let r = ui.add(b).on_hover_text(format!("{name}: {word}\n{tip}\nRight-click: avoid. Shift+click: only this."));
         if r.clicked() && ui.input(|i| i.modifiers.shift) {
-            self.set_skills(vec![key.to_string()]);
+            self.set_skills(skills::with_tree(&self.s.practice, t, vec![key.to_string()]));
         } else if r.clicked() {
-            let next = skills::cycle(&self.s.practice, key);
+            let next = skills::with_tree(&self.s.practice, t, skills::cycle(&view, key));
             self.set_skills(next);
         } else if r.secondary_clicked() {
-            let next = skills::set_state(&self.s.practice, key, -1);
+            let next = skills::with_tree(&self.s.practice, t, skills::set_state(&view, key, -1));
             self.set_skills(next);
         }
     }
@@ -456,6 +458,7 @@ impl App {
             ui.label("Select a keymode first.");
         }
         for (at, mode) in modes.iter().copied().enumerate() {
+            let t = skills::tree_index(mode);
             if modes.len() > 1 {
                 ui.label(RichText::new(if mode == 4 { "4K" } else { "5K–10K" }).family(egui::FontFamily::Name("bold".into())));
             }
@@ -466,7 +469,7 @@ impl App {
                 // Together: a chip and its ▾ wrap as one.
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.;
-                    app.chip(ui, &parent.key, parent.name, parent.tip);
+                    app.chip(ui, t, &parent.key, parent.name, parent.tip);
                     if !parent.children.is_empty() {
                         let id = (mode, parent.key.clone());
                         let open = app.chips_open.contains(&id);
@@ -480,7 +483,7 @@ impl App {
                 if !parent.children.is_empty() && self.chips_open.contains(&(mode, parent.key.clone())) {
                     theme::dim(ui, parent.name);
                     let children: Vec<&Skill> = parent.children.iter().collect();
-                    self.chip_rows(ui, &children, |ui, c| chip_width(ui, c.name), |app, ui, c| app.chip(ui, &c.key, c.name, c.tip));
+                    self.chip_rows(ui, &children, |ui, c| chip_width(ui, c.name), |app, ui, c| app.chip(ui, t, &c.key, c.name, c.tip));
                 }
             }
         }
@@ -489,7 +492,13 @@ impl App {
 
     /// How much of each included skill, and how strongly each avoided one is kept out.
     fn skill_sliders(&mut self, ui: &mut Ui) {
-        let (included, avoided): (Vec<String>, Vec<String>) = self.s.practice.iter().cloned().partition(|k| !k.starts_with('!'));
+        let mut tokens: Vec<String> = Vec::new();
+        for k in skills::for_tree(&self.s.practice, 0).into_iter().chain(skills::for_tree(&self.s.practice, 1)) {
+            if !tokens.contains(&k) {
+                tokens.push(k);
+            }
+        }
+        let (included, avoided): (Vec<String>, Vec<String>) = tokens.into_iter().partition(|k| !k.starts_with('!'));
         if !included.is_empty() {
             theme::section(ui, "HOW MUCH OF EACH");
             // One rule with the keymodes (user 2026-11-14): share = slider × eligible maps when following counts, else slider.
@@ -674,6 +683,14 @@ impl App {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| draw_badges(ui, c));
                     });
                 });
+                // its download and import, under its text; Next stops it
+                if let Some((_, text, progress, failed)) = self.delivery.as_ref().filter(|d| c.identity().as_deref() == Some(d.0.as_str())) {
+                    if *failed {
+                        ui.label(RichText::new(text).small().color(fmt::RED));
+                    } else {
+                        ui.add(egui::ProgressBar::new(progress.unwrap_or(0.)).text(RichText::new(text).small()).animate(progress.is_none()).desired_height(14.));
+                    }
+                }
             });
         } else if !v.target_msg.is_empty() {
             theme::block(ui, &[(vec![fmt::plain(v.target_msg.clone())], 1)], v.target_tip.as_deref());
@@ -1095,6 +1112,7 @@ mod tests {
         let text = |c: Pick| badges(&c).into_iter().map(|b| b.0).collect::<Vec<_>>().join(" ");
         assert_eq!(text(Pick { installed: true, ..Pick::default() }), "");
         assert_eq!(text(Pick { installed: false, ..Pick::default() }), "WEB");
+        assert_eq!(text(Pick { installed: true, source_web: true, ..Pick::default() }), "WEB", "a downloaded pick keeps it");
         let convert = Pick { convert_of: Some("src".into()), source_keys: 7, keys: 10, ..Pick::default() };
         assert_eq!(text(Pick { installed: true, ..convert.clone() }), "7K→10K", "an imported convert stays one");
         assert_eq!(text(Pick { source_web: true, ..convert }), "WEB 7K→10K");

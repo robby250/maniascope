@@ -104,8 +104,9 @@ impl PerNote {
 
     /// The per-note forecast's accuracy (lazer units) for chart `sha` at `rate`, played at `now` (days); None without enough
     /// history (three solved plays of the keymode in the window) or without the chart file.
-    pub fn accuracy(&self, db: &Db, sha: &str, rate: f64, stable: bool, now: f64) -> Option<f64> {
-        let c = ms_calc::chart::parse(&std::fs::read(chart_path(Some(sha))?).ok()?).ok()?;
+    /// `data`: the chart's bytes when they aren't in the game's store yet (a convert not yet imported); else read from there.
+    pub fn accuracy(&self, db: &Db, sha: &str, data: Option<&[u8]>, rate: f64, stable: bool, now: f64) -> Option<f64> {
+        let c = ms_calc::chart::parse(&match data { Some(d) => d.to_vec(), None => std::fs::read(chart_path(Some(sha))?).ok()? }).ok()?;
         let past = self.history(db, now - WINDOW - 1., now).ok()?;
         let theta = self.forecast(&past, now, c.keys as i64, sha)?;
         let d = self.net.difficulties(&chart_records(&c, rate).ok()?, place(&past, now), !stable);

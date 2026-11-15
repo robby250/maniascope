@@ -177,6 +177,8 @@ pub fn density(d: Density, parts: &Parts, series: &Series, total: &[f64], ev: &E
     let ratio = |a: Vec<f64>, b: Vec<f64>| -> Vec<f64> { (0..nb).map(|i| if b[i] > 0.0 { a[i] / b[i] } else { 0.0 }).collect() };
     let at = |v: &[f64], i: usize| v.get(i).copied().unwrap_or(0.0);
     match d {
+        // quad texture's embedded minijacks are its own (user 2026-11-14: Doof Doof Untz Untz reads Quadstream, then Minijacks)
+        Density::PerRow(P::mj) => ratio(w(P::mj), w(P::rows)).into_iter().enumerate().map(|(i, x)| x * (1.0 - at(ev.quad, i))).collect(),
         Density::PerRow(p) => ratio(w(p), w(P::rows)),
         Density::Ratio(p, q) => ratio(w(p), w(q)),
         Density::Share(p) | Density::Interleaved(p) => {
@@ -244,7 +246,11 @@ pub fn slice(series: &mut Series, parts: &Parts, total: &[f64], ev: &Evidence, k
     // out of Stream: 1.9.0 moved jack bursts out of every jack part); within its own family it stays layered.
     let family = |s: Sk| crate::taxonomy::of(s).family;
     for &base in &bases {
-        let cut: Vec<f64> = (0..nb).map(|b| slices.iter().filter(|s| !s.2 && s.1.contains(&base) && family(s.0) != family(base)).map(|s| s.3[b]).sum::<f64>().min(1.0)).collect();
+        let over: Vec<&[f64]> = slices.iter().filter(|s| !s.2 && s.1.contains(&base) && family(s.0) != family(base)).map(|s| &s.3[..]).collect();
+        if over.is_empty() {
+            continue;
+        }
+        let cut: Vec<f64> = (0..nb).map(|b| over.iter().map(|s| s[b]).sum::<f64>().min(1.0)).collect();
         if cut.iter().any(|c| *c > 0.0) {
             series.get_mut(base).iter_mut().zip(&cut).for_each(|(x, c)| *x *= 1.0 - c);
         }

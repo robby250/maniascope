@@ -131,6 +131,7 @@ pub struct App {
     pub units: Shown,
     pub result: Option<(Vec<Line>, String)>,
     pub status_text: String,
+    pub delivery: Option<(String, String, Option<f32>, bool)>, // the pick on its way into osu!: identity, text, share, failed
     pub bg_progress: Option<(usize, usize)>,
     pub blocker: Option<String>,
     pub bg_main: bool, // the worker's counted job also shows in the main window: not a few new maps (user 2026-11-13)
@@ -187,7 +188,7 @@ impl App {
             s, rx, list_open, mail: mail.clone(), q: q.clone(), halt: halt.clone(), play: play.clone(), busy: busy.clone(), game: game.clone(), client_name: Arc::new(Mutex::new(client.clone())), viewer: Arc::default(), db,
             obs: Obs { note: "starting…".into(), ..Obs::default() }, shown: None, pending: None, generation: 0, requested: None, live: None, card: None, card_note: None,
             views: MODES.into_iter().map(|m| (m, view())).collect(), stats: None, stats_open: false, stats_wait: None, chips_open: HashSet::new(), revision: 0, selection_id: 0,
-            units: Shown { client, miss_ratio }, result: None, status_text: String::new(), bg_progress: None, bg_main: false, blocker: None, foot: String::new(), recs_opened: None, open: Open::default(), save_at: None, page: None, tracking, debug,
+            units: Shown { client, miss_ratio }, result: None, status_text: String::new(), delivery: None, bg_progress: None, bg_main: false, blocker: None, foot: String::new(), recs_opened: None, open: Open::default(), save_at: None, page: None, tracking, debug,
             web: Default::default(), resized: None, extra: 0., clipboard: arboard::Clipboard::new().ok(), flash: None, profile_asked: false, keys_checked: None,
         };
         app.auto_keys(true);
@@ -406,6 +407,7 @@ impl App {
                 }
             }
             Out::Stats(data) => self.stats = Some(data),
+            Out::Delivery { identity, text, progress, failed } => self.delivery = (!text.is_empty()).then_some((identity, text, progress, failed)),
             Out::Status { text, progress, blocking, learning } => {
                 if blocking {
                     self.blocker = Some(text.clone());

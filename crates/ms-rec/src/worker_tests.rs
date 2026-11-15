@@ -691,3 +691,15 @@ fn a_closed_playlist_window_builds_and_publishes_nothing() {
     assert!(l.w.slot.request.lock().unwrap().is_some());
     assert_eq!(pools(&l).len(), 1);
 }
+
+#[test]
+fn a_menu_convert_is_taken_out_of_the_queue_with_its_own_map_and_the_rest_keep_their_order() {
+    let q = Queue::default();
+    q.put(Task::Publish);
+    q.put(Task::ConvertSelected { path: "a.osu".into(), keys: 7 });
+    q.put(Task::Refit);
+    let taken = q.take(|t| matches!(t, Task::ConvertSelected { .. }));
+    assert!(matches!(taken.as_slice(), [Task::ConvertSelected { path, keys: 7 }] if path.as_os_str() == "a.osu"));
+    assert!(matches!(q.get(Duration::ZERO), Some(Task::Publish)));
+    assert!(matches!(q.get(Duration::ZERO), Some(Task::Refit)));
+}

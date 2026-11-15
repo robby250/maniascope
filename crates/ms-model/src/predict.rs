@@ -313,6 +313,8 @@ pub struct PredModel {
     pub glob: f64,
     pub sd_all: f64,
     pub shape: HashMap<i64, (Vec<f64>, Vec<f64>, Vec<f64>)>, // keys → (zmean, zscale, beta)
+    /// keys → (centre ln rating, personal steepness): log miss per ln rating beyond the population curve
+    pub steep: HashMap<i64, (f64, f64)>,
     pub recent: HashMap<i64, (Vec<f64>, Vec<f64>, Vec<f64>)>,
     pub aff: HashMap<String, (f64, f64)>,
     pub rate_aff: HashMap<String, (Vec<f64>, Vec<f64>, Vec<f64>)>, // chart → (log rates, values, counts)
@@ -328,6 +330,9 @@ pub struct PredModel {
     pub slopes: Arc<Slopes>,
     pub modes: ByKeys<Mode>,
     pub fallback: Mode,
+    /// Vibro charts are mashed, so they get their own personal fit (user 2026-11-14: "can't vibro charts have their own
+    /// personal vibro fit"): own level on them and their own chart memory; `personal` reads a vibro chart from it.
+    pub vibro: Option<Arc<PredModel>>,
 }
 
 /// One chart of a builder request.
@@ -345,11 +350,11 @@ pub struct ScoreJob {
 impl PredModel {
     /// A population-only model: `base_of` for many plays.
     pub fn population(c: Arc<Consts>, pop: Arc<Pop>) -> PredModel {
-        PredModel { c, pop, levels: HashMap::default(), level: HashMap::default(), glob: 0., sd_all: 0., shape: HashMap::default(),
+        PredModel { c, pop, levels: HashMap::default(), level: HashMap::default(), glob: 0., sd_all: 0., shape: HashMap::default(), steep: HashMap::default(),
                     recent: HashMap::default(), aff: HashMap::default(), rate_aff: HashMap::default(), rate_support: HashMap::default(),
                     rate_bandwidth: [(0, 1.)].into_iter().collect(), tau2_c: 0., kap_c: 1., shown: (0., 1.), judged_ln: 0., retry: 0.,
                     sd_att: HashMap::default(), slopes: Arc::new(Slopes::default()), modes: ByKeys::default(),
-                    fallback: Mode { tau: 8., log_rate: false, amplitudes: Vec::new(), session: 0., fatigue: 0. } }
+                    fallback: Mode { tau: 8., log_rate: false, amplitudes: Vec::new(), session: 0., fatigue: 0. }, vibro: None }
     }
 
     /// A fitted Personal and its warm-up model.
@@ -359,20 +364,23 @@ impl PredModel {
         let rate_aff = fit.rate_aff.iter().map(|(c, a)| {
             (c.clone(), (a.iter().map(|x| x.0.ln()).collect(), a.iter().map(|x| x.1).collect(), a.iter().map(|x| x.2).collect()))
         }).collect();
-        PredModel { c, pop, levels, level, glob: fit.glob, sd_all: fit.sd_all, shape, recent: fit.recent.clone(), aff: fit.aff.clone(), rate_aff,
+        PredModel { c, pop, levels, level, glob: fit.glob, sd_all: fit.sd_all, shape, steep: fit.steep.clone(), recent: fit.recent.clone(), aff: fit.aff.clone(), rate_aff,
                     rate_support: fit.rate_support.clone(), rate_bandwidth: fit.rate_bandwidth.iter().map(|(&k, &v)| (k, v)).collect(), tau2_c: fit.tau2_c,
                     kap_c: fit.kap_c, shown, judged_ln, retry: fit.retry, sd_att: fit.sd_att.clone(), slopes: Arc::new(warmup.slopes.clone()),
-                    modes: warmup.modes.iter().map(|(&k, v)| (k, v.clone())).collect(), fallback: warmup.fallback.clone() }
+                    modes: warmup.modes.iter().map(|(&k, v)| (k, v.clone())).collect(), fallback: warmup.fallback.clone(), vibro: None }
     }
 
     /// nps.candidates_from's scoring of `jobs` into the request's Choices. `store` keeps the charts' features read
     /// across calls; its owner drops a chart whenever the chart's analyses change.
     #[allow(clippy::too_many_arguments)]
     pub fn score_into(&self, choices: &mut Choices, session: &PredSession, store: &FeatStore, jobs: &[ScoreJob],
-                      selected: &[String], tuning: &crate::skills::Tuning, target: f64, rates: (f64, f64), skills: bool, wants_vibro: bool, preference: bool, nps_weight: f64, now: f64) -> Res<()> {
-        let ctx = Ctx { target, rates, warm: session.warm, skills, wants_vibro, preference, version: store.version, nps_weight };
-        let sel: Vec<Selection> = store.trees.iter().map(|t| t.select(selected, tuning)).collect();
-        let included: Vec<&String> = selected.iter().filter(|k| !k.starts_with('!')).collect();
+                      selected: &[String], tuning: &crate::skills::Tuning, target: f64, rates: (f64, f64), skills: bool, preference: bool, nps_weight: f64, now: f64) -> Res<()> {
+        let wants_special = [0, 1].map(|t| crate::skills::wants_special(selected, t));
+        let ctx = Ctx { target, rates, warm: session.warm, skills, wants_special, preference, version: store.version, nps_weight };
+        // each tree reads its own choices (`skills::SCOPES`)
+        let views: Vec<Vec<String>> = (0..store.trees.len()).map(|t| crate::skills::for_tree(selected, t)).collect();
+        let sel: Vec<Selection> = store.trees.iter().zip(&views).map(|(t, v)| t.select(v, tuning)).collect();
+        let included: Vec<Vec<&String>> = views.iter().map(|v| v.iter().filter(|k| !k.starts_with('!')).collect()).collect();
         static EMPTY: Vec<Entry> = Vec::new();
         let entries = |sha: &str| store.charts.get(sha).unwrap_or(&EMPTY);
         // Every core but two (~0.4 s on one thread for 25k charts).
@@ -387,7 +395,8 @@ impl PredModel {
                             let entry = entries(&j.sha).iter().find(|x| x.offer.rate == rate).unwrap();
                             let feats = entry.feats.as_ref().unwrap();
                             let matched = entry.skill.as_ref().map_or_else(Vec::new, |s| {
-                                s.matched(&sel[usize::from(feats.keys != 4)]).into_iter().map(|i| included[i].clone()).collect()
+                                let t = crate::skills::tree_index(feats.keys);
+                                s.matched(&sel[t]).into_iter().map(|i| included[t][i].clone()).collect()
                             });
                             let practice = if skills {
                                 let tree = &store.trees[usize::from(feats.keys != 4)];
@@ -413,22 +422,33 @@ impl PredModel {
         Ok(())
     }
 
+    /// The tab's accuracy target for this chart. A vibro chart aims where the player's vibro level puts a chart as hard as the
+    /// ones the target picks elsewhere (user 2026-11-14: "automatic from my vibro plays … adapt in time as i get better"): the
+    /// levels are fitted against each play's prediction, so harder offers don't lower it (no spiral from offers that went
+    /// badly), and it rises to the tab's target as the vibro level reaches the rest.
+    pub fn target_for(&self, f: &Feats, target: f64) -> f64 {
+        match self.vibro.as_ref().filter(|_| self.c.vibro_chart(f)) {
+            Some(v) => 1. - (1. - target) * (v.level_of(f.keys) - self.level_of(f.keys)).max(0.).exp(),
+            None => target,
+        }
+    }
+
     /// nps.central_target.
     pub fn central_target(&self, target: f64, warm: bool) -> f64 {
-        let ctx = Ctx { target, rates: (MIN_RATE, MAX_RATE), warm, skills: false, wants_vibro: false, preference: false, version: 0, nps_weight: 0. };
+        let ctx = Ctx { target, rates: (MIN_RATE, MAX_RATE), warm, skills: false, wants_special: [[false; 2]; 2], preference: false, version: 0, nps_weight: 0. };
         ctx.central()
     }
 
     /// nps.eligible: a prediction inside the tab's accuracy band.
     pub fn eligible(&self, p: &Prediction, target: f64, warm: bool) -> bool {
-        let ctx = Ctx { target, rates: (MIN_RATE, MAX_RATE), warm, skills: false, wants_vibro: false, preference: false, version: 0, nps_weight: 0. };
+        let ctx = Ctx { target, rates: (MIN_RATE, MAX_RATE), warm, skills: false, wants_special: [[false; 2]; 2], preference: false, version: 0, nps_weight: 0. };
         ctx.eligible(p)
     }
 
     /// nps.Builder.initial_value: a known chart's density at the rate that meets the target, for analysis order.
     pub fn initial_value(&self, store: &FeatStore, job: &ScoreJob, rate: f64, session: &PredSession, target: f64) -> Res<f64> {
         let (Some(f), Some((notes, length))) = (store.feats(&job.sha, rate), store.size(&job.sha, rate)) else { return Ok(0.) };
-        let ctx = Ctx { target, rates: (MIN_RATE, MAX_RATE), warm: session.warm, skills: false, wants_vibro: false, preference: false, version: store.version, nps_weight: 0. };
+        let ctx = Ctx { target: self.target_for(f, target), rates: (MIN_RATE, MAX_RATE), warm: session.warm, skills: false, wants_special: [[false; 2]; 2], preference: false, version: store.version, nps_weight: 0. };
         let p = self.predict(f, &job.key, job.bid, rate, session)?;
         let need = rate * (ctx.rate_shift(&p, ctx.central()) / p.slope).exp();
         Ok(notes / length.max(1000.) * need.min(MAX_RATE) * if need < MIN_RATE * 0.85 { 0.05 } else { 1. })
@@ -449,12 +469,18 @@ struct Offer {
     nps: f64,
     play_span: Option<f64>,
     drill: f64,
-    vibro: bool,
     family: String, // nps family (the chart's shape hash)
     description: String,
 }
 
 impl Offer {
+    /// 0 Vibro, 1 Mash: the card's lead skill when it is one of them. Not a map to play for its rating: a 7-key chord re-struck
+    /// for two minutes (user 2026-11-14, offered 96 %, played 72 %) had no single-column runs for the structure's vibro test.
+    fn special(&self) -> Option<usize> {
+        let lead = self.description.split(" / ").next().unwrap_or("");
+        ["Vibro", "Mash"].iter().position(|s| *s == lead)
+    }
+
     fn of(rate: f64, f: &Dict) -> Offer {
         // None reads as missing: fields of rates the filter skips first can be None.
         let num = |d: Option<&Dict>, k: &str| d.and_then(|d| d.get(k)).filter(|v| !v.is_none()).map(Val::f);
@@ -467,7 +493,6 @@ impl Offer {
             nps: num(st, "nps").unwrap_or(0.),
             play_span: num(st, "play_span"),
             drill: num(st, "drill").unwrap_or(0.),
-            vibro: st.and_then(|d| d.get("vibro_focused")).is_some_and(Val::truthy),
             family: st.and_then(|d| d.get("family")).filter(|v| !v.is_none()).map_or_else(String::new, text),
             // ponytail: descriptions in feats computed before 2026-11-02 still say "Delay" (now one Stream family) until the
             // next calculator run rewrites them; renamed here instead of recomputing every chart.
@@ -667,9 +692,10 @@ impl FeatStore {
     pub fn metadata(&self, sha: &str, rate: f64, selected: &[String], tuning: &crate::skills::Tuning, practice: bool, model: &PredModel) -> Option<crate::choices::Metadata> {
         let e = self.charts.get(sha)?.iter().find(|e| e.offer.rate == rate)?;
         let feats = e.feats.as_ref()?;
-        let tree = usize::from(feats.keys != 4);
-        let sel = self.trees[tree].select(selected, tuning);
-        let included: Vec<&String> = selected.iter().filter(|k| !k.starts_with('!')).collect();
+        let tree = crate::skills::tree_index(feats.keys);
+        let view = crate::skills::for_tree(selected, tree);
+        let sel = self.trees[tree].select(&view, tuning);
+        let included: Vec<&String> = view.iter().filter(|k| !k.starts_with('!')).collect();
         let skill = e.skill.as_ref().filter(|_| practice);
         Some(crate::choices::Metadata {
             family: e.offer.family.clone(), group: groups()[model.group(feats)].0.to_string(), nps: e.offer.nps, length: e.offer.play_span.unwrap_or(e.offer.length / 1000.) / rate,
@@ -728,7 +754,7 @@ struct Ctx {
     rates: (f64, f64), // the tab's HT/DT range: offered rates and proposals stay inside it
     warm: bool,
     skills: bool,
-    wants_vibro: bool,
+    wants_special: [[bool; 2]; 2], // per tree: [Vibro, Mash] picked in a Skills playlist
     preference: bool,
     version: i64,
     nps_weight: f64, // a custom playlist's variety ↔ NPS slider: how much a map's NPS adds to its skill value
@@ -951,7 +977,12 @@ fn unmash(acc: f64) -> f64 {
 impl PredModel {
     /// `p` moved halfway towards another forecast's accuracy `acc` (the personal per-note forecast, plan 2026-11-13b S7: the
     /// average of both beat either on the walk-forward audit), every shown accuracy moved by the same step on the model scale.
+    /// A vibro chart keeps its own fit's: the per-note net reads notes hit one by one, and vibro is mashed (user 2026-11-15:
+    /// Death Melody listed near the target, set at 78.4 % once blended).
     pub fn blend(&self, p: &mut Prediction, f: &Feats, acc: f64) {
+        if self.c.vibro_chart(f) {
+            return;
+        }
         let (a, bb, judged) = (self.shown.0, self.shown.1, self.judged_ln * f.z_tail[0]);
         let y = |acc: f64| ((1. - unmash(acc)).max(1e-9).ln() - a - judged) / bb;
         let shown = |y: f64| mash_floor(0f64.max(1f64.min(1. - (20f64.min(a + bb * y + judged)).exp())));
@@ -983,6 +1014,8 @@ impl PredModel {
         if rated.is_empty() {
             return Ok(None);
         }
+        let own = Ctx { target: self.target_for(rated[0].1, ctx.target), ..*ctx };
+        let ctx = &own;
         let target = ctx.central();
         // Rates whose last finish (14 days) missed the target by more than MISS_TOL: not offered again, the next rate
         // comes from that result (user 2026-10-13: "not get picked exactly the same rate even though it's not accurate").
@@ -1046,7 +1079,7 @@ impl PredModel {
         // at 94.9 % for a 96 % target, because the denser rate scored higher anywhere in the band). Value breaks ties.
         let mut best: Option<(usize, f64)> = None;
         for (i, &(o, _, ref e, s)) in rated.iter().enumerate() {
-            if missed(o.rate).is_some() || !ctx.eligible(e) || (o.vibro && !(ctx.skills && ctx.wants_vibro)) {
+            if missed(o.rate).is_some() || !ctx.eligible(e) || o.special().is_some_and(|i| !(ctx.skills && ctx.wants_special[crate::skills::tree_index(f.keys)][i])) {
                 continue;
             }
             if let Some(v) = ctx.value(o, s, o.nps, e, e.acc_mid, o.rate, target) {
@@ -1184,10 +1217,16 @@ impl PredModel {
 
     /// Personal.predict → (mu, model sd, attempt sd)
     pub fn personal(&self, f: &Feats, chart: &str, b: Option<i64>, rate: f64) -> (f64, f64, f64) {
+        if let Some(v) = self.vibro.as_ref().filter(|_| self.c.vibro_chart(f)) {
+            return v.personal(f, chart, b, rate);
+        }
         let k = f.keys;
         let (base, n_mb) = self.base_of(f, b, rate, self.levels.get(&k).copied());
         let (l, lv, sd) = self.level.get(&k).copied().unwrap_or((self.glob + 0.3, 0.25, self.sd_all));
         let mut mu = l + base;
+        if let Some(&(centre, steep)) = self.steep.get(&k) {
+            mu += steep * (f.overall.max(0.05).ln() - centre);
+        }
         if let Some((zm, zs, beta)) = self.shape.get(&k) {
             let z = self.zvec(f, mu);
             let mut dot = 0.;
@@ -1385,9 +1424,9 @@ mod model_tests {
     fn model(pop: Pop) -> PredModel {
         let c = Arc::new(Consts::standard());
         PredModel { c, pop: Arc::new(Pop { tau2: 0.1, kappa: 3., knee: 4., ..pop }), levels: HashMap::default(), level: [(7, (-3., 0.01, 0.2))].into_iter().collect(), glob: -3., sd_all: 0.2,
-                    shape: HashMap::default(), recent: HashMap::default(), aff: [("known".to_string(), (-0.6, 10.))].into_iter().collect(), rate_aff: HashMap::default(),
+                    shape: HashMap::default(), steep: HashMap::default(), recent: HashMap::default(), aff: [("known".to_string(), (-0.6, 10.))].into_iter().collect(), rate_aff: HashMap::default(),
                     rate_support: [("known".to_string(), (1., 1.))].into_iter().collect(), rate_bandwidth: ByKeys { map: [(0, 0.18), (7, 0.12)].into_iter().collect() }, tau2_c: 0.12, kap_c: 2.,
-                    shown: (0.75f64.ln(), 1.), judged_ln: 0., retry: 0., sd_att: [(7, 0.2)].into_iter().collect(), slopes: Arc::new(Slopes::default()), modes: ByKeys::default(), fallback: Mode::default() }
+                    shown: (0.75f64.ln(), 1.), judged_ln: 0., retry: 0., sd_att: [(7, 0.2)].into_iter().collect(), slopes: Arc::new(Slopes::default()), modes: ByKeys::default(), fallback: Mode::default(), vibro: None }
     }
 
     fn plain(m: &PredModel) -> Feats {
@@ -1401,6 +1440,32 @@ mod model_tests {
         assert!(c.vibro_chart(&with(0.6, 9.)), "a vibro dan song");
         assert!(!c.vibro_chart(&with(0.26, 27.6)), "REFORM Iota: a quarter vibro, dense rice besides");
         assert!(!c.vibro_chart(&with(0.01, 5.)), "almost no runs"); // VIBRO_ONLY .02 since calc bc901ee5b05a
+    }
+
+    #[test]
+    fn a_vibro_chart_reads_the_vibro_fit_and_other_charts_the_ability_fit() {
+        let mut m = model(Pop::default());
+        let mut own = model(Pop::default());
+        own.glob = -5.;
+        own.level.clear();
+        let own = Arc::new(own);
+        m.vibro = Some(own.clone());
+        let plain = plain(&m);
+        let mut vibro = plain.clone();
+        vibro.vibro = (1., 0.);
+        assert!(m.c.vibro_chart(&vibro) && !m.c.vibro_chart(&plain));
+        assert_eq!(m.personal(&plain, "known", None, 1.).0, model(Pop::default()).personal(&plain, "known", None, 1.).0);
+        assert_eq!(m.personal(&vibro, "known", None, 1.), own.personal(&vibro, "known", None, 1.));
+        assert!(m.personal(&vibro, "known", None, 1.).0 < m.personal(&plain, "known", None, 1.).0 - 1.);
+        // a vibro level 0.5 log-miss under the rest aims vibro charts at 1 − 4 % × e^0.5
+        let mut own = model(Pop::default());
+        own.level.insert(7, (m.level_of(7) + 0.5, 0.01, 0.2));
+        m.vibro = Some(Arc::new(own));
+        assert!((m.target_for(&vibro, 0.96) - (1. - 0.04 * 0.5f64.exp())).abs() < 1e-12 && m.target_for(&plain, 0.96) == 0.96);
+        // the per-note forecast leaves a vibro chart alone
+        let mut p = Prediction { acc_mid: 0.96, ..Prediction::default() };
+        m.blend(&mut p, &vibro, 0.7);
+        assert_eq!(p.acc_mid, 0.96);
     }
 
     #[test]
@@ -1594,7 +1659,7 @@ mod model_tests {
 #[cfg(test)]
 mod skill_tests {
     use super::*;
-    use crate::skills::{demanded, dimensions, feat_trees, normalize, sliders, tree, wants_vibro};
+    use crate::skills::{demanded, dimensions, feat_trees, normalize, sliders, tree, wants_special};
 
     fn feature(keys: i64, sk: &[(&str, f64)]) -> Dict {
         let mut d = Dict::new();
@@ -1662,7 +1727,7 @@ mod skill_tests {
         assert_eq!(strength(&hard, &["!sv"]), 0.);
         assert_eq!(strength(&hard, &["chordstream", "!sv"]), 0.);
         assert_eq!(strength(&feature(7, &[("vibro", 1.)]), &["!vibro"]), 0.); // Vibro its own row since 2026-11-14
-        assert!(!wants_vibro(&strings(&["jackspeed"])));
+        assert!(wants_special(&strings(&["jackspeed"]), 0) == [false; 2]);
     }
 
     #[test]
@@ -1721,7 +1786,7 @@ mod skill_tests {
             assert!(wide.contains(&n), "{n}");
         }
         assert!(!["Chords", "Delay", "Bracket"].iter().any(|n| four.contains(n) || wide.contains(n)));
-        assert!(wants_vibro(&strings(&["vibro"])) && wants_vibro(&strings(&["jackspeed/vibro"])) && !wants_vibro(&strings(&["jackspeed"])));
+        assert!(wants_special(&strings(&["vibro"]), 0)[0] && wants_special(&strings(&["jackspeed/vibro"]), 1)[0] && wants_special(&strings(&["mash"]), 0) == [false, true]);
         assert!(!normalize(&strings(&["trill"])).is_empty() && !normalize(&strings(&["trill"])).contains(&"trill".to_string()));
     }
 
@@ -1779,7 +1844,7 @@ mod target_tests {
     use super::*;
 
     fn ctx(target: f64, warm: bool) -> Ctx {
-        Ctx { target, rates: (MIN_RATE, MAX_RATE), warm, skills: false, wants_vibro: false, preference: false, version: 1, nps_weight: 0. }
+        Ctx { target, rates: (MIN_RATE, MAX_RATE), warm, skills: false, wants_special: [[false; 2]; 2], preference: false, version: 1, nps_weight: 0. }
     }
 
     fn prediction(acc: f64, opening: f64) -> Prediction {
@@ -1788,7 +1853,7 @@ mod target_tests {
 
     #[test]
     fn density_counts_by_the_keymodes_warm_up_not_the_family_just_played() {
-        let offer = Offer { rate: 1., notes: 2000., length: 150_000., version: None, nps: 16., play_span: Some(150.), drill: 0., vibro: false,
+        let offer = Offer { rate: 1., notes: 2000., length: 150_000., version: None, nps: 16., play_span: Some(150.), drill: 0.,
                             family: String::new(), description: String::new() };
         let value = |activation: f64, warmth: f64| {
             let p = Prediction { acc_mid: 0.96, sdm: 0.4, activation, warmth, ..prediction(0.96, 0.96) };
@@ -1828,9 +1893,15 @@ mod target_tests {
 
     #[test]
     fn lazer_rates_half_to_double_are_offerable() {
-        let offer = |rate| Offer { rate, notes: 500., length: 60000., version: Some(1), nps: 8., play_span: None, drill: 0., vibro: false, family: String::new(), description: String::new() };
+        let offer = |rate| Offer { rate, notes: 500., length: 60000., version: Some(1), nps: 8., play_span: None, drill: 0., family: String::new(), description: String::new() };
         assert!([0.5, 0.55, 1.8, 2.0].iter().all(|&r| offer(r).static_ok(1)));
         assert!(!offer(0.45).static_ok(1) && !offer(2.05).static_ok(1));
+    }
+
+    #[test]
+    fn charts_led_by_vibro_or_mash_are_special() {
+        let led = |d: &str| Offer { rate: 1., notes: 500., length: 60000., version: Some(1), nps: 8., play_span: None, drill: 0., family: String::new(), description: d.into() }.special();
+        assert_eq!((led("Vibro"), led("Mash / Stream"), led("Chordjack / Mash"), led("")), (Some(0), Some(1), None, None));
     }
 
     #[test]

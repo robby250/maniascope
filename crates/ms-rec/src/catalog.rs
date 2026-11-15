@@ -157,7 +157,7 @@ pub struct Pick {
     pub generated_at: f64,
     pub convert_of: Option<String>,
     pub source_keys: i64,
-    pub source_web: bool,
+    pub source_web: bool, // from the website: a convert's source, or the map itself once its download is installed (it keeps its WEB badge)
     pub set_id: Option<i64>,
 }
 

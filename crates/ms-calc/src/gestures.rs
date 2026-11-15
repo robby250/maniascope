@@ -297,7 +297,7 @@ fn same_chord(rows: &Rows, masks: &[u32], clean: &[bool]) -> Vec<f64> {
 }
 
 /// [vibro, vibro_easy, vibro_control, vibro_sustain, vibro_locked, vibro_shift] per note.
-fn vibro(notes: &Notes, rows: &Rows, run_full: f64) -> [Vec<f64>; 6] {
+fn vibro(notes: &Notes, rows: &Rows, k: &crate::params::Knobs) -> [Vec<f64>; 6] {
     let n = rows.len();
     let nn = notes.t.len();
     let mut res: [Vec<f64>; 6] = std::array::from_fn(|_| vec![0.0; nn]);
@@ -320,7 +320,7 @@ fn vibro(notes: &Notes, rows: &Rows, run_full: f64) -> [Vec<f64>; 6] {
             continue;
         }
         connected[r] = true;
-        speed[r] = smooth(1.0 / gap, 9.0, 13.0);
+        speed[r] = 1.0 / gap; // re-strikes per second; how fast is fast depends on the run's length (below)
         similarity[r] = shared as f64 / (masks[r] | masks[r - 1]).count_ones() as f64;
     }
     if !speed.iter().any(|&x| x != 0.0) {
@@ -343,8 +343,15 @@ fn vibro(notes: &Notes, rows: &Rows, run_full: f64) -> [Vec<f64>; 6] {
         let same = similarity[start..end].iter().filter(|&&x| x == 1.0).count() as f64 / (end - start) as f64;
         // vibro is sustained: the dans' fast runs hold 19–500 rows (median), short bursts of 4–5 are chordjack (user 2026-11-14:
         // Megaburn, Go Bananas "kinda slow and too short bursts for vibro")
+        // fast from the run's own vibro speed (`structure::vibro_gap`, one rule with the column runs; a fixed 9 Hz read short
+        // bursts as vibro: user 2026-11-14), fully at 1.1× it (165 BPM
+        // barely, 176 fully: user vibro ~170–180; "barely vibro" may show 2nd or 3rd)
+        let lo = 1.0 / crate::structure::vibro_gap((end - start + 1) as f64, k);
+        for x in &mut speed[start..end] {
+            *x = smooth(*x, lo, 1.1 * lo);
+        }
         let fast = speed[start..end].iter().filter(|&&x| x > 0.0).count();
-        let sustained = smooth((fast + 1) as f64, 4.0, run_full);
+        let sustained = smooth((fast + 1) as f64, 4.0, k.VIBRO_RUN);
         for r in start..end {
             if speed[r] == 0.0 {
                 continue;
@@ -437,7 +444,7 @@ pub fn analyse(chart: &Chart, rate: f64, k: &crate::params::Knobs) -> Analysis {
     } else {
         js.pop().unwrap()
     };
-    let vib = vibro(&notes, &rows, k.VIBRO_RUN);
+    let vib = vibro(&notes, &rows, k);
     let zeros = vec![0.0f64; nn];
     // per-note values in SERIES order
     let per_note: [&Vec<f64>; 14] = [
