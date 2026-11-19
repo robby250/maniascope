@@ -154,7 +154,7 @@ fn the_saved_list_is_published_before_the_background_import_can_finish() {
 }
 
 #[test]
-fn the_card_names_a_pending_rate_a_failure_and_unusable_mods() {
+fn the_card_names_a_pending_rate_a_failure_and_the_mods_it_leaves_out() {
     let w = world("card", sloped, 240);
     let r = run(&w, false);
     let file = w.dir.join("chart.osu");
@@ -163,14 +163,16 @@ fn the_card_names_a_pending_rate_a_failure_and_unusable_mods() {
     r.wait("started", |m| matches!(m, Out::Status { text, .. } if text.is_empty()).then_some(()));
     let valid = w.dir.join("valid.osu");
     std::fs::write(&valid, chart_bytes(40)).unwrap();
-    r.q.put(Task::Selected { path: Some(valid), rate: Some(1.25), mods: Some(dt.clone()) });
+    r.q.put(Task::Selected { path: Some(valid.clone()), rate: Some(1.25), mods: Some(dt.clone()) });
     r.card("pending", |_, n| n.as_deref() == Some("Calculating prediction at 1.25×…"));
     r.q.put(Task::Selected { path: Some(file.clone()), rate: Some(1.25), mods: Some(dt.clone()) });
     r.card("failed", |_, n| n.as_deref().is_some_and(|n| n.starts_with("Prediction unavailable at 1.25×: ")));
     r.q.put(Task::Selected { path: Some(file.clone()), rate: None, mods: None });
     r.card("unknown", |_, n| n.as_deref().is_some_and(|n| n.contains("Waiting for osu!")));
-    r.q.put(Task::Selected { path: Some(file), rate: Some(1.25), mods: Some(vec![json!({"acronym": "CS"})]) });
-    r.card("mods", |_, n| n.as_deref() == Some("Prediction unavailable for these mods"));
+    // user 2026-11-19: "when auto is on it should still say the expected acc without auto"
+    r.q.put(Task::Selected { path: Some(valid), rate: Some(1.), mods: Some(vec![json!({"acronym": "AT"}), json!({"acronym": "HO"})]) });
+    let card = r.card("mods", |c, _| c.is_some()).0.unwrap();
+    assert_eq!((card.mods.join(" "), card.without.join(" ")), ("HO".to_string(), "AT".to_string()));
 }
 
 #[test]

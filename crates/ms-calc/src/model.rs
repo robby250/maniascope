@@ -64,13 +64,14 @@ pub fn endurance_of(series: &[Vec<f64>], bin_seconds: f64, ref_q: f64) -> ((f64,
                 summaries.push(0.0);
                 continue;
             }
+            let rising = (-bin_seconds / 45.0).exp();
             let (mut state, mut weighted, mut total) = (0.0f64, 0.0f64, 0.0f64);
             let mut track = Vec::with_capacity(values.len());
             for &v in values {
                 let load = 3f64.min(0f64.max(v / peak));
                 let target = 0f64.max(load - 0.2).powf(1.3);
-                let tau = if target > state { 45.0 } else { 7.0 + 20.0 * 1f64.min(load) };
-                let decay = (-bin_seconds / tau).exp();
+                // rising: one decay for the whole chart, made once (it called exp per bin)
+                let decay = if target > state { rising } else { (-bin_seconds / (7.0 + 20.0 * 1f64.min(load))).exp() };
                 state = target + (state - target) * decay;
                 track.push(state);
                 weighted += v * state;

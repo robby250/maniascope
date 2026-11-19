@@ -7,6 +7,7 @@ pub mod o2jam;
 pub mod engine;
 pub mod evidence;
 pub mod history;
+pub mod modcharts;
 pub mod navigation;
 pub mod pernote;
 pub mod pp;

@@ -90,15 +90,20 @@ impl PerNote {
         let past = self.history(db, from - 1., f64::INFINITY)?;
         for (key, played, sha, rate, stats, mods, client, n) in &todo {
             let solved = (|| {
-                let (t, rate, stats) = (days(played.as_deref()?)?, (*rate)?, parse_stats(stats.as_deref()?)?);
+                // a modded play is solved on the chart as played; an unseeded Random's columns are unknown
+                let m = evidence_mods(mods.as_deref()).filter(|m| m.random != Some(None))?;
+                let (t, rate, stats) = (days(played.as_deref()?)?, rate.or(m.rate)?, parse_stats(stats.as_deref()?)?);
                 let acc = acc_lazer(&stats);
-                // Random moves the columns the records read; short and failed plays aren't evidence (evidence_rows' rule)
-                if evidence_mods(mods.as_deref()) != Some(false) || acc < 0.5 || n.unwrap_or(0) < 100 {
+                // short and failed plays aren't evidence (evidence_rows' rule)
+                if acc < 0.5 || n.unwrap_or(0) < 100 {
                     return None;
                 }
-                let c = ms_calc::chart::parse(&std::fs::read(chart_path(sha.as_deref())?).ok()?).ok()?;
+                let (data, tag) = (std::fs::read(chart_path(sha.as_deref())?).ok()?, m.tag());
+                let c = ms_calc::chart::parse(&if tag.is_empty() { data } else { ms_calc::mods::tagged(&data, &tag) }).ok()?;
                 let d = self.net.difficulties(&chart_records(&c, rate).ok()?, place(&past, t), !client.as_deref().unwrap_or("").starts_with("stable"));
-                Some((c.keys as i64, theta_of(&d, 1. - acc)))
+                // the net reads the chart's own windows: a play under moved ones (Hard Rock, Easy, Difficulty Adjust) counts as the
+                // loss the window law gives it there
+                Some((c.keys as i64, theta_of(&d, (1. - acc) * (-ms_calc::mods::window_law(c.window_shift)).exp())))
             })();
             db.execute("INSERT OR REPLACE INTO play_theta VALUES (?,?,?,?)", rusqlite::params![key, self.id, solved.map(|s| s.0), solved.map(|s| s.1)])?;
         }
@@ -114,7 +119,7 @@ impl PerNote {
         let got = match hit {
             Some(g) => g,
             None => {
-                let c = ms_calc::chart::parse(&match data { Some(d) => d.to_vec(), None => std::fs::read(chart_path(Some(sha))?).ok()? }).ok()?;
+                let c = ms_calc::chart::parse(&match data { Some(d) => d.to_vec(), None => std::fs::read(crate::modcharts::chart_file(db, sha)?).ok()? }).ok()?;
                 let past = self.history(db, now - WINDOW - 1., now).ok()?;
                 let theta = self.forecast(&past, now, c.keys as i64, sha)?;
                 let g = std::sync::Arc::new((c, past, theta));
@@ -126,7 +131,7 @@ impl PerNote {
         };
         let (c, past, theta) = &*got;
         let d = self.net.difficulties(&chart_records(c, rate).ok()?, place(past, now), !stable);
-        Some(1. - expected_loss(&d, *theta))
+        Some(1. - (expected_loss(&d, *theta) * ms_calc::mods::window_law(c.window_shift).exp()).min(1.))
     }
 
     /// thetafc's "ship: last+retry+form": a same-keymode ewma (3-day decay, same session ×4), moved by the session's last

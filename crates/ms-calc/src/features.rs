@@ -187,6 +187,9 @@ pub fn features_of(res: &Dict, prm: &Params) -> Dict {
     f.set("keys", res.get("keys").cloned().unwrap_or(Val::Int(0)));
     f.set("overall", o);
     f.set("od", res.get("od").cloned().unwrap_or(Val::F(0.)));
+    if let Some(w) = res.get("window_shift") {
+        f.set("window_shift", w.clone());
+    }
     f.set("ln", res.f("ln_notes") / notes.f().max(1.));
     f.set("notes", notes);
     f.set("length", res.get("length").cloned().unwrap_or(Val::Int(0)));
@@ -194,6 +197,10 @@ pub fn features_of(res: &Dict, prm: &Params) -> Dict {
     let stamina = if overall != 0. { scores.fget("stamina", overall) / overall } else { 1. };
     f.set("stam", stamina);
     f.set("sk", Val::Dict(sk));
+    // the card's whole-Stream rating as a share of the overall, beside `sk` (the model's inputs and top_skill read every `sk` key)
+    if let Some(v) = scores.get(crate::card::STREAM_FAMILY).filter(|_| overall != 0.) {
+        f.set(crate::card::STREAM_FAMILY, round_digits(v.f() / overall, 4));
+    }
     f.set("description", if res.fget("notes", 0.) >= 2. { crate::card::describe(res, &prm.k).0 } else { "Sparse".to_string() });
     let or_empty = |k: &str| res.get(k).cloned().unwrap_or_else(|| Val::Dict(Dict::new()));
     f.set("endurance", or_empty("endurance"));
@@ -282,6 +289,31 @@ mod shared_tests {
         [2, 3].iter().for_each(|&k| { RECENT.get(k, || k); });
         assert_eq!(RECENT.slots.lock().unwrap().len(), 2);
         assert_eq!(RECENT.get(1, || 9), 9);
+    }
+
+    /// A 4K two-hand vibro (rows [1,2] / [3,4], OD 6): at the rate where its rolls start to fit the great window
+    /// the rating fell by a quarter in one step (user 2026-11-19: "weird to see difficulty fall when you increase the rate").
+    #[test]
+    fn a_rating_does_not_drop_at_the_rate_where_rolls_start_to_mash() {
+        let vibro = |gap: i64| {
+            let mut text = "osu file format v14\n[General]\nMode:3\n[Difficulty]\nCircleSize:4\nOverallDifficulty:6\n[HitObjects]\n".to_string();
+            for i in 0..600 {
+                for c in if i % 2 == 0 { [0, 1] } else { [2, 3] } {
+                    text += &format!("{},192,{},1,0,0:0:0:0:\n", 64 + 128 * c, 1000 + i * gap);
+                }
+            }
+            chart::parse(text.as_bytes()).unwrap()
+        };
+        // the rolls fit the great window from 1.4x on
+        let c = vibro((1400.0 * vibro(100).great_window()).round() as i64);
+        let worst_step = |ramp: Option<f64>| {
+            let mut prm = standard_params();
+            if let Some(r) = ramp { prm.k.MASH_RAMP = r; }
+            let r: Vec<f64> = (0..=24).map(|i| compute::compute(&c, 1.0 + 0.05 * f64::from(i), true, &prm).unwrap().dict("scores").unwrap().f("overall")).collect();
+            r.windows(2).map(|w| w[1] / w[0]).fold(f64::INFINITY, f64::min)
+        };
+        assert!(worst_step(Some(0.0)) < 0.85, "without the ramp the chart must show the drop: {}", worst_step(Some(0.0)));
+        assert!(worst_step(None) > 0.97, "{}", worst_step(None));
     }
 
     #[test]

@@ -81,14 +81,20 @@ pub fn set_check(c: &Pick, obs: &Obs) -> (bool, bool, Vec<String>) {
     (known, known && off.is_empty(), off)
 }
 
+/// The pick's expected accuracy: the card's once osu! has the pick set, so both show one number. The pick's own is from
+/// when Next was pressed (user 2026-11-19: row ~96.3 %, card 96.7 % seven minutes into the warm-up clock).
+pub fn pick_acc(c: &Pick, obs: &Obs, card: Option<&Card>) -> f64 {
+    card.filter(|_| set_check(c, obs).1).map_or(c.pred.acc_mid, |k| k.acc_mid)
+}
+
 /// The picked map: [rate to set (green once osu! shows it) and expectation, title], so they never move.
-pub fn target_lines(c: &Pick, obs: &Obs, shown: &Shown) -> Vec<Line> {
+pub fn target_lines(c: &Pick, obs: &Obs, card: Option<&Card>, shown: &Shown) -> Vec<Line> {
     let wanted = wanted_mod(c.rate);
     let observed = obs.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let same = same_map(c, Some(&observed), None, obs.bid);
     let (known, correct, _) = set_check(c, obs);
     let colour = if correct { GREEN } else if known { RED } else { GREY };
-    let expected = if same && c.sha.as_deref().is_some_and(|s| s != observed) { "Updated chart selected".to_string() } else { format!("~{:.1}%", 100. * shown.acc(c.pred.acc_mid)) };
+    let expected = if same && c.sha.as_deref().is_some_and(|s| s != observed) { "Updated chart selected".to_string() } else { format!("~{:.1}%", 100. * shown.acc(pick_acc(c, obs, card))) };
     vec![vec![Span { text: format!("{} SET {:.2}× · {wanted}", if correct { "✓" } else { "→" }, c.rate), bold: true, small: false, color: Some(colour) }, plain("  "), bold(expected)], pick_line(c)]
 }
 
@@ -111,6 +117,9 @@ pub fn prediction_line(c: &Card, pp: bool, shown: &Shown) -> (Line, String) {
     let pct = |x: f64| 100. * shown.acc(x);
     let (mid, lo, hi) = (pct(c.acc_mid), pct(c.acc_lo), pct(c.acc_hi));
     let mut parts: Vec<Line> = vec![vec![bold(format!("Expected ~{mid:.1}%")), plain(" "), small(format!("({lo:.1}–{hi:.1}%)"))]];
+    if !c.without.is_empty() {
+        parts.push(vec![small(format!("without {}", c.without.join(", ")))]); // mods nothing models: the number is the chart's without them
+    }
     let form = form_text(c.form, c.acc_mid, shown);
     if !form.is_empty() {
         parts.push(vec![Span { bold: true, ..small(form.clone()) }]);
@@ -123,6 +132,12 @@ pub fn prediction_line(c: &Card, pp: bool, shown: &Shown) -> (Line, String) {
     }
     let line = parts.join(&small(" · "));
     let mut tip = vec![format!("Your expected accuracy on this map at this rate, from your own plays: ~{mid:.1}%, usually {lo:.1}–{hi:.1}%")];
+    if !c.mods.is_empty() {
+        tip.push(format!("With {}: the chart as these mods make it", c.mods.join(", ")));
+    }
+    if !c.without.is_empty() {
+        tip.push(format!("{} can't be forecast: this is the chart without {}", c.without.join(", "), if c.without.len() == 1 { "it" } else { "them" }));
+    }
     if !form.is_empty() {
         tip.push(format!("Form now: {form} against your rested level on this map"));
     }
@@ -179,7 +194,7 @@ pub fn duration(s: f64) -> String {
 
 /// Context line of the main window: dan before the rate, so the rate note goes first when the line is cut.
 pub fn context(a: &Analysis, dan: Option<&str>, mode: &str) -> String {
-    format!("{}K{}  ·  {:.2}×{mode}{}", a.keys, dan.map_or(String::new(), |d| format!("  ·  {d}")), a.rate, if a.sv_ignored { "  ·  SV ignored (Constant Speed)" } else { "" })
+    format!("{}K{}  ·  {:.2}×{mode}{}", a.keys, dan.map_or(String::new(), |d| format!("  ·  {d}")), a.rate, ms_calc::mods::Mods::from_tag(&a.mods).labels().iter().map(|m| format!("  ·  {m}")).collect::<String>())
 }
 
 // osu!lazer star badge (osu.Game/Graphics/OsuColour.cs): the pill takes STAR, its text is 75 % black below 6.5 ★, Orange1 up
@@ -263,6 +278,19 @@ mod tests {
         assert_eq!(nps_colours(12.).len(), 2);
         assert_eq!(nps_colours(30.).len(), 3); // 20 to 30 runs through the 25 NPS stop
         assert_eq!(rating_colours(5.).0.len(), 1);
+    }
+
+    #[test]
+    fn the_set_pick_shows_the_cards_expected() {
+        let mut c = Pick { sha: Some("a".repeat(64)), rate: 1., ..Pick::default() };
+        c.pred.acc_mid = 0.963;
+        let card = Card { acc_mid: 0.967, ..Default::default() };
+        let set = Obs { source: Some("game"), path: Some("a".repeat(64).into()), rate: Some(1.), ..Obs::default() };
+        assert_eq!(pick_acc(&c, &set, Some(&card)), 0.967);
+        assert_eq!(pick_acc(&c, &set, None), 0.963);
+        // another map or rate in osu!: the card is not the pick's
+        assert_eq!(pick_acc(&c, &Obs { rate: Some(1.1), ..set.clone() }, Some(&card)), 0.963);
+        assert_eq!(pick_acc(&c, &Obs { path: Some("b".repeat(64).into()), ..set }, Some(&card)), 0.963);
     }
 
     #[test]

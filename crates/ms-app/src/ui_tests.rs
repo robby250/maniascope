@@ -262,11 +262,11 @@ fn the_main_window_shows_the_analysis_bar_in_its_status_row_until_the_library_is
     let ctx = egui::Context::default();
     let mut a = app(prefs(), &ctx);
     let analysis = crate::viewer::Analysis {
-        path: "x.osu".into(), rate: 1., sv: true, keys: 7, title: "Black Lotus".into(), artist: "wa.".into(), version: "Another".into(), creator: "Blocko".into(),
+        path: "x.osu".into(), rate: 1., mods: String::new(), keys: 7, title: "Black Lotus".into(), artist: "wa.".into(), version: "Another".into(), creator: "Blocko".into(),
         overall: 7.05, press: 7.05, notes: 2400, ln_notes: 0., nps: Some(28.1), span: Some((0., 105_000.)), timeline: (0..60).map(|i| 4. + (i as f64 / 6.).sin()).collect(),
-        entries: Vec::new(), tags: Vec::new(), also: Vec::new(), bars: Vec::new(), peak_nps: None, bid: None, names: Vec::new(), tech: Vec::new(), sv_ignored: false, dan_vibro: Default::default(), o2jam: None,
+        entries: Vec::new(), tags: Vec::new(), also: Vec::new(), bars: Vec::new(), peak_nps: None, bid: None, names: Vec::new(), tech: Vec::new(), dan_vibro: Default::default(), o2jam: None,
     };
-    a.shown = Some(crate::app::Selected { path: "x.osu".into(), rate: 1., sv: true, result: Ok(std::sync::Arc::new(analysis)) });
+    a.shown = Some(crate::app::Selected { path: "x.osu".into(), rate: 1., mods: String::new(), result: Ok(std::sync::Arc::new(analysis)) });
     a.on_rec(Out::Status { text: "Analysing maps · 104,075 / 104,226".into(), progress: Some((104_075, 104_226)), blocking: false, learning: None });
     let (w, ht) = (430., 250.);
     let mut h = Harness::builder().with_size(egui::vec2(w, ht)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.main_ui(ui), a);
@@ -561,8 +561,8 @@ fn a_late_result_for_another_chart_cannot_replace_the_settled_one() {
     a.obs = observed(&first, 1.);
     a.refresh();
     let done = |generation, path: &PathBuf| {
-        let result = viewer::analyse(path, 1., true, &standard_params()).map(Arc::new);
-        viewer::Done { request: viewer::Request { generation, path: path.clone(), rate: 1., sv: true }, result }
+        let result = viewer::analyse(path, 1., "", &standard_params()).map(Arc::new);
+        viewer::Done { request: viewer::Request { generation, path: path.clone(), rate: 1., mods: String::new() }, result }
     };
     a.on_analysed(done(a.generation, &first));
     assert!(a.shown.is_some() && a.pending.is_none());
@@ -597,9 +597,9 @@ fn clicking_the_title_copies_its_search_text_and_says_so() {
     let file = osu_file(&dir, "a.osu");
     a.obs = observed(&file, 1.);
     a.refresh();
-    let result = viewer::analyse(&file, 1., true, &standard_params()).map(Arc::new);
+    let result = viewer::analyse(&file, 1., "", &standard_params()).map(Arc::new);
     let generation = a.generation;
-    a.on_analysed(viewer::Done { request: viewer::Request { generation, path: file.clone(), rate: 1., sv: true }, result });
+    a.on_analysed(viewer::Done { request: viewer::Request { generation, path: file.clone(), rate: 1., mods: String::new() }, result });
     let mut h = Harness::builder().with_size(egui::vec2(430., 300.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.main_ui(ui), a);
     h.step();
     assert!(h.query_by_label_contains("Copied").is_none());
@@ -666,9 +666,9 @@ fn stats_open_on_the_selected_maps_keymode_and_remember_the_last_one() {
     let file = osu_file(&dir, "a.osu");
     a.obs = observed(&file, 1.);
     a.refresh();
-    let result = viewer::analyse(&file, 1., true, &standard_params()).map(Arc::new);
+    let result = viewer::analyse(&file, 1., "", &standard_params()).map(Arc::new);
     let generation = a.generation;
-    a.on_analysed(viewer::Done { request: viewer::Request { generation, path: file.clone(), rate: 1., sv: true }, result });
+    a.on_analysed(viewer::Done { request: viewer::Request { generation, path: file.clone(), rate: 1., mods: String::new() }, result });
     a.set_stats(true);
     assert_eq!(a.s.stats_keys, Some(7));
     let back = Settings::from_json(&a.s.to_json());
@@ -756,13 +756,13 @@ fn a_card_row_carries_its_modifier_tags_beside_the_name() {
     let mut a = app(prefs(), &ctx);
     let entry = |name: &str, rating: f64, tags: &[&str]| crate::viewer::Entry { name: name.into(), rating, parts: Vec::new(), tags: tags.iter().map(|t| t.to_string()).collect() };
     let analysis = crate::viewer::Analysis {
-        path: "x.osu".into(), rate: 1., sv: true, keys: 7, title: "Cyber Shaman".into(), artist: "Cosmo".into(), version: "Local difficulty".into(), creator: "someone".into(),
+        path: "x.osu".into(), rate: 1., mods: String::new(), keys: 7, title: "Cyber Shaman".into(), artist: "Cosmo".into(), version: "Local difficulty".into(), creator: "someone".into(),
         overall: 6.1, press: 6.1, notes: 2400, ln_notes: 900., nps: Some(14.2), span: Some((0., 150_000.)), timeline: (0..60).map(|i| 4. + (i as f64 / 6.).sin()).collect(),
         entries: vec![entry("LN Release", 6.0, &["Tech"]), entry("Stream", 5.6, &["Stamina"]), entry("Chordjack", 4.9, &[])], tags: Vec::new(), also: Vec::new(), bars: Vec::new(),
-        peak_nps: None, bid: None, names: Vec::new(), tech: Vec::new(), sv_ignored: false, dan_vibro: Default::default(), o2jam: Some(84.4),
+        peak_nps: None, bid: None, names: Vec::new(), tech: Vec::new(), dan_vibro: Default::default(), o2jam: Some(84.4),
     };
     a.s.display.o2jam = true;
-    a.shown = Some(crate::app::Selected { path: "x.osu".into(), rate: 1., sv: true, result: Ok(std::sync::Arc::new(analysis)) });
+    a.shown = Some(crate::app::Selected { path: "x.osu".into(), rate: 1., mods: String::new(), result: Ok(std::sync::Arc::new(analysis)) });
     a.s.display.skills = 3;
     let mut h = Harness::builder().with_size(egui::vec2(460., 260.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.main_ui(ui), a);
     h.step();
@@ -822,11 +822,11 @@ fn closing_details_returns_the_window_to_its_compact_size() {
     let mut a = app(prefs(), &ctx);
     a.s.win = (430., 240.);
     let analysis = crate::viewer::Analysis {
-        path: "x.osu".into(), rate: 1., sv: true, keys: 7, title: "T".into(), artist: "A".into(), version: "V".into(), creator: "C".into(),
+        path: "x.osu".into(), rate: 1., mods: String::new(), keys: 7, title: "T".into(), artist: "A".into(), version: "V".into(), creator: "C".into(),
         overall: 5., press: 5., notes: 2400, ln_notes: 0., nps: Some(20.), span: Some((0., 105_000.)), timeline: vec![4.; 60],
-        entries: Vec::new(), tags: Vec::new(), also: Vec::new(), bars: (0..4).map(|i| (format!("s{i}"), format!("S{i}"), 0.5)).collect(), peak_nps: None, bid: None, names: Vec::new(), tech: Vec::new(), sv_ignored: false, dan_vibro: Default::default(), o2jam: None,
+        entries: Vec::new(), tags: Vec::new(), also: Vec::new(), bars: (0..4).map(|i| (format!("s{i}"), format!("S{i}"), 0.5)).collect(), peak_nps: None, bid: None, names: Vec::new(), tech: Vec::new(), dan_vibro: Default::default(), o2jam: None,
     };
-    a.shown = Some(crate::app::Selected { path: "x.osu".into(), rate: 1., sv: true, result: Ok(std::sync::Arc::new(analysis)) });
+    a.shown = Some(crate::app::Selected { path: "x.osu".into(), rate: 1., mods: String::new(), result: Ok(std::sync::Arc::new(analysis)) });
     let mut h = Harness::builder().with_size(egui::vec2(430., 240.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| {
         a.main_ui(ui);
         a.track_window(&ui.ctx().clone());

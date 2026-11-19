@@ -8,7 +8,7 @@ use ms_calc::val::Dict;
 /// (start ms, end ms, column).
 pub fn chart(mut notes: Vec<(f64, f64, u8)>, keys: usize, od: f64) -> Chart {
     notes.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.2.cmp(&b.2)).then(a.1.total_cmp(&b.1)));
-    Chart { keys, t: notes.iter().map(|n| n.0).collect(), end: notes.iter().map(|n| n.1).collect(), col: notes.iter().map(|n| n.2).collect(), sv: Vec::new(), od, stacked: 0.,
+    Chart { keys, t: notes.iter().map(|n| n.0).collect(), end: notes.iter().map(|n| n.1).collect(), col: notes.iter().map(|n| n.2).collect(), sv: Vec::new(), od, od_free: false, window_shift: 0.0, no_release: false, stacked: 0.,
             title: "synthetic control".into(), artist: "synthetic control".into(), version: "synthetic control".into(), creator: "synthetic control".into() }
 }
 

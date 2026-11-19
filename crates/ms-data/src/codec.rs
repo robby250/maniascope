@@ -98,6 +98,27 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// A stored row's keymode and rating from its first bytes (`keys` and `overall` lead a feature dict): what a two-phase
+/// carry reads of 200,000 rows without their 3 kB each. None: not a binary row, or neither leads it within `data`.
+pub fn rating(data: &[u8]) -> Option<(i64, f64)> {
+    let mut r = Reader { b: data.strip_prefix(&[MAGIC, 7])?, at: 0 };
+    let (n, mut keys, mut overall) = (r.u32().ok()?, None, None);
+    for _ in 0..n.min(8) {
+        let len = u16::from_le_bytes(r.take(2).ok()?.try_into().unwrap()) as usize;
+        let key = r.take(len).ok()?;
+        match (key, r.value().ok()?) {
+            (b"keys", Val::Int(k)) => keys = Some(k),
+            (b"overall", Val::F(o)) => overall = Some(o),
+            (b"overall", Val::Int(o)) => overall = Some(o as f64),
+            _ => {}
+        }
+        if let (Some(k), Some(o)) = (keys, overall) {
+            return Some((k, o));
+        }
+    }
+    None
+}
+
 pub fn decode(data: &[u8]) -> Result<Val, String> {
     if data.first() != Some(&MAGIC) {
         return Err("not a binary feature row".into());
@@ -161,6 +182,8 @@ mod tests {
         d.set("sk", Val::List(vec![Val::None, Val::Bool(true), Val::Str("ü".into())]));
         let v = Val::Dict(d);
         assert_eq!(decode(&encode(&v)).unwrap(), v);
+        let row = encode(&v);
+        assert_eq!((rating(&row[..40]), rating(&row[..12]), rating(b"{}")), (Some((7, 5.5)), None, None), "a row's head is enough");
         assert!(decode(b"{}").is_err() && load(b"{\"a\": 1}").is_ok());
     }
 

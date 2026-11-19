@@ -76,8 +76,10 @@ fn pools(l: &Live) -> Vec<Vec<Pick>> {
     l.rx.try_iter().filter_map(|m| if let Out::Pool { shown, .. } = m { Some(shown) } else { None }).collect()
 }
 
+/// The NPS list dealt from nothing.
 fn fresh_list(l: &mut Live) -> Vec<Pick> {
-    l.w.pool("nps").unwrap().1
+    l.w.playlists.insert("nps", Vec::new());
+    l.w.list("nps").unwrap().1
 }
 
 fn shas(rows: &[Pick]) -> Vec<String> {
@@ -93,52 +95,40 @@ fn done() -> Done {
 }
 
 #[test]
-fn a_prepared_queue_keeps_its_order_and_records_the_selection_at_once() {
+fn the_list_keeps_its_rows_and_records_the_selection_at_once() {
     let mut l = live("order", 240, busy(false));
-    let list = fresh_list(&mut l);
-    assert!(list.len() >= 3, "{}", list.len());
-    let (a, b, c) = (list[0].clone(), list[1].clone(), list[2].clone());
-    l.w.playlists.insert("nps", vec![a.clone(), b.clone()]);
-    let shown = l.w.prepared_playlist("nps", vec![c.clone(), b.clone(), a.clone()]).unwrap();
-    assert_eq!(shas(&shown)[..3], shas(&[a.clone(), b.clone(), c.clone()]));
+    let shown = fresh_list(&mut l);
+    assert!(shown.len() >= 3, "{}", shown.len());
+    // User 2026-11-14: "why does the playlist update when i press next … the order of songs changes".
+    assert_eq!(shas(&l.w.list("nps").unwrap().1), shas(&shown), "a background update leaves every row where it is");
     // A later filter change cannot discard a selection already made.
     l.w.revision = 2;
-    l.w.t_next(false, Some("nps".into()), Some(1), Some(Box::new(shown[0].clone())), Some(done()), Some(100.), 1).unwrap();
-    assert_eq!(events(&l, "next")[0].0, 100.);
+    let at = now() - 1.;
+    l.w.t_next(false, Some("nps".into()), Some(1), Some(Box::new(shown[0].clone())), Some(done()), Some(at), 1).unwrap();
+    assert_eq!(events(&l, "next")[0].0, at);
     let offer = events(&l, "offer").remove(0);
-    assert_eq!(offer.0, 100.);
+    assert_eq!(offer.0, at);
     assert_eq!(offer.1["accuracy"].as_f64(), Some(shown[0].pred.acc_mid));
     let target = l.rx.try_iter().find_map(|m| if let Out::Target { copy, selection_id, .. } = m { Some((copy, selection_id)) } else { None });
     assert_eq!(target, Some((None, 1)));
-    assert_eq!(shas(&l.w.playlists["nps"])[..2], shas(&shown)[1..3]);
-    let again = l.w.prepared_playlist("nps", vec![a, c, b]).unwrap();
-    assert!(!shas(&again).contains(&shown[0].sha.clone().unwrap()), "a consumed pick does not come back");
+    let after = shas(&l.w.list("nps").unwrap().1);
+    assert_eq!(after[..shown.len() - 1], shas(&shown)[1..], "the rest moved up as it was");
+    assert!(!after.contains(&shown[0].sha.clone().unwrap()), "an offered pick does not come back");
 }
 
 #[test]
-fn the_queue_drops_maps_that_fell_out_of_the_current_ranking() {
-    let mut l = live("credible", 240, busy(false));
-    let list = fresh_list(&mut l);
-    let (stale, kept, new) = (list[0].clone(), list[1].clone(), list[2].clone());
-    l.w.playlists.insert("nps", vec![kept.clone(), stale]);
-    l.w.credible.insert("nps".into(), [kept.identity().unwrap(), new.identity().unwrap()].into_iter().collect());
-    let shown = l.w.prepared_playlist("nps", vec![new.clone()]).unwrap();
-    assert_eq!(shas(&shown), shas(&[kept, new]));
-}
-
-#[test]
-fn the_next_map_stays_first_at_its_rate_through_background_updates() {
-    let mut l = live("pinned", 240, busy(false));
-    let list = fresh_list(&mut l);
-    let (next, b, c) = (list[0].clone(), list[1].clone(), list[2].clone());
-    l.w.playlists.insert("nps", vec![next.clone(), b.clone()]);
-    l.w.targets.insert("nps".into(), Box::new(next.clone())); // Next offered it
-    // A refit that drops the next map from the ranking does not take it away.
-    l.w.credible.insert("nps".into(), [b.identity().unwrap(), c.identity().unwrap()].into_iter().collect());
-    for fresh in [vec![c.clone(), b.clone()], vec![b.clone(), c.clone()]] {
-        let shown = l.w.prepared_playlist("nps", fresh).unwrap();
-        assert_eq!((shown[0].sha.clone(), shown[0].rate), (next.sha.clone(), next.rate));
-    }
+fn a_row_that_left_the_tab_is_replaced_where_it_was() {
+    let mut l = live("replaced", 240, busy(false));
+    let shown = fresh_list(&mut l);
+    assert!(shown.len() >= 4, "{}", shown.len());
+    // rows 1 and 3 stay, row 0 is another keymode's now and row 2's chart was deleted
+    let mut queue = vec![shown[1].clone(), shown[0].clone(), shown[3].clone(), shown[2].clone()];
+    queue[1].keys = 4;
+    queue[3].sha = Some("f".repeat(64));
+    l.w.playlists.insert("nps", queue);
+    let again = shas(&l.w.list("nps").unwrap().1);
+    assert_eq!((&again[0], &again[2]), (&shas(&shown)[1], &shas(&shown)[3]), "the rows that stand keep their places");
+    assert!(again.len() == shown.len() && again.contains(&shas(&shown)[0]) && again.contains(&shas(&shown)[2]), "the open places and the end were dealt again: {again:?}");
 }
 
 #[test]
@@ -149,17 +139,11 @@ fn a_row_that_moves_up_after_a_play_is_aimed_at_the_target() {
     b.rate = 1.37; // its prepared rate, never aimed
     l.w.playlists.insert("nps", vec![b.clone()]);
     l.w.targets.insert("nps".into(), Box::new(played));
-    let shown = l.w.prepared_playlist("nps", Vec::new()).unwrap();
+    let shown = l.w.list("nps").unwrap().1;
     let mut aimed = b.clone();
     l.w.aim(&mut aimed, "nps").unwrap();
     assert_ne!(aimed.rate, 1.37, "the fixture must aim somewhere else");
-    let head = shown.iter().find(|c| c.sha == b.sha).unwrap();
-    assert_eq!(head.rate, aimed.rate, "1.10.0: kept at 1.37 because it was first in the queue");
-    // Offered at 1.37, it stays there.
-    l.w.targets.insert("nps".into(), Box::new(b.clone()));
-    l.w.playlists.insert("nps", vec![b.clone()]);
-    let shown = l.w.prepared_playlist("nps", Vec::new()).unwrap();
-    assert_eq!(shown[0].rate, 1.37);
+    assert_eq!((shown[0].sha.clone(), shown[0].rate), (b.sha.clone(), aimed.rate), "1.10.0: kept at 1.37 because it was first in the queue");
 }
 
 #[test]
@@ -179,20 +163,13 @@ fn a_local_queue_rechecks_readiness_after_a_prediction_refresh_and_pp_does_not()
     };
     let want: Vec<String> = rows.iter().filter(|c| fits(c)).filter_map(|c| c.sha.clone()).collect();
     assert!(!want.is_empty() && want.len() < rows.len(), "{}", want.len());
-    // The queue's first map is the next one and stays even when unready: start with a ready one.
-    let mut rows = rows;
-    let first = rows.iter().position(|c| fits(c)).unwrap();
-    rows.swap(0, first);
     l.w.playlists.insert("nps", rows.clone());
-    let mut shown = shas(&l.w.prepared_playlist("nps", Vec::new()).unwrap());
-    shown.sort();
-    let mut sorted = want.clone();
-    sorted.truncate(20);
-    sorted.sort();
-    assert_eq!(shown, sorted);
+    // the rows that stayed (the dealt ones say why they are there), in their order
+    let stayed: Vec<String> = shas(&l.w.list("nps").unwrap().1.into_iter().filter(|c| c.why.is_empty()).collect::<Vec<_>>());
+    assert_eq!(stayed, want[..want.len().min(20)]);
     // PP owns another eligibility policy.
     l.w.playlists.insert("pp", rows[..4].to_vec());
-    assert_eq!(l.w.prepared_playlist("pp", Vec::new()).unwrap().len(), 4);
+    assert_eq!(shas(&l.w.list("pp").unwrap().1)[..4], shas(&rows[..4]));
 }
 
 #[test]
@@ -274,11 +251,11 @@ fn a_builder_failure_is_scoped_keeps_the_list_and_clears_on_ready() {
     l.w.t_nps_update(failed(revision)).unwrap();
     assert!(Arc::ptr_eq(&l.w.states["nps"].candidates, &candidates));
     assert_eq!(kv_get(&l.world.db, "playlist_cache:nps"), saved);
-    let note = l.w.pool("nps").unwrap().2;
+    let note = l.w.list("nps").unwrap().2;
     assert!(note.contains("worker exited") && !note.contains("looking for maps"), "{note}");
     l.w.t_nps_update(Update::Ready(published(&l, "nps"))).unwrap();
     assert!(!l.w.states["nps"].build_failed && l.w.states["nps"].error.is_empty());
-    assert!(!l.w.pool("nps").unwrap().2.contains("worker exited"));
+    assert!(!l.w.list("nps").unwrap().2.contains("worker exited"));
 }
 
 fn configure(mode: &str, revision: u64) -> Config {
@@ -353,6 +330,17 @@ fn pp_maps_mix_into_the_nps_list_only_when_on_and_stay_pp_rows() {
 }
 
 #[test]
+fn a_pp_row_in_a_skills_list_carries_the_lists_skill_selection() {
+    let mut l = live("mixskills", 240, busy(false));
+    log(&l.world.db, "offer", Some("md5:x"), Some(now() - 900.), &json!({"mode": "pp"})).unwrap();
+    l.w.session_cache = None;
+    let mix = PpMix { on: true, every: 4, chance: 0., ..PpMix::default() };
+    l.w.t_configure(Config { skills_mix: Some(mix), practice_skills: Some(vec!["chordjack".into()]), ..configure("skills", 1) }).unwrap();
+    let row = pools(&l).pop().unwrap().into_iter().find(|c| c.purpose == "nps_mix").expect("a PP row");
+    assert_eq!(row.practice_skills, vec!["chordjack".to_string()]);
+}
+
+#[test]
 fn a_due_pp_row_reaches_the_top_when_no_map_was_offered_yet() {
     // Aegleseeker (2026-11-15): the queue's first row was kept in front of the PP row after every play, so Next never took it.
     let mut l = live("due", 240, busy(false));
@@ -364,14 +352,6 @@ fn a_due_pp_row_reaches_the_top_when_no_map_was_offered_yet() {
     let mix = PpMix { on: true, every: 4, chance: 0., ..PpMix::default() };
     l.w.t_configure(Config { pp_mix: Some(mix), ..configure("nps", 1) }).unwrap();
     assert_eq!(pools(&l).pop().unwrap()[0].purpose, "nps_mix", "five NPS offers since the last PP one: the PP row is next");
-}
-
-#[test]
-fn pp_rows_come_every_nth_pick() {
-    let row = |s: &str| Pick { title: s.into(), ..Pick::default() };
-    let titled = |n: &[&str]| n.iter().map(|s| row(s)).collect::<Vec<_>>();
-    let out = place_every(titled(&["n0", "n1", "n2", "n3", "n4", "n5", "n6", "n7"]), titled(&["pp4", "pp1"]), 4, 1);
-    assert_eq!(out.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(), ["n0", "n1", "pp4", "n2", "n3", "n4", "pp1", "n5", "n6", "n7"]);
 }
 
 #[test]
@@ -488,12 +468,12 @@ fn an_updated_map_keeps_its_offer_link_without_reusing_the_old_revision() {
 #[test]
 fn an_offer_keeps_the_prepared_forecast_as_it_was_generated() {
     let mut l = live("forecast", 240, busy(false));
-    let list = fresh_list(&mut l);
-    l.w.t_open(Box::new(list[0].clone()), Some("nps".into()), Some(l.w.revision.wrapping_sub(1)), Some(done()), Some(1990.), 0).unwrap();
+    let list = fresh_list(&mut l); // its first row is aimed at the target; the others are as prepared
+    l.w.t_open(Box::new(list[1].clone()), Some("nps".into()), Some(l.w.revision.wrapping_sub(1)), Some(done()), Some(1990.), 0).unwrap();
     let (t, saved) = events(&l, "offer").remove(0);
     assert_eq!(t, 1990.);
-    assert_eq!(saved["accuracy"].as_f64(), Some(list[0].pred.acc_mid));
-    assert_eq!(saved["accuracy_forecast"]["mid"].as_f64(), Some(list[0].pred.acc_mid));
+    assert_eq!(saved["accuracy"].as_f64(), Some(list[1].pred.acc_mid));
+    assert_eq!(saved["accuracy_forecast"]["mid"].as_f64(), Some(list[1].pred.acc_mid));
     assert!(saved["accuracy_forecast_recorded_at"].as_f64().unwrap() > 1990.);
     assert_eq!(saved["accuracy_forecast"]["rate"], 1.);
     assert_eq!(saved["calculator"].as_str(), Some(CALC_ID));
@@ -592,22 +572,6 @@ fn a_restart_keeps_the_saved_lists_converts() {
 }
 
 #[test]
-fn each_keymode_mixes_in_its_converts_by_its_own_maps() {
-    // user 2026-11-13: in a 4K–10K list "converts really far in the list … never end up in the front": the shown order
-    // took one convert share over every keymode's maps (0.3 against all 7K maps) instead of 10K's own (~2.5).
-    let mut l = live("convert-mix", 240, busy(false));
-    l.w.keys.insert("nps", vec![7, 10]);
-    l.w.stream_mix.insert("nps", ([0., 1.], [false, true]));
-    let pick = |i: usize, keys: i64, convert: bool| Pick { keys, installed: !convert, sha: Some(format!("{i:064}")), md5: Some(format!("{i:032}")), convert_of: convert.then(|| "src".into()), ..Pick::default() };
-    let mut fresh: Vec<Pick> = (0..30).map(|i| pick(i, 7, false)).collect(); // many 7K maps
-    fresh.extend((30..42).map(|i| pick(i, 10, false))); // 10K natives
-    fresh.extend((42..66).map(|i| pick(i, 10, true))); // twice as many 10K converts
-    let shown = l.w.prepared_playlist("nps", fresh).unwrap();
-    let tenk: Vec<bool> = shown.iter().filter(|p| p.keys == 10).map(|p| p.convert_of.is_some()).collect();
-    assert!(tenk.iter().filter(|c| **c).count() * 2 > tenk.len(), "10K rows, converts true: {tenk:?}");
-}
-
-#[test]
 fn a_filter_nothing_matches_offers_nothing() {
     let mut l = live("filter", 240, busy(false));
     l.w.practice_skills = vec!["sv".into()];
@@ -646,14 +610,14 @@ fn a_newer_request_ends_the_running_build_and_gameplay_pauses_it() {
 #[test]
 fn the_next_pick_is_offered_at_its_target_rate() {
     let mut l = live("aim", 240, busy(false));
-    let list = fresh_list(&mut l);
-    let before = list[0].clone();
-    let shown = l.w.prepared_playlist("nps", list).unwrap();
+    let shown = fresh_list(&mut l);
+    let prepared = l.w.prepared("nps").1;
+    let before = prepared.list.items[prepared.find(&shown[0].identity().unwrap()).unwrap()].clone(); // as the list was built: not aimed
     let n = l.w.session().unwrap();
     let target = l.w.rec.as_ref().unwrap().model().central_target(n.target, n.view.warm_flag);
     let head = &shown[0];
     assert_eq!(head.sha, l.w.playlists["nps"][0].sha);
-    let (off, was) = ((head.pred.acc_mid - target).abs(), (before.pred.acc_mid - target).abs());
+    let (off, was) = ((head.pred.acc_mid - target).abs(), (before.acc_mid - target).abs());
     assert!(was > ms_model::predict::ACC_TOL, "the fixture's head was already on target: {was}");
     assert!(off <= ms_model::predict::ACC_TOL, "head at {:.2}× predicts {:.4}, target {target:.4} (was {:.2}×)", head.rate, head.pred.acc_mid, before.rate);
     assert_eq!(head.var, crate::catalog::rate_label(head.rate));

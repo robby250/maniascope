@@ -28,7 +28,8 @@ pub struct Tech {
 pub struct Analysis {
     pub path: PathBuf,
     pub rate: f64,
-    pub sv: bool,
+    /// The mods the analysis includes: their tag (`ms_calc::mods`), "" for the chart as written.
+    pub mods: String,
     pub keys: i64,
     pub title: String,
     pub artist: String,
@@ -49,7 +50,6 @@ pub struct Analysis {
     pub bid: Option<i64>, // the chart's BeatmapID, for its website page
     pub names: Vec<(String, String)>, // key, display name
     pub tech: Vec<Tech>,
-    pub sv_ignored: bool,
     pub dan_vibro: ms_rec::dans::Vibro,
     pub o2jam: Option<f64>, // O2Jam level (7K), from the scores above
 }
@@ -113,10 +113,13 @@ fn bars(names: &[(String, String)], sc: &Dict) -> Vec<(String, String, f64)> {
     out
 }
 
-pub fn analyse(path: &Path, rate: f64, sv: bool, prm: &Params) -> Result<Analysis, String> {
-    let data = std::fs::read(path).map_err(|e| e.to_string())?;
+pub fn analyse(path: &Path, rate: f64, mods: &str, prm: &Params) -> Result<Analysis, String> {
+    let mut data = std::fs::read(path).map_err(|e| e.to_string())?;
+    if !mods.is_empty() {
+        data = ms_calc::mods::tagged(&data, mods); // the chart as played with the mods: its own file
+    }
     let chart = parse(&data).map_err(|e| format!("{e:?}"))?;
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compute_selected(&data, &chart, rate, sv, prm))).map_err(|_| "internal error (see crash.log)".to_string())??;
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compute_selected(&data, &chart, rate, true, prm))).map_err(|_| "internal error (see crash.log)".to_string())??;
     let sc = res.dict("scores").ok_or("no scores")?;
     let keys = chart.keys as i64;
     let names: Vec<(String, String)> = ms_calc::taxonomy::rated(chart.keys).iter().filter(|s| ms_calc::taxonomy::shown(**s)).map(|s| (s.name().to_string(), display_name(*s).to_string())).collect();
@@ -126,9 +129,9 @@ pub fn analyse(path: &Path, rate: f64, sv: bool, prm: &Params) -> Result<Analysi
         _ => Vec::new(),
     };
     Ok(Analysis {
-        path: path.to_path_buf(), rate, sv, keys, overall: sc.f("overall"), press: res.fget("press_overall", sc.f("overall")), notes: res.fget("notes", 0.) as usize, ln_notes: res.fget("ln_notes", 0.), nps: raw_nps(&chart, rate), peak_nps: peak_nps(&chart, rate), bid: beatmap_id(&data),
+        path: path.to_path_buf(), rate, mods: mods.to_string(), keys, overall: sc.f("overall"), press: res.fget("press_overall", sc.f("overall")), notes: res.fget("notes", 0.) as usize, ln_notes: res.fget("ln_notes", 0.), nps: raw_nps(&chart, rate), peak_nps: peak_nps(&chart, rate), bid: beatmap_id(&data),
         span: (chart.len() >= 2).then(|| (chart.t[0], chart.last_end())), timeline: res.get("timeline").map_or_else(Vec::new, Val::list_f), entries, tags: describe(&res, &prm.k).1.into_iter().filter(|t| !t.starts_with("also ")).collect(), also: ms_calc::card::also(&res),
-        bars: bars(&names, sc), names, tech, sv_ignored: matches!(res.get("sv"), Some(Val::Str(s)) if s == "ignored"),
+        bars: bars(&names, sc), names, tech,
         dan_vibro: ms_rec::dans::vibro_runs(&chart, rate, &prm.k), title: chart.title.clone(), artist: chart.artist.clone(), version: chart.version.clone(), creator: chart.creator.clone(),
         o2jam: ms_rec::o2jam::level(keys, |k| sc.fget(k, 0.), res.fget("ln_notes", 0.) / res.fget("notes", 1.).max(1.), (chart.len() >= 2).then(|| (chart.last_end() - chart.t[0]) / 1000. / rate).unwrap_or(0.), res.fget("notes", 0.)),
     })
@@ -139,7 +142,7 @@ pub struct Request {
     pub generation: u64,
     pub path: PathBuf,
     pub rate: f64,
-    pub sv: bool,
+    pub mods: String,
 }
 
 pub struct Done {
@@ -168,7 +171,7 @@ impl Viewer {
     pub fn cached(&self, r: &Request) -> Option<Arc<Analysis>> {
         let mut memory = self.memory.lock().unwrap();
         let now = stamp(&r.path);
-        let at = memory.iter().position(|(at, a)| a.path == r.path && a.rate == r.rate && a.sv == r.sv && *at == now)?;
+        let at = memory.iter().position(|(at, a)| a.path == r.path && a.rate == r.rate && a.mods == r.mods && *at == now)?;
         let hit = memory.remove(at)?;
         memory.push_back(hit.clone());
         Some(hit.1)
@@ -198,7 +201,7 @@ impl Viewer {
                 slot.pending.take().unwrap()
             };
             let before = stamp(&request.path);
-            let result = analyse(&request.path, ms_calc::py::round_digits(request.rate, 4), request.sv, prm).map(Arc::new);
+            let result = analyse(&request.path, ms_calc::py::round_digits(request.rate, 4), &request.mods, prm).map(Arc::new);
             if before != stamp(&request.path) {
                 continue; // the chart changed under the analysis: a later observation asks again
             }
@@ -236,7 +239,7 @@ mod tests {
         write(&old, 80);
         write(&new, 90);
         let viewer = Arc::new(Viewer::default());
-        let request = |path: &PathBuf, generation| Request { generation, path: path.clone(), rate: 1., sv: true };
+        let request = |path: &PathBuf, generation| Request { generation, path: path.clone(), rate: 1., mods: String::new() };
         viewer.request(Some(request(&old, 1)));
         viewer.request(Some(request(&new, 2))); // the viewer never got to the old one
         let (tx, rx) = channel();
@@ -246,7 +249,7 @@ mod tests {
         let hit = request(&new, 3);
         assert!(viewer.cached(&hit).is_some());
         assert!(viewer.cached(&Request { rate: 1.1, ..hit.clone() }).is_none());
-        assert!(viewer.cached(&Request { sv: false, ..hit.clone() }).is_none());
+        assert!(viewer.cached(&Request { mods: "CS".into(), ..hit.clone() }).is_none());
         std::thread::sleep(std::time::Duration::from_millis(20));
         write(&new, 70);
         assert!(viewer.cached(&hit).is_none(), "an edited chart is not the analysed one");

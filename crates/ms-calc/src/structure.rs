@@ -244,25 +244,32 @@ pub fn column_runs(chart: &Chart, rate: f64, k: &Knobs) -> Vec<Run> {
 
 fn column_runs_of(chart: &Chart, rate: f64, k: &Knobs) -> Vec<Run> {
     let (gap, hand_gap) = (1000.0 * k.LJ_GAP * rate, 1000.0 * k.VIBRO_GAP * rate); // chart ms
-    let hand: Vec<usize> = (0..chart.keys).map(|c| crate::flow::hand(c, chart.keys, true).0).collect();
-    let mut open: Vec<Vec<usize>> = vec![Vec::new(); chart.keys];
-    let mut chord: Vec<Vec<u32>> = vec![Vec::new(); chart.keys]; // the hand's chord at each hit of the open run
-    let mut left = vec![false; chart.keys]; // a row without this column was struck since this column's last hit
+    let keys = chart.keys;
+    // each hand's columns as a mask, the per-column flags as bits: a row is a few mask operations (it looped keys × keys)
+    let hm = (0..keys).fold([0u32; 2], |mut m, c| { m[crate::flow::hand(c, keys, true).0] |= 1 << c; m });
+    let mine = |c: usize| hm[(hm[1] >> c & 1) as usize];
+    let mut open: Vec<Vec<usize>> = vec![Vec::new(); keys];
+    let mut chord: Vec<Vec<u32>> = vec![Vec::new(); keys]; // the hand's chord at each hit of the open run
+    let mut left = 0u32; // a row without this column was struck since this column's last hit
     // another finger of the hand played between two of this column's hits: not one finger's repetition, so never Longjacks;
     // a vibro run stays (a mashed roll, the hand vibrating over two columns; user 2026-11-15: REFORM Kappa Speed's 16–30 ms rows)
-    let (mut between, mut alternated) = (vec![false; chart.keys], vec![false; chart.keys]);
+    let (mut between, mut alternated) = (0u32, 0u32);
     let mut out = Vec::new();
-    let close = |notes: Vec<usize>, chords: Vec<u32>, alternated: bool, out: &mut Vec<Run>| {
-        if notes.len() < k.VIBRO_MIN {
-            return;
+    let mut gaps: Vec<f64> = Vec::new();
+    // a closed run leaves its buffers behind, empty: most "runs" are one note and never reach the list
+    let mut close = |notes: &mut Vec<usize>, chords: &mut Vec<u32>, alternated: bool, out: &mut Vec<Run>| {
+        if notes.len() >= k.VIBRO_MIN {
+            gaps.clear();
+            gaps.extend(notes.windows(2).map(|w| chart.t[w[1]] - chart.t[w[0]]));
+            gaps.sort_by(f64::total_cmp);
+            let r = chords.windows(2).filter(|w| w[0] == w[1]).count() as f64 / (chords.len() - 1) as f64;
+            let vibro = gaps[gaps.len() / 2] < 1000.0 * rate * vibro_gap(notes.len() as f64, k) * r.powf(k.VIBRO_P);
+            if vibro || !alternated {
+                out.push(Run { vibro, notes: notes.clone() });
+            }
         }
-        let mut gaps: Vec<f64> = notes.windows(2).map(|w| chart.t[w[1]] - chart.t[w[0]]).collect();
-        gaps.sort_by(f64::total_cmp);
-        let r = chords.windows(2).filter(|w| w[0] == w[1]).count() as f64 / (chords.len() - 1) as f64;
-        let vibro = gaps[gaps.len() / 2] < 1000.0 * rate * vibro_gap(notes.len() as f64, k) * r.powf(k.VIBRO_P);
-        if vibro || !alternated {
-            out.push(Run { vibro, notes });
-        }
+        notes.clear();
+        chords.clear();
     };
     let mut i = 0;
     while i < chart.len() {
@@ -273,28 +280,31 @@ fn column_runs_of(chart: &Chart, rate: f64, k: &Knobs) -> Vec<Run> {
         let row = chart.col[i..m].iter().fold(0u32, |a, &c| a | 1 << c);
         for x in i..m {
             let c = chart.col[x] as usize;
-            if open[c].last().is_some_and(|&a| (left[c] && chart.t[x] - chart.t[a] >= hand_gap) || chart.t[x] - chart.t[a] >= gap) {
-                close(std::mem::take(&mut open[c]), std::mem::take(&mut chord[c]), std::mem::take(&mut alternated[c]), &mut out);
+            let bit = 1u32 << c;
+            if open[c].last().is_some_and(|&a| (left & bit != 0 && chart.t[x] - chart.t[a] >= hand_gap) || chart.t[x] - chart.t[a] >= gap) {
+                close(&mut open[c], &mut chord[c], alternated & bit != 0, &mut out);
+                alternated &= !bit;
             }
             if !open[c].is_empty() {
-                alternated[c] |= between[c];
+                alternated |= between & bit;
             }
             open[c].push(x);
-            chord[c].push((0..chart.keys).filter(|&o| row >> o & 1 == 1 && hand[o] == hand[c]).fold(0u32, |a, o| a | 1 << o));
-            (left[c], between[c]) = (false, false);
+            chord[c].push(row & mine(c));
+            left &= !bit;
+            between &= !bit;
         }
-        for c in 0..chart.keys {
-            if row >> c & 1 == 0 {
-                left[c] = true;
-                // a hit by another finger of the hand between two of this column's ends the run: repetition is one finger
-                // (user 2026-11-15: REFORM Eta–Kappa speed and stamina maps read Longjacks first at 1.1–1.5×)
-                between[c] |= (0..chart.keys).any(|o| o != c && row >> o & 1 == 1 && hand[o] == hand[c]);
+        left |= !row;
+        // a hit by another finger of the hand between two of this column's ends the run: repetition is one finger
+        // (user 2026-11-15: REFORM Eta–Kappa speed and stamina maps read Longjacks first at 1.1–1.5×)
+        for h in hm {
+            if row & h != 0 {
+                between |= h & !row;
             }
         }
         i = m;
     }
-    for c in 0..chart.keys {
-        close(std::mem::take(&mut open[c]), std::mem::take(&mut chord[c]), alternated[c], &mut out);
+    for c in 0..keys {
+        close(&mut open[c], &mut chord[c], alternated >> c & 1 == 1, &mut out);
     }
     out
 }

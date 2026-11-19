@@ -67,20 +67,25 @@ pub fn normalize_rates((lo, hi): (f64, f64)) -> (f64, f64) {
     (lo.min(hi), hi.max(lo))
 }
 
-/// {keys: (lo, hi)} ratings that can land near the target: website charts outside are never loaded. The level +
-/// population curve alone put the target at ov; every NPS candidate of 2026-10-01 (4,513 website chart-rates) lay
-/// within 0.64–1.00·ov, so 0.55–1.10 loses none.
+/// The rating the level + population curve alone put at accuracy `target` on keymode `k`: the player's level in stars.
+pub fn level_rating(model: &PredModel, k: i64, target: f64, c: &Consts) -> f64 {
+    let level = model.level.get(&k).map_or(model.glob + 0.3, |l| l.0);
+    let y = (1. - target).ln();
+    let (mut lo, mut hi) = (0.5f64.ln(), 60f64.ln());
+    for _ in 0..40 {
+        let mid = (lo + hi) / 2.;
+        if level + model.base_of(&Feats::bare(k, mid.exp(), 8., c), None, 0., None).0 < y { lo = mid } else { hi = mid }
+    }
+    lo.exp()
+}
+
+/// {keys: (lo, hi)} ratings that can land near the target: website charts outside are never loaded. Every NPS candidate of
+/// 2026-10-01 (4,513 website chart-rates) lay within 0.64–1.00 of the level's rating, so 0.55–1.10 loses none.
 pub fn reach(model: &PredModel, keys: &[i64], target: f64, c: &Consts) -> HashMap<i64, (f64, f64)> {
+    let tenth = |x: f64| (x * 10.).round() / 10.;
     keys.iter().map(|&k| {
-        let level = model.level.get(&k).map_or(model.glob + 0.3, |l| l.0);
-        let y = (1. - target).ln();
-        let (mut lo, mut hi) = (0.5f64.ln(), 60f64.ln());
-        for _ in 0..40 {
-            let mid = (lo + hi) / 2.;
-            if level + model.base_of(&Feats::bare(k, mid.exp(), 8., c), None, 0., None).0 < y { lo = mid } else { hi = mid }
-        }
-        let tenth = |x: f64| (x * 10.).round() / 10.;
-        (k, (tenth(0.55 * lo.exp()), tenth(1.1 * lo.exp())))
+        let ov = level_rating(model, k, target, c);
+        (k, (tenth(0.55 * ov), tenth(1.1 * ov)))
     }).collect()
 }
 
@@ -455,7 +460,8 @@ impl Builder {
         let imported = kv_get(db, "library_version").and_then(|v| v.as_i64()); // bumped only when the library changes
         let web_path = web_dir().join("web.msp");
         let web_mtime = std::fs::metadata(&web_path).and_then(|m| m.modified()).ok();
-        let web = web_mtime.and_then(|_| Web::open(&web_path).ok());
+        // another calculator's website list (the background carry hasn't reached it yet) offers nothing: its ratings aren't ours
+        let web = web_mtime.and_then(|_| Web::open(&web_path).ok()).filter(|w| w.calc == r.calc);
         let reaches = (web_mtime.is_some() || !r.converts.is_empty()).then(|| reach(&r.model, &allowed, r.target, &r.model.c));
         let window = reaches.as_ref().map(|x| {
             let mut v: Vec<(i64, u64, u64)> = x.iter().map(|(k, (a, b))| (*k, a.to_bits(), b.to_bits())).collect();
@@ -602,7 +608,10 @@ impl Builder {
             }
             let take = |pending_enrich: &mut VecDeque<String>, pending_unknown: &mut VecDeque<String>, bad: &HashMap<String, String>, store: &FeatStore| -> Vec<(String, f64)> {
                 let mut out = Vec::new();
-                for (queue, n) in [(pending_enrich, 24), (pending_unknown, 40)] {
+                // a chart without a row yet waits for the background carry, which moves its stored row here far sooner than
+                // an analysis from nothing would (`Worker::carry_rest`)
+                let unknown = if ms_data::store::CARRYING.load(std::sync::atomic::Ordering::Relaxed) { 0 } else { 40 };
+                for (queue, n) in [(pending_enrich, 24), (pending_unknown, unknown)] {
                     for _ in 0..n.min(queue.len()) {
                         let sha = queue.pop_front().unwrap();
                         if !bad.contains_key(&sha) {
@@ -715,20 +724,13 @@ pub struct RankInputs<'a> {
     pub mode: &'a str,
     pub web: f64,
     pub convert: f64,
-    pub weighted: [bool; 2],
     pub taste: &'a HashMap<(i64, String), f64>,
-    pub consumed: &'a HashSet<String>,
+    pub offered: &'a HashSet<String>, // offered a moment ago: back only once nothing else is left
     pub recent_sets: &'a HashSet<i64>, // what was just played or offered: a convert of those waits, it's the same song
     pub recent_convert_sets: &'a HashSet<i64>, // the converts among them: their real maps wait the same way
     pub seed: Option<String>,
     pub focus: f64,
-    pub count: usize,
-    pub recent: Vec<(u8, i64)>,
-    pub recent_skills: Vec<(String, i64)>,
-    pub key_shares: std::collections::BTreeMap<i64, f64>,
-    pub skill_weights: Option<std::collections::HashMap<String, f64>>,
-    pub selected_skills: &'a [String],
-    pub miss_ratio: Option<f64>, // the active client is stable: recdata.shown_acc
+    pub skills: bool, // the list is dealt by skill slots
 }
 
 /// A convert and its source are one song: a convert waits while its set was just played or offered, a real map only
@@ -737,33 +739,35 @@ fn same_song_waits(convert: bool, inst: Option<&Inst>, recent_sets: &HashSet<i64
     inst.and_then(|i| i.set_id).is_some_and(|s| if convert { recent_sets } else { recent_convert_sets }.contains(&s))
 }
 
-/// nps.rank: the first `count` of a publication's prepared pool as list entries, in shown order, and the streams' odds.
-pub fn rank(prepared: &ms_model::choices::Prepared, catalog: &HashMap<String, Arc<Inst>>, session: &Session, store: &FeatStore, inputs: RankInputs<'_>) -> (Vec<Pick>, [f64; 4]) {
+/// The rows of a publication's prepared pool the tab's list may take, best first (`Prepared::rank`: entry, value, weight,
+/// category share), and whether freshness was relaxed. `choices::deal` gives them their places.
+pub fn rank(prepared: &ms_model::choices::Prepared, catalog: &HashMap<String, Arc<Inst>>, session: &Session, inputs: RankInputs<'_>) -> (Vec<(usize, f64, f64, f64)>, bool) {
     let recent: Vec<_> = session.attempts.iter().rev().take(6).rev().filter(|a| a.a.get("profile").is_some_and(|p| !p.is_null()) && a.meaningful).collect();
     let mode = inputs.mode;
     let freshness = |key: &str, length: f64, pool: f64| session.freshness(key, length, Some(mode), Some(pool), ms_model::session::EXPOSURE_S);
     let eventful = |key: &str| session.eventful(key);
-    let consumed = |c: &ms_model::choices::Choice| inputs.consumed.contains(&c.identity()) || same_song_waits(c.convert, catalog.get(&c.sha).map(Arc::as_ref), inputs.recent_sets, inputs.recent_convert_sets);
-    let (rows, relax, odds) = prepared.rank(Ranking {
-        keys: inputs.keys, nps: mode == "nps", web: inputs.web, convert: inputs.convert, weighted: inputs.weighted, taste: inputs.taste, eventful: &eventful, freshness: &freshness,
+    let waits = |c: &ms_model::choices::Choice| inputs.offered.contains(&c.identity()) || same_song_waits(c.convert, catalog.get(&c.sha).map(Arc::as_ref), inputs.recent_sets, inputs.recent_convert_sets);
+    prepared.rank(Ranking {
+        keys: inputs.keys, nps: mode == "nps", web: inputs.web, convert: inputs.convert, taste: inputs.taste, eventful: &eventful, freshness: &freshness,
         recent_families: recent.iter().rev().take(4).rev().filter_map(|a| a.text("family").map(str::to_string)).collect(),
         recent_profiles: recent.iter().filter_map(|a| a.a.get("profile")?.as_array().map(|p| p.iter().filter_map(Value::as_f64).collect())).collect(),
-        current_keys: session.current_keys(), consumed: &consumed,
+        current_keys: session.current_keys(), waits: &waits,
         // A custom playlist's slider at "off" (< 0): no shuffle, the best skill match first.
-        shuffle: inputs.seed.filter(|_| inputs.focus >= 0.).map(|s| (s, inputs.focus)), count: Some(inputs.count), recent: inputs.recent, recent_skills: inputs.recent_skills, key_shares: inputs.key_shares, skill_weights: inputs.skill_weights,
-    });
-    let picks = rows.into_iter().filter_map(|(i, value, weight, share)| {
-        let mut p = prepared_pick(prepared, i, catalog, mode, inputs.selected_skills, store)?;
-        let c = &prepared.list.items[i];
-        let headline = if mode == "nps" { format!("{:.1} raw NPS", c.nps) } else { c.practice.clone() };
-        let shown = inputs.miss_ratio.map_or(c.acc_mid, |m| 1. - (1. - c.acc_mid) * m);
-        p.value = value;
-        p.weight = weight;
-        p.category_share = share;
-        p.why = format!("{headline} · {} · expect ~{:.1}%{}", c.description, 100. * shown, if relax { " · freshness relaxed" } else { "" });
-        Some(p)
-    }).collect();
-    (picks, odds)
+        shuffle: inputs.seed.filter(|_| inputs.focus >= 0.).map(|s| (s, inputs.focus)), skills: inputs.skills,
+    })
+}
+
+/// A ranked row as a list entry. miss_ratio: the active client is stable (recdata.shown_acc).
+#[allow(clippy::too_many_arguments)]
+pub fn ranked_pick(prepared: &ms_model::choices::Prepared, (i, value, weight, share): (usize, f64, f64, f64), relax: bool, catalog: &HashMap<String, Arc<Inst>>, mode: &str, selected: &[String], store: &FeatStore,
+                   miss_ratio: Option<f64>) -> Option<Pick> {
+    let mut p = prepared_pick(prepared, i, catalog, mode, selected, store)?;
+    let c = &prepared.list.items[i];
+    let headline = if mode == "nps" { format!("{:.1} raw NPS", c.nps) } else { c.practice.clone() };
+    let shown = miss_ratio.map_or(c.acc_mid, |m| 1. - (1. - c.acc_mid) * m);
+    (p.value, p.weight, p.category_share) = (value, weight, share);
+    p.why = format!("{headline} · {} · expect ~{:.1}%{}", c.description, 100. * shown, if relax { " · freshness relaxed" } else { "" });
+    Some(p)
 }
 
 /// nps.prepared_choice: entry `i` of a prepared pool as a list entry.

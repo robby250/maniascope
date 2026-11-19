@@ -24,14 +24,14 @@ use std::sync::{Arc, Mutex};
 /// recommend.predictor_id of the model the Rust port reproduces: forecasts stay comparable across the port. A change to
 /// the prediction model takes a new id, so old forecasts are not read as this model's.
 pub const PREDICTOR_ID: &str = "532ce129f6fa"; // predictor families from the skill table (2026-11-11); was a6d61e058f5d
-pub const CALC_ID: &str = "009e2b28af08";
+pub const CALC_ID: &str = "14be0f41537b";
 /// Differ from CALC_ID in calibration only (calib/carry.json), newest first: a crawl still running holds the website rows back a whole
 /// calculator, so those can start older than the library's. Each carry keeps its source row.
 // Every shipped calculator, newest last: a ship that leaves its predecessor out drops the scores whose chart file is gone
 // (1.10.0: 7K evidence 8718 → 3959 plays on a copy without the files).
-pub const CARRIED_CALCS: [&str; 31] = ["2f01eca5e738", "7cee1dfdba7f", "a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f",
+pub const CARRIED_CALCS: [&str; 33] = ["2f01eca5e738", "7cee1dfdba7f", "a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f",
                                        "4ccede2d49cf", "09639faa6673", "d3a86f7b014f", "f92680b7b136", "0f9f7da275f1", "a386c60fbb06", "a990d0ea0ada", "2789b337ae54", "bc901ee5b05a", "4c42635f416e", "5f0c6b2fdd16",
-                                       "29a02d72f4a7", "eea12425de4c", "6f3c526261aa", "83c4b154d906", "8b4eb56bb201", "c4681b3a3229", "da01b4c516f3", "0c5d5c8a61e7", "fc49ee7e2b64", "635154fd6f71"];
+                                       "29a02d72f4a7", "eea12425de4c", "6f3c526261aa", "83c4b154d906", "8b4eb56bb201", "c4681b3a3229", "da01b4c516f3", "0c5d5c8a61e7", "fc49ee7e2b64", "635154fd6f71", "009e2b28af08", "ea60729870d6"];
 const SURE_PLAYS: usize = 50; // of the player's own, on a keymode: fewer and the model is mostly the population's guess
 pub const ACTIVE_KEYS: std::ops::RangeInclusive<i64> = 4..=10;
 
@@ -137,6 +137,9 @@ pub struct Card {
     pub acc_mid: f64,
     pub acc_lo: f64,
     pub acc_hi: f64,
+    /// Mods the numbers include (`Mods::labels`) and mods they leave out: the card names both.
+    pub mods: Vec<String>,
+    pub without: Vec<String>,
     pub sure: bool, // enough of the player's own plays on this keymode to show acc_mid unasked
     pub form: (Option<&'static str>, f64),
     pub length: f64,
@@ -174,6 +177,11 @@ impl Engine {
     pub fn new(public: Arc<Public>, c: Arc<Consts>, r: Refit, settings: PpSettings) -> Engine {
         let source = FeatureSource { public: public.clone(), calc: CALC_ID.to_string(), cache: HashMap::default() };
         Engine { transfer: Arc::new(family_transfer(&c)), public, c, prm: Arc::new(standard_params()), r, source, settings, observing: Arc::default(), variants: None, pernote: None }
+    }
+
+    /// Stored features changed under the PP candidates (the background carry landed): they are read again on the next request.
+    pub fn forget_variants(&mut self) {
+        self.variants = None;
     }
 
     /// A finished refit replaces the models; results that landed meanwhile are observed again.
@@ -291,8 +299,9 @@ impl Engine {
         Ok(score(&variants, &s, threads))
     }
 
-    /// recommend.pool with choose=False: (phase, the first n_show of the eligible maps, note).
-    pub fn pool(&mut self, db: &Db, keys: &[i64], n: &Now, n_show: usize) -> Result<(&'static str, Vec<Pick>, String)> {
+    /// The PP list's rows, best first in the session's weighted shuffle: (phase, the eligible maps, note). The worker's list
+    /// gives them their places, as it does on every tab.
+    pub fn pool(&mut self, db: &Db, keys: &[i64], n: &Now) -> Result<(&'static str, Vec<Pick>, String)> {
         let list = self.scored(db, keys, n)?;
         let phase = n.session.phase();
         let month = now_months();
@@ -307,10 +316,9 @@ impl Engine {
                 rows = warmups(&f, &list, &n.session, k0, &n.tables, &n.view_tables, &by_chart, &typ);
             }
         }
-        let seed = n.session.all.iter().filter(|e| matches!(e.kind.as_str(), "offer" | "reset")).map(|e| e.id).max().unwrap_or(0); // PP: a weighted draw per offer (its rotation)
         let ids: Vec<(String, f64)> = rows.iter().map(|c| (c.md5.clone().or_else(|| c.sha.clone()).or_else(|| c.bid.map(|b| b.to_string())).unwrap_or_else(|| c.title.clone()), c.weight)).collect();
-        let order = preview_order(&ids, &seed.to_string(), 0.);
-        let shown: Vec<Pick> = order.into_iter().take(n_show).map(|i| rows[i].clone()).collect();
+        let order = preview_order(&ids, &n.session.shuffle_seed().to_string(), 0.);
+        let shown: Vec<Pick> = order.into_iter().map(|i| rows[i].clone()).collect();
         let top = rows.iter().filter(|c| c.best_rank <= 100).count();
         let mut note = if rows.is_empty() { "No likely PP gains at this readiness — try Skills or an easier map".to_string() } else { format!("{} eligible · {top} top-100", commas(rows.len())) };
         if relaxed {
@@ -373,7 +381,7 @@ impl Engine {
         let pp = ranked.then(|| estimates(&e.pp, stars.unwrap(), hits, bid, &self.r.ledger));
         let plays_like = self.plays_like(&f, b, rate);
         let nps = f.dict("nps").and_then(|d| d.get("nps")).filter(|v| !v.is_none()).map(Val::f); // None under two notes (structure.rs)
-        Ok(Some(Card { bid, md5, keys: feats.keys, title, var: rate_label_pp(rate), rate, ranked, artist, song, version, acc_mid: e.shown.acc_mid, acc_lo: e.shown.acc_lo, acc_hi: e.shown.acc_hi, sure: self.own_plays(feats.keys) >= SURE_PLAYS,
+        Ok(Some(Card { mods: Vec::new(), without: Vec::new(), bid, md5, keys: feats.keys, title, var: rate_label_pp(rate), rate, ranked, artist, song, version, acc_mid: e.shown.acc_mid, acc_lo: e.shown.acc_lo, acc_hi: e.shown.acc_hi, sure: self.own_plays(feats.keys) >= SURE_PLAYS,
                        form: n.session.form_state(feats.keys), length: f.f("length") / 1000. / rate, skill: top_skill(&f), nps, pp, pp_expected: stars.map(|s| crate::pp::expected(&e.pp, s, hits)), plays_like }))
     }
 
@@ -517,6 +525,7 @@ pub fn carry_web(db: &ms_data::store::Db) -> std::result::Result<(), String> {
 /// A stored chart by its sha: lazer's store, the website cache, or a convert remade from its source.
 pub struct Charts {
     converts: HashMap<String, Inst>,
+    modded: HashMap<String, (String, String)>, // modcharts: sha → (source sha, tag)
     root: std::path::PathBuf,
     last: std::sync::Mutex<Option<(String, Option<ms_calc::chart::Chart>)>>, // rows of one chart's rates come in a run
     pub missing: std::sync::atomic::AtomicUsize, // charts without a file: their rows keep the old rating
@@ -524,15 +533,22 @@ pub struct Charts {
 
 impl Charts {
     pub fn new(db: &Db) -> Result<Charts> {
-        Ok(Charts { converts: crate::converts::rows(db)?.into_iter().map(|i| (i.sha256.clone(), i)).collect(), root: ms_data::paths::lazer_data(), last: Default::default(), missing: Default::default() })
+        let modded = db.prepare("SELECT sha, source, tag FROM mod_charts")?.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?.collect::<Result<_>>()?;
+        Ok(Charts { modded, converts: crate::converts::rows(db)?.into_iter().map(|i| (i.sha256.clone(), i)).collect(), root: ms_data::paths::lazer_data(), last: Default::default(), missing: Default::default() })
     }
 
     pub fn chart(&self, sha: &str) -> Option<ms_calc::chart::Chart> {
+        if let Some((source, tag)) = self.modded.get(sha) {
+            return ms_calc::chart::parse(&ms_calc::mods::tagged(&self.data(source)?, tag)).ok(); // a chart as played with mods: its source + the tag
+        }
+        ms_calc::chart::parse(&self.data(sha)?).ok()
+    }
+
+    fn data(&self, sha: &str) -> Option<Vec<u8>> {
         let web = ms_data::webmaps::web_dir().join("osu").join(format!("{sha}.osu"));
         // Stable's store too: a stable player's charts all read as missing and kept the old calculator's analysis (a player
         // 2026-11-05: every LN skill at 0 charts, v1.4.0).
-        let data = crate::pp::chart_path(Some(sha)).and_then(|p| std::fs::read(p).ok()).or_else(|| std::fs::read(web).ok()).or_else(|| crate::converts::bytes(self.converts.get(sha)?, &self.root))?;
-        ms_calc::chart::parse(&data).ok()
+        crate::pp::chart_path(Some(sha)).and_then(|p| std::fs::read(p).ok()).or_else(|| std::fs::read(web).ok()).or_else(|| crate::converts::bytes(self.converts.get(sha)?, &self.root))
     }
 
     /// `chart`, counting the ones missing.

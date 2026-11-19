@@ -844,6 +844,7 @@ pub struct Feats {
     pub keys: i64,
     pub overall: f64,
     pub od: f64,
+    pub window: f64,                   // Chart::window_shift: a mod moved the hit windows (0 on a plain chart)
     pub length: f64,
     pub sk: Vec<f64>,                  // by Consts.names, missing = 0
     pub dom: usize,                    // warmup.dominant
@@ -876,7 +877,7 @@ impl Feats {
 
     /// A chart known by its rating alone (nps.reach's search).
     pub fn bare(keys: i64, overall: f64, od: f64, c: &Consts) -> Feats {
-        Feats { keys, overall, od, length: 0., sk: vec![0.; c.names.len()], dom: c.family("rice"), z_tail: [0.; 5], width: 0., geometry: None, vibro: (0., 0.), vibro_speed: 0., unhittable: 0. }
+        Feats { keys, overall, od, window: 0., length: 0., sk: vec![0.; c.names.len()], dom: c.family("rice"), z_tail: [0.; 5], width: 0., geometry: None, vibro: (0., 0.), vibro_speed: 0., unhittable: 0. }
     }
 
     pub fn of(f: &Dict, c: &Consts) -> Res<Feats> {
@@ -913,6 +914,7 @@ impl Feats {
             keys,
             overall: need("overall")?.f(),
             od: need("od")?.f(),
+            window: f.get("window_shift").map_or(0., Val::f),
             length: f.get("length").map_or(0., Val::f),
             sk,
             dom: c.pick_dominant(order.into_iter()),
@@ -1196,7 +1198,7 @@ impl PredModel {
         let lr = f.overall.max(0.05).ln();
         let curve = pop.curve(f.keys);
         let bend = (lr - pop.knee.ln()).max(0.).powi(2);
-        (s * lr + curve * bend + c * (64. - 3. * f.od).max(10.).ln() + mb + self.gap_term(f, level), n_mb)
+        (s * lr + curve * bend + c * (64. - 3. * f.od).max(10.).ln() + ms_calc::mods::window_law(f.window) + mb + self.gap_term(f, level), n_mb)
     }
 
     /// personal::unread: the deficit of the next own play of a chart not yet learned, (a + UNREAD_SV·SV rating²)/(1 + plays).
@@ -1653,6 +1655,9 @@ mod model_tests {
         let f = plain(&m);
         let a = m.base_of(&f, Some(1), 1., None).0;
         assert!((a - m.base_of(&f, Some(1), 0.9999, None).0).abs() < 0.001 && (a - m.base_of(&f, Some(1), 1.0001, None).0).abs() < 0.001);
+        // Hard Rock's windows (÷ 1.4) cost what the window law says; Easy's give less back
+        let moved = |shift: f64| m.base_of(&Feats { window: shift, ..f.clone() }, Some(1), 1., None).0 - a;
+        assert!((moved(-(1.4f64.ln())) - 0.5345).abs() < 1e-3 && (moved(1.4f64.ln()) + 0.3361).abs() < 1e-3 && moved(0.) == 0.);
     }
 
     #[test]

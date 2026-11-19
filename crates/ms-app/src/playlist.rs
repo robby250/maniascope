@@ -662,7 +662,7 @@ impl App {
     fn list_page(&mut self, ui: &mut Ui, mode: &'static str) {
         let v = &self.views[mode];
         if let Some(c) = &v.target {
-            let lines = fmt::target_lines(c, &self.obs, &self.units);
+            let lines = fmt::target_lines(c, &self.obs, self.card.as_deref(), &self.units);
             // A PP pick keeps its "+pp · chance" on the right, like the rows under it (user 2026-11-02).
             let number = pp_row(c, mode).then(|| row_text(c, mode, &self.units).0);
             // A red SET says what osu! still shows differently.

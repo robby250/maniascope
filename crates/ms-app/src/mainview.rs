@@ -297,8 +297,8 @@ impl App {
             parts.push((format!("O2Jam Lv. {l:.0}"), format!("O2Jam level {l:.1} at this rate: our calc's ratings mapped onto O2Jam levels, fitted on 4,400 O2Jam charts and osu! converts named with their level (typically off by 5–8 levels). Trained mostly on LN-heavy O2Jam charts: pure rice charts may read off.")));
         }
         parts.push((format!("{:.2}×{}", a.rate, if known { "" } else { " (osu! rate unknown)" }), if known { "Rate read from osu!'s mods.".into() } else { "osu! hasn't reported a rate yet: 1.00× assumed.".into() }));
-        if a.sv_ignored {
-            parts.push(("SV ignored (Constant Speed)".into(), "lazer's Constant Speed is on: scroll speed changes don't count.".into()));
+        for m in ms_calc::mods::Mods::from_tag(&a.mods).labels() {
+            parts.push((m, "A mod that is on in osu!: the difficulty, the skills and the dan are those of the chart as it is played with it.".into()));
         }
         // Chart length, or time left (real seconds at this rate) in play.
         if let Some((t0, t1)) = a.span {

@@ -2,12 +2,11 @@
 use crate::pyjson::dumps;
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use rusqlite::{params, params_from_iter, types::Value as Sql, Connection, OptionalExtension, Row};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::path::Path;
 
 pub const SUPPORTED_KEYS: std::ops::RangeInclusive<i64> = 4..=10;
 pub const RANKED_STATUS: [i64; 2] = [1, 2]; // ranked, approved; 4 = loved (warmup only)
-const RANKED_MODS: [&str; 13] = ["NF", "EZ", "HD", "FI", "FL", "MR", "SD", "PF", "HT", "DC", "DT", "NC", "CL"];
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS scores(key TEXT PRIMARY KEY, src TEXT, local_id TEXT, online_id INTEGER,
@@ -23,6 +22,8 @@ CREATE TABLE IF NOT EXISTS converts(source_sha TEXT, target INTEGER, converter T
   web INTEGER, PRIMARY KEY(source_sha, target, converter));
 CREATE INDEX IF NOT EXISTS converts_sha ON converts(sha);
 CREATE TABLE IF NOT EXISTS feats(key TEXT PRIMARY KEY, data TEXT);
+CREATE TABLE IF NOT EXISTS mod_charts(sha TEXT PRIMARY KEY, source TEXT, tag TEXT);
+CREATE INDEX IF NOT EXISTS mod_charts_source ON mod_charts(source, tag);
 CREATE TABLE IF NOT EXISTS installed(sha256 TEXT PRIMARY KEY, beatmap_id INTEGER, set_id INTEGER, md5 TEXT,
   status INTEGER, keys INTEGER, od REAL, length REAL, title TEXT, artist TEXT, version TEXT);
 CREATE TABLE IF NOT EXISTS installed_local(sha256 TEXT PRIMARY KEY, online_md5 TEXT, audio_sha TEXT,
@@ -43,6 +44,33 @@ pub static CARRIED: [std::sync::atomic::AtomicUsize; 2] = [std::sync::atomic::At
 
 /// The app's worker keeps it current while a carry runs.
 pub static GAME_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A carry of the rest of the library runs in the background (the app's two-phase start): the list builder leaves the
+/// charts without a row of this calculator to it instead of analysing them from nothing.
+pub static CARRYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The `sha@rate` names of `names` whose stored rating (any calculator's row) lies in its keymode's window `near`: what the
+/// first list after a calculator change can offer. A name whose rating can't be read from its row's head counts as near.
+pub fn near_names(db: &Db, names: &std::collections::HashSet<String>, near: &std::collections::HashMap<i64, (f64, f64)>) -> Result<std::collections::HashSet<String>> {
+    let mut out = std::collections::HashSet::new();
+    let mut q = db.prepare("SELECT key, substr(data, 1, 96) FROM feats")?;
+    let mut rows = q.query([])?;
+    while let Some(r) = rows.next()? {
+        let key: String = r.get(0)?;
+        let name = key.rsplit_once('|').map_or("", |n| n.0);
+        if !names.contains(name) || out.contains(name) {
+            continue;
+        }
+        let head = match r.get_ref(1)? {
+            rusqlite::types::ValueRef::Blob(b) => crate::codec::rating(b),
+            _ => None,
+        };
+        if head.is_none_or(|(k, overall)| near.get(&k).is_some_and(|w| (w.0..=w.1).contains(&overall))) {
+            out.insert(name.to_string());
+        }
+    }
+    Ok(out)
+}
 
 /// Threads of a carry batch: every core but two, half of them beside a running game (the wait after a calculator update is
 /// this, user 2026-11-19; half always left a 24-core machine's other 12 idle with no game up).
@@ -303,41 +331,15 @@ fn event(r: &Row<'_>) -> Result<Event> {
                info: info.and_then(|i| serde_json::from_str(&i).ok()).unwrap_or_else(|| json!({})) })
 }
 
-/// lazer mod list → (rate | None, ranked). Custom DT/HT speeds and any other setting are unranked (osu! wiki,
-/// Double Time (lazer)); adjust_pitch alone keeps a score ranked.
+/// lazer mod list → (rate | None, ranked): `ms_calc::mods::plan`'s reading. A time ramp is rate 1 on its own chart.
 pub fn variant(mods: &[Value]) -> (Option<f64>, bool) {
-    let (mut rate, mut ranked) = (1., true);
-    for m in mods {
-        let acronym = m.get("acronym").and_then(Value::as_str).unwrap_or("").to_uppercase();
-        let empty = Map::new();
-        let settings: Vec<(&String, &Value)> = m.get("settings").and_then(Value::as_object).unwrap_or(&empty).iter()
-            .filter(|(k, _)| k.as_str() != "adjust_pitch").collect();
-        if ["WU", "WD", "AS"].contains(&acronym.as_str()) {
-            return (None, false);
-        }
-        let default = match acronym.as_str() {
-            "HT" | "DC" => Some(0.75),
-            "DT" | "NC" => Some(1.5),
-            _ => None,
-        };
-        if let Some(default) = default {
-            rate = settings.iter().find(|(k, _)| k.as_str() == "speed_change").and_then(|(_, v)| v.as_f64()).unwrap_or(default);
-            ranked &= rate == default && settings.iter().all(|(k, _)| k.as_str() == "speed_change");
-        } else {
-            ranked &= RANKED_MODS.contains(&acronym.as_str()) && settings.is_empty();
-        }
-    }
-    (Some(rate), ranked)
+    let m = ms_calc::mods::plan(mods);
+    (m.rate, m.ranked)
 }
 
-/// Only known constant-rate, unmodified-chart contexts enter live residuals.
+/// Whether a play in this context is the player's own result on a chart the calculator can build: it enters live residuals.
 pub fn predictable_context(mods: &[Value], rate: f64) -> bool {
-    const ALLOWED: [&str; 11] = ["NF", "HD", "FI", "FL", "MR", "SD", "PF", "DT", "NC", "HT", "DC"];
-    rate.is_finite() && rate > 0. && mods.iter().all(|m| {
-        let acronym = m.get("acronym").and_then(Value::as_str).unwrap_or("").to_uppercase();
-        ALLOWED.contains(&acronym.as_str()) && m.get("settings").and_then(Value::as_object)
-            .is_none_or(|s| s.keys().all(|k| k == "speed_change" || k == "adjust_pitch"))
-    })
+    rate.is_finite() && rate > 0. && ms_calc::mods::plan(mods).tracked
 }
 
 /// (perfect, great, good, ok, meh, miss)
@@ -480,6 +482,28 @@ mod tests {
     }
 
     #[test]
+    fn near_names_are_the_rows_rated_inside_their_keymodes_window() {
+        let db = db();
+        let row = |name: &str, keys: i64, overall: f64| {
+            let mut d = ms_calc::val::Dict::new();
+            d.set("keys", ms_calc::val::Val::Int(keys));
+            d.set("overall", overall);
+            d.set("sk", ms_calc::val::Val::List(vec![ms_calc::val::Val::F(0.5); 400])); // a real row is ~3 kB: its head is read alone
+            db.execute("INSERT INTO feats VALUES (?,?)", params![format!("{name}|old"), crate::codec::encode(&ms_calc::val::Val::Dict(d))]).unwrap();
+        };
+        row("in@1.000", 7, 9.0);
+        row("low@1.000", 7, 6.0);
+        row("high@1.000", 7, 12.0);
+        row("other@1.000", 4, 9.0); // a keymode without a window: not near
+        row("unasked@1.000", 7, 9.0);
+        db.execute("INSERT INTO feats VALUES ('text@1.000|old', '{\"keys\": 7}')", []).unwrap(); // unreadable head: carried first, to be safe
+        let names = ["in", "low", "high", "other", "text", "gone"].iter().map(|n| format!("{n}@1.000")).collect();
+        let mut near: Vec<String> = near_names(&db, &names, &[(7, (7.5, 10.5))].into_iter().collect()).unwrap().into_iter().collect();
+        near.sort();
+        assert_eq!(near, ["in@1.000", "text@1.000"]);
+    }
+
+    #[test]
     fn pruning_takes_only_other_calculators_rows() {
         let dir = std::env::temp_dir().join(format!("ms-prune-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -563,8 +587,9 @@ mod tests {
         assert_eq!(variant(&[json!({"acronym": "DT"})]), (Some(1.5), true));
         assert_eq!(variant(&[json!({"acronym": "DT", "settings": {"speed_change": 1.3}})]), (Some(1.3), false));
         assert_eq!(variant(&[json!({"acronym": "HT", "settings": {"adjust_pitch": true}})]), (Some(0.75), true));
-        assert_eq!(variant(&[json!({"acronym": "WU"})]), (None, false));
-        assert!(!predictable_context(&[json!({"acronym": "AT"})], 1.));
+        assert_eq!(variant(&[json!({"acronym": "WU"})]), (Some(1.), false));
+        assert_eq!(variant(&[json!({"acronym": "AS"})]), (None, false));
+        assert!(!predictable_context(&[json!({"acronym": "AT"})], 1.) && predictable_context(&[json!({"acronym": "IN"}), json!({"acronym": "CS"})], 1.));
         assert!(predictable_context(&[json!({"acronym": "NC", "settings": {"speed_change": 1.2}})], 1.2));
     }
 

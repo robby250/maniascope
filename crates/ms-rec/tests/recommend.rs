@@ -129,7 +129,8 @@ fn ranked_variants() {
     assert_eq!(v(json!([{"acronym": "DT", "settings": {"adjust_pitch": true}}])), (Some(1.5), true));
     assert_eq!(v(json!([{"acronym": "HT"}, {"acronym": "NF"}])), (Some(0.75), true));
     assert_eq!(v(json!([{"acronym": "CS"}])), (Some(1.), false));
-    assert_eq!(v(json!([{"acronym": "WU"}])), (None, false));
+    assert_eq!(v(json!([{"acronym": "WU"}])), (Some(1.), false)); // a time ramp is its own chart at 1×
+    assert_eq!(v(json!([{"acronym": "AS"}])), (None, false));
 }
 
 const STATS: [i64; 6] = [900, 50, 20, 10, 5, 15];

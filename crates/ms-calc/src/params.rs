@@ -125,9 +125,20 @@ knobs! {
     V_FAST: f64 = 12.0,
     SPEED_P: f64 = 1.5,
     W_JACK: f64 = 3.3,      // on 7K; other keymodes as (7/keys)^W_JACK_KEYS: 4.37 on 4K, 2.76 on 10K (2026-11-19: 7K residual rises with a map's jack share; searched with the keymode power)
-    W_JACK_KEYS: f64 = 0.5,
+    W_JACK_KEYS: f64 = 0.67, // flat 0.57–0.77 (thin-keymode retune 2026-11-19)
     JACK_P: f64 = 0.5,      // on 4K; wider keymodes as (keys/4)^JACK_P_KEYS (open loop p8/p12: wide keys want a steeper jack speed curve)
-    JACK_P_KEYS: f64 = 1.0,
+    JACK_P_KEYS: f64 = 1.44, // flat 1.3–1.55 (thin-keymode retune 2026-11-19: 8K–10K confirm −0.3 … −1 %, 4K/7K ±0.1 %)
+    STREAM_FAMILY: f64 = 0.933, // 5K+ card: the Stream row = this × the rating of the fast and slow halves together (0 = the stronger half). Searched 2026-11-19 so Stream leads as many 5K+ cards as the stronger half did (47.3 % of 6,119; user: within 0.3 points)
+    // A re-hit is played by the cheapest of two techniques (user 2026-11-19: finger, wrist and arm jack with different speed,
+    // stamina and precision). Neither cost falls with speed, so a rating never falls when the rate rises (the old knee made a
+    // re-hit under 70 ms cheaper than one at 70 ms). Searched together 2026-11-19 (31 trials): the values below.
+    JACK_RUN_P: f64 = 0.195, // finger: effort × ((1 + re-hits before it in the column's run) / JACK_RUN_REF)^this (top replays: loss over charge doubles from a lone re-hit to the 17th, every speed, 4K and 7K); flat .15–.25
+    JACK_RUN_REF: f64 = 4.0,
+    JACK_ARM: f64 = 1.0,     // arm: its effort at JACK_ARM_V re-hits/s over the finger's there; ±0.2 costs 0.2–0.35 %
+    JACK_ARM_V: f64 = 14.0,  // on 4K; other keymodes as (keys/4)^JACK_ARM_KEYS
+    JACK_ARM_KEYS: f64 = -0.25, // flat from −0.45 to −0.05
+    JACK_ARM_Q: f64 = 0.0,   // arm effort ∝ speed^this, floored at 0: the search asks for a falling cost, flat costs 0.02 %
+    JACK_ARM_RUN_P: f64 = 0.054, // arm: × ((1 + re-hits before) / JACK_RUN_REF)^this (it lasts longer than the finger)
     W_IJACK: f64 = 0.4,
     JACK_SHARE: f64 = 1.4,
     MIRROR: f64 = 0.25,
@@ -149,6 +160,7 @@ knobs! {
     FLAM: f64 = 0.045,
     MASH_SPAN: f64 = 1.0, // Chart::mashed: rows on other columns within this share of the great window, one gesture (0 = off)
     MASH_EASE: f64 = 0.5, // share of a bin's demand eased where its written rows merged into one gesture, × great window / OD 8's (compute.rs)
+    MASH_RAMP: f64 = 0.4, // a merged roll eases in full from this share of the span inside it, in proportion before (0 = at once)
     MASH_COVER: f64 = 0.8, // Chart::mashed: share of the keys a gesture covers to merge (a rolled chord, not a flam)
     VF_JACK: f64 = 0.5,     // 0 → 1: a jacked note's finger-repeat factor fades out (its jack effort already scales with that speed); 4K value
     VF_JACK_KEYS: f64 = 2.0, // VF_JACK scales as (4/keys)^this: the 4K gain, flat it cost 7K/10K (open loop p7/p11)

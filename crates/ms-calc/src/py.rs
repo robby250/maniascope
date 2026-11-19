@@ -41,6 +41,10 @@ pub fn int(s: &str) -> Option<i64> {
 /// `int(float(s))`: NaN is a ValueError (Err(false)), ±inf an OverflowError (Err(true)).
 pub fn int_float(s: &str) -> Result<i64, bool> {
     // nearly every field is a plain integer: below 2^53 the float round trip is exact
+    let b = s.as_bytes();
+    if (1..=15).contains(&b.len()) && b.iter().all(u8::is_ascii_digit) {
+        return Ok(b.iter().fold(0i64, |v, d| v * 10 + i64::from(d - b'0'))); // digits only, under 10^15: the same value, no trim or sign handling
+    }
     if let Ok(v) = s.trim().parse::<i64>() {
         if v.unsigned_abs() < 1 << 53 {
             return Ok(v);

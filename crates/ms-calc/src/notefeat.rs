@@ -17,31 +17,54 @@ type Counts<K> = HashMap<K, u32, std::hash::BuildHasherDefault<crate::val::Fx>>;
 pub(crate) struct Markov {
     seen: VecDeque<(u32, u32)>,
     pair: Counts<(u32, u32)>,
-    from: Counts<u32>,
-    freq: Counts<u32>,
+    from: Tally,
+    freq: Tally,
     alphabet: f64,
     window: usize,
 }
 
+/// Counts by chord mask: a plain table while the keymode's masks fit one (≤ 12 keys), a map beyond.
+enum Tally {
+    Table(Vec<u32>),
+    Map(Counts<u32>),
+}
+impl Tally {
+    fn new(alphabet: f64) -> Tally {
+        if alphabet < 4096. { Tally::Table(vec![0; alphabet as usize + 1]) } else { Tally::Map(Counts::default()) }
+    }
+    fn at(&mut self, k: u32) -> &mut u32 {
+        if let Tally::Table(t) = self {
+            if k as usize >= t.len() {
+                // a mask past the alphabet (never from a chart of that keymode): the map from here on
+                *self = Tally::Map(t.iter().enumerate().filter(|x| *x.1 != 0).map(|(i, v)| (i as u32, *v)).collect());
+            }
+        }
+        match self {
+            Tally::Table(t) => &mut t[k as usize],
+            Tally::Map(m) => m.entry(k).or_default(),
+        }
+    }
+}
+
 impl Markov {
     pub(crate) fn new(alphabet: f64, window: usize) -> Markov {
-        Markov { seen: VecDeque::new(), pair: Counts::default(), from: Counts::default(), freq: Counts::default(), alphabet, window }
+        Markov { seen: VecDeque::new(), pair: Counts::default(), from: Tally::new(alphabet), freq: Tally::new(alphabet), alphabet, window }
     }
 
     pub(crate) fn step(&mut self, prev: u32, cur: u32) -> f64 {
         let n = self.seen.len() as f64;
-        let get = |m: &Counts<u32>, k: u32| f64::from(m.get(&k).copied().unwrap_or(0));
-        let base = (get(&self.freq, cur) + 0.5) / (n + 0.5 * self.alphabet);
-        let p = (f64::from(self.pair.get(&(prev, cur)).copied().unwrap_or(0)) + base) / (get(&self.from, prev) + 1.);
-        *self.pair.entry((prev, cur)).or_default() += 1;
-        *self.from.entry(prev).or_default() += 1;
-        *self.freq.entry(cur).or_default() += 1;
+        let base = (f64::from(*self.freq.at(cur)) + 0.5) / (n + 0.5 * self.alphabet);
+        let pair = self.pair.entry((prev, cur)).or_default();
+        let p = (f64::from(*pair) + base) / (f64::from(*self.from.at(prev)) + 1.);
+        *pair += 1;
+        *self.from.at(prev) += 1;
+        *self.freq.at(cur) += 1;
         self.seen.push_back((prev, cur));
         if self.seen.len() > self.window {
             let (a, b) = self.seen.pop_front().unwrap();
             *self.pair.get_mut(&(a, b)).unwrap() -= 1;
-            *self.from.get_mut(&a).unwrap() -= 1;
-            *self.freq.get_mut(&b).unwrap() -= 1;
+            *self.from.at(a) -= 1;
+            *self.freq.at(b) -= 1;
         }
         -p.log2()
     }

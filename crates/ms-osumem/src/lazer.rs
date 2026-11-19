@@ -9,9 +9,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const ANCHOR: &str = "01 01 00 00 00 00 80 44 00 00 40 44"; // OsuGame's ScalingContainerTargetDrawSize
-const ASSEMBLIES: [&str; 3] = ["osu!", "osu.Game", "osu.Framework"];
+const ASSEMBLIES: [&str; 4] = ["osu!", "osu.Game", "osu.Framework", "osu.Game.Rulesets.Mania"];
+// The mods whose settings change the chart, and the two bindable shapes their values sit in (a number; a nullable number).
+const WIND_UP: &str = "osu.Game.Rulesets.Mods.ModWindUp";
+const WIND_DOWN: &str = "osu.Game.Rulesets.Mods.ModWindDown";
+const RANDOM: &str = "osu.Game.Rulesets.Mods.ModRandom";
+const ADJUST: &str = "osu.Game.Rulesets.Mania.Mods.ManiaModDifficultyAdjust";
+const NUMBER: &str = "osu.Framework.Bindables.BindableDouble";
+const NULLABLE: &str = "osu.Game.Rulesets.Mods.DifficultyBindable";
 const GAME_CLASS: &str = "osu.Desktop.OsuGameDesktop";
-const CLASSES: [&str; 28] = [GAME_CLASS, "osu.Framework.Audio.Track.Track", "osu.Framework.Platform.Storage", "osu.Framework.Screens.ScreenStack", "osu.Framework.Timing.DecouplingFramedClock",
+const CLASSES: [&str; 34] = [GAME_CLASS, WIND_UP, WIND_DOWN, RANDOM, ADJUST, NUMBER, NULLABLE, "osu.Framework.Audio.Track.Track", "osu.Framework.Platform.Storage", "osu.Framework.Screens.ScreenStack", "osu.Framework.Timing.DecouplingFramedClock",
     "osu.Framework.Timing.FramedClock", "osu.Game.Beatmaps.BeatmapInfo", "osu.Game.Beatmaps.FramedBeatmapClock", "osu.Game.Beatmaps.WorkingBeatmapCache+BeatmapManagerWorkingBeatmap",
     "osu.Game.IO.WrappedStorage", "osu.Game.Models.RealmUser", "osu.Game.Online.API.APIAccess", "osu.Game.Online.API.LocalUserState", "osu.Game.Online.API.Requests.Responses.APIUser",
     "osu.Game.Online.Chat.ExternalLinkOpener", "osu.Game.OsuGame", "osu.Game.OsuGameBase", "osu.Game.Rulesets.RulesetInfo", "osu.Game.Scoring.ScoreInfo", "osu.Game.Screens.Edit.Editor",
@@ -146,18 +153,51 @@ impl Lazer {
         if self.p.u8(bindable + 0x50)? == 1 {
             return Some(()); // disabled in gameplay: the list keeps what the score's mods say
         }
-        let mut list = Vec::new();
+        let mut items = Vec::new();
         for item in self.items(self.p.ptr(bindable + 0x20)?)? {
-            let Some(name) = self.mods.get(&self.p.ptr(item)?).copied() else { continue };
+            items.push((item, self.p.ptr(item)?));
+        }
+        // The map is of the ruleset it was read under: a mod type it lacks means the ruleset changed since (seen live
+        // 2026-11-19: a reader attached before the switch to mania read no mods at all).
+        if items.iter().any(|(_, t)| !self.mods.contains_key(t)) {
+            self.mods.clear();
+            self.map_mods(game)?;
+        }
+        let mut list = Vec::new();
+        for (item, class) in items {
+            let Some(name) = self.mods.get(&class).copied() else { continue };
             let mut entry = json!({"acronym": name});
             if matches!(name, "DT" | "NC" | "HT" | "DC") {
                 entry["settings"] = json!({"speed_change": self.p.f64(self.p.ptr(item + 0x10)? + 0x40)?});
+            } else if let Some(settings) = self.settings(name, item) {
+                entry["settings"] = settings;
             }
             list.push(entry);
         }
         let name: String = list.iter().filter_map(|m| m["acronym"].as_str()).collect();
         self.menu_mods = json!({"array": list, "name": name});
         Some(())
+    }
+
+    /// What the player set on a chart-changing mod in song select, as a score would store it (user 2026-11-19: "maniascope
+    /// should track the customize too, it does that for DT"). The offsets come from the DLLs; a value outside what the
+    /// game's sliders allow is not a setting (the mod then counts with its defaults). Live on lazer 2026.1117.0: Wind Up's rates
+    /// and a typed Random seed read as shown; the Difficulty Adjust sliders were not exercised.
+    fn settings(&self, name: &str, item: u64) -> Option<Value> {
+        let number = |class: &str, field: &str| self.p.f64(self.at(item, class, field)? + self.off(NUMBER, "value")?);
+        // a nullable: one byte "has a value", the value 4 bytes on
+        let nullable = |class: &str, field: &str| Some(self.at(item, class, field)? + self.off(NULLABLE, "value")?).filter(|a| self.p.u8(*a) == Some(1)).map(|a| a + 4);
+        match name {
+            "WU" | "WD" => {
+                let class = if name == "WU" { WIND_UP } else { WIND_DOWN };
+                let (from, to) = (number(class, "<InitialRate>k__BackingField")?, number(class, "<FinalRate>k__BackingField")?);
+                ((0.4..=2.1).contains(&from) && (0.4..=2.1).contains(&to)).then(|| json!({"initial_rate": from, "final_rate": to}))
+            }
+            "RD" => self.p.i32(nullable(RANDOM, "<Seed>k__BackingField")?).filter(|s| *s >= 0).map(|s| json!({"seed": s})),
+            "DA" => self.p.i32(nullable(ADJUST, "<OverallDifficulty>k__BackingField")?).map(|bits| f32::from_bits(bits as u32)).filter(|od| (0.0..=11.0).contains(od))
+                .map(|od| json!({"overall_difficulty": (f64::from(od) * 10.).round() / 10.})),
+            _ => None,
+        }
     }
 
     fn score_mods(&self, info: u64) -> Option<Value> {

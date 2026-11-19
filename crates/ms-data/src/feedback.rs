@@ -13,25 +13,19 @@ fn array(m: &Value) -> Option<&Vec<Value>> {
     m.get("array").unwrap_or(m).as_array()
 }
 
-/// tosu `play.mods` → (constant rate | None, note). Unknown is never 1.0.
-pub fn rate_from_mods(mods: &Value) -> (Option<f64>, String) {
-    let Some(arr) = array(mods) else { return (None, "rate not reported".to_string()) };
-    let mut rate = 1.;
-    for m in arr {
-        let acronym = m["acronym"].as_str().unwrap_or("").to_uppercase();
-        match acronym.as_str() {
-            "WU" | "WD" | "AS" => return (None, format!("{acronym} is variable speed — unsupported, set the rate manually")),
-            "DT" | "NC" => rate = m["settings"]["speed_change"].as_f64().unwrap_or(1.5),
-            "HT" | "DC" => rate = m["settings"]["speed_change"].as_f64().unwrap_or(0.75),
-            _ => {}
-        }
-    }
-    if (0.1..=5.).contains(&rate) { (Some(rate), String::new()) } else { (None, format!("implausible rate {rate}")) }
+/// tosu `play.mods` as what the mods do (`ms_calc::mods::plan`); None: no mod list reported.
+pub fn mods(mods: &Value) -> Option<ms_calc::mods::Mods> {
+    array(mods).map(|a| ms_calc::mods::plan(a))
 }
 
-/// tosu `play.mods` include Constant Speed (scroll changes removed).
-pub fn constant_speed(mods: &Value) -> bool {
-    array(mods).is_some_and(|a| a.iter().any(|m| m["acronym"].as_str().unwrap_or("").eq_ignore_ascii_case("CS")))
+/// tosu `play.mods` → (constant rate | None, note). Unknown is never 1.0.
+pub fn rate_from_mods(mods: &Value) -> (Option<f64>, String) {
+    match self::mods(mods).map(|m| m.rate) {
+        None => (None, "rate not reported".to_string()),
+        Some(None) => (None, "Adaptive Speed: the rate follows your hits".to_string()),
+        Some(Some(rate)) if (0.1..=5.).contains(&rate) => (Some(rate), String::new()),
+        Some(Some(rate)) => (None, format!("implausible rate {rate}")),
+    }
 }
 
 pub fn load() -> Value {

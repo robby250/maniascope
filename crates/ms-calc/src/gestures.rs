@@ -46,7 +46,8 @@ pub type Rows = Vec<(f64, usize, usize)>;
 pub struct Packet {
     pub center: f64,
     pub hand: u8,
-    pub ids: Vec<usize>,
+    /// its notes, as a range of the packets' shared note list
+    pub ids: std::ops::Range<usize>,
     pub cols: u32,
     pub span: f64,
     pub direction: f64,
@@ -54,9 +55,11 @@ pub struct Packet {
     pub held: f64,
 }
 
-fn packets(notes: &Notes, rows: &Rows, hand_of: &[u8], window: f64) -> Vec<Packet> {
+/// Each hand's packets in (centre, hand) order, and the note list their `ids` point into. One buffer per kind for the
+/// whole chart (it made four vectors per row and three per packet).
+fn packets(notes: &Notes, rows: &Rows, hand_of: &[u8], window: f64) -> (Vec<Packet>, Vec<usize>) {
     let n = notes.t.len();
-    let mut out: Vec<Packet> = Vec::new();
+    let mut ids: Vec<usize> = Vec::with_capacity(n);
     let mut segments = vec![0usize; n];
     let mut segment = 0usize;
     for i in 0..n {
@@ -65,33 +68,28 @@ fn packets(notes: &Notes, rows: &Rows, hand_of: &[u8], window: f64) -> Vec<Packe
         }
         segments[i] = segment;
     }
+    let mut hands: [Vec<Packet>; 2] = [Vec::new(), Vec::new()];
+    let mut local: Vec<usize> = Vec::new();
     for h in 0..2u8 {
-        let mut group: Vec<usize> = Vec::new();
+        let out = &mut hands[h as usize];
+        let mut start = ids.len(); // the open group is ids[start..]
         let mut used = 0u32;
         let mut holds: Vec<(u8, f64)> = Vec::new(); // dict col -> end, insertion order
         let mut group_hold = 0.0f64;
-        let close = |group: &mut Vec<usize>, used: &mut u32, group_hold: &mut f64, out: &mut Vec<Packet>| {
+        let close = |ids: &Vec<usize>, start: &mut usize, used: &mut u32, group_hold: &mut f64, out: &mut Vec<Packet>| {
+            let group = &ids[*start..];
             if group.is_empty() {
                 return;
             }
             let t0 = notes.t[group[0]];
             let tl = notes.t[*group.last().unwrap()];
+            let cols = group.iter().fold(0u32, |m, &i| m | 1 << notes.c[i]);
             if t0 == tl {
                 let mean = py::sum(std::iter::repeat(t0).take(group.len())) / group.len() as f64;
-                let cols = group.iter().fold(0u32, |m, &i| m | 1 << notes.c[i]);
-                out.push(Packet {
-                    center: mean, hand: h, ids: group.clone(), cols, span: 0.0, direction: 0.0, gap: 0.0,
-                    held: *group_hold,
-                });
+                out.push(Packet { center: mean, hand: h, ids: *start..ids.len(), cols, span: 0.0, direction: 0.0, gap: 0.0, held: *group_hold });
             } else {
-                let ts: Vec<f64> = group.iter().map(|&i| notes.t[i]).collect();
-                let order: Vec<u8> = group.iter().map(|&i| notes.c[i]).collect();
-                let dirs: Vec<i64> = order.windows(2).map(|w| if w[1] > w[0] { 1 } else { -1 }).collect();
-                let direction = if !dirs.is_empty() && ts[ts.len() - 1] - ts[0] > 0.003 {
-                    dirs.iter().sum::<i64>() as f64 / dirs.len() as f64
-                } else {
-                    0.0
-                };
+                let dirs: i64 = group.windows(2).map(|w| if notes.c[w[1]] > notes.c[w[0]] { 1 } else { -1 }).sum();
+                let direction = if group.len() > 1 && tl - t0 > 0.003 { dirs as f64 / (group.len() - 1) as f64 } else { 0.0 };
                 let mut gap: Option<f64> = None;
                 for i in group[0] + 1..=*group.last().unwrap() {
                     let g = notes.t[i] - notes.t[i - 1];
@@ -101,68 +99,91 @@ fn packets(notes: &Notes, rows: &Rows, hand_of: &[u8], window: f64) -> Vec<Packe
                     });
                 }
                 out.push(Packet {
-                    center: py::sum(ts.iter().copied()) / ts.len() as f64,
+                    center: py::sum(group.iter().map(|&i| notes.t[i])) / group.len() as f64,
                     hand: h,
-                    ids: group.clone(),
-                    cols: order.iter().fold(0u32, |m, &c| m | 1 << c),
-                    span: ts[ts.len() - 1] - ts[0],
+                    ids: *start..ids.len(),
+                    cols,
+                    span: tl - t0,
                     direction,
                     gap: gap.unwrap_or(0.0),
                     held: *group_hold,
                 });
             }
-            group.clear();
+            *start = ids.len();
             *used = 0;
             *group_hold = 0.0;
         };
         for &(t, a, z) in rows {
-            let mut local: Vec<usize> = (a..z).filter(|&i| hand_of[notes.c[i] as usize] == h).collect();
-            if local.is_empty() {
-                continue;
-            }
-            let long: Vec<usize> = local.iter().copied().filter(|&i| notes.e[i] - t > 0.003).collect();
-            if !long.is_empty() {
-                close(&mut group, &mut used, &mut group_hold, &mut out);
-                for &i in &long {
+            local.clear();
+            let mut long = false;
+            for i in a..z {
+                if hand_of[notes.c[i] as usize] != h {
+                    continue;
+                }
+                if notes.e[i] - t > 0.003 {
+                    if !long {
+                        close(&ids, &mut start, &mut used, &mut group_hold, out);
+                        long = true;
+                    }
                     let (c, e) = (notes.c[i], notes.e[i]);
                     match holds.iter_mut().find(|x| x.0 == c) {
                         Some(x) => x.1 = e,
                         None => holds.push((c, e)),
                     }
+                } else {
+                    local.push(i);
                 }
-                local.retain(|i| !long.contains(i));
-                if local.is_empty() {
-                    continue;
-                }
+            }
+            if local.is_empty() {
+                continue;
             }
             let cols = local.iter().fold(0u32, |m, &i| m | 1 << notes.c[i]);
-            if !group.is_empty()
+            if ids.len() > start
                 && (used & cols != 0
-                    || t - notes.t[group[0]] > 2.0 * window
-                    || segments[local[0]] != segments[*group.last().unwrap()]
+                    || t - notes.t[ids[start]] > 2.0 * window
+                    || segments[local[0]] != segments[*ids.last().unwrap()]
                     || local.len() > 1)
             {
-                close(&mut group, &mut used, &mut group_hold, &mut out);
+                close(&ids, &mut start, &mut used, &mut group_hold, out);
             }
-            group.extend_from_slice(&local);
+            ids.extend_from_slice(&local);
             used |= cols;
             let held = holds.iter().filter(|x| x.1 > t + 0.003).count() as f64;
             group_hold = group_hold.max(held);
             if local.len() > 1 {
-                close(&mut group, &mut used, &mut group_hold, &mut out);
+                close(&ids, &mut start, &mut used, &mut group_hold, out);
             }
         }
-        close(&mut group, &mut used, &mut group_hold, &mut out);
+        close(&ids, &mut start, &mut used, &mut group_hold, out);
     }
-    out.sort_by(|a, b| (a.center, a.hand).partial_cmp(&(b.center, b.hand)).unwrap());
-    out
+    // each hand's packets come in centre order: one merge is the (centre, hand) sort
+    let [left, right] = hands;
+    let sorted = |v: &[Packet]| v.windows(2).all(|w| w[0].center <= w[1].center);
+    let mut out = Vec::with_capacity(left.len() + right.len());
+    if sorted(&left) && sorted(&right) {
+        let (mut l, mut r) = (left.into_iter().peekable(), right.into_iter().peekable());
+        loop {
+            match (l.peek(), r.peek()) {
+                (Some(a), Some(b)) => out.push(if a.center <= b.center { l.next().unwrap() } else { r.next().unwrap() }),
+                (Some(_), None) => out.push(l.next().unwrap()),
+                (None, Some(_)) => out.push(r.next().unwrap()),
+                (None, None) => break,
+            }
+        }
+    } else {
+        out.extend(left);
+        out.extend(right);
+        out.sort_by(|a, b| (a.center, a.hand).partial_cmp(&(b.center, b.hand)).unwrap());
+    }
+    (out, ids)
 }
 
 /// [rolled, jumptrill, control, anchor, jumptrill_easy] per note.
 fn jumptrills(notes: &Notes, rows: &Rows, hand_of: &[u8], window: f64) -> [Vec<f64>; 5] {
     let n = notes.t.len();
     let mut res: [Vec<f64>; 5] = std::array::from_fn(|_| vec![0.0; n]);
-    let packets = packets(notes, rows, hand_of, window);
+    let (packets, ids) = packets(notes, rows, hand_of, window);
+    let of = |p: &Packet| &ids[p.ids.clone()];
     let np = packets.len();
     let mut cross = vec![false; n];
     for &(_, a, z) in rows {
@@ -196,9 +217,9 @@ fn jumptrills(notes: &Notes, rows: &Rows, hand_of: &[u8], window: f64) -> [Vec<f
                     - (p.cols & prev.cols).count_ones() as f64 / 1u32.max((p.cols | prev.cols).count_ones()) as f64;
                 let turn = 0f64.max(-p.direction * prev.direction);
                 let mut best: Option<f64> = None;
-                for &i in &p.ids {
+                for &i in of(p) {
                     let c = notes.c[i];
-                    if let Some(&li) = prev.ids.iter().rev().find(|&&x| notes.c[x] == c) {
+                    if let Some(&li) = of(prev).iter().rev().find(|&&x| notes.c[x] == c) {
                         let v = 0f64.max(1.0 - (notes.t[i] - notes.t[li]) / cycle);
                         best = Some(match best {
                             Some(m) if m >= v => m,
@@ -226,7 +247,7 @@ fn jumptrills(notes: &Notes, rows: &Rows, hand_of: &[u8], window: f64) -> [Vec<f
             continue;
         }
         let nids: usize = seg.iter().map(|p| p.ids.len()).sum();
-        let ncross: usize = seg.iter().flat_map(|p| p.ids.iter()).filter(|&&i| cross[i]).count();
+        let ncross: usize = seg.iter().flat_map(|p| of(p).iter()).filter(|&&i| cross[i]).count();
         if ncross as f64 > 0.25 * nids as f64 {
             continue;
         }
@@ -238,7 +259,7 @@ fn jumptrills(notes: &Notes, rows: &Rows, hand_of: &[u8], window: f64) -> [Vec<f
             let mut lo = f64::NEG_INFINITY;
             let mut hi = f64::INFINITY;
             for (j, p) in seg.iter().enumerate() {
-                for &i in &p.ids {
+                for &i in of(p) {
                     let a = notes.t[i] - window - j as f64 * gap;
                     let b = notes.t[i] + window - j as f64 * gap;
                     if a > lo {
@@ -264,7 +285,7 @@ fn jumptrills(notes: &Notes, rows: &Rows, hand_of: &[u8], window: f64) -> [Vec<f
             control_at(j, &mut controls, &mut anchors);
             let p = &packets[j];
             let cj = controls[j].unwrap();
-            for &i in &p.ids {
+            for &i in of(p) {
                 res[1][i] = res[1][i].max(strength);
                 if p.span > 0.003 {
                     res[0][i] = res[0][i].max(strength);
@@ -417,7 +438,7 @@ pub fn analyse(chart: &Chart, rate: f64, k: &crate::params::Knobs) -> Analysis {
     let first = notes.t[0];
     let max_e = notes.e.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let bins = ((max_e - first) / bin_seconds + 1e-9) as usize + 1;
-    let mut rows: Rows = Vec::new();
+    let mut rows: Rows = Vec::with_capacity(nn);
     let mut at = 0.0f64;
     let mut start = 0usize;
     for i in 0..nn {
@@ -431,20 +452,23 @@ pub fn analyse(chart: &Chart, rate: f64, k: &crate::params::Knobs) -> Analysis {
         }
     }
     rows.push((at, start, nn));
+    crate::tick::lap("g.head");
     let half = chart.keys / 2;
     let assignments: &[bool] = if chart.keys % 2 == 1 { &[false, true] } else { &[false] };
     let mut js: Vec<[Vec<f64>; 5]> = Vec::new();
-    let window = great_window(chart.od);
+    let window = chart.great_window();
     for &cl in assignments {
         let hand_of: Vec<u8> = (0..chart.keys).map(|c| if c < half || (cl && c == half) { 0 } else { 1 }).collect();
         js.push(jumptrills(&notes, &rows, &hand_of, window));
     }
+    crate::tick::lap("g.jumptrills");
     let point: [Vec<f64>; 5] = if js.len() == 2 {
         std::array::from_fn(|k| js[0][k].iter().zip(&js[1][k]).map(|(l, r)| (l + r) / 2.0).collect())
     } else {
         js.pop().unwrap()
     };
     let vib = vibro(&notes, &rows, k);
+    crate::tick::lap("g.vibro");
     let zeros = vec![0.0f64; nn];
     // per-note values in SERIES order
     let per_note: [&Vec<f64>; 14] = [
@@ -466,9 +490,10 @@ pub fn analyse(chart: &Chart, rate: f64, k: &crate::params::Knobs) -> Analysis {
         }
     }
     let mut state = 0.0f64;
+    let decays = [(-bin_seconds / 15.0).exp(), (-bin_seconds / 4.0).exp()]; // the two values a bin's decay takes
     for b in 0..bins {
         let value = series[s::JUMPTRILL][b];
-        let decay = (-bin_seconds / if value > state { 15.0 } else { 4.0 }).exp();
+        let decay = decays[usize::from(!(value > state))];
         state = value + (state - value) * decay;
         series[s::JUMPTRILL_SUSTAIN][b] = value * state;
     }

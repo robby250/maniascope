@@ -71,7 +71,8 @@ pub fn ranked(res: &Dict, name_at: f64) -> Vec<Cand> {
     for &(key, label, _, _) in taxonomy::FAMILIES.iter().filter(|f| !matches!(f.0, "technical" | "stamina")) {
         let rows: Vec<&taxonomy::Row> = taxonomy::family(key).filter(on).collect();
         let Some(lead) = rows.iter().max_by(|a, b| sc.f(a.sk.name()).total_cmp(&sc.f(b.sk.name()))) else { continue };
-        let r = sc.f(lead.sk.name());
+        // the whole Stream family where compute rated it (5K+)
+        let r = if key == "stream" && sc.f(STREAM_FAMILY) > 0.0 { sc.f(STREAM_FAMILY) } else { sc.f(lead.sk.name()) };
         let typed = rows.iter().filter(|x| x.child.is_some()).max_by(|a, b| sc.f(a.sk.name()).total_cmp(&sc.f(b.sk.name())));
         let plain = rows.iter().find(|x| x.child.is_none()).map_or(label, |x| x.name);
         let name = typed.filter(|t| sc.f(t.sk.name()) >= name_at * r).map_or(plain, |t| t.name);
@@ -83,6 +84,14 @@ pub fn ranked(res: &Dict, name_at: f64) -> Vec<Cand> {
     }
     out.sort_by(|a, b| py::round_digits(b.2, 6).total_cmp(&py::round_digits(a.2, 6)));
     out
+}
+
+/// The score key of the whole Stream family on keymodes that split it (compute.rs).
+pub const STREAM_FAMILY: &str = "stream_family";
+
+/// The fast and slow Stream halves together, per bin.
+pub fn stream_family(series: &Series) -> Vec<f64> {
+    series.get(Sk::stream).iter().zip(series.get(Sk::delay)).map(|(a, b)| a + b).collect()
 }
 
 /// Per family row (its leading skill), each tag's share: the row's rating with its demand read under the tag (Tech:
@@ -97,7 +106,9 @@ pub fn tags(series: &Series, sc: &Dict, judged: &Judged, keys: usize, k: &Knobs)
         if own <= 0.0 || !series.has(s) || s == Sk::stamina || s == Sk::mash {
             continue;
         }
-        let row = series.get(s);
+        let whole = (sc.f(STREAM_FAMILY) > 0.0 && taxonomy::of(s).family == "stream").then(|| stream_family(series));
+        let row = whole.as_deref().unwrap_or(series.get(s));
+        let own = if whole.is_some() { rating(row, judged, keys, k) } else { own };
         let mut d = Dict::new();
         d.set("Tech", rating(&min_series(row, series.get(Sk::technical)), judged, keys, k) / own);
         d.set("Stamina", stamina_rating(row, judged, keys, k) / own);
@@ -290,3 +301,28 @@ pub fn tech_where(series: &Series, parts: &Parts, start: f64, rate: f64, k: &Kno
     out
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Stream family ranks by its whole rating where compute gave one, by its stronger half otherwise.
+    #[test]
+    fn stream_family_ranks_as_a_whole() {
+        let lead = |whole: Option<f64>| {
+            let (mut res, mut sc) = (Dict::new(), Dict::new());
+            for (k, v) in [("stream", 5.0), ("delay", 5.0), ("chordstream", 6.0)] {
+                sc.set(k, v);
+            }
+            if let Some(w) = whole {
+                sc.set(STREAM_FAMILY, w);
+            }
+            res.set("keys", 7usize);
+            res.set("scores", Val::Dict(sc));
+            let top = ranked(&res, 1.0)[0];
+            (top.1, top.2)
+        };
+        assert_eq!(lead(None), ("Chordstream", 6.0));
+        assert_eq!(lead(Some(7.0)), ("Stream", 7.0));
+    }
+}

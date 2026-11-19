@@ -213,7 +213,59 @@ fn is_chart(name: &str) -> bool {
 pub type Report<'a> = &'a dyn Fn(&str, Option<f32>) -> bool;
 pub const CANCELLED: &str = "cancelled";
 
+/// Where the upcoming website pick's set waits (user 2026-11-19: "predownloads the next map from the playlist when it's a
+/// web pick … when it becomes current selection it just gets imported … if it's skipped or not used … deleted later").
+fn ahead_dir() -> PathBuf {
+    paths::cache().join("ahead")
+}
+
+/// The set this pick's delivery would download, if any.
+pub fn set_to_download(p: &Pick, db: &Db, stable: bool) -> Option<i64> {
+    let set = p.set_id.filter(|s| *s > 0)?;
+    (!p.installed && (p.convert_of.is_none() || needs_original(p, db, stable))).then_some(set)
+}
+
+/// Fetches the upcoming pick's set ahead; sets fetched for other picks go, but for `keep` (the current pick's, which its
+/// delivery may be about to take). `live` false stops it.
+pub fn fetch_ahead(set: Option<i64>, keep: Option<i64>, live: &dyn Fn() -> bool) -> std::result::Result<(), String> {
+    let dir = ahead_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    prune_ahead(&dir, &[set, keep]);
+    let Some(set) = set else { return Ok(()) };
+    let to = dir.join(format!("{set}.osz"));
+    if to.is_file() || to.with_extension("osz.part").is_file() {
+        return Ok(()); // here, or on its way
+    }
+    first_ok(&MIRRORS, |m| fetch(&format!("{m}{set}"), &to, &|_, _| live()))
+}
+
+fn prune_ahead(dir: &Path, keep: &[Option<i64>]) {
+    let kept: Vec<String> = keep.iter().flatten().map(|s| format!("{s}.osz")).collect();
+    for f in std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()) {
+        let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if !kept.iter().any(|k| name == *k || name == format!("{k}.part")) {
+            let _ = std::fs::remove_file(&f);
+        }
+    }
+}
+
+/// The set fetched ahead, moved to `to`; one still on its way is waited for. False: nothing ahead, download it.
+fn take_ahead(dir: &Path, set: i64, to: &Path, report: Report) -> bool {
+    let ahead = dir.join(format!("{set}.osz"));
+    while !ahead.is_file() && ahead.with_extension("osz.part").is_file() {
+        if !report("Downloading (started ahead)…", None) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    ahead.is_file() && (std::fs::rename(&ahead, to).is_ok() || std::fs::copy(&ahead, to).and_then(|_| std::fs::remove_file(&ahead)).is_ok())
+}
+
 fn download(set: i64, to: &Path, report: Report) -> std::result::Result<(), String> {
+    if take_ahead(&ahead_dir(), set, to, report) {
+        let _ = ms_data::webmaps::delivered(set);
+        return Ok(());
+    }
     let got = first_ok(&MIRRORS, |m| fetch(&format!("{m}{set}"), to, report));
     if got.is_ok() {
         let _ = ms_data::webmaps::delivered(set);
@@ -415,6 +467,27 @@ fn imported(p: &Pick, timeout: &str, report: Report) -> std::result::Result<(), 
 mod tests {
     use super::*;
     use ms_calc::features::standard_params;
+
+    #[test]
+    fn a_set_fetched_ahead_is_taken_and_the_others_are_pruned() {
+        let dir = std::env::temp_dir().join(format!("ms-ahead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["11.osz", "22.osz", "33.osz", "33.osz.part", "44.osz.part"] {
+            std::fs::write(dir.join(name), name).unwrap();
+        }
+        prune_ahead(&dir, &[Some(11), None, Some(33)]);
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["11.osz", "33.osz", "33.osz.part"]);
+        let to = dir.join("out.osz");
+        assert!(take_ahead(&dir, 11, &to, &|_, _| true));
+        assert_eq!((std::fs::read_to_string(&to).unwrap().as_str(), dir.join("11.osz").exists()), ("11.osz", false));
+        assert!(!take_ahead(&dir, 55, &to, &|_, _| true), "nothing ahead: the caller downloads");
+        std::fs::remove_file(dir.join("33.osz")).unwrap();
+        assert!(!take_ahead(&dir, 33, &to, &|_, _| false), "one on its way is waited for until the player moves on");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use std::sync::Arc;
 
     fn chart() -> String {

@@ -9,6 +9,7 @@ pub mod features;
 pub mod flow;
 pub mod gestures;
 pub mod kern;
+pub mod mods;
 pub mod model;
 pub mod notefeat;
 pub mod notenet;
@@ -19,6 +20,7 @@ pub mod scroll;
 pub mod skills;
 pub mod structure;
 pub mod taxonomy;
+pub mod tick;
 pub mod val;
 
 // Every binary links the calculator: its many short-lived vectors made the system allocator ~9 % of a chart's analysis.
@@ -26,4 +28,4 @@ pub mod val;
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // A refit takes the sha256 of calib/difficulty.json; a rules-only change (labels, same stars) that of it plus the rule commit.
-pub const CALC_ID: &str = "009e2b28af08";
+pub const CALC_ID: &str = "14be0f41537b";

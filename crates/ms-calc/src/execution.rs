@@ -84,6 +84,7 @@ pub fn analyse(chart: &Chart, g: &Geometry, bin_seconds: f64) -> Info {
             note_pseudo[x] = if spans[i] > 0.006 { value } else { 0.0 };
         }
     }
+    crate::tick::lap("x.groups");
     let mut mash = vec![0.0f64; bins];
     let mut pseudo = vec![0.0f64; bins];
     let mut regular = vec![0.0f64; bins];
@@ -94,6 +95,7 @@ pub fn analyse(chart: &Chart, g: &Geometry, bin_seconds: f64) -> Info {
     let rows = &g.rows;
     let half = chart.keys / 2;
     let roll = pattern::smooth_rolls(rows, chart.keys);
+    crate::tick::lap("x.smooth_rolls");
     // Odd keymodes: the middle key with each hand in turn, averaged, as demand and smooth_rolls do (user 2026-11-03: "a
     // thumb is a finger … do 3"); it went to the right hand only.
     let splits: Vec<u32> = if chart.keys % 2 == 1 { vec![((1u64 << (half + 1)) - 1) as u32, ((1u64 << half) - 1) as u32] } else { vec![((1u64 << half) - 1) as u32] };
@@ -104,6 +106,7 @@ pub fn analyse(chart: &Chart, g: &Geometry, bin_seconds: f64) -> Info {
             pulses[ri].1 += p.1 / splits.len() as f64;
         }
     }
+    crate::tick::lap("x.pulses");
     let mut tail_count = 0.0f64;
     let mut synced = 0.0f64;
     for (ri, row) in rows.iter().enumerate() {
@@ -155,8 +158,8 @@ pub fn analyse(chart: &Chart, g: &Geometry, bin_seconds: f64) -> Info {
 /// Per row (pulse, unsmoothed pulse) of the hand-to-hand timing, the left hand playing `lo_mask`'s columns.
 fn hand_pulses(rows: &[crate::demand::Row], lo_mask: u32, roll: &[Vec<f64>; 2]) -> Vec<(f64, f64)> {
     let mut last: [Option<f64>; 2] = [None, None];
-    let mut history: [std::collections::VecDeque<f64>; 2] = Default::default();
-    let mut recent: Vec<f64> = Vec::with_capacity(6);
+    // each hand's last six gaps, oldest first, in place (a deque copied into a vector and sorted per row)
+    let (mut history, mut held) = ([[0.0f64; 6]; 2], [0usize; 2]);
     let mut out = Vec::with_capacity(rows.len());
     for (ri, row) in rows.iter().enumerate() {
         let t = row.t;
@@ -171,9 +174,16 @@ fn hand_pulses(rows: &[crate::demand::Row], lo_mask: u32, roll: &[Vec<f64>; 2]) 
             let g = last[hand].map(|l| t - l);
             match g {
                 Some(g) if g != 0.0 && 0.006 < g && g < 0.5 => {
-                    recent.clear();
-                    recent.extend(history[hand].iter());
-                    recent.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let n = held[hand];
+                    let mut recent = history[hand];
+                    for x in 1..n {
+                        let mut y = x;
+                        while y > 0 && recent[y - 1] > recent[y] {
+                            recent.swap(y - 1, y);
+                            y -= 1;
+                        }
+                    }
+                    let recent = &recent[..n];
                     let reference = if recent.len() >= 2 { recent[recent.len() / 2] } else { g };
                     let original_value = off_grid(g, reference, true);
                     original_pulse = Some(original_pulse.map_or(original_value, |m: f64| if original_value > m { original_value } else { m }));
@@ -191,12 +201,15 @@ fn hand_pulses(rows: &[crate::demand::Row], lo_mask: u32, roll: &[Vec<f64>; 2]) 
                     let value = if chosen == reference { original_value } else { off_grid(g, chosen, true) };
                     let aw = value * (1.0 - roll[hand][ri]);
                     pulse = Some(pulse.map_or(aw, |m: f64| if aw > m { aw } else { m }));
-                    if history[hand].len() == 6 {
-                        history[hand].pop_front();
+                    if n == 6 {
+                        history[hand].copy_within(1.., 0);
+                        history[hand][5] = g;
+                    } else {
+                        history[hand][n] = g;
+                        held[hand] = n + 1;
                     }
-                    history[hand].push_back(g);
                 }
-                _ => history[hand].clear(),
+                _ => held[hand] = 0,
             }
             last[hand] = Some(t);
         }
@@ -285,10 +298,11 @@ pub fn attribute(
         / 1f64.max(py::sum(parts.get(P::rows).iter().copied()));
     let mean = sum_total / 1usize.max(total.len()) as f64;
     let mm = 1f64.max(mean);
-    let peak = py::sum(total.iter().map(|&t| t * 0f64.max(1f64.max(t / mm).ln()))) / weight;
+    // up to the mean the log is of exactly 1: 0, no call
+    let peak = py::sum(total.iter().map(|&t| t * if t / mm > 1.0 { 0f64.max(1f64.max(t / mm).ln()) } else { 0.0 })) / weight;
     let surge = py::sum(total.windows(2).map(|w| {
         let d = 0f64.max(w[1] - w[0]);
-        d * (d / mm).ln_1p()
+        if d == 0.0 { 0.0 } else { d * (d / mm).ln_1p() } // no rise: 0 × ln 1
     })) / weight;
     let mut extra: Vec<(&'static str, f64)> = vec![
         ("mash", mash),

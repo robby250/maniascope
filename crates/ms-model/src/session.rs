@@ -16,6 +16,8 @@ pub const HISTORY_S: f64 = 3. * 86400.;
 pub const FORM_DECAY_S: f64 = 3. * 86400.;
 pub const EXPOSURE_S: f64 = 14. * 86400.;
 pub const SNOOZE_S: f64 = 12. * 3600.; // a right-click "Skip for 12 h"
+/// Readiness in a keymode counted as warm: what Skip warmup sets, and where continuous play settles (COOLING is 10 min).
+pub const WARM_MINUTES: f64 = 10.;
 pub const FORM_NOTICE: f64 = 0.08; // log error: about .4 point at 95 %, under it the readout says nothing
 const PESSIMISM: f64 = 0.25;
 const PUSH_DOWN: f64 = 2.;
@@ -311,7 +313,7 @@ impl Session {
     /// Relevant minutes in this keymode. Other keymodes cannot erase cold readiness.
     pub fn activation(&self, keys: i64, family: Option<usize>) -> f64 {
         if self.warm_flag {
-            return 10.;
+            return WARM_MINUTES;
         }
         self.warmup.as_ref().map_or(0., |m| activation(&self.history(m), self.now, keys, family, &self.transfer))
     }
@@ -479,7 +481,10 @@ impl Session {
         let unit = if p.log_rate { 3. } else { 1. };
         let fatigue = m.fatigue(keys, clock) * unit;
         // warmup_penalty(keys, None): the mean family amplitude at the keymode's whole readiness.
-        let cold = m.penalty(&self.consts, keys, None, self.activation(keys, None), 0., Some(1.), clock) * if p.log_rate { 3. } else { 1. } - fatigue;
+        // Against the warmest play gets (WARM_MINUTES): what a slow curve still holds there is never played off, so it is
+        // no warm-up (user 2026-11-19: "warming up" 1 h 37 min into a session; 7K curve ~15 min, readiness 2–7 min).
+        let at = |minutes: f64| m.penalty(&self.consts, keys, None, minutes, 0., Some(1.), clock) * unit;
+        let cold = at(self.activation(keys, None)) - fatigue - (at(WARM_MINUTES) - at(f64::INFINITY));
         let form = self.correction(keys, None);
         let reason = if cold > FORM_NOTICE {
             Some("warming up")
@@ -610,6 +615,12 @@ impl Session {
             }
         }
         f.max(1e-6)
+    }
+
+    /// Finished in the current session: a PP map mixed into another list is not offered twice in one session (user
+    /// 2026-11-19: the same PP map twice in an evening, back as soon as eight other maps were played).
+    pub fn finished_now(&self, map: &str) -> bool {
+        self.attempts.iter().any(|a| a.finished && a.beatmap.as_deref() == Some(map))
     }
 
     /// Identities with session events (the others are fresh).

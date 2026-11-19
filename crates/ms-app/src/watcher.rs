@@ -1,6 +1,6 @@
 //! Observing the game: its memory first (ms-osumem, tosu's v2 frame shape), lazer's log as the rate-less fallback. Emits an observation whenever the
 //! selection, rate or connection changes; tracks each attempt from gameplay to its result.
-use ms_data::feedback::{constant_speed, rate_from_mods};
+use ms_data::feedback::rate_from_mods;
 use ms_data::imports::{stable_link, stable_songs};
 use ms_data::paths::{lazer_data, local_file, long_path, stable_data, stable_store};
 use ms_data::store::{now, timestamp};
@@ -25,7 +25,6 @@ pub struct Obs {
     pub source: Option<&'static str>, // "game" | "log"
     pub path: Option<PathBuf>,
     pub rate: Option<f64>, // None: unknown, never No Mod
-    pub cs: bool,
     pub mods: Option<Vec<Value>>,
     pub bid: Option<i64>,
     pub client: Option<String>,
@@ -254,7 +253,7 @@ impl Tracker {
         }
         let list = mods.get("array").or(Some(mods)).and_then(Value::as_array).cloned();
         let note = if path.is_some() { note } else if mania { "selected map file not found".into() } else { "not an osu!mania map".into() };
-        Obs { source: Some("game"), path, rate, cs: constant_speed(mods), mods: list, bid: d["beatmap"]["id"].as_i64(), client: d["client"].as_str().map(str::to_string), note }
+        Obs { source: Some("game"), path, rate, mods: list, bid: d["beatmap"]["id"].as_i64(), client: d["client"].as_str().map(str::to_string), note }
     }
 }
 

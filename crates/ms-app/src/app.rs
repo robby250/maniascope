@@ -72,7 +72,7 @@ pub struct View {
 pub struct Selected {
     pub path: PathBuf,
     pub rate: f64,
-    pub sv: bool,
+    pub mods: String,
     pub result: Result<Arc<Analysis>, String>,
 }
 
@@ -117,7 +117,7 @@ pub struct App {
     pub shown: Option<Selected>,
     pub pending: Option<Pending>,
     pub generation: u64,
-    pub requested: Option<(PathBuf, Option<SystemTime>, f64, bool)>,
+    pub requested: Option<(PathBuf, Option<SystemTime>, f64, String)>,
     pub live: Option<f64>,
     pub card: Option<Box<Card>>,
     pub card_note: Option<String>,
@@ -535,15 +535,15 @@ impl App {
         (self.obs.path.clone(), self.obs.rate.filter(|r| *r != 0.).unwrap_or(1.), self.obs.rate.is_some())
     }
 
-    /// Scroll changes count unless lazer's selection has Constant Speed.
-    fn sv(&self) -> bool {
-        !self.obs.cs
+    /// The selection's mods as the analysis takes them (`ms_calc::mods` tag): "" for the chart as written.
+    fn mods(&self) -> String {
+        self.obs.mods.as_ref().map_or_else(String::new, |m| ms_calc::mods::plan(m).tag())
     }
 
     /// Reconcile the display with the effective state and ask for an analysis if needed.
     pub fn refresh(&mut self) {
         let (path, rate, _) = self.effective();
-        let sv = self.sv();
+        let mods = self.mods();
         let Some(path) = path else {
             self.generation += 1; // invalidate anything in flight
             self.requested = None;
@@ -552,7 +552,7 @@ impl App {
             self.update_status();
             return;
         };
-        if self.shown.as_ref().is_some_and(|s| (&s.path, s.rate, s.sv) == (&path, rate, sv)) {
+        if self.shown.as_ref().is_some_and(|s| (&s.path, s.rate, &s.mods) == (&path, rate, &mods)) {
             // Returning to the already displayed chart must invalidate a newer in-flight selection too. Otherwise its
             // delayed result can replace the chart the user has actually settled on.
             if self.requested.take().is_some() {
@@ -563,11 +563,11 @@ impl App {
         } else {
             // Repeated observations while this selection is computing must not invalidate its own result or queue it again.
             let stamp = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-            let key = (path.clone(), stamp, rate, sv);
+            let key = (path.clone(), stamp, rate, mods.clone());
             if self.requested.as_ref() != Some(&key) {
                 self.requested = Some(key);
                 self.generation += 1;
-                let request = viewer::Request { generation: self.generation, path: path.clone(), rate, sv };
+                let request = viewer::Request { generation: self.generation, path: path.clone(), rate, mods };
                 match self.viewer.cached(&request) {
                     Some(hit) => {
                         self.viewer.request(None);
@@ -601,7 +601,7 @@ impl App {
         self.requested = None;
         self.pending = None;
         let r = d.request;
-        self.shown = Some(Selected { path: r.path, rate: r.rate, sv: r.sv, result: d.result });
+        self.shown = Some(Selected { path: r.path, rate: r.rate, mods: r.mods, result: d.result });
         self.update_status();
         self.overlay_update();
     }
@@ -640,7 +640,7 @@ impl App {
             state["form"] = json!(fmt::form_text(c.form, c.acc_mid, &self.units));
         }
         if let Some(p) = &self.views[self.mode()].target {
-            state["pick"] = json!({"title": p.title, "expected": format!("~{:.1}%", 100. * self.units.acc(p.pred.acc_mid)), "set": format!("{:.2}× {}", p.rate, fmt::wanted_mod(p.rate))});
+            state["pick"] = json!({"title": p.title, "expected": format!("~{:.1}%", 100. * self.units.acc(fmt::pick_acc(p, &self.obs, self.card.as_deref()))), "set": format!("{:.2}× {}", p.rate, fmt::wanted_mod(p.rate))});
         }
         // Only a tosu the player runs themselves: ManiaScope no longer needs one.
         let Some(dir) = ms_rec::navigation::running_tosu().map(|exe| ms_data::tools::overlay_dir(&exe)) else { return };

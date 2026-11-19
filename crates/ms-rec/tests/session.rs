@@ -259,6 +259,15 @@ fn session_warm_up_and_fatigue_reach_the_live_penalty() {
 }
 
 #[test]
+fn a_map_finished_this_session_is_known_as_such() {
+    let s = session(finish(&[0.]), 1200., None);
+    assert!(s.finished_now("md5:m0") && !s.finished_now("md5:m1"));
+    assert!(!session(events(&[0.], json!({}), "abort", 30.), 1200., None).finished_now("md5:m0"));
+    // the next session starts clean
+    assert!(!session(finish(&[0.]), 1200. + 2. * ms_model::session::SESSION_GAP, None).finished_now("md5:m0"));
+}
+
+#[test]
 fn the_form_readout_names_the_reason() {
     let c = consts();
     let plays: Vec<Completion> = (0..16).map(|i| Completion { end: 1000. + 600. * i as f64, t: 700. + 600. * i as f64, keys: 7, family: c.family("chordjack"), played_seconds: 300., key: Some(i.to_string()), chart: i.to_string() }).collect();
@@ -269,6 +278,10 @@ fn the_form_readout_names_the_reason() {
     assert!(calm.0.is_none() && calm.1 < 0.08, "{calm:?}");
     let skip = vec![event(1, 1050., "skip_warmup", "", json!({}))];
     assert_eq!(session(skip, 1100., Some(m)).form_state(7), (None, 0.));
+    // A slow family curve: cold at the start, and no warm-up left an hour of play in, though the curve has not run out.
+    let slow = model(vec![(7, Mode { tau: 15., amplitudes: vec![0.3; c.families.len()], ..Mode::default() })], (0..16).map(|i| Completion { end: 1000. + 600. * i as f64, t: 700. + 600. * i as f64, keys: 7, family: c.family("chordjack"), played_seconds: 300., key: Some(i.to_string()), chart: i.to_string() }).collect());
+    assert_eq!(session(Vec::new(), 720., Some(slow.clone())).form_state(7).0, Some("warming up"));
+    assert_eq!(session(Vec::new(), 1000. + 600. * 6. + 30., Some(slow)).form_state(7).0, None);
 }
 
 #[test]

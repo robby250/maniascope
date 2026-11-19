@@ -55,7 +55,15 @@ const GAP_EDGES: [f64; 4] = [0.09, 0.13, 0.18, 0.26];
 /// How much of a gap counts as under `edge`: 1 → 0 over ±10 % of it (log scale). A hard edge let a 2 % rate step move a
 /// hand's presses across a band at once: +9 % rating from 0.92× to 0.94× (rate_sweep_is_smooth_and_uncapped, 2026-11-06).
 fn under(gap: f64, edge: f64) -> f64 {
-    (0.5 - (gap / edge).ln() / 0.2).clamp(0., 1.)
+    let r = gap / edge;
+    // outside ±20 % of the edge the ramp is exactly 0 or 1: no log (four edges per press, at most one of them near)
+    if r > 1.2 {
+        return 0.;
+    }
+    if r < 0.8 {
+        return 1.;
+    }
+    (0.5 - r.ln() / 0.2).clamp(0., 1.)
 }
 pub const DIRECT: usize = crate::model::SR_NAMES_LEN + NAMES.len();
 
@@ -147,7 +155,7 @@ fn hand_masks(keys: usize, centre_left: bool) -> [u32; 2] {
 /// The chart's rows: (seconds at `rate`, column mask).
 pub fn rows(chart: &Chart, rate: f64) -> Vec<(f64, u32)> {
     let scale = 0.001 / rate;
-    let mut rows: Vec<(f64, u32)> = Vec::new();
+    let mut rows: Vec<(f64, u32)> = Vec::with_capacity(chart.len());
     let mut i = 0;
     while i < chart.len() {
         let t = chart.t[i];
@@ -163,7 +171,8 @@ pub fn rows(chart: &Chart, rate: f64) -> Vec<(f64, u32)> {
 
 /// Of the chart as written: read as played (`Chart::played`), flams on the written notes (a mashed roll's spread).
 pub fn flow(written: &Chart, rate: f64, k: &Knobs) -> Flow {
-    let played = written.played(rate, k);
+    crate::tick::lap("f.before");
+    let played = written.played(rate, k).map(|p| p.0);
     let chart = played.as_ref().unwrap_or(written);
     let scale = 0.001 / rate;
     let rows = rows(chart, rate);
@@ -172,9 +181,12 @@ pub fn flow(written: &Chart, rate: f64, k: &Knobs) -> Flow {
     let holds = held(chart);
     let (mut gaps, mut hold_tap, mut shape_load) = ([0.; 4], [0.; 2], 0.);
     for &centre_left in splits {
+        crate::tick::lap("f.head");
         let (b, s) = order(chart, scale, centre_left, k);
+        crate::tick::lap("f.order");
         let part = splits.len() as f64;
         let h = hand_pass(&rows, &holds, chart.keys, centre_left, k);
+        crate::tick::lap("f.hand_pass");
         broken += b / part;
         skip += s / part;
         split += h.split / part;
@@ -185,12 +197,25 @@ pub fn flow(written: &Chart, rate: f64, k: &Knobs) -> Flow {
         variety += h.variety / part;
         chaos += h.chaos / part;
         shape_load += shape_loads(&rows, chart.keys, centre_left) / part;
+        crate::tick::lap("f.shape_loads");
         (0..4).for_each(|i| gaps[i] += h.gaps[i] / part);
         (0..2).for_each(|i| hold_tap[i] += h.hold_tap[i] / part);
     }
+    crate::tick::lap("f.head");
     let even = evenness(chart, scale, k);
-    let (coupling, roll, flam) = (coupling(chart, scale, k), rolls(chart, scale, k), flams(written, scale, k));
-    let (isolated, vibro_run, jack_comp) = (isolation(&rows), vibro_runs(chart, rate, k), jack_compensation(chart, scale, k));
+    crate::tick::lap("f.evenness");
+    let coupling = coupling(chart, scale, k);
+    crate::tick::lap("f.coupling");
+    let roll = rolls(chart, scale, k);
+    crate::tick::lap("f.rolls");
+    let flam = flams(written, scale, k);
+    crate::tick::lap("f.flams");
+    let isolated = isolation(&rows);
+    crate::tick::lap("f.isolation");
+    let vibro_run = vibro_runs(chart, rate, k);
+    crate::tick::lap("f.vibro_runs");
+    let jack_comp = jack_compensation(chart, scale, k);
+    crate::tick::lap("f.jack_comp");
     let (mut changed, mut seen) = (0usize, Vec::with_capacity(k.FLOW_MEMORY));
     for pair in rows.windows(2) {
         let p = (pair[0].1, pair[1].1);
@@ -262,7 +287,7 @@ fn hand_pass(rows: &[(f64, u32)], held: &[u32], keys: usize, centre_left: bool, 
     let mut last_col = vec![f64::NEG_INFINITY; keys];
     let (mut s_total, mut s_split, mut j_total, mut j_chain, mut r_total, mut r_hit, mut c_total, mut c_chaos) = (0., 0., 0., 0., 0., 0., 0., 0.);
     let (mut gaps, mut hold, mut presses) = ([0.; 4], [0.; 2], 0.);
-    let mut marks: Vec<(f64, i32)> = Vec::new();
+    let mut marks: Vec<(f64, i32)> = Vec::with_capacity(2 * rows.len());
     for (&(t, mask), &held) in rows.iter().zip(held) {
         let hands = [mask & hm[0], mask & hm[1]];
         let holding = [held & hm[0], held & hm[1]];

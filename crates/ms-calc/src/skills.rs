@@ -170,25 +170,55 @@ pub struct Evidence<'a> {
     pub interleaved: f64,
 }
 
+/// The ±EVIDENCE_WIN sums of the parts a chart's slices read, each made once (every slice summed its own, the base parts
+/// once per share slice).
+#[derive(Default)]
+pub struct Wins {
+    part: Vec<Option<Vec<f64>>>,
+    base: Option<Vec<f64>>,
+}
+impl Wins {
+    fn of(&mut self, parts: &Parts, p: P) -> &[f64] {
+        if self.part.is_empty() {
+            self.part = vec![None; crate::demand::NP];
+        }
+        self.part[p as usize].get_or_insert_with(|| win(parts.get(p), EVIDENCE_WIN))
+    }
+    fn base(&mut self, parts: &Parts, keys: usize, nb: usize) -> &[f64] {
+        if self.base.is_none() {
+            let mut acc = vec![0.0; nb];
+            for q in base_parts(keys) {
+                let v = self.of(parts, q).to_vec();
+                acc = acc.iter().zip(&v).map(|(a, b)| a + b).collect();
+            }
+            self.base = Some(acc);
+        }
+        self.base.as_deref().unwrap()
+    }
+}
+
 /// A slice's evidence density in each bin (taxonomy::Density over ±EVIDENCE_WIN bins).
-pub fn density(d: Density, parts: &Parts, series: &Series, total: &[f64], ev: &Evidence, keys: usize, k: &Knobs) -> Vec<f64> {
+pub fn density(d: Density, parts: &Parts, series: &Series, total: &[f64], ev: &Evidence, keys: usize, k: &Knobs, wins: &mut Wins) -> Vec<f64> {
     let nb = total.len();
-    let w = |p: P| win(parts.get(p), EVIDENCE_WIN);
-    let ratio = |a: Vec<f64>, b: Vec<f64>| -> Vec<f64> { (0..nb).map(|i| if b[i] > 0.0 { a[i] / b[i] } else { 0.0 }).collect() };
+    let ratio = |a: &[f64], b: &[f64]| -> Vec<f64> { (0..nb).map(|i| if b[i] > 0.0 { a[i] / b[i] } else { 0.0 }).collect() };
     let at = |v: &[f64], i: usize| v.get(i).copied().unwrap_or(0.0);
+    let per = |p: P, q: P, wins: &mut Wins| {
+        let a = wins.of(parts, p).to_vec();
+        ratio(&a, wins.of(parts, q))
+    };
     match d {
         // quad texture's embedded minijacks are its own (user 2026-11-14: Doof Doof Untz Untz reads Quadstream, then Minijacks)
-        Density::PerRow(P::mj) => ratio(w(P::mj), w(P::rows)).into_iter().enumerate().map(|(i, x)| x * (1.0 - at(ev.quad, i))).collect(),
-        Density::PerRow(p) => ratio(w(p), w(P::rows)),
-        Density::Ratio(p, q) => ratio(w(p), w(q)),
+        Density::PerRow(P::mj) => per(P::mj, P::rows, wins).into_iter().enumerate().map(|(i, x)| x * (1.0 - at(ev.quad, i))).collect(),
+        Density::PerRow(p) => per(p, P::rows, wins),
+        Density::Ratio(p, q) => per(p, q, wins),
         Density::Share(p) | Density::Interleaved(p) => {
-            let base: Vec<f64> = base_parts(keys).iter().map(|&q| w(q)).fold(vec![0.0; nb], |acc, v| acc.iter().zip(&v).map(|(a, b)| a + b).collect());
+            let a = wins.of(parts, p).to_vec();
             let gate = if matches!(d, Density::Interleaved(_)) { ev.interleaved } else { 1.0 };
-            ratio(w(p), base).into_iter().map(|x| x * gate).collect()
+            ratio(&a, wins.base(parts, keys, nb)).into_iter().map(|x| x * gate).collect()
         }
         Density::Technical => {
             let nosv: Vec<f64> = total.iter().zip(parts.get(P::sv_raw)).map(|(t, s)| 0f64.max(t - s / k.BIN)).collect();
-            ratio(series.get(Sk::technical).to_vec(), nosv)
+            ratio(series.get(Sk::technical), &nosv)
         }
         Density::VibroRuns => (0..nb).map(|i| at(ev.own, i)).collect(),
         Density::Quad => (0..nb).map(|i| at(ev.quad, i)).collect(),
@@ -201,8 +231,16 @@ pub const RAMP_LEVEL: f64 = 5.0;
 /// One ramp for every slice: 0 at or under `lo`, 1 at or over `hi`, linear between; both × (keys/7)^e × (level/RAMP_LEVEL)^g,
 /// `level` the chart's raw overall (harder charts hold more of every specialty's evidence).
 pub fn ramp(x: f64, r: [f64; 4], keys: usize, level: f64) -> f64 {
+    ramp_at(x, ramp_edges(r, keys, level))
+}
+
+/// A ramp's (lo, hi) on a chart: the same for every bin (it took two powers per bin).
+pub fn ramp_edges(r: [f64; 4], keys: usize, level: f64) -> (f64, f64) {
     let s = (keys as f64 / 7.0).powf(r[2]) * (level.max(0.1) / RAMP_LEVEL).powf(r[3]);
-    let (lo, hi) = (r[0] * s, r[1] * s);
+    (r[0] * s, r[1] * s)
+}
+
+fn ramp_at(x: f64, (lo, hi): (f64, f64)) -> f64 {
     if hi <= lo { (x >= hi) as u8 as f64 } else { ((x - lo) / (hi - lo)).clamp(0.0, 1.0) }
 }
 
@@ -216,9 +254,10 @@ pub fn ramp(x: f64, r: [f64; 4], keys: usize, level: f64) -> f64 {
 pub fn slice(series: &mut Series, parts: &Parts, total: &[f64], ev: &Evidence, keys: usize, level: f64, k: &Knobs) -> Vec<(Sk, Vec<f64>)> {
     use crate::taxonomy::{Role, TABLE};
     let nb = series.nbins;
+    let mut wins = Wins::default();
     let slices: Vec<(Sk, &[Sk], Density, Vec<f64>)> = TABLE.iter().filter(|r| series.has(r.sk)).filter_map(|r| match r.role {
         Role::Slice(of) => {
-            let d = density(r.density?, parts, series, total, ev, keys, k);
+            let d = density(r.density?, parts, series, total, ev, keys, k, &mut wins);
             Some((r.sk, of, r.density?, d))
         }
         _ => None,
@@ -229,8 +268,8 @@ pub fn slice(series: &mut Series, parts: &Parts, total: &[f64], ev: &Evidence, k
         (*s, (0..nb).filter(|&b| can(b)).map(|b| d[b]).collect())
     }).collect();
     let slices: Vec<(Sk, &[Sk], bool, Vec<f64>)> = slices.into_iter().map(|(s, of, d, x)| {
-        let r = k.ramp(s);
-        let mut share: Vec<f64> = x.into_iter().map(|x| ramp(x, r, keys, level)).collect();
+        let edges = ramp_edges(k.ramp(s), keys, level);
+        let mut share: Vec<f64> = x.into_iter().map(|x| ramp_at(x, edges)).collect();
         if s == Sk::vibro {
             // anchored jacks at vibro speed: at most VIBRO_SHIFT of the bin, the chordjack keeps the rest (shown 2nd, not 1st)
             share.iter_mut().zip(ev.shift).for_each(|(v, &x)| *v = v.max(k.VIBRO_SHIFT * 1f64.min(x / 0.8)));
@@ -395,24 +434,66 @@ fn pow(x: f64, p: f64) -> f64 {
 }
 
 /// (level^p, judgements) of each bin with notes and demand, where level = `fatigued(local_levels(..))`, straight from the
-/// demand: star(c·√m)^p = (A·c^B)^p · m^(B·p/2), one powf per bin and no level vector (most of a rating's cost was there).
-fn powered(series: &[f64], window: f64, judged: &Judged, keys: usize, k: &Knobs) -> Vec<(f64, f64)> {
+/// demand: star(c·√m)^p = (A·c^B)^p · m^(B·p/2), one power per bin and no level vector (most of a rating's cost was there).
+fn powered(series: &[f64], window: f64, judged: &Judged, keys: usize, k: &Knobs) -> Levels {
     powered_with(series, window, &judged.notes, judged.factor(keys, k), k.ACC_POWER, k)
 }
 
+/// The bins a rating reads, in single precision (ratings agree with double precision to ~1e-6): level^p and judgements.
+#[derive(Default)]
+struct Levels {
+    x: Vec<f32>,
+    n: Vec<f32>,
+}
+
+/// e^x for |x| ≤ 87, relative error 2e-7; no branch, so a loop over it runs four lanes at a time.
+#[inline(always)]
+fn exp32(x: f32) -> f32 {
+    let k = (x * std::f32::consts::LOG2_E).round_ties_even();
+    let r = (x - k * 0.693_359_4) + k * 2.121_944_4e-4; // ln 2 in two parts
+    let p = 1.0 + r * (1.0 + r * (0.5 + r * (1.0 / 6.0 + r * (1.0 / 24.0 + r * (1.0 / 120.0 + r * (1.0 / 720.0))))));
+    p * f32::from_bits(((unsafe { k.to_int_unchecked::<i32>() } + 127) as u32) << 23)
+}
+
+/// ln x of a positive normal x, absolute error ~1e-7 per unit of the result.
+#[inline(always)]
+fn ln32(x: f32) -> f32 {
+    let bits = x.to_bits();
+    let m = f32::from_bits(bits & 0x007f_ffff | 0x3f80_0000);
+    let big = m > std::f32::consts::SQRT_2;
+    let m = if big { 0.5 * m } else { m };
+    let e = ((bits >> 23) as i32 - 127 + big as i32) as f32;
+    let s = (m - 1.0) / (m + 1.0);
+    let z = s * s;
+    2.0 * s * (1.0 + z * (1.0 / 3.0 + z * (1.0 / 5.0 + z * (1.0 / 7.0 + z * (1.0 / 9.0))))) + e * std::f32::consts::LN_2
+}
+
+/// x[i] = scale[i]·x[i]^q. Its own function over plain slices: inside `powered_with` the loop stayed scalar.
+#[inline(never)]
+fn raise(x: &mut [f32], scale: &[f32], q: f32) {
+    for i in 0..x.len().min(scale.len()) {
+        x[i] = scale[i] * exp32((q * ln32(x[i])).clamp(-87.0, 87.0));
+    }
+}
+
 /// `powered` at power `p` with each bin's fatigue factor (1 + w·fatigue)^p given.
-fn powered_with(series: &[f64], window: f64, notes: &[f64], factor: &[f64], p: f64, k: &Knobs) -> Vec<(f64, f64)> {
+fn powered_with(series: &[f64], window: f64, notes: &[f64], factor: &[f64], p: f64, k: &Knobs) -> Levels {
     let w = 1usize.max((window / k.BIN) as usize);
     let unit = pow(k.STAR_A * (k.SCALE / k.LOCAL_TOL).powf(k.STAR_B), p);
-    let mut out = Vec::new();
+    let mut out = Levels { x: Vec::with_capacity(series.len()), n: Vec::with_capacity(series.len()) };
+    let mut scale = Vec::with_capacity(series.len());
     let mut acc = 0.0f64;
     for i in 0..series.len() {
         acc = 0f64.max(acc + series[i] - if i >= w { series[i - w] } else { 0.0 });
         let n = notes.get(i).copied().unwrap_or(0.0);
         if acc > 0.0 && n > 0.0 {
-            out.push((unit * (acc / w as f64).powf(k.STAR_B * p / 2.0) * factor[i], n));
+            out.x.push(((acc / w as f64) as f32).max(f32::MIN_POSITIVE));
+            out.n.push(n as f32);
+            scale.push((unit * factor[i]) as f32);
         }
     }
+    let q = (k.STAR_B * p / 2.0) as f32;
+    raise(&mut out.x, &scale, q);
     out
 }
 
@@ -432,48 +513,60 @@ pub fn fatigued(mut levels: Vec<f64>, fatigue: &[f64], w: f64) -> Vec<f64> {
 /// `rating` from levels already made (the SV-reading calibration builds them from its own window sums).
 /// ponytail: one pass, the level curves (ACC_POWER_LVL …) don't reach it; give it `rating`'s second pass if they ship.
 pub fn accuracy_rating(levels: &[f64], notes: &[f64], k: &Knobs) -> f64 {
-    let lp: Vec<(f64, f64)> = levels.iter().zip(notes).filter(|(l, n)| **l > 0.0 && **n > 0.0).map(|(l, n)| (pow(*l, k.ACC_POWER), *n)).collect();
-    search(&lp, notes, k)
+    let (x, n) = levels.iter().zip(notes).filter(|(l, n)| **l > 0.0 && **n > 0.0).map(|(l, n)| (pow(*l, k.ACC_POWER) as f32, *n as f32)).unzip();
+    search(&Levels { x, n }, notes, k)
 }
 
 /// The search behind every rating, on (level^p, judgements) of the bins with notes; `notes` holds every bin's judgements.
-fn search(lp: &[(f64, f64)], notes: &[f64], k: &Knobs) -> f64 {
+fn search(lp: &Levels, notes: &[f64], k: &Knobs) -> f64 {
     solve(lp, notes, k.ACC_POWER, k.ACC_TARGET)
 }
 
-fn solve(lp: &[(f64, f64)], notes: &[f64], p: f64, target: f64) -> f64 {
+/// Σ n·(1 − e^−x·scale) and Σ n·x·scale·e^−x·scale over the bins: the loss at a skill and its slope's size.
+fn lost(lp: &Levels, scale: f32) -> (f64, f64) {
+    let (mut loss, mut slope) = (0.0f64, 0.0f64);
+    let (mut l, mut s) = ([0.0f32; 64], [0.0f32; 64]);
+    for (x, n) in lp.x.chunks(64).zip(lp.n.chunks(64)) {
+        let m = x.len().min(n.len());
+        // a plain loop over slices: the compiler runs it four lanes at a time (it kept a closure per bin scalar)
+        for i in 0..m {
+            let v = (x[i] * scale).min(80.0); // from 80, e^−x is nothing in single precision
+            let e = exp32(-v);
+            l[i] = n[i] * (1.0 - e);
+            s[i] = n[i] * v * e;
+        }
+        loss += l[..m].iter().map(|v| *v as f64).sum::<f64>();
+        slope += s[..m].iter().map(|v| *v as f64).sum::<f64>();
+    }
+    (loss, slope)
+}
+
+fn solve(lp: &Levels, notes: &[f64], p: f64, target: f64) -> f64 {
     let den: f64 = notes.iter().sum();
-    let mean = lp.iter().map(|(x, n)| n * x).sum::<f64>() / den.max(1e-9);
+    let mean = lp.x.iter().zip(&lp.n).map(|(x, n)| *n as f64 * *x as f64).sum::<f64>() / den.max(1e-9);
     if den <= 0.0 || mean <= 0.0 {
         return 0.0;
     }
     // v = ln(skill^p); loss(v) = Σ n·(1 − e^−x)/den with x = level^p·e^−v falls monotonically and, at a small target, almost
-    // as e^−v: Newton on ln(loss) takes about 4 steps. exp, not expm1: a note losing almost nothing is off by ~1e-16 absolute,
-    // nothing against the target's total, and expm1 cost twice as much (ratings move ≤ 1e-14).
+    // as e^−v: Newton on ln(loss) takes about 4 steps.
     let at = |v: f64| {
-        let scale = (-v).exp();
-        let (loss, slope) = lp.iter().fold((0.0, 0.0), |(f, d), (x, n)| {
-            let x = x * scale;
-            // a bin losing almost nothing: 1 − e^−x by its series (error x⁵/120 < 1e-17), no exp
-            let lost = if x < 1e-3 { x * (1.0 - x * (0.5 - x * (1.0 / 6.0 - x / 24.0))) } else { 1.0 - (-x).exp() };
-            (f + n * lost, d + n * x * (1.0 - lost))
-        });
+        let (loss, slope) = lost(lp, (-v).exp() as f32);
         (loss / den, -slope / den)
     };
     let (mut lo, mut hi) = (mean.ln() - 3.0 * p * 10f64.ln(), mean.ln() + 3.0 * p * 10f64.ln());
-    if lp.iter().map(|(_, n)| n).sum::<f64>() / den <= target {
-        return (lo / p).exp(); // too few of the chart's notes to lose the target even all missed: the search's floor (it bisected 43 times to it)
+    if lp.n.iter().map(|n| *n as f64).sum::<f64>() / den <= target {
+        return (lo / p).exp(); // too few of the chart's notes to lose the target even all missed: the search's floor
     }
     if at(lo).0 <= target {
-        return (lo / p).exp(); // under the target even at the floor: the search bisected ~43 times to within 1e-10 of it (a tenth of all searches)
+        return (lo / p).exp(); // under the target even at the floor
     }
     let mut v = mean.ln() - (-(1.0 - target).ln()).ln(); // exact when every note meets the same level
     for _ in 0..100 {
         let (loss, slope) = at(v);
         if loss > target { lo = v } else { hi = v }
         let step = if loss > 0.0 && slope < 0.0 { ((loss / target).ln() * loss / slope).clamp(-3.0, 3.0) } else { 3.0 }; // no loss: skill far too high
-        if step.abs() < 1e-6 {
-            v -= step; // Newton is quadratic here: what this step leaves is ~step², below 1e-12
+        if step.abs() < 1e-5 {
+            v -= step; // Newton is quadratic here: what this step leaves is ~step², below the single-precision sums' own 1e-7
             break;
         }
         // a step leaving the bracket bisects it (never the converged point: that sits on the bracket's edge)

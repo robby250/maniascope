@@ -12,8 +12,6 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-const EVIDENCE_MODS: [&str; 13] = ["NF", "HD", "FI", "FL", "MR", "SD", "PF", "DT", "NC", "HT", "DC", "CL", "RD"];
-const STABLE_MODS: i64 = 1 | 8 | 64 | 256 | 512 | 1024 | 1048576 | 1073741824 | 16384 | 32; // stage1 rules drop the rest
 /// Stable judges a hold once from its head and head + release error, harsher than lazer's separate head and tail. The
 /// same 1,224 own lazer replays re-judged by stable's rule (`calib replay_review` stable_stats, 2026-11-05) had log(1 − acc)
 /// higher by these × the chart's LN share; held-out MAE on charts over 30 % LN .20 pp (display) and .27 (acc320), against
@@ -143,14 +141,13 @@ impl FeatureSource {
     }
 }
 
-/// Whether a score's mods leave it evidence: None when they don't, else whether Random moved its columns.
-pub fn evidence_mods(text: Option<&str>) -> Option<bool> {
+/// A score's mods (lazer's list, or stable's bits) as what they do; None: not the player's own play of a chart the
+/// calculator can build. Stable's Random stays out: its seed is in the replay, not in the score.
+pub fn evidence_mods(text: Option<&str>) -> Option<ms_calc::mods::Mods> {
     let mods: Value = text.and_then(|m| serde_json::from_str(m).ok()).unwrap_or(Value::Array(Vec::new()));
-    if let Some(bits) = mods.as_i64() {
-        return (bits & !STABLE_MODS == 0).then_some(false);
-    }
-    let acronyms: Vec<String> = mods.as_array().map_or(&[][..], Vec::as_slice).iter().map(|m| m.get("acronym").and_then(Value::as_str).unwrap_or("").to_uppercase()).collect();
-    acronyms.iter().all(|a| EVIDENCE_MODS.contains(&a.as_str())).then(|| acronyms.iter().any(|a| a == "RD"))
+    let stable = mods.as_i64().map(ms_data::share::stable_mods);
+    let m = ms_calc::mods::plan(stable.as_ref().unwrap_or(&mods).as_array().map_or(&[][..], Vec::as_slice));
+    (m.tracked && !(stable.is_some() && m.random.is_some())).then_some(m)
 }
 
 /// recommend.evidence_rows.
@@ -166,16 +163,26 @@ pub fn evidence_rows(db: &Db, source: &mut FeatureSource, c: &Consts) -> Result<
     let mut out = Rows::default();
     let mut dedupe: HashMap<*const Dict, usize> = HashMap::default();
     for r in &scores {
-        let Some(rd) = evidence_mods(r.mods.as_deref()).filter(|_| r.rate.is_some()) else {
+        let Some((rate, m)) = evidence_mods(r.mods.as_deref()).and_then(|m| Some((r.rate.or(m.rate)?, m))) else {
             *out.skipped.entry("mods").or_default() += 1;
             continue;
         };
+        let (rd, tag) = (m.random.is_some(), m.tag());
         let acc = r.acc.unwrap_or(0.);
         if acc == 0. || acc < 0.5 || r.n.unwrap_or(0) < 100 {
             *out.skipped.entry("short/failed").or_default() += 1;
             continue;
         }
-        let (f, b) = source.of(db, r.sha.as_deref(), r.md5.as_deref(), r.bid, r.rate)?;
+        // a modded play is a play of its own chart (modcharts): no public twin, its own identity below
+        let modded = if tag.is_empty() { None } else { r.sha.as_deref().map(|sha| crate::modcharts::find(db, sha, &tag)).transpose()?.flatten() };
+        if !tag.is_empty() && modded.is_none() {
+            *out.skipped.entry("no features").or_default() += 1; // the worker's fill builds the chart, then it counts
+            continue;
+        }
+        let (f, b) = match &modded {
+            Some(sha) => source.of(db, Some(sha), None, None, Some(rate))?,
+            None => source.of(db, r.sha.as_deref(), r.md5.as_deref(), r.bid, Some(rate))?,
+        };
         let Some(f) = f else {
             *out.skipped.entry("no features").or_default() += 1;
             continue;
@@ -190,7 +197,7 @@ pub fn evidence_rows(db: &Db, source: &mut FeatureSource, c: &Consts) -> Result<
                 out.feats.len() - 1
             }
         };
-        let chart = r.md5.clone().filter(|m| !m.is_empty()).or_else(|| r.sha.clone()).unwrap_or_default();
+        let chart = modded.clone().or_else(|| r.md5.clone().filter(|m| !m.is_empty())).or_else(|| r.sha.clone()).unwrap_or_default();
         let ln = f.fget("ln", 0.);
         let family = f.dict("nps").and_then(|n| n.get("family")).filter(|v| v.truthy()).map_or_else(|| chart.clone(), |v| match v {
             Val::Str(s) => s.clone(),
@@ -208,13 +215,13 @@ pub fn evidence_rows(db: &Db, source: &mut FeatureSource, c: &Consts) -> Result<
             keys: out.feats[at].keys,
             t,
             chart,
-            sha: r.sha.clone(),
+            sha: modded.or_else(|| r.sha.clone()),
             f: at,
             src: r.src.clone(),
             client: r.client.clone(),
             ts: r.played.as_deref().and_then(timestamp),
             b,
-            rate: r.rate.unwrap_or(1.),
+            rate,
             key: r.key.clone(),
             rd,
             completed: completed(r.n.unwrap_or(0), notes, ln, !stable),

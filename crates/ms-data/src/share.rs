@@ -17,7 +17,7 @@ fn hex(data: &[u8]) -> String {
 
 /// stable's mod bits as lazer's mod list; mods the reconstruction can't judge (key mods, ScoreV2, …) keep a name it refuses.
 pub fn stable_mods(bits: i64) -> Value {
-    const NAMES: [(i64, &str); 12] = [(1, "NF"), (8, "HD"), (16, "HR"), (32, "SD"), (64, "DT"), (256, "HT"), (512, "NC"), (1024, "FL"), (16384, "PF"),
+    const NAMES: [(i64, &str); 13] = [(1, "NF"), (2, "EZ"), (8, "HD"), (16, "HR"), (32, "SD"), (64, "DT"), (256, "HT"), (512, "NC"), (1024, "FL"), (16384, "PF"),
                                       (1 << 20, "FI"), (1 << 21, "RD"), (1 << 30, "MR")];
     let mut out: Vec<Value> = NAMES.iter().filter(|(b, n)| bits & b != 0 && !(*n == "DT" && bits & 512 != 0)).map(|(_, n)| json!({"acronym": n})).collect();
     let known: i64 = NAMES.iter().map(|x| x.0).sum();
