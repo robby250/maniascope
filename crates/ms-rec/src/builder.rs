@@ -180,7 +180,9 @@ pub struct Builder {
     pub store: Arc<RwLock<FeatStore>>,
     catalog: HashMap<String, Arc<Inst>>,
     order: Vec<String>, // catalogue order: library, then website; equal-valued copies of a chart resolve by it
-    catalog_key: Option<(String, Vec<i64>, Option<f64>, Option<std::time::SystemTime>, String, Vec<(i64, Vec<i64>)>)>,
+    rated: HashMap<String, f64>,
+    rated_calc: String,
+    catalog_key: Option<(String, Vec<i64>, Option<i64>, Option<std::time::SystemTime>, String, Vec<(i64, Vec<i64>)>)>,
     index_size: usize, // converts indexed before the next publication; grows, so the first show up quickly
     catalog_error: String,
     loaded_rowid: i64,
@@ -196,7 +198,7 @@ pub struct Builder {
 
 fn job(sha: &str, inst: &Inst) -> ScoreJob {
     ScoreJob { sha: sha.to_string(), key: inst.md5.clone().filter(|m| !m.is_empty()).unwrap_or_else(|| inst.sha256.clone()), bid: None, md5: inst.md5.clone().unwrap_or_default(),
-               keys: inst.keys, installed: inst.installed, playcount: inst.playcount.unwrap_or(0) as f64, convert: inst.convert_of.is_some() }
+               keys: inst.keys, installed: inst.installed, playcount: inst.playcount.unwrap_or(0) as f64, convert: inst.convert_of.is_some(), source_web: inst.convert_of.is_some() && inst.source_web }
 }
 
 fn publish_job(sha: &str, inst: &Inst, public: &Public) -> ScoreJob {
@@ -205,7 +207,7 @@ fn publish_job(sha: &str, inst: &Inst, public: &Public) -> ScoreJob {
 
 impl Builder {
     pub fn new(store: Arc<RwLock<FeatStore>>, prm: Arc<Params>) -> Builder {
-        Builder { store, catalog: HashMap::default(), order: Vec::new(), catalog_key: None, catalog_error: String::new(), loaded_rowid: 0, web: HashSet::new(), window: None, installed_md5: HashSet::new(), index_size: 256,
+        Builder { store, catalog: HashMap::default(), order: Vec::new(), rated: HashMap::default(), rated_calc: String::new(), catalog_key: None, catalog_error: String::new(), loaded_rowid: 0, web: HashSet::new(), window: None, installed_md5: HashSet::new(), index_size: 256,
                   prm, wanted: Arc::new(|| false), busy: Arc::new(|| false), game: Arc::new(|| false), emit: Arc::new(|_| {}) }
     }
 
@@ -357,9 +359,23 @@ impl Builder {
         let (library, _) = library(db, &r.client)?;
         let (none, root) = (HashMap::default(), crate::catalog::local_origin(&r.client).1);
         let mut source = crate::evidence::FeatureSource { public: r.public.clone(), calc: r.calc.clone(), cache: Default::default() };
+        // A source's 1× rating, kept across requests for this calc: every list request re-decoded up to ~50k feature
+        // records one query each to read one number (2026-11-17 audit). A chart analysed later has no entry yet: None
+        // ("unrated converts anyway") is not kept.
+        if self.rated_calc != r.calc {
+            (self.rated, self.rated_calc) = (HashMap::default(), r.calc.clone());
+        }
+        let memo = &mut self.rated;
         let mut rated = |sha: &str| {
+            if let Some(&v) = memo.get(sha) {
+                return Some(v);
+            }
             let key = source.key(sha, 1.);
-            source.lookup(db, &key).ok().flatten().map(|f| f.f("overall"))
+            let v = source.lookup(db, &key).ok().flatten().map(|f| f.f("overall"));
+            if let Some(v) = v {
+                memo.insert(sha.to_string(), v);
+            }
+            v
         };
         let jobs = crate::converts::pending(db, &library, web, &self.installed_md5, &r.converts, reaches.unwrap_or(&none), &mut rated, &root, self.index_size)?;
         if jobs.is_empty() {
@@ -436,7 +452,7 @@ impl Builder {
             return Ok(()); // PP never waits for an invisible tab
         }
         let allowed: Vec<i64> = if r.mode == "nps" { r.keys.clone() } else { r.skills_keys.clone() };
-        let imported = kv_get(db, "realm_import").and_then(|v| v["t"].as_f64());
+        let imported = kv_get(db, "library_version").and_then(|v| v.as_i64()); // bumped only when the library changes
         let web_path = web_dir().join("web.msp");
         let web_mtime = std::fs::metadata(&web_path).and_then(|m| m.modified()).ok();
         let web = web_mtime.and_then(|_| Web::open(&web_path).ok());
@@ -722,7 +738,7 @@ fn same_song_waits(convert: bool, inst: Option<&Inst>, recent_sets: &HashSet<i64
 }
 
 /// nps.rank: the first `count` of a publication's prepared pool as list entries, in shown order, and the streams' odds.
-pub fn rank(prepared: &ms_model::choices::Prepared, catalog: &HashMap<String, Arc<Inst>>, session: &Session, store: &FeatStore, inputs: RankInputs<'_>) -> (Vec<Pick>, [f64; 3]) {
+pub fn rank(prepared: &ms_model::choices::Prepared, catalog: &HashMap<String, Arc<Inst>>, session: &Session, store: &FeatStore, inputs: RankInputs<'_>) -> (Vec<Pick>, [f64; 4]) {
     let recent: Vec<_> = session.attempts.iter().rev().take(6).rev().filter(|a| a.a.get("profile").is_some_and(|p| !p.is_null()) && a.meaningful).collect();
     let mode = inputs.mode;
     let freshness = |key: &str, length: f64, pool: f64| session.freshness(key, length, Some(mode), Some(pool), ms_model::session::EXPOSURE_S);

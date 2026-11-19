@@ -168,3 +168,36 @@ impl From<Vec<f64>> for Val {
         Val::floats(&x)
     }
 }
+
+/// FxHash (rustc's) for maps built from our own data: SipHash was a fifth of a prediction and ~3 % of a chart's rating
+/// (the pattern-surprise chain).
+#[derive(Default, Clone, Copy)]
+pub struct Fx(u64);
+
+impl std::hash::Hasher for Fx {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for c in bytes.chunks(8) {
+            let mut w = [0u8; 8];
+            w[..c.len()].copy_from_slice(c);
+            self.write_u64(u64::from_le_bytes(w));
+        }
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+    fn write_i64(&mut self, i: i64) {
+        self.write_u64(i as u64)
+    }
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64)
+    }
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(i as u64)
+    }
+    fn write_u8(&mut self, i: u8) {
+        self.write_u64(i as u64)
+    }
+}

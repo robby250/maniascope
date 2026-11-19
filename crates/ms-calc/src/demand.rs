@@ -49,8 +49,15 @@ pub fn part_keys(wide: bool) -> Vec<P> {
     out
 }
 
+/// A closed burst of same-column re-hits: short ones are minijacks at each re-hit's speed weight, longer ones sustained jacks.
+fn add_burst(comp: &mut [f64], burst: &[(usize, f64)], max: usize, o: &impl Fn(P) -> usize) {
+    for &(b, w) in burst {
+        if burst.len() <= max { comp[o(P::mj) + b] += w } else { comp[o(P::sus) + b] += 1.0 }
+    }
+}
+
 #[inline]
-fn non_demand(p: P) -> bool {
+pub fn non_demand(p: P) -> bool {
     matches!(p, P::odd | P::rodd | P::pins | P::psw | P::oht | P::anc | P::rows | P::sv_raw | P::mj | P::sus | P::lj | P::shield | P::inv | P::hyb | P::vib | P::cover | P::stag | P::lnend | P::used)
 }
 
@@ -212,7 +219,7 @@ pub fn pattern_evidence(rows: &[Row], trill: &[Trill], k: &Knobs) -> (Vec<f64>, 
 }
 
 /// 1H Trill runs with the other hand playing in between: the hand's own rows alternate two single columns at a steady
-/// gap ≤ 0.2 s, and the other hand plays on at most 3 of the run's rows (its own or between: chords on every trill row are a bracket) and never alternates two columns itself (that is
+/// gap ≤ 0.2 s, and the other hand plays on at most 3 of the run's rows (its own or between) and chords at most one trill row (more is a chord pattern or bracket) and never alternates two columns itself (that is
 /// a split trill or bracket). hand_patterns only finds trills where the other hand is silent: the user's 2,201 7K charts
 /// never rated 1H Trill above .28 (2026-11-10, "0 1h trill plays").
 fn mixed_trills(rows: &[Row], hand_mask: [u32; 2], oht: &mut [bool]) {
@@ -233,7 +240,9 @@ fn mixed_trills(rows: &[Row], hand_mask: [u32; 2], oht: &mut [bool]) {
             between.clear();
             between.extend((w[0]..=w[3]).map(|r| rows[r].mask & other).filter(|&x| x != 0));
             let alternating = between.len() >= 3 && between.windows(3).all(|t| t[0] == t[2] && t[0] != t[1] && t[0] & (t[0] - 1) == 0);
-            if between.len() <= 3 && !alternating {
+            // Chords on two of the four trill rows are a chord pattern (4K "[13]2[14]2" chordjack), not one hand trilling.
+            let chords = w.iter().filter(|&&r| rows[r].mask & other != 0).count();
+            if between.len() <= 3 && !alternating && chords <= 1 {
                 w.iter().for_each(|&r| oht[r] = true);
             }
         }
@@ -348,6 +357,7 @@ pub fn demand(
     let shapes_t = k.SHAPES_T * (10.0 / keys as f64).powf(k.SHAPES_KEYS);
     let mix_edge = k.MIX_V * (7.0 / keys as f64).powf(k.MIX_KEYS);
     let vf_jacked = 1.0 - k.VF_JACK * (4.0 / keys as f64).powf(k.VF_JACK_KEYS);
+    let rhd_n = k.RHD_N * (keys as f64 / 7.0).powf(k.RHD_X);
     // max(1, x)^p is exactly 1 for x ≤ 1: no pow call.
     let above_one = |x: f64, p: f64| if x > 1.0 { x.powf(p) } else { 1.0 };
     let hand_of = hand_of(keys, centre_left);
@@ -378,7 +388,7 @@ pub fn demand(
     }
     let mut jrun = vec![0usize; keys];
     let mut lj_row = vec![0u32; keys]; // the row of each column's last hit
-    let mut burst: Vec<usize> = Vec::new();
+    let mut burst: Vec<(usize, f64)> = Vec::new(); // bin, the re-hit's minijack weight
     let rows = &g.rows;
     let nr = rows.len();
     let mut trill = vec![Trill::None; nr];
@@ -437,6 +447,7 @@ pub fn demand(
     let mut prev_row_mask = 0u32;
     let mut pending: Vec<(f64, usize)> = Vec::with_capacity(16);
     let mut shapes_seen: [Vec<(f64, u32)>; 2] = [Vec::new(), Vec::new()];
+    let mut hand_recent: [Vec<f64>; 2] = [Vec::new(), Vec::new()]; // a hand's note heads in the last RHD_SPAN s
     let mut distinct: Vec<u32> = Vec::new();
     let w_cross = if wide { k.W_CROSS_WIDE } else { k.W_CROSS };
     let flam = k.FLAM;
@@ -444,7 +455,9 @@ pub fn demand(
         let (i, j) = (row.start, row.end);
         let t = times[i];
         let size = j - i;
-        let share = row_share.get(size).copied().unwrap_or_else(|| (size as f64).powf(-k.ROW_SHARE));
+        let gap = if ri > 0 { t - prev_row_t } else { 0.0 };
+        let share = row_share.get(size).copied().unwrap_or_else(|| (size as f64).powf(-k.ROW_SHARE))
+            * if k.ROW_FAST != 0.0 && size > 1 && ri > 0 { (size as f64).powf(-k.ROW_FAST * (1.0 - smooth(gap, k.ROW_FAST_LO, k.ROW_FAST_HI))) } else { 1.0 };
         let b = ((t - t0) / bin) as usize;
         let fb = (nfine - 1).min(((t - t0) * phases as f64 / bin) as usize);
         let tr: Option<usize> = match trill[ri] {
@@ -453,7 +466,6 @@ pub fn demand(
             Trill::Splittrill => Some(o(P::splittrill)),
         };
         rows_by_size[size.min(3) - 1][b] += 1;
-        let gap = if ri > 0 { t - prev_row_t } else { 0.0 };
         let cross = if gap != 0.0 { w_cross * v(gap, flam, 2.0) } else { 0.0 };
         let mut tech = 0.0;
         if gap != 0.0 && gap < 0.5 {
@@ -549,12 +561,13 @@ pub fn demand(
         let any_vib = g.vib[i..j].iter().any(|&x| x);
         comp[o(P::vib) + b] += any_vib as u8 as f64;
         if gap != 0.0 && gap < 0.25 && row_mask & prev_row_mask != 0 {
-            burst.push(b);
+            // a minijack in full up to MJ_FULL, none from MJ_NONE: slow re-hits read Minijacks first though the user saw none
+            // and only while few columns re-hit: a re-hit of most of the keys is a chordjack/mash (user 2026-11-17: 10K
+            // Wonder tale, 7–8-key chords twice at 128 ms, read Minijacks first)
+            let wide_rehit = smooth((row_mask & prev_row_mask).count_ones() as f64 / keys as f64, k.MJ_WIDE_LO, k.MJ_WIDE_HI);
+            burst.push((b, ((k.MJ_NONE - gap) / (k.MJ_NONE - k.MJ_FULL)).clamp(0.0, 1.0) * (1.0 - wide_rehit)));
         } else {
-            let part = if burst.len() <= k.MJ_BURST { P::mj } else { P::sus };
-            for &rb in &burst {
-                comp[o(part) + rb] += 1.0;
-            }
+            add_burst(&mut comp, &burst, k.MJ_BURST, &o);
             burst.clear();
         }
         let mut n_hand = [0usize; 2];
@@ -567,6 +580,17 @@ pub fn demand(
             let h = hand_of[c] as usize;
             n_hand[h] += 1;
             n_jack[h] += (previous_mask[h] >> c & 1) as usize;
+        }
+        // Hardest-7K study (2026-11-18): top players lose more on column re-hits only while the same hand is dense (Absolute
+        // Zero, Decipher ≥ 14 notes a hand in 0.5 s; Victory's re-hits in sparse hands cost nothing extra); each alone failed.
+        let mut hand_dense = [0.0f64; 2];
+        if k.RHD_W != 0.0 {
+            for h in 0..2 {
+                hand_recent[h].extend(std::iter::repeat_n(t, n_hand[h]));
+                let gone = hand_recent[h].partition_point(|&x| x < t - k.RHD_SPAN);
+                hand_recent[h].drain(..gone);
+                hand_dense[h] = (hand_recent[h].len() as f64 / rhd_n - 1.0).max(0.0);
+            }
         }
         if n_jack[0] != 0 && n_jack[1] != 0 {
             let mh = if n_jack[0] <= n_jack[1] { 0 } else { 1 };
@@ -659,7 +683,8 @@ pub fn demand(
             let groups = (row_hand[h] & !(row_hand[h] << 1)).count_ones() as f64;
             let cost = 1. + mix[h] + many[h] + if size as f64 >= k.GROUP_SIZE { w_group * (groups - 1.) } else { 0. };
             // V_FINGER over keymodes (·(keys/7)^x) rejected 2026-11-07 (r6c): DevSelect better, DevConfirm 4K and 10K worse.
-            let rice = (e_hand + e_jack) * above_one(vdj / k.V_FINGER, if jacked { vf_jacked } else { 1.0 }) * cost;
+            let dense_rehit = 1.0 + k.RHD_W * (vdj / k.V_FINGER - 1.0).max(0.0) * hand_dense[h];
+            let rice = (e_hand + e_jack) * above_one(vdj / k.V_FINGER, if jacked { vf_jacked } else { 1.0 }) * dense_rehit * cost;
             let rice = if keys % 2 == 1 && c == keys / 2 { rice * (1.0 + k.W_CENTRE) } else { rice };
             let mut held_same = 0.0f64;
             let mut held_other = 0.0f64;
@@ -908,10 +933,7 @@ pub fn demand(
             comp[o(P::cover) + hb] += 0f64.max(e.min(hi) - t.max(lo));
         }
     }
-    let part = if burst.len() <= k.MJ_BURST { P::mj } else { P::sus };
-    for &rb in &burst {
-        comp[o(part) + rb] += 1.0;
-    }
+    add_burst(&mut comp, &burst, k.MJ_BURST, &o);
     if !wide {
         for b in 0..nbins {
             let low = b.saturating_sub(2);
@@ -931,6 +953,29 @@ pub fn demand(
         }
     }
     let offsets: Vec<usize> = keys_out.iter().filter(|&&p| !non_demand(p)).map(|&p| o(p)).collect();
+    // Pattern information (replay study 2026-11-17: Sea of Stars' gap to Onus/Blossom follows the surprise bits per second of its
+    // chord sequence at high density): each row's −log2 under an order-1 chain over the last 128 rows (notefeat's), per keymode bit
+    // (÷ keys), summed per bin; the bin's total × e^(PATTERN_INFO · max(0, that − PATTERN_INFO_B)).
+    let info: Vec<f64> = if k.PATTERN_INFO == 0.0 { Vec::new() } else {
+        let mut chain = crate::notefeat::Markov::new(2f64.powi(keys as i32) - 1., 128);
+        let mut out = vec![0.0f64; nbins];
+        let (mut i, mut prev) = (0usize, 0u32);
+        while i < n {
+            let mut j = i;
+            let mut mask = 0u32;
+            while j < n && times[j] - times[i] <= 0.003 {
+                mask |= 1 << columns[j];
+                j += 1;
+            }
+            let b = (nbins - 1).min(((times[i] - t0) / bin) as usize);
+            out[b] += chain.step(prev, mask) / keys as f64;
+            prev = mask;
+            i = j;
+        }
+        out
+    };
+    let info_w = k.PATTERN_INFO * (keys as f64 / 7.0).powf(k.PATTERN_INFO_X);
+    let info_x = |b: usize| if info.is_empty() { 1.0 } else { (info_w * (info[b] - k.PATTERN_INFO_B).max(0.0)).exp() };
     let plain = if want_plain {
         let mut pc = comp.clone();
         for p in [P::sv, P::sv_raw].iter().chain(SV_KINDS.iter()) {
@@ -941,9 +986,9 @@ pub fn demand(
         let mut pt = vec![0.0f64; nbins];
         for b in 0..nbins {
             let (left, right, cv) = (hands[b], hands[nbins + b], plain_x[b]);
-            let raw = left + right + cv;
+            let raw = hands[b] + hands[nbins + b] + cv; // the parts scale up to the total
             if raw > 0.0 {
-                pt[b] = ((left * left + right * right).sqrt() + cv) / bin;
+                pt[b] = ((left * left + right * right).sqrt() + cv) / bin * info_x(b);
                 let factor = pt[b] / raw;
                 for &off in &offsets {
                     pc[off + b] *= factor;
@@ -961,9 +1006,9 @@ pub fn demand(
     let mut totals = vec![0.0f64; nbins];
     for b in 0..nbins {
         let (left, right, cv) = (hands[b], hands[nbins + b], hands[2 * nbins + b]);
-        let raw = left + right + cv;
+        let raw = hands[b] + hands[nbins + b] + cv; // the parts scale up to the total
         if raw > 0.0 {
-            totals[b] = ((left * left + right * right).sqrt() + cv) / bin;
+            totals[b] = ((left * left + right * right).sqrt() + cv) / bin * info_x(b);
             let factor = totals[b] / raw;
             for &off in &offsets {
                 comp[off + b] *= factor;

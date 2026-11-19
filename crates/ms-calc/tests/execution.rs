@@ -15,7 +15,8 @@ fn compact_pseudo_chords_are_not_continuous_delay_or_jumptrills() {
         cols.iter().map(move |&c| (1000. + 85. * i as f64, c))
     }), 7, 5.);
     let p = run(&pseudo, 1.);
-    assert!(execution(&p, "pseudo_mash") > 0.5);
+    // a 7-key roll 48 ms wide is struck as one chord (Chart::mashed): mash, no longer a pseudo chord
+    assert!(execution(&p, "mash") > 0.5);
     assert!(score(&p, "mash") > score(&p, "technical"));
     assert!(execution(&run(&precise, 1.), "mash") < 0.02);
     assert!(execution(&run(&alternating, 1.), "mash") < 0.02);

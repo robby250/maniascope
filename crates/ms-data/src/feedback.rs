@@ -1,8 +1,7 @@
 //! Local evidence for calibration, read by `calib feedback`: ~/.config/maniascope/feedback.json (per
 //! machine). An entry is a chart identity (sha256 of the file) at a rate; judgments compare two entries.
-use crate::imports::score_allowed;
 use crate::paths;
-use crate::store::{local_stamp, Db};
+use crate::store::local_stamp;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -70,21 +69,19 @@ pub fn chart_path(m: &Value) -> Option<PathBuf> {
 }
 
 /// Record one of the user's own results (from tosu's results screen); false if known.
-pub fn add_score(db: &mut Value, score: &Value, path: &str, store: &Db) -> rusqlite::Result<bool> {
-    if !score_allowed(store, score, None, false)? {
-        return Ok(false);
-    }
+/// Appends a result (the caller checked `score_allowed`); false: already there.
+pub fn add_score(db: &mut Value, score: &Value, path: &str) -> bool {
     const SAME: [&str; 5] = ["sha256", "score", "accuracy", "max_combo", "played"];
     let scores = db["scores"].as_array_mut().expect("load made it a list");
     let id = score.get("id").filter(|v| v.as_str().is_some_and(|s| !s.is_empty()));
     if scores.iter().any(|s| SAME.iter().all(|k| s.get(*k) == score.get(*k)) || (id.is_some() && s.get("id") == id)) {
-        return Ok(false);
+        return false;
     }
     let mut row = score.clone();
     row["path"] = json!(path);
     row["seen"] = json!(local_stamp()[..10]);
     scores.push(row);
-    Ok(true)
+    true
 }
 
 pub fn label(m: &Value) -> String {

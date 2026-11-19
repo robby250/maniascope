@@ -31,6 +31,8 @@ CREATE INDEX IF NOT EXISTS scores_bm ON scores(beatmap_id);
 CREATE INDEX IF NOT EXISTS scores_sha ON scores(sha256);
 CREATE INDEX IF NOT EXISTS scores_local ON scores(local_id);
 CREATE INDEX IF NOT EXISTS installed_bid ON installed(beatmap_id);
+CREATE INDEX IF NOT EXISTS installed_md5 ON installed(md5);
+CREATE INDEX IF NOT EXISTS converts_md5 ON converts(md5);
 CREATE INDEX IF NOT EXISTS events_t ON events(t);
 ";
 
@@ -38,6 +40,18 @@ pub type Db = Connection;
 
 /// Charts carried so far / to carry in this run (own rows and website rows), for the app's progress line.
 pub static CARRIED: [std::sync::atomic::AtomicUsize; 2] = [std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0)];
+
+/// The app's worker keeps it current while a carry runs.
+pub static GAME_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Threads of a carry batch: every core but two, half of them beside a running game (the wait after a calculator update is
+/// this, user 2026-11-19; half always left a 24-core machine's other 12 idle with no game up).
+/// MS_CARRY_THREADS: calibration boxes with no game use every core (the knob screens spend ~85 % of each run here).
+pub fn carry_threads() -> usize {
+    let cores = std::thread::available_parallelism().map_or(2, |x| x.get());
+    std::env::var("MS_CARRY_THREADS").ok().and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| if GAME_UP.load(std::sync::atomic::Ordering::Relaxed) { cores / 2 } else { cores.saturating_sub(2) }.max(1))
+}
 
 /// Stored chart features moved to the calculator `to`, so a calibration change doesn't re-analyse the library. Charts it doesn't
 /// move keep their bytes. Rows are copied, as every older calculator's were left; a stopped run resumes.
@@ -48,20 +62,17 @@ pub fn carry_feats(db: &Db, from: &str, to: &str, after: &ms_calc::params::Param
     // A launch during a crawl repeats the carry, and a second source calculator repeats most rows: only the missing cost anything.
     let name = |k: &str| k.rsplit_once('|').map_or("", |n| n.0).to_string();
     let keys: Vec<String> = all.into_iter().filter(|k| !there.contains(&format!("{}|{to}", name(k))) && only.is_none_or(|o| o.contains(&name(k)))).collect();
-    // A chart's rates sit together in key order, so its file is read and its convert remade once. Half the cores: the game may be up.
-    // MS_CARRY_THREADS: calibration boxes with no game use every core (the knob screens spend ~85 % of each run here).
-    let threads = std::env::var("MS_CARRY_THREADS").ok().and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| (std::thread::available_parallelism().map_or(2, |x| x.get()) / 2).max(1));
+    // A chart's rates sit together in key order, so its file is read and its convert remade once.
     let sha_of = |k: &str| k.rsplit_once('|').map_or(k, |n| n.0).rsplit_once('@').map_or("", |n| n.0).to_string();
     let charts: Vec<&[String]> = keys.chunk_by(|a, b| sha_of(a) == sha_of(b)).collect();
     CARRIED[1].fetch_add(charts.len(), std::sync::atomic::Ordering::Relaxed);
-    for batch in charts.chunks(200) {
+    for batch in charts.chunks(1000) { // a batch waits for its slowest chart with the other threads idle: 200 left 2.5 of 14 cores unused
         CARRIED[0].fetch_add(batch.len(), std::sync::atomic::Ordering::Relaxed);
         let mut stored: Vec<Vec<(String, Sql)>> = Vec::with_capacity(batch.len());
         for group in batch {
             stored.push(group.iter().map(|key| Ok((key.clone(), db.query_row("SELECT data FROM feats WHERE key=?", [key], |r| r.get(0))?))).collect::<Result<_>>()?);
         }
-        let moved = ms_calc::background::background_map(&stored, threads, |group| {
+        let moved = ms_calc::background::background_map(&stored, carry_threads(), |group| {
             let file = std::cell::OnceCell::new();
             let sha = sha_of(&group[0].0);
             let chart = || file.get_or_init(|| chart(&sha).map(std::rc::Rc::new)).clone();

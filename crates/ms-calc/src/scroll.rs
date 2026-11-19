@@ -227,7 +227,9 @@ pub fn reading(chart: &Chart, rate: f64, prm: &Params) -> Result<(Vec<f64>, Vec<
             if ws.len() != 4 || ws.iter().any(|w| !w.is_finite() || *w < 0.0) {
                 return Err("Invalid scroll-reading coefficients".into());
             }
-            [ws[0], ws[1], ws[2], ws[3]]
+            // stutter SV read too hard on public scores (its share of the SV cost against the residual: 4K r −.20, 7K −.32)
+            // SV-heavy public maps play easier than rated (2026-11-16, 8b4e dev: 4K SV share ≥ .4 bias −.155, 89 maps): SV_READ scales the whole cost
+            [ws[0] * prm.k.SV_READ, ws[1] * prm.k.SV_READ, ws[2] * prm.k.SV_READ, ws[3] * prm.k.SV_STUTTER * prm.k.SV_READ]
         }
     };
     let n = info.vectors.len();

@@ -1,7 +1,7 @@
 //! Full analysis of a chart at a rate (skill_calc.compute/_compute).
 use crate::card;
 use crate::chart::Chart;
-use crate::demand::{self, Geometry, Parts, Run};
+use crate::demand::{self, Geometry, Parts, Run, P};
 use crate::execution::{self, Info};
 use crate::gestures;
 use crate::model;
@@ -34,6 +34,7 @@ pub struct Shared {
     pub tech_profile: Option<[f64; 3]>,
     pub quadstream: Option<(Vec<f64>, f64)>,
     pub endurance: Option<((f64, f64), Vec<f64>)>,
+    pub end_series: Option<Vec<Vec<f64>>>,
     pub structure: Option<Dict>,
 }
 
@@ -63,6 +64,9 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     if !(rate > 0.0) || !rate.is_finite() {
         return Err(format!("invalid rate: {rate}"));
     }
+    // analysed as played: notes the player strikes as one gesture (Chart::mashed) are one row
+    let (written, played) = (chart, chart.played(rate, k));
+    let chart = played.as_ref().unwrap_or(chart);
     let n = chart.len();
     let keys = chart.keys;
     let mut res = Dict::new();
@@ -85,46 +89,17 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
         res.set("structure", structure::structure(chart, rate, k));
         return Ok(res);
     }
-    let read = if sv && !prm.off("sv_reading") { Some(scroll::reading(chart, rate, prm)?) } else { None };
+    let (read, runs) = demand_pass(chart, rate, sv, keys, shared, prm)?;
     let any_strain = read.as_ref().is_some_and(|r| r.0.iter().any(|&x| x != 0.0));
-    let runs: Vec<Run> = if !sv && shared.plain_runs.is_some() {
-        shared.plain_runs.take().unwrap() // the one plain pass (compute) reads it once
-    } else {
-        let want_plain = sv && !chart.sv.is_empty() && any_strain;
-        let g = demand::geometry(chart, rate, k);
-        let mut rs = Vec::new();
-        let mut plains = Vec::new();
-        let one = |cl: bool| demand::demand(chart, &g, cl, read.as_ref().map(|r| &r.0[..]), read.as_ref().map(|r| &r.1[..]), want_plain, k);
-        // odd keymodes: the middle key with each hand, two independent passes on two threads (a fifth of a 7K chart's time)
-        let both = if keys % 2 == 1 {
-            std::thread::scope(|s| {
-                let right = s.spawn(|| one(false));
-                vec![one(true), right.join().expect("demand pass")]
-            })
-        } else {
-            vec![one(true)]
-        };
-        for (run, plain) in both {
-            rs.push(run);
-            if let Some(p) = plain {
-                plains.push(p);
-            }
-        }
-        shared.geometry = Some(g);
-        if want_plain {
-            shared.plain_runs = Some(plains);
-        }
-        rs
-    };
-    if shared.endurance.is_none() {
-        let fines: Vec<&[Vec<f64>; 3]> = runs.iter().map(|r| &r.fine).collect();
-        shared.endurance = Some(if prm.off("endurance") {
-            ((0.0, 0.0), vec![0.0; runs[0].totals.len()])
-        } else {
-            model::endurance(&fines, k.BIN, k.PHASES)
-        });
+    if shared.end_series.is_none() {
+        shared.end_series = Some(model::endurance_series(&runs.iter().map(|r| &r.fine).collect::<Vec<_>>(), k.PHASES));
     }
-    let (total, mut parts): (Vec<f64>, Parts) = if runs.len() == 2 {
+    shared.endurance = Some(if prm.off("endurance") {
+        ((0.0, 0.0), vec![0.0; runs[0].totals.len()])
+    } else {
+        model::endurance_of(shared.end_series.as_ref().unwrap(), k.BIN, k.END_REF_Q)
+    });
+    let (mut total, mut parts): (Vec<f64>, Parts) = if runs.len() == 2 {
         let t: Vec<f64> = runs[0].totals.iter().zip(&runs[1].totals).map(|(l, r)| (l + r) / 2.0).collect();
         let mut p = runs[0].parts.clone();
         for (x, y) in p.data.iter_mut().zip(&runs[1].parts.data) {
@@ -135,18 +110,62 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
         let r = runs.into_iter().next().unwrap();
         (r.totals, r.parts)
     };
+    if shared.execution.is_none() {
+        shared.execution = Some(execution::analyse(chart, shared.geometry.as_ref().unwrap(), k.BIN));
+    }
+    // a mashed passage is struck, not read note by note: its demand eases by MASH_EASE of the share of its written rows
+    // that merged into one gesture (Chart::mashed; user 2026-11-15: A Fool Moon Night's all-key mash sections ~98.5–99 % on
+    // OD 4). The mash detector's share eased ordinary 4K patterns too (dump TEST +.0003).
+    if k.MASH_EASE > 0.0 && played.is_some() {
+        let (g, bin) = (shared.geometry.as_ref().unwrap(), k.BIN);
+        let rows_per_bin = |c: &Chart| {
+            let mut n = vec![0.0f64; total.len()];
+            for w in 0..c.len() {
+                if w == 0 || c.t[w] != c.t[w - 1] {
+                    let b = ((c.t[w] / 1000.0 / rate - g.times[0]) / bin).max(0.0) as usize;
+                    if let Some(x) = n.get_mut(b) { *x += 1.0; }
+                }
+            }
+            n
+        };
+        let (wr, pr) = (rows_per_bin(written), rows_per_bin(chart));
+        let m: Vec<f64> = wr.iter().zip(&pr).map(|(w, p)| if *w > 0.0 { (1.0 - p / w).max(0.0) } else { 0.0 }).collect();
+        // the wider the great window, the more a mash's spread still lands in it (user: "OD4 so it's very easy to manip")
+        let window = crate::gestures::great_window(chart.od) / crate::gestures::great_window(8.0);
+        let ease: Vec<f64> = (0..total.len()).map(|b| 1.0 - (k.MASH_EASE * window * m.get(b).copied().unwrap_or(0.0)).min(0.9)).collect();
+        total.iter_mut().zip(&ease).for_each(|(t, e)| *t *= e);
+        for &p in parts.keys.clone().iter().filter(|&&p| !demand::non_demand(p)) {
+            parts.get_mut(p).iter_mut().zip(&ease).for_each(|(v, e)| *v *= e);
+        }
+    }
     let tracing = shared.trace.is_some();
     let g = shared.geometry.as_ref().unwrap();
     let judged = skills::Judged::new(&g.times, &g.ends, total.len(), shared.endurance.as_ref().unwrap().1.clone(), k);
+    if k.SURF.iter().any(|&c| c != 0.0) || [k.OD_POW, k.OD_POW_L, k.SWITCH_W, k.SWITCH_L, k.VIB_L, k.OD_LN, k.OD_LN_L, k.LN_TOP, k.LN_TOP_MIX, k.SUSTAIN_W].iter().any(|&c| c != 0.0) {
+        let first = skills::rating(&total, &judged, keys, k);
+        let sustain = if k.SUSTAIN_W != 0.0 && first > 0.0 { skills::window_rating(&total, &judged, keys, k.SUSTAIN_WINDOW, k) / first } else { 0.0 };
+        surfaces(&mut total, &mut parts, first, keys, k);
+        // share of the chart's notes inside vibro runs: top players' vibro surplus grows with it (panel 2026-11-17: run share
+        // < .1 −.26, .25–.5 −.84, ≥ .5 −1.64), so speed charts with short bursts (REFORM Kappa/Iota Speed, .14/.09) keep theirs
+        let run_share = if k.VIB_L != 0.0 { structure::vibro_notes(chart, rate, k).iter().map(Vec::len).sum::<usize>() as f64 / n.max(1) as f64 } else { 0.0 };
+        level_terms(&mut total, &mut parts, first, chart.od, run_share, sustain, keys, k);
+    }
     let overall = skills::rating(&total, &judged, keys, k);
     sc.set("overall", overall);
+    // The press rating: the chart with its holds as taps (each bin without the LN parts' share, releases not judged). The regular
+    // dans read it: an LN chart's regular dan is what hitting its notes asks, not its hold control (user 2026-11-19: the LN
+    // Stellium course read "Reg Stellium+"). No second analysis: one more rating of the series.
+    let press = if parts.keys.contains(&P::ln) && parts.get(P::ln).iter().any(|&v| v != 0.0) {
+        let rice: Vec<f64> = total.iter().zip(parts.get(P::ln)).map(|(t, l)| (t - l).max(0.0)).collect();
+        skills::rating(&rice, &skills::Judged::new(&g.times, &g.times, total.len(), judged.fatigue.clone(), k), keys, k)
+    } else {
+        overall
+    };
+    res.set("press_overall", press);
     // Sustained demand: the same rating on minutes-long windows, so a uniformly hard chart keeps it near the overall.
     sc.set("stamina", skills::stamina_rating(&total, &judged, keys, k));
     let mut series = skills::attribute(&parts, &total, keys, false, k);
     let mut rated = Vec::new();
-    if shared.execution.is_none() {
-        shared.execution = Some(execution::analyse(chart, shared.geometry.as_ref().unwrap(), k.BIN));
-    }
     if shared.gestures.is_none() {
         // Off: empty series (every reader is length-guarded), zero features, no roll plans.
         shared.gestures = Some(if prm.off("gestures") {
@@ -252,7 +271,7 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     res.set("length", if length.fract() == 0.0 && length.abs() < 9e15 { Val::Int(length as i64) } else { Val::F(length) });
     if prm.model["joint"]["modes"][chart.keys.to_string()].is_object() {
         if let Some(e) = res.dict_mut("execution") {
-            crate::flow::flow(chart, rate, &prm.k).store(e);
+            crate::flow::flow(written, rate, &prm.k).store(e);
         }
     }
     model::apply(prm, &mut res, chart.od, rate);
@@ -305,4 +324,151 @@ pub fn compute(chart: &Chart, rate: f64, sv: bool, prm: &Params) -> Result<Dict,
     ap.set("version", 3i64);
     result.set("archetype_profile", ap);
     Ok(result)
+}
+
+type Reading = (Vec<f64>, Vec<[f64; 5]>, [f64; 4]);
+
+/// The SV reading and the demand runs of a pass (the plain pass takes the runs the SV pass left).
+fn demand_pass(chart: &Chart, rate: f64, sv: bool, keys: usize, shared: &mut Shared, prm: &Params) -> Result<(Option<Reading>, Vec<Run>), String> {
+    let k = &prm.k;
+    let read = if sv && !prm.off("sv_reading") { Some(scroll::reading(chart, rate, prm)?) } else { None };
+    let any_strain = read.as_ref().is_some_and(|r| r.0.iter().any(|&x| x != 0.0));
+    let runs = if !sv && shared.plain_runs.is_some() {
+        shared.plain_runs.take().unwrap() // the one plain pass (compute) reads it once
+    } else {
+        let want_plain = sv && !chart.sv.is_empty() && any_strain;
+        let g = demand::geometry(chart, rate, k);
+        let mut rs = Vec::new();
+        let mut plains = Vec::new();
+        let one = |cl: bool| demand::demand(chart, &g, cl, read.as_ref().map(|r| &r.0[..]), read.as_ref().map(|r| &r.1[..]), want_plain, k);
+        // odd keymodes: the middle key with each hand, two independent passes on two threads (a fifth of a 7K chart's time)
+        let both = if keys % 2 == 1 {
+            std::thread::scope(|s| {
+                let right = s.spawn(|| one(false));
+                vec![one(true), right.join().expect("demand pass")]
+            })
+        } else {
+            vec![one(true)]
+        };
+        for (run, plain) in both {
+            rs.push(run);
+            if let Some(p) = plain {
+                plains.push(p);
+            }
+        }
+        shared.geometry = Some(g);
+        if want_plain {
+            shared.plain_runs = Some(plains);
+        }
+        rs
+    };
+    Ok((read, runs))
+}
+
+/// Pattern strength surfaces (plan 2026-11-16 curves): each demand part × e^(SURF[5p..5p+5]·(x, x², L, x·L, L²)) with
+/// x = ln(keys/7) and L = ln(first-pass overall / SURF_REF); each bin's total moves by its parts' weighted share, so all-zero
+/// coefficients leave it exactly as it was.
+/// Plan 2026-11-16 B6/B7, over L = ln(first-pass overall / LEVEL_REF) (default 0 = off):
+/// - hit window: every bin × (great window / OD 8's)^−(OD_POW + OD_POW_L·L) (a tight window costs more at the top?);
+/// - pattern switching: bin × (1 + SWITCH_W·e^(SWITCH_L·L)·(1 − cos(parts of b, parts of b−1))), the change of pattern mix
+///   between neighbouring bins.
+fn level_terms(total: &mut [f64], parts: &mut Parts, first: f64, od: f64, run_share: f64, sustain: f64, keys: usize, k: &crate::params::Knobs) {
+    let l = (first.max(1e-6) / k.LEVEL_REF).ln();
+    let nb = parts.nbins;
+    let mut m = vec![1.0f64; nb];
+    // Sustained load (own 7K plays 2026-11-18: maps whose 180 s rating stays near the overall score .31 ± .06 pp under the forecast,
+    // n 293; short or peaky maps don't): every bin × (1 + SUSTAIN_W·(keys/7)^SUSTAIN_X·e^(SUSTAIN_L·L)·max(0, sustain − SUSTAIN_R)),
+    // sustain = the SUSTAIN_WINDOW-second rating / the overall.
+    if k.SUSTAIN_W != 0.0 {
+        let f = 1.0 + k.SUSTAIN_W * (keys as f64 / 7.0).powf(k.SUSTAIN_X) * (k.SUSTAIN_L * l).exp() * (sustain - k.SUSTAIN_R).max(0.0);
+        m.iter_mut().for_each(|v| *v *= f);
+    }
+    if k.OD_POW != 0.0 || k.OD_POW_L != 0.0 {
+        let window = crate::gestures::great_window(od) / crate::gestures::great_window(8.0);
+        m.iter_mut().for_each(|v| *v *= window.powf(-(k.OD_POW + k.OD_POW_L * l)));
+    }
+    if k.SWITCH_W != 0.0 {
+        let demand: Vec<_> = parts.keys.iter().copied().filter(|&p| !demand::non_demand(p)).collect();
+        let w = k.SWITCH_W * (k.SWITCH_L * l).exp();
+        for b in 1..nb {
+            let (mut ab, mut aa, mut bb) = (0.0, 0.0, 0.0);
+            for &p in &demand {
+                let (x, y) = (parts.data[p as usize * nb + b], parts.data[p as usize * nb + b - 1]);
+                ab += x * y; aa += x * x; bb += y * y;
+            }
+            if aa > 0.0 && bb > 0.0 {
+                m[b] *= 1.0 + w * (1.0 - ab / (aa * bb).sqrt()).max(0.0);
+            }
+        }
+    }
+    if k.VIB_L != 0.0 && parts.keys.contains(&P::vib) {
+        let vib = &parts.data[P::vib as usize * nb..(P::vib as usize + 1) * nb];
+        m.iter_mut().zip(vib).for_each(|(v, s)| *v *= (k.VIB_L * l * run_share * s.clamp(0.0, 1.0)).exp());
+    }
+    let (before, mut after) = (parts_sum(parts), vec![0.0f64; nb]);
+    let ln_m = if k.OD_LN != 0.0 || k.OD_LN_L != 0.0 {
+        (crate::gestures::great_window(od) / crate::gestures::great_window(8.0)).powf(-(k.OD_LN + k.OD_LN_L * l))
+    } else { 1.0 };
+    // LN ease at the top only (zero below the hinge), strongest in LN-heavy stretches: top players and the per-note net agree
+    // LN-heavy stretches play easier than rated (study 2026-11-18), own replays the reverse at lower levels (LN_BASE)
+    let top = (l - k.LN_TOP_L0).max(0.0);
+    let mut ln_f = vec![ln_m; nb];
+    let mix = k.LN_TOP_MIX * (keys as f64 / 7.0).powf(k.LN_TOP_MIX_X);
+    if top > 0.0 && (k.LN_TOP != 0.0 || mix != 0.0) {
+        let share: Vec<f64> = (0..nb).map(|b| {
+            let (mut lnv, mut all) = (0.0, 0.0);
+            for &p in parts.keys.iter().filter(|&&p| !demand::non_demand(p)) {
+                let v = parts.data[p as usize * nb + b];
+                all += v;
+                if matches!(p, P::ln | P::ln_rel) { lnv += v }
+            }
+            if all > 0.0 { lnv / all } else { 0.0 }
+        }).collect();
+        let w = (k.LN_TOP_WIN / k.BIN).round() as usize;
+        let mut acc = 0.0;
+        for b in 0..nb {
+            acc += share[b] - if w > 0 && b >= w { share[b - w] } else { 0.0 };
+            let s = if w == 0 { 1.0 } else { acc / (b + 1).min(w) as f64 };
+            // top players: LN-heavy stretches easier, mixed ones (rice under held LNs) harder (7K panel by level × LN share)
+            ln_f[b] = ln_m * (-k.LN_TOP * top * s.max(0.0).powf(k.LN_TOP_P)).exp(); // the rolling sum drifts below 0: NaN at a fractional power
+            m[b] *= (mix * top * (4.0 * s * (k.LN_TOP_MIX_C - s) / (k.LN_TOP_MIX_C * k.LN_TOP_MIX_C)).max(0.0)).exp();
+        }
+    }
+    for &p in parts.keys.clone().iter().filter(|&&p| !demand::non_demand(p)) {
+        let is_ln = matches!(p, P::ln | P::ln_rel);
+        parts.data[p as usize * nb..(p as usize + 1) * nb].iter_mut().zip(&m).enumerate().for_each(|(b, (v, f))| { *v *= f * if is_ln { ln_f[b] } else { 1.0 }; after[b] += *v; });
+    }
+    // the total follows its demand parts (an LN-only factor moves only their share of it)
+    total.iter_mut().enumerate().for_each(|(b, t)| if before[b] > 0.0 { *t *= after[b] / before[b] } else { *t *= m[b] });
+}
+
+fn parts_sum(parts: &Parts) -> Vec<f64> {
+    let nb = parts.nbins;
+    let mut s = vec![0.0f64; nb];
+    for &p in parts.keys.iter().filter(|&&p| !demand::non_demand(p)) {
+        parts.data[p as usize * nb..(p as usize + 1) * nb].iter().enumerate().for_each(|(b, v)| s[b] += v);
+    }
+    s
+}
+
+fn surfaces(total: &mut [f64], parts: &mut Parts, first: f64, keys: usize, k: &crate::params::Knobs) {
+    let (x, l) = ((keys as f64 / 7.0).ln(), (first.max(1e-6) / k.SURF_REF).ln());
+    let basis = [x, x * x, l, x * l, l * l];
+    let nb = parts.nbins;
+    let (mut before, mut after) = (vec![0.0f64; nb], vec![0.0f64; nb]);
+    for &p in parts.keys.clone().iter().filter(|&&p| !demand::non_demand(p)) {
+        let c = &k.SURF[5 * p as usize..5 * p as usize + 5];
+        let m = c.iter().zip(&basis).map(|(c, b)| c * b).sum::<f64>().exp();
+        let s = &mut parts.data[p as usize * nb..(p as usize + 1) * nb];
+        for (b, v) in s.iter_mut().enumerate() {
+            before[b] += *v;
+            *v *= m;
+            after[b] += *v;
+        }
+    }
+    for (b, t) in total.iter_mut().enumerate() {
+        if before[b] > 0.0 {
+            *t *= after[b] / before[b];
+        }
+    }
 }

@@ -232,8 +232,9 @@ pub fn attribute(
     k: &Knobs,
 ) -> (Parts, Vec<(&'static str, f64)>, Vec<f64>) {
     let m = &info.mash;
-    // Rice: the base skills of the rice and chord fit families (mash and rolls take from them).
-    let rice: Vec<Sk> = crate::taxonomy::TABLE.iter().filter(|r| r.role == crate::taxonomy::Role::Base && matches!(r.fit, "rice" | "chords") && series.has(r.sk)).map(|r| r.sk).collect();
+    // Rice: the base skills of the rice, chord and jack fit families (mash and rolls take from them: a smeared chord run is
+    // not jacked either, user 2026-11-15: A Fool Moon Night's mashed 7-key runs read Minijacks first).
+    let rice: Vec<Sk> = crate::taxonomy::TABLE.iter().filter(|r| r.role == crate::taxonomy::Role::Base && matches!(r.fit, "rice" | "chords" | "jack" | "chordjack") && series.has(r.sk)).map(|r| r.sk).collect();
     let mut changed = parts.clone();
     let zipn = |a: usize, b: usize| a.min(b);
     {

@@ -13,7 +13,7 @@ use ms_data::imports::{self, add_live_score, import_library, Imported};
 use ms_data::public::Public;
 use ms_data::store::{acc_lazer, acc320, connect, kv_get, kv_set, log_event, now, parse_stats, predictable_context, stable_miss_ratio, timestamp, tracking_allowed, Db, Result, Stats, SUPPORTED_KEYS};
 use ms_data::{replays, webmaps};
-use ms_model::choices::{key_shares, keymode_order, stream_odds, ChoiceList, Prepared, CONVERT, REAL, WEB};
+use ms_model::choices::{key_shares, keymode_order, stream_odds, ChoiceList, Prepared, CONVERT, REAL, WEB, WEB_CONVERT};
 use crate::converts::{self, Setting};
 use ms_model::predict::{Consts, FeatStore, HashMap};
 use ms_model::session::SESSION_GAP;
@@ -168,7 +168,13 @@ impl Queue {
             Task::Selected { .. } => *self.selected_at.lock().unwrap() = Some(Instant::now()),
             _ => {}
         }
-        self.lanes.lock().unwrap()[lane].push_back(task);
+        let mut lanes = self.lanes.lock().unwrap();
+        if matches!(task, Task::Selected { .. }) {
+            // only the latest selection matters: scrolling song select queued one full card per chart passed (2026-11-17 audit)
+            lanes[lane].retain(|t| !matches!(t, Task::Selected { .. }));
+        }
+        lanes[lane].push_back(task);
+        drop(lanes);
         self.wake.notify_one();
     }
 
@@ -273,6 +279,7 @@ pub struct Worker {
     restored: HashSet<String>,
     shown: Shown,
     session_cache: Option<((Option<i64>, i64), f64, Arc<Now>)>,
+    events_cache: Option<(Option<i64>, f64, Vec<Arc<ms_data::store::Event>>)>,
     taste_cache: (Option<i64>, HashMap<(i64, String), f64>),
     nps_pool: HashMap<&'static str, BTreeMap<i64, Vec<f64>>>, // per tab: eligible maps' NPS per keymode, sorted (choices::nps_eligible)
     sel: (Option<PathBuf>, Option<f64>, Option<Vec<Value>>),
@@ -383,7 +390,7 @@ impl Worker {
             converts: [("nps", BTreeMap::new()), ("skills", BTreeMap::new())].into_iter().collect(), stream_mix: [("nps", ([0., 0.], [false; 2])), ("skills", ([0., 0.], [false; 2]))].into_iter().collect(), mix_logged: HashMap::default(), convert_turn: Arc::new(AtomicU64::new(0)),
             acc_targets: [("nps", DEFAULT_TARGET), ("skills", DEFAULT_TARGET)].into_iter().collect(), rates: [("nps", builder::DEFAULT_RATES), ("skills", builder::DEFAULT_RATES)].into_iter().collect(), pp_mix: PpMix::default(), settings: PpSettings::default(), practice_skills: Vec::new(),
             states: [("nps", ListState::default()), ("skills", ListState::default())].into_iter().collect(), credible: Default::default(), restored: HashSet::new(),
-            shown: Shown { client, miss_ratio }, session_cache: None, taste_cache: (None, HashMap::default()), nps_pool: HashMap::default(), sel: (None, None, None), loading: None, learning: Arc::default(), first_import, refresh_queued: false,
+            shown: Shown { client, miss_ratio }, session_cache: None, events_cache: None, taste_cache: (None, HashMap::default()), nps_pool: HashMap::default(), sel: (None, None, None), loading: None, learning: Arc::default(), first_import, refresh_queued: false,
             refit_due: false, refit_running: false, refit_again: false, last_refit: now(), last_idle_check: Instant::now(), nps_requested: Instant::now(), clock_due: true, replay_due: Some(Instant::now() + Duration::from_secs(10)),
             replay_retries: 0, jobs: Arc::default(), feature_errors: Arc::default(), feature_pending: Arc::default(), stats_visible: false, stats_cache: None, current: None, yielding: false,
         }
@@ -506,6 +513,7 @@ impl Worker {
         let carried = std::thread::scope(|s| {
             let carry = s.spawn(|| connect(&path).map_err(|e| e.to_string()).and_then(|db| Self::carry_all(&db)));
             while !carry.is_finished() {
+                ms_data::store::GAME_UP.store((self.h.game)(), Ordering::Relaxed);
                 for task in self.q.take(|t| matches!(t, Task::ConvertSelected { .. })) {
                     self.run_task(task);
                 }
@@ -524,7 +532,7 @@ impl Worker {
 
     /// Ok(true) once both stores carried. The own rows' error stops the launch; the website's waits for the next launch.
     fn carry_all(db: &Db) -> std::result::Result<bool, String> {
-        crate::engine::carry_rows(db, None)?;
+        crate::engine::carry_rows(db, Some(&crate::engine::app_names(db).map_err(|e| e.to_string())?))?;
         // A crawl from before the update can still hold it.
         if ms_data::webmaps::running() {
             return Ok(false);
@@ -671,7 +679,15 @@ impl Worker {
                 return Ok(n.clone());
             }
         }
-        let n = Arc::new(self.rec.as_ref().expect("a fitted model").now_state(&self.db, target)?);
+        // The events only change with a new row or a new minute of window: re-reading ~8 MB of event JSON (14 days of starts'
+        // feature records) every 2 s of tasks was most of a state (2026-11-17 audit); the session itself is rebuilt for now().
+        let current = now();
+        let since = crate::engine::Engine::events_since(current);
+        if self.events_cache.as_ref().is_none_or(|c| c.0 != id || c.1 != since) {
+            self.events_cache = Some((id, since, ms_data::events::load_events(&self.db, since)?));
+        }
+        let events = self.events_cache.as_ref().unwrap().2.clone();
+        let n = Arc::new(self.rec.as_ref().expect("a fitted model").state_with(events, target, current)?);
         self.session_cache = Some((stamp, target, n.clone()));
         Ok(n)
     }
@@ -690,10 +706,13 @@ impl Worker {
         let (phase, shown, note) = self.pool(mode)?;
         let mut shown = self.prepared_playlist(mode, shown)?;
         if mode != "pp" && self.mix_of(mode).on {
-            let head = shown.first().and_then(Pick::identity);
+            // A PP row never goes in front of the map Next already offered; any other first row is just the queue's next one,
+            // and keeping that in front put a due PP row second after every play, forever (user 2026-11-15: Aegleseeker).
+            let offered = self.targets.get(mode).and_then(|t| t.identity());
+            let head = shown.first().and_then(Pick::identity).filter(|h| offered.as_deref() == Some(h.as_str()));
             shown = self.mix_pp(mode, shown)?;
             if let Some(h) = head {
-                to_front(&mut shown, &h); // a PP row slots in after the next map, never in front of it
+                to_front(&mut shown, &h);
             }
             self.playlists.insert(mode, shown.clone());
         }
@@ -734,7 +753,7 @@ impl Worker {
     }
 
     fn recent(n: &Now, mode: &str) -> Vec<(u8, i64)> {
-        let of = |e: &Arc<ms_data::store::Event>| (if e.info["convert"].as_bool() == Some(true) { CONVERT } else if e.info["web"].as_bool() == Some(true) { WEB } else { REAL }, e.info["keys"].as_i64().unwrap_or(0));
+        let of = |e: &Arc<ms_data::store::Event>| (if e.info["convert"].as_bool() == Some(true) { if e.info["source_web"].as_bool() == Some(true) { WEB_CONVERT } else { CONVERT } } else if e.info["web"].as_bool() == Some(true) { WEB } else { REAL }, e.info["keys"].as_i64().unwrap_or(0));
         let all: Vec<(u8, i64)> = n.session.all.iter().filter(|e| e.kind == "offer" && e.info["mode"].as_str() == Some(mode)).map(of).collect();
         all[all.len().saturating_sub(40)..].to_vec()
     }
@@ -811,7 +830,7 @@ impl Worker {
             let entries: Vec<(String, f64, usize)> = sl.into_iter().map(|(k, w)| { let n = counts.get(&k).copied().unwrap_or(0); (k, w, n) }).collect();
             ms_model::choices::mix_shares(&entries, self.skill_tuning.by_count).into_iter().collect::<std::collections::HashMap<_, _>>()
         });
-        let seed = n.session.all.iter().filter(|e| matches!(e.kind.as_str(), "offer" | "reset")).map(|e| e.id).max().unwrap_or(0); // the list holds until the next offer: a quit reshuffled it (user 2026-11-15)
+        let seed = n.session.shuffle_seed(); // one shuffle per run of offers: a quit (user 2026-11-15) or a pick must not re-draw it
         let seed = Some(seed.to_string()); // the custom playlist's slider at off drops it (builder::rank)
         let consumed: HashSet<String> = self.consumed.iter().cloned().collect();
         let active: Vec<&Setting> = self.keys[mode].iter().filter_map(|k| self.converts[mode].get(k)).filter(|s| s.on && !s.sources.is_empty()).collect();
@@ -1779,7 +1798,7 @@ impl Worker {
         });
         let info = json!({
             "mode": logged, "keys": c.keys, "group": c.group, "bid": c.bid, "rate": c.rate, "selection": selection, "length": c.length, "accuracy": c.pred.acc_mid, "title": c.title,
-            "opening_accuracy": c.pred.opening_acc, "activation_minutes": c.pred.activation, "purpose": c.purpose, "md5": c.md5, "sha": c.sha, "web": c.stream() == WEB, "convert": c.convert_of.is_some(), "p_up": c.p_up, "gain": c.gain, "best_pp": c.best,
+            "opening_accuracy": c.pred.opening_acc, "activation_minutes": c.pred.activation, "purpose": c.purpose, "md5": c.md5, "sha": c.sha, "web": c.stream() == WEB, "source_web": c.stream() == WEB_CONVERT, "convert": c.convert_of.is_some(), "p_up": c.p_up, "gain": c.gain, "best_pp": c.best,
             "pp_mid": c.pp_mid, "practice_skills": shown.as_ref().map(|s| &s.0), "matched_skills": shown.as_ref().map(|s| &s.1), "accuracy_forecast": forecast, "accuracy_forecast_recorded_at": now(),
             "predictor": forecast.as_ref().map_or(json!(PREDICTOR_ID), |f| f["predictor"].clone()), "calculator": forecast.as_ref().map_or(json!(CALC_ID), |f| f["calculator"].clone()),
         });
@@ -2003,20 +2022,9 @@ impl Worker {
             }
             let run = || -> std::result::Result<(Imported, usize, bool), String> {
                 let db = connect(&path).map_err(|e| e.to_string())?;
-                let signature = |db: &Db| -> std::result::Result<Vec<u8>, String> {
-                    use sha2::{Digest, Sha256};
-                    let mut digest = Sha256::new();
-                    let mut q = db.prepare("SELECT sha256,md5,status,keys FROM installed ORDER BY sha256").map_err(|e| e.to_string())?;
-                    let rows = q.query_map([], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, Option<i64>>(3)?))).map_err(|e| e.to_string())?;
-                    for row in rows.flatten() {
-                        digest.update(format!("{row:?}"));
-                    }
-                    Ok(digest.finalize().to_vec())
-                };
-                let before = signature(&db)?;
                 let result = import_library(&db, &client)?;
                 let recovered = recover_results(&db).map_err(|e| e.to_string())?;
-                let mut changed = signature(&db)? != before;
+                let mut changed = result.changed;
                 // A website chart now in the client drops its stored .osu right away, not at the next launch (user 2026-11-06).
                 // A running crawl does the same at its start and owns state.db meanwhile.
                 if changed && !ms_data::webmaps::running() {
@@ -2213,7 +2221,9 @@ impl Worker {
                     recover_results(&db).map_err(e)?;
                     replays::archive(&db, &raw, "lazer").map_err(e)?;
                 }
-                let pending = db.query_row("SELECT 1 FROM replay_evidence WHERE status='missing' AND julianday(played)>=julianday('now','-3 days') LIMIT 1", [], |_| Ok(())).optional().map_err(e)?.is_some();
+                // retry only for the play just finished: one older score without a replay retried 3 more full catch-ups (each a
+                // ~200 MB realm copy) after every later play (2026-11-17)
+                let pending = db.query_row("SELECT 1 FROM replay_evidence WHERE status='missing' AND julianday(played)>=julianday('now','-30 minutes') LIMIT 1", [], |_| Ok(())).optional().map_err(e)?.is_some();
                 let fresh: Vec<String> = db.prepare("SELECT key FROM scores WHERE fresh=1 AND julianday(played)>=julianday('now','-3 days')").map_err(e)?.query_map([], |r| r.get(0)).map_err(e)?.flatten().collect();
                 Ok((pending, fresh))
             };

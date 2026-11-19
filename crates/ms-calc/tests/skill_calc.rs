@@ -525,3 +525,42 @@ fn a_chart_row_stores_the_ln_types() {
     let sk = out[0].1.dict("sk").expect("sk");
     assert!(sk.get("ln").is_some_and(|v| v.f() > 0.) && sk.get("ln_release").is_some(), "{:?}", sk.get("ln"));
 }
+
+
+#[test]
+fn sv_lifting_the_rating_over_its_square_root_reads_as_memorization() {
+    let res = |with: f64, without: f64| {
+        let mut sc = ms_calc::val::Dict::new();
+        sc.set("overall", with);
+        let mut r = ms_calc::val::Dict::new();
+        r.set("scores", ms_calc::val::Val::Dict(sc));
+        r.set("no_sv_overall", without);
+        r
+    };
+    assert!(ms_calc::card::memorized(&res(11.3, 6.8)), "Bring Our Ignition Back [suppression vip] 1.73");
+    assert!(!ms_calc::card::memorized(&res(9.24, 6.38)), "Check this out [Jacks rains from above !] 1.13: predictable rhythm");
+    assert!(ms_calc::card::memorized(&res(9.23, 6.27)), "Carry me away [7K SV Challenge] 1.18: the 4K diff's SV");
+    assert!(!ms_calc::card::memorized(&res(9.36, 0.0)), "no SV pass");
+}
+
+#[test]
+fn the_families_correction_fades_to_the_fitted_top_constant() {
+    // REFORM Eta (under 4K's top) kept ×1.15 while Theta (over it) got ×1.0 and rated under Eta (user 2026-11-15)
+    let l = ms_calc::flow::LEVEL;
+    let model = serde_json::json!({"columns": [0], "low": [-10.0], "high": [10.0], "mean": [0.0], "sd": [1.0], "coeff": [0.2],
+                                   "top": 1.3, "fade": 0.1, "top_shift": 0.05});
+    let at = |level: f64| { let mut row = vec![1.0; l + 1]; row[l] = level; ms_calc::model::joint_shift(&model, &row) };
+    assert!((at(1.0) - 0.2).abs() < 1e-12, "under the band: the chart's own correction");
+    assert!((at(1.5) - 0.05).abs() < 1e-12, "over the top: the fitted constant");
+    assert!((at(1.25) - 0.125).abs() < 1e-12, "half way: half each");
+}
+
+#[test]
+fn slow_half_beat_rehits_are_not_minijacks() {
+    // KORO-KO-LOID / DUN DUN (2026-11-16): re-hits at ~235 and ~171 ms read Minijacks first; at ~100 ms it is one
+    // 1/4 rice at 1000 + i·step ms with one repeated column per bar; the 1/2 version's re-hits are 2·step apart
+    let pattern = |step: f64| rice((0..600).map(move |i| (1000. + i as f64 * step, [0u8, 2, 4, 6, 6, 1, 3, 5, 0, 4][i % 10])), 7, 8.);
+    let (slow, fast) = (run(&pattern(171.), 1.), run(&pattern(100.), 1.));
+    assert!(score(&slow, "minijack") < 0.05 * score(&slow, "overall"), "slow minijack {} of {}", score(&slow, "minijack"), score(&slow, "overall"));
+    assert!(score(&fast, "minijack") > 0.3 * score(&fast, "overall"), "fast minijack {} of {}", score(&fast, "minijack"), score(&fast, "overall"));
+}

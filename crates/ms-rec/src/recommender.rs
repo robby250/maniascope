@@ -96,6 +96,7 @@ pub fn fit_target(c: &Arc<Consts>, public: &Public, pop: &ms_data::public::Popul
         model.rate_support.extend(own.rate_support.clone());
         model.vibro = Some(Arc::new(own));
     }
+    model.vibro_pace = ms_model::predict::vibro_pace(&vibro.iter().map(|r| (r.ts.unwrap_or(0.), feats[r.f].vibro_speed)).collect::<Vec<_>>());
     Target { fit, warmup, model: Arc::new(model) }
 }
 

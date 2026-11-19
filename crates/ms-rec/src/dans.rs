@@ -16,9 +16,9 @@ use std::sync::OnceLock;
 
 const TABLE: &str = include_str!("../../../calib/dans.json");
 const COURSES: &str = include_str!("../../../calib/dan_courses.tsv");
+const OFFSETS: &str = include_str!("../../../calib/stats_offsets.tsv");
 pub const VIBRO_SHARE: f64 = 0.06; // share of notes in vibro runs: 119/132 vibro dan charts, 4/139 other 4K dan charts (2026-11-13 run rule)
 const LN_SHARE: f64 = 0.22;   // LN dans' charts hold >= 25% LN notes, rice dans' <= 19% (2026-10-01)
-const LN_MAJORITY: f64 = 0.5; // from here holds are most notes: the LN dan alone
 
 pub fn series(keys: i64, kind: &str) -> Option<&'static str> {
     match (keys, kind) {
@@ -36,7 +36,8 @@ pub fn series(keys: i64, kind: &str) -> Option<&'static str> {
 pub fn short(series: &str) -> &'static str {
     match series {
         "7K Regular" => "Reg ",
-        "7K LN" | "4K LN" => "LN ",
+        "7K LN" => "LN ",
+        "4K LN" => "LN", // LN1 … LN17 (user 2026-11-16)
         "6K Regular" => "6K ",
         "6K LN" => "6K LN ",
         "10K Regular" => "10K ",
@@ -160,8 +161,13 @@ pub fn named(series: &str, p: f64) -> Option<String> {
     if p < -0.5 {
         return Some(format!("below {prefix}{}", t[0].0));
     }
-    if p > t.len() as f64 - 0.5 {
-        return Some(format!("{prefix}{}+", t[t.len() - 1].0));
+    let top = t.len() as f64 - 1.;
+    if p > top + 0.25 {
+        // past the top dan (user 2026-11-18: a 7K map far above Stellium read only "Stellium+"): the first "+" adds ⅓ of a
+        // tier step (position extends the last step), the second ⅔ (one step), each further "+" one more step
+        let off = p - top;
+        let plus = if off <= 2. / 3. { 1 } else { 1 + off.round() as usize };
+        return Some(format!("{prefix}{}{}", t[t.len() - 1].0, "+".repeat(plus)));
     }
     let j = (p.round_ties_even().max(0.) as usize).min(t.len() - 1);
     let off = p - j as f64;
@@ -172,14 +178,15 @@ pub fn kind(ln_share: f64) -> &'static str {
     if ln_share >= LN_SHARE { "ln" } else { "rice" }
 }
 
-pub fn label(keys: i64, rating: f64, ln_share: f64, vibro: Option<&Vibro>, secs: f64) -> Option<String> {
-    let rating = length_scaled(data().length, rating, secs);
+/// `press`: the rating with holds as taps (compute's `press_overall`), what the regular dans are read and built with.
+pub fn label(keys: i64, rating: f64, press: f64, ln_share: f64, vibro: Option<&Vibro>, secs: f64) -> Option<String> {
+    let (rating, press) = (length_scaled(data().length, rating, secs), length_scaled(data().length, press, secs));
     // Vibro last: the rice/LN dan is the main reading (user 2026-10-01).
     let vibro = vibro.filter(|_| keys == 4);
-    // Mixed charts (LN dan share but mostly taps) read on both, the tap dans first (user 2026-10-01: a 29 % LN rice
-    // stamina chart showed only "LN Gamma").
-    let kinds: Vec<&str> = if !(LN_SHARE..LN_MAJORITY).contains(&ln_share) { vec![kind(ln_share)] } else { vec!["rice", "ln"] };
-    let mut parts: Vec<String> = kinds.iter().filter(|_| !vibro.is_some_and(vibro_only)).filter_map(|k| place(series(keys, k)?, rating, None)).collect();
+    // Every chart reads on the regular dans first; an LN chart on the LN dans too (user 2026-11-15: a 71 % LN chart
+    // showed only "LN Yokaze−", "regular first everywhere"; 2026-10-01: a 29 % LN rice chart only "LN Gamma").
+    let kinds: Vec<&str> = if ln_share >= LN_SHARE { vec!["rice", "ln"] } else { vec!["rice"] };
+    let mut parts: Vec<String> = kinds.iter().filter(|_| !vibro.is_some_and(vibro_only)).filter_map(|k| place(series(keys, k)?, if *k == "rice" { press } else { rating }, None)).collect();
     parts.extend(vibro.filter(|v| v.share >= VIBRO_SHARE).and_then(|v| place("4K Vibro", rating, Some(v))));
     if parts.is_empty() { None } else { Some(parts.join(" · ")) }
 }
@@ -192,10 +199,49 @@ pub fn ability_kind(skill: &str) -> &'static str {
 /// The dan a Stats value reads as: values come from the player's predicted accuracy on that skill's dan songs
 /// (stats::dan_value), so the rating places directly. None for vibro (its dan is stats::Group::dan) and keymodes without dans.
 pub fn ability(keys: i64, value: f64, skill: &str) -> Option<String> {
+    let (series, p) = ability_position(keys, value, skill)?;
+    named(series, p)
+}
+
+/// The series and fractional tier a Stats value reads at (`ability`).
+pub fn ability_position(keys: i64, v: f64, skill: &str) -> Option<(&'static str, f64)> {
     if skill.ends_with("vibro") {
         return None;
     }
-    place(series(keys, ability_kind(skill))?, value, None)
+    let series = series(keys, ability_kind(skill))?;
+    Some((series, position(tiers(series).filter(|t| !t.is_empty())?, value(series, v, None)) + stats_offset(series)))
+}
+
+/// Tiers added to every Stats reading on `series`: the readings are calibrated to the players' known dans
+/// (calib/player_reference.tsv) with each calculator, as the stars are anchored to osu! (user 2026-11-18: a reading that
+/// moved with a calc was counted against the calc). Fitted by `calib levels --fit-offsets` (calib/stats_offsets.tsv).
+pub fn stats_offset(series: &str) -> f64 {
+    static O: OnceLock<HashMap<String, f64>> = OnceLock::new();
+    O.get_or_init(|| offsets(OFFSETS, None)).get(series).copied().unwrap_or(0.)
+}
+
+/// Each series' offset from `player\tseries\toffset\tn` rows: the players' means weighted by their reference counts,
+/// leaving `without` out.
+pub fn offsets(text: &str, without: Option<&str>) -> HashMap<String, f64> {
+    let mut sums: HashMap<String, (f64, f64)> = HashMap::new();
+    for f in text.lines().skip(1).map(|l| l.split('\t').collect::<Vec<_>>()).filter(|f| f.len() == 4 && Some(f[0]) != without) {
+        if let (Ok(o), Ok(n)) = (f[2].parse::<f64>(), f[3].parse::<f64>()) {
+            let e = sums.entry(f[1].to_string()).or_default();
+            *e = (e.0 + o * n, e.1 + n);
+        }
+    }
+    sums.into_iter().filter(|(_, (_, n))| *n > 0.).map(|(k, (s, n))| (k, s / n)).collect()
+}
+
+/// Fractional tier of a dan as `named` writes it ("Gamma", "10th+", "Azimuth−"; series prefix optional; "++"/"−−" half a tier).
+pub fn label_position(series: &str, label: &str) -> Option<f64> {
+    let t = tiers(series)?;
+    let name = label.strip_prefix(short(series)).unwrap_or(label);
+    let base = name.trim_end_matches(['+', '−', '-']);
+    let i = t.iter().position(|x| x.0 == base)?;
+    let suffix = &name[base.len()..];
+    let off = match suffix { "" => 0., "+" => 1. / 3., _ if i + 1 == t.len() && suffix.len() >= 2 && suffix.bytes().all(|c| c == b'+') => suffix.len() as f64 - 1., "++" => 0.5, "−" | "-" => -1. / 3., _ => -0.5 };
+    Some(i as f64 + off)
 }
 
 #[cfg(test)]
@@ -203,9 +249,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stats_offsets_average_the_players_by_their_reference_counts() {
+        let o = offsets("player\tseries\toffset\tn\nown\t7K LN\t0.2\t2\ntester\t7K LN\t-0.1\t1\nown\t4K REFORM\t0.17\t1\n", None);
+        assert!((o["7K LN"] - 0.1).abs() < 1e-12 && (o["4K REFORM"] - 0.17).abs() < 1e-12 && !o.contains_key("7K Regular"));
+        assert_eq!(offsets("player\tseries\toffset\tn\nown\t7K LN\t0.2\t2\n", Some("own")).get("7K LN"), None);
+    }
+
+    #[test]
+    fn a_dan_label_reads_back_at_its_tier() {
+        for p in [3., 4. + 1. / 3., 5. - 1. / 3.] {
+            let label = named("7K Regular", p).unwrap();
+            assert!((label_position("7K Regular", &label).unwrap() - p).abs() < 1e-9, "{label}");
+        }
+        assert_eq!(label_position("7K Regular", "Gamma++"), label_position("7K Regular", "Reg Gamma").map(|p| p + 0.5));
+        // past the top dan: "+" ⅓, "++" one tier step, then one more step per "+"
+        let top = tiers("7K Regular").unwrap().len() as f64 - 1.;
+        for (p, plus) in [(0.4, "+"), (0.7, "++"), (1.3, "++"), (1.6, "+++"), (2.6, "++++")] {
+            assert_eq!(named("7K Regular", top + p).unwrap(), format!("Reg Stellium{plus}"));
+        }
+        assert_eq!(label_position("7K Regular", "Stellium++"), Some(top + 1.));
+        assert_eq!(label_position("7K Regular", "Stellium++++"), Some(top + 3.));
+    }
+
+    #[test]
+    fn every_chart_reads_a_regular_dan_and_ln_charts_an_ln_dan_too() {
+        let kinds = |share: f64| label(7, 12.0, 12.0, share, None, 180.).unwrap_or_default().split(" · ").map(|p| p.starts_with("LN ")).collect::<Vec<_>>();
+        assert_eq!(kinds(0.05), [false], "a rice chart: the regular dan only");
+        assert_eq!(kinds(0.3), [false, true], "a mixed chart: regular first");
+        assert_eq!(kinds(0.71), [false, true], "an LN chart: regular first too");
+    }
+
+    #[test]
     fn every_dan_tier_has_its_courses_pass_mark() {
         assert_eq!(pass("7K LN", "1st"), Some((0.95, true)));
-        assert_eq!(pass("4K LN", "1st"), Some((0.97, false))); // ScoreV2
+        assert_eq!(pass("4K LN", "1"), Some((0.97, false))); // ScoreV2
+        assert_eq!(pass("4K LN", "17"), Some((0.97, false)), "Yeehee");
         assert_eq!(pass("4K REFORM", "Theta"), Some((0.96, true)));
         assert_eq!(pass("4K Vibro", "Vibro W"), Some((0.93, true)));
         for (series, tiers) in &data().series {

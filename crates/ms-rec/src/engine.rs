@@ -24,14 +24,14 @@ use std::sync::{Arc, Mutex};
 /// recommend.predictor_id of the model the Rust port reproduces: forecasts stay comparable across the port. A change to
 /// the prediction model takes a new id, so old forecasts are not read as this model's.
 pub const PREDICTOR_ID: &str = "532ce129f6fa"; // predictor families from the skill table (2026-11-11); was a6d61e058f5d
-pub const CALC_ID: &str = "eea12425de4c";
+pub const CALC_ID: &str = "009e2b28af08";
 /// Differ from CALC_ID in calibration only (calib/carry.json), newest first: a crawl still running holds the website rows back a whole
 /// calculator, so those can start older than the library's. Each carry keeps its source row.
 // Every shipped calculator, newest last: a ship that leaves its predecessor out drops the scores whose chart file is gone
 // (1.10.0: 7K evidence 8718 → 3959 plays on a copy without the files).
-pub const CARRIED_CALCS: [&str; 22] = ["2f01eca5e738", "7cee1dfdba7f", "a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f",
+pub const CARRIED_CALCS: [&str; 31] = ["2f01eca5e738", "7cee1dfdba7f", "a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f",
                                        "4ccede2d49cf", "09639faa6673", "d3a86f7b014f", "f92680b7b136", "0f9f7da275f1", "a386c60fbb06", "a990d0ea0ada", "2789b337ae54", "bc901ee5b05a", "4c42635f416e", "5f0c6b2fdd16",
-                                       "29a02d72f4a7"];
+                                       "29a02d72f4a7", "eea12425de4c", "6f3c526261aa", "83c4b154d906", "8b4eb56bb201", "c4681b3a3229", "da01b4c516f3", "0c5d5c8a61e7", "fc49ee7e2b64", "635154fd6f71"];
 const SURE_PLAYS: usize = 50; // of the player's own, on a keymode: fewer and the model is mostly the population's guess
 pub const ACTIVE_KEYS: std::ops::RangeInclusive<i64> = 4..=10;
 
@@ -195,7 +195,16 @@ impl Engine {
     }
 
     pub fn state_at(&self, db: &Db, target: f64, current: f64) -> Result<Now> {
-        let events = load_events(db, ((current - HISTORY_S) / 60.).floor() * 60.)?;
+        self.state_with(load_events(db, Self::events_since(current))?, target, current)
+    }
+
+    /// The start of the event window a state at `current` reads (a whole minute: callers cache the events per minute).
+    pub fn events_since(current: f64) -> f64 {
+        ((current - HISTORY_S) / 60.).floor() * 60.
+    }
+
+    /// A state from already loaded events (`load_events(db, events_since(current))`).
+    pub fn state_with(&self, events: Vec<Arc<ms_data::store::Event>>, target: f64, current: f64) -> Result<Now> {
         let session = Session::new(events, current, Some(self.r.fitted.pp.warmup.clone()), self.c.clone(), self.transfer.clone());
         let view = self.r.fitted.display.as_ref().map_or_else(|| session.display_view(self.r.fitted.pp.warmup.clone()), |d| session.display_view(d.warmup.clone()));
         let all: Vec<i64> = ACTIVE_KEYS.collect();
@@ -298,7 +307,7 @@ impl Engine {
                 rows = warmups(&f, &list, &n.session, k0, &n.tables, &n.view_tables, &by_chart, &typ);
             }
         }
-        let seed = n.session.all.iter().filter(|e| matches!(e.kind.as_str(), "offer" | "reset")).map(|e| e.id).max().unwrap_or(0);
+        let seed = n.session.all.iter().filter(|e| matches!(e.kind.as_str(), "offer" | "reset")).map(|e| e.id).max().unwrap_or(0); // PP: a weighted draw per offer (its rotation)
         let ids: Vec<(String, f64)> = rows.iter().map(|c| (c.md5.clone().or_else(|| c.sha.clone()).or_else(|| c.bid.map(|b| b.to_string())).unwrap_or_else(|| c.title.clone()), c.weight)).collect();
         let order = preview_order(&ids, &seed.to_string(), 0.);
         let shown: Vec<Pick> = order.into_iter().take(n_show).map(|i| rows[i].clone()).collect();
@@ -434,6 +443,17 @@ mod tests {
     }
 
     #[test]
+    fn a_calculator_change_carries_played_rows_and_each_charts_row_nearest_1x() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE feats(key TEXT PRIMARY KEY, data TEXT); CREATE TABLE scores(sha256 TEXT, rate REAL);
+            INSERT INTO feats VALUES ('a@1.000|old',''),('a@0.970|old',''),('a@1.200|old',''),('b@0.900|old',''),('b@1.300|older','');
+            INSERT INTO scores VALUES ('a', 1.2), ('c', NULL);").unwrap();
+        let mut names: Vec<String> = app_names(&db).unwrap().into_iter().collect();
+        names.sort();
+        assert_eq!(names, ["a@1.000", "a@1.200", "b@0.900", "c@1.000"], "a@0.970 was a refinement of a past list");
+    }
+
+    #[test]
     fn plays_like_moves_stars_by_the_public_map_effect() {
         let p = pop();
         let (ratio, n) = plays_like_ratio(&p, 4, 10., 1, 1.).unwrap();
@@ -464,6 +484,22 @@ pub fn carry_rows(db: &ms_data::store::Db, only: Option<&std::collections::HashS
     Ok(())
 }
 
+/// The names the app carries at a calculator change: every played row and each chart's row nearest 1×. A chart's other rates
+/// were refinements of past playlists (half of G835LX's 204,906 rows, 2026-11-19) and each was analysed again before the first
+/// list; the builder analyses the few it asks for (`refined`).
+pub fn app_names(db: &ms_data::store::Db) -> rusqlite::Result<std::collections::HashSet<String>> {
+    let mut near: HashMap<String, f64> = HashMap::default();
+    for key in db.prepare("SELECT key FROM feats")?.query_map([], |r| r.get::<_, String>(0))? {
+        let key = key?;
+        let Some((sha, rate)) = key.rsplit_once('|').and_then(|n| n.0.rsplit_once('@')) else { continue };
+        let Ok(rate) = rate.parse::<f64>() else { continue };
+        near.entry(sha.to_string()).and_modify(|r| if (rate - 1.).abs() < (*r - 1.).abs() { *r = rate }).or_insert(rate);
+    }
+    let mut names = played_names(db)?;
+    names.extend(near.into_iter().map(|(sha, rate)| format!("{sha}@{rate:.3}")));
+    Ok(names)
+}
+
 /// The `sha@rate` feature names of every score in the database (what a fit reads), as `evidence` keys them.
 pub fn played_names(db: &ms_data::store::Db) -> rusqlite::Result<std::collections::HashSet<String>> {
     db.prepare("SELECT sha256, rate FROM scores WHERE sha256 IS NOT NULL")?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<f64>>(1)?.unwrap_or(1.))))?
@@ -474,7 +510,8 @@ pub fn played_names(db: &ms_data::store::Db) -> rusqlite::Result<std::collection
 pub fn carry_web(db: &ms_data::store::Db) -> std::result::Result<(), String> {
     ms_data::webmaps::forget_in_client()?;
     let charts = Charts::new(db).map_err(|e| e.to_string())?;
-    CARRIED_CALCS.iter().rev().try_for_each(|from| ms_data::webmaps::carry(from, CALC_ID, &ms_calc::features::standard_params(), &|sha| charts.counted(sha)))
+    CARRIED_CALCS.iter().rev().try_for_each(|from| ms_data::webmaps::carry(from, CALC_ID, &ms_calc::features::standard_params(), &|sha| charts.counted(sha)))?;
+    ms_data::webmaps::prune(CALC_ID)
 }
 
 /// A stored chart by its sha: lazer's store, the website cache, or a convert remade from its source.

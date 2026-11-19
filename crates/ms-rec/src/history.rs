@@ -126,8 +126,22 @@ pub fn play_history(db: &Db, limit: usize, outliers: bool, until: Option<f64>) -
             }
         }
     }
-    let events: Vec<Ev> = db.prepare("SELECT id,t,kind,beatmap,info FROM events WHERE kind IN ('start','finish','void') AND (? IS NULL OR t<=?) ORDER BY t,id")?
-        .query_map(params![until, until], |r| Ok(Ev { id: r.get(0)?, t: r.get(1)?, kind: r.get(2)?, beatmap: r.get(3)?, info: event_info(&r.get::<_, String>(4)?) }))?.collect::<Result<_>>()?;
+    type Row = (String, Option<String>, Option<String>, Option<f64>, f64, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>);
+    let mut scores: Vec<Row> = db.prepare("SELECT s.key,s.played,s.stats,s.rate,s.acc,s.sha256,i.artist,i.title,i.version,i.keys,s.mods FROM scores s LEFT JOIN installed i ON i.sha256=s.sha256 WHERE s.src!='public' ORDER BY s.played DESC")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?)))?.collect::<Result<_>>()?;
+    // A limited list (no outlier ranking) needs only its newest scores and the events around them: every event's JSON
+    // (each start holds a whole feature record) was parsed to show 1-300 rows (2026-11-17 audit). A start is paired with
+    // the finish that follows it, so a day before the oldest kept score covers every pair.
+    let at = |p: &Option<String>| p.as_deref().and_then(timestamp);
+    scores.retain(|r| until.is_none_or(|u| at(&r.1).is_some_and(|t| t <= u)));
+    let mut since: Option<f64> = None;
+    if limit != 0 && !outliers {
+        scores.sort_by(|a, b| at(&b.1).unwrap_or(0.).total_cmp(&at(&a.1).unwrap_or(0.)));
+        scores.truncate(limit);
+        since = scores.iter().map(|r| at(&r.1).unwrap_or(0.)).fold(None, |m: Option<f64>, t| Some(m.map_or(t, |m| m.min(t)))).map(|t| t - 86400.);
+    }
+    let events: Vec<Ev> = db.prepare("SELECT id,t,kind,beatmap,info FROM events WHERE kind IN ('start','finish','void') AND (? IS NULL OR t<=?) AND (? IS NULL OR t>=?) ORDER BY t,id")?
+        .query_map(params![until, until, since, since], |r| Ok(Ev { id: r.get(0)?, t: r.get(1)?, kind: r.get(2)?, beatmap: r.get(3)?, info: event_info(&r.get::<_, String>(4)?) }))?.collect::<Result<_>>()?;
     let starts: HashMap<i64, usize> = events.iter().enumerate().filter(|x| x.1.kind == "start").map(|x| (x.1.id, x.0)).collect();
     let (mut paired, mut pending): (HashMap<String, (usize, usize)>, Option<usize>) = Default::default();
     for (i, e) in events.iter().enumerate() {
@@ -145,9 +159,7 @@ pub fn play_history(db: &Db, limit: usize, outliers: bool, until: Option<f64>) -
             }
         }
     }
-    type Row = (String, Option<String>, Option<String>, Option<f64>, f64, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>);
-    let scores: Vec<Row> = db.prepare("SELECT s.key,s.played,s.stats,s.rate,s.acc,s.sha256,i.artist,i.title,i.version,i.keys,s.mods FROM scores s LEFT JOIN installed i ON i.sha256=s.sha256 WHERE s.src!='public' ORDER BY s.played DESC")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?)))?.collect::<Result<_>>()?;
+
     let mut out = Vec::new();
     for (key, played, stats, rate, acc, sha, artist, title, version, keys, mods) in scores {
         let t = played.as_deref().and_then(timestamp);

@@ -507,10 +507,18 @@ impl App {
         if let Some(o) = score.as_object_mut() {
             o.remove("mods_list");
         }
-        let mut db = feedback::load();
-        if feedback::add_score(&mut db, &score, &path.to_string_lossy(), &self.db).unwrap_or(false) {
-            let _ = feedback::save(&db);
-            self.foot = format!("score saved for calibration: {:.2}% {} ({} total)", score["accuracy"].as_f64().unwrap_or(0.), score["rank"].as_str().unwrap_or(""), db["scores"].as_array().map_or(0, Vec::len));
+        if score_allowed(&self.db, &score, None, false).unwrap_or(false) {
+            // feedback.json (7.5 MB on G835LX) is parsed and rewritten whole: off the UI thread, one writer at a time
+            self.foot = format!("score saved for calibration: {:.2}% {}", score["accuracy"].as_f64().unwrap_or(0.), score["rank"].as_str().unwrap_or(""));
+            static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let path = path.to_string_lossy().into_owned();
+            std::thread::spawn(move || {
+                let _one = WRITER.lock();
+                let mut db = feedback::load();
+                if feedback::add_score(&mut db, &score, &path) {
+                    let _ = feedback::save(&db);
+                }
+            });
         }
     }
 
@@ -622,7 +630,7 @@ impl App {
         let mut state = json!({});
         if let Some(a) = self.analysis() {
             let step = (a.timeline.len() / 120).max(1);
-            let dan = self.s.display.info.then(|| ms_rec::dans::label(a.keys, a.overall, a.ln_notes / a.notes.max(1) as f64, Some(&a.dan_vibro), a.seconds())).flatten();
+            let dan = self.s.display.info.then(|| ms_rec::dans::label(a.keys, a.overall, a.press, a.ln_notes / a.notes.max(1) as f64, Some(&a.dan_vibro), a.seconds())).flatten();
             state = json!({"title": a.title, "artist": a.artist, "version": format!("[{}]  {}", a.version, a.creator), "rating": ms_rec::shown::stars(a.keys, a.overall), "context": fmt::context(a, dan.as_deref(), ""), "nps": a.nps,
                            "ln": (100. * a.ln_notes / a.notes.max(1) as f64).round(), "skills": a.entries.iter().take(self.s.display.skills).map(|e| json!({"name": e.name, "tags": e.tags, "rating": ms_rec::shown::stars(a.keys, e.rating)})).collect::<Vec<_>>(),
                            "timeline": a.timeline.chunks(step).map(|c| c.iter().copied().fold(f64::MIN, f64::max)).collect::<Vec<_>>()});

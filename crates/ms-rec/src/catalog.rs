@@ -164,7 +164,7 @@ pub struct Pick {
 impl Pick {
     /// Which how-often slider the map answers to (ms_model::choices).
     pub fn stream(&self) -> u8 {
-        if self.convert_of.is_some() { ms_model::choices::CONVERT } else if self.installed { ms_model::choices::REAL } else { ms_model::choices::WEB }
+        if self.convert_of.is_some() { if self.source_web { ms_model::choices::WEB_CONVERT } else { ms_model::choices::CONVERT } } else if self.installed { ms_model::choices::REAL } else { ms_model::choices::WEB }
     }
 
     /// recommend.event_key

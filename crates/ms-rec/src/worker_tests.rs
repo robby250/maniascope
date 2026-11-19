@@ -230,7 +230,7 @@ fn a_retained_pick_and_its_candidate_read_from_newer_features() {
     old.family = Some("old family".into());
     old.why = "1.0 raw NPS · Old · expect ~95.0%".into();
     l.w.playlists.insert("nps", vec![old.clone()]);
-    let stale = Choice { sha: sha.clone(), md5: old.md5.clone().unwrap(), keys: 7, rate, value: 0., installed: true, convert: false, playcount: -1., family: "old family".into(), group: "rice".into(),
+    let stale = Choice { sha: sha.clone(), md5: old.md5.clone().unwrap(), keys: 7, rate, value: 0., installed: true, convert: false, source_web: false, playcount: -1., family: "old family".into(), group: "rice".into(),
         nps: 1., length: 1., profile: Vec::new(), description: "Old".into(), matched: Vec::new(), practice: String::new(), acc_mid: 0.95, pred: old.pred.clone(), generated_at: 0. };
     l.w.mode = "skills".into(); // nothing publishes this list: the test reads what accept left
     l.w.states.get_mut("nps").unwrap().restored = false;
@@ -353,6 +353,20 @@ fn pp_maps_mix_into_the_nps_list_only_when_on_and_stay_pp_rows() {
 }
 
 #[test]
+fn a_due_pp_row_reaches_the_top_when_no_map_was_offered_yet() {
+    // Aegleseeker (2026-11-15): the queue's first row was kept in front of the PP row after every play, so Next never took it.
+    let mut l = live("due", 240, busy(false));
+    log(&l.world.db, "offer", Some("md5:x"), Some(now() - 900.), &json!({"mode": "pp"})).unwrap();
+    for i in 0..5 {
+        log(&l.world.db, "offer", Some(&format!("sha:n{i}")), Some(now() - 800. + 100. * f64::from(i)), &json!({"mode": "nps"})).unwrap();
+    }
+    l.w.session_cache = None;
+    let mix = PpMix { on: true, every: 4, chance: 0., ..PpMix::default() };
+    l.w.t_configure(Config { pp_mix: Some(mix), ..configure("nps", 1) }).unwrap();
+    assert_eq!(pools(&l).pop().unwrap()[0].purpose, "nps_mix", "five NPS offers since the last PP one: the PP row is next");
+}
+
+#[test]
 fn pp_rows_come_every_nth_pick() {
     let row = |s: &str| Pick { title: s.into(), ..Pick::default() };
     let titled = |n: &[&str]| n.iter().map(|s| row(s)).collect::<Vec<_>>();
@@ -412,7 +426,7 @@ fn the_first_run_learns_the_level_before_suggesting() {
     assert!(pools(&l).is_empty(), "the reason, not 4K Beginner maps");
     *l.w.learning.lock().unwrap() = None;
     l.w.first_import = true;
-    l.w.t_imported(Some(ms_data::imports::Imported { user_id: None, seen: 0, new: 11049, installed: 52988, miss_ratio: None }), 0, true, None).unwrap();
+    l.w.t_imported(Some(ms_data::imports::Imported { user_id: None, seen: 0, new: 11049, installed: 52988, miss_ratio: None, changed: true }), 0, true, None).unwrap();
     assert!(!l.w.first_import);
     assert!(l.w.refit_running, "the import restarts the fit");
     assert!(l.w.jobs.filling.load(Ordering::SeqCst), "and the analysis of the played charts");

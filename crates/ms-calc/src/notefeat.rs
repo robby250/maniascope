@@ -12,23 +12,25 @@ pub const COLUMNS: [&str; W] = [
 
 /// Surprise of the next chord given the last, over a sliding window: −log2 of an order-1 estimate, backed off to chord frequency.
 /// A repeated or looping pattern costs near 0 bits, a generated one costs close to the keymode's whole alphabet.
-struct Markov {
+type Counts<K> = HashMap<K, u32, std::hash::BuildHasherDefault<crate::val::Fx>>;
+
+pub(crate) struct Markov {
     seen: VecDeque<(u32, u32)>,
-    pair: HashMap<(u32, u32), u32>,
-    from: HashMap<u32, u32>,
-    freq: HashMap<u32, u32>,
+    pair: Counts<(u32, u32)>,
+    from: Counts<u32>,
+    freq: Counts<u32>,
     alphabet: f64,
     window: usize,
 }
 
 impl Markov {
-    fn new(alphabet: f64, window: usize) -> Markov {
-        Markov { seen: VecDeque::new(), pair: HashMap::new(), from: HashMap::new(), freq: HashMap::new(), alphabet, window }
+    pub(crate) fn new(alphabet: f64, window: usize) -> Markov {
+        Markov { seen: VecDeque::new(), pair: Counts::default(), from: Counts::default(), freq: Counts::default(), alphabet, window }
     }
 
-    fn step(&mut self, prev: u32, cur: u32) -> f64 {
+    pub(crate) fn step(&mut self, prev: u32, cur: u32) -> f64 {
         let n = self.seen.len() as f64;
-        let get = |m: &HashMap<u32, u32>, k: u32| f64::from(m.get(&k).copied().unwrap_or(0));
+        let get = |m: &Counts<u32>, k: u32| f64::from(m.get(&k).copied().unwrap_or(0));
         let base = (get(&self.freq, cur) + 0.5) / (n + 0.5 * self.alphabet);
         let p = (f64::from(self.pair.get(&(prev, cur)).copied().unwrap_or(0)) + base) / (get(&self.from, prev) + 1.);
         *self.pair.entry((prev, cur)).or_default() += 1;

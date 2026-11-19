@@ -20,6 +20,9 @@ pub struct PerNote {
     coef: [f64; 6], // θ − ewma: constant, last same-keymode θ in the session − ewma, has one, session form, retry θ − ewma, has one
     clip: f64,      // a history play's θ enters the forecast at most this far from its keymode's EWMA before it
     id: String,     // the weights' hash: new weights solve the history again
+    // the last chart's parse, history and θ, per minute: an offer's rate search asked `accuracy` up to ~10 rates in a row and
+    // each re-read the chart, the play history and the forecast; only the network pass depends on the rate (2026-11-17 audit)
+    memo: std::sync::Mutex<Option<((String, i64), std::sync::Arc<(ms_calc::chart::Chart, Vec<Past>, f64)>)>>,
 }
 
 /// An own play of the last WINDOW days; θ None when not solvable (chart gone, mods, short).
@@ -56,7 +59,7 @@ impl PerNote {
         let c = |k: &str| f[k].as_f64().ok_or(format!("forecast {k}"));
         let coef = [c("const")?, c("last")?, c("has_last")?, c("form")?, c("retry")?, c("has_retry")?];
         let clip = f["clip"].as_f64().unwrap_or(f64::INFINITY);
-        Ok(PerNote { net: Net::parse(text)?, coef, clip, id: crate::engine::hashes(text.as_bytes()).0[..12].to_string() })
+        Ok(PerNote { net: Net::parse(text)?, coef, clip, id: crate::engine::hashes(text.as_bytes()).0[..12].to_string(), memo: Default::default() })
     }
 
     /// Every own play from `from` to `to` (days), by time, its θ when solved under these weights.
@@ -106,11 +109,24 @@ impl PerNote {
     /// history (three solved plays of the keymode in the window) or without the chart file.
     /// `data`: the chart's bytes when they aren't in the game's store yet (a convert not yet imported); else read from there.
     pub fn accuracy(&self, db: &Db, sha: &str, data: Option<&[u8]>, rate: f64, stable: bool, now: f64) -> Option<f64> {
-        let c = ms_calc::chart::parse(&match data { Some(d) => d.to_vec(), None => std::fs::read(chart_path(Some(sha))?).ok()? }).ok()?;
-        let past = self.history(db, now - WINDOW - 1., now).ok()?;
-        let theta = self.forecast(&past, now, c.keys as i64, sha)?;
-        let d = self.net.difficulties(&chart_records(&c, rate).ok()?, place(&past, now), !stable);
-        Some(1. - expected_loss(&d, theta))
+        let key = (sha.to_string(), (now * 1440.).floor() as i64);
+        let hit = self.memo.lock().ok().and_then(|m| m.as_ref().filter(|m| m.0 == key).map(|m| m.1.clone()));
+        let got = match hit {
+            Some(g) => g,
+            None => {
+                let c = ms_calc::chart::parse(&match data { Some(d) => d.to_vec(), None => std::fs::read(chart_path(Some(sha))?).ok()? }).ok()?;
+                let past = self.history(db, now - WINDOW - 1., now).ok()?;
+                let theta = self.forecast(&past, now, c.keys as i64, sha)?;
+                let g = std::sync::Arc::new((c, past, theta));
+                if let Ok(mut m) = self.memo.lock() {
+                    *m = Some((key, g.clone()));
+                }
+                g
+            }
+        };
+        let (c, past, theta) = &*got;
+        let d = self.net.difficulties(&chart_records(c, rate).ok()?, place(past, now), !stable);
+        Some(1. - expected_loss(&d, *theta))
     }
 
     /// thetafc's "ship: last+retry+form": a same-keymode ewma (3-day decay, same session ×4), moved by the session's last
@@ -200,7 +216,7 @@ mod tests {
         assert_eq!(place(&past, 100. + 80. / 1440.).1, 0.); // 60 min after the last play: a new session
         let pn = PerNote { net: Net::parse(r#"{"inputs": [], "mu": [], "sd": [], "l1": {"in": 1, "out": 1, "w": [0], "b": [0]},
             "l2": {"in": 1, "out": 1, "w": [0], "b": [0]}, "l3": {"in": 1, "out": 1, "w": [0], "b": [0]}}"#).unwrap(),
-                            coef: [0., 0.5, 0., 0., 0.25, 0.], clip: f64::INFINITY, id: String::new() };
+                            coef: [0., 0.5, 0., 0., 0.25, 0.], clip: f64::INFINITY, id: String::new(), memo: Default::default() };
         let e = { let w2 = 4. * (-(5. / 1440.) / 3f64).exp(); let w1: f64 = (0..3).map(|i| (-(now - 98. - f64::from(i) * 0.01) / 3.).exp()).sum(); (w1 + 2. * w2) / (w1 + w2) };
         // last same-keymode play and a retry of "a" both read 2 − e
         let th = pn.forecast(&past, now, 7, "a").unwrap();

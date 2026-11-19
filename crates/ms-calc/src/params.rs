@@ -124,8 +124,8 @@ knobs! {
     V_FAST_B: f64 = 1.0914,
     V_FAST: f64 = 12.0,
     SPEED_P: f64 = 1.5,
-    W_JACK: f64 = 3.0,      // on 7K; other keymodes as (7/keys)^W_JACK_KEYS: 3.3 on 4K as before, 2.82 on 10K (was 3.3 everywhere but 7K)
-    W_JACK_KEYS: f64 = 0.17,
+    W_JACK: f64 = 3.3,      // on 7K; other keymodes as (7/keys)^W_JACK_KEYS: 4.37 on 4K, 2.76 on 10K (2026-11-19: 7K residual rises with a map's jack share; searched with the keymode power)
+    W_JACK_KEYS: f64 = 0.5,
     JACK_P: f64 = 0.5,      // on 4K; wider keymodes as (keys/4)^JACK_P_KEYS (open loop p8/p12: wide keys want a steeper jack speed curve)
     JACK_P_KEYS: f64 = 1.0,
     W_IJACK: f64 = 0.4,
@@ -143,10 +143,20 @@ knobs! {
     W_REPRESS: f64 = 0.30,
     LN_BASE: f64 = 30.0,    // own replays: LN sections played harder than charged on every keymode (open loop p9/p13; 10 before)
     ROW_SHARE: f64 = 0.3,
+    ROW_FAST: f64 = 0.0,   // fast chords merge into one gesture: a row's share exponent + this·(1 − smooth(gap, ROW_FAST_LO, ROW_FAST_HI)) (top-50 panels: big chords play easier at the top, r −.55 4K / −.31 7K)
+    ROW_FAST_LO: f64 = 0.08,
+    ROW_FAST_HI: f64 = 0.2,
     FLAM: f64 = 0.045,
+    MASH_SPAN: f64 = 1.0, // Chart::mashed: rows on other columns within this share of the great window, one gesture (0 = off)
+    MASH_EASE: f64 = 0.5, // share of a bin's demand eased where its written rows merged into one gesture, × great window / OD 8's (compute.rs)
+    MASH_COVER: f64 = 0.8, // Chart::mashed: share of the keys a gesture covers to merge (a rolled chord, not a flam)
     VF_JACK: f64 = 0.5,     // 0 → 1: a jacked note's finger-repeat factor fades out (its jack effort already scales with that speed); 4K value
     VF_JACK_KEYS: f64 = 2.0, // VF_JACK scales as (4/keys)^this: the 4K gain, flat it cost 7K/10K (open loop p7/p11)
     V_FINGER: f64 = 6.0,    // a finger's own sustainable tap rate (finger-tapping studies: 5–7/s); replays: cost starts at 120–160 ms a column
+    RHD_W: f64 = 0.0,       // hardest-7K study: a column re-hit past V_FINGER costs × (1 + this · (rate/V_FINGER − 1) · hand excess) (0 = off)
+    RHD_N: f64 = 10.0,      // the hand excess: its notes in the last RHD_SPAN s / (this · (keys/7)^RHD_X) − 1, floored at 0
+    RHD_X: f64 = 1.0,
+    RHD_SPAN: f64 = 0.5,
     // Chord switching, measured on 5.2M notes of own replays at equal speed, width and play (docs/REPORT_2026-11-01_CHORD_SWITCH.md).
     W_GROUP: f64 = 0.5,     // each extra separate group of fingers in a hand's chord: `10110`, not `11100`
     GROUP_A: f64 = 0.7785,  // W_GROUP × e^(A·x + B·x²): started at the old (min(keys,7)/7)^2 at 4K/7K/10K
@@ -166,9 +176,45 @@ knobs! {
     PHASES: usize = 8,
     W_CENTRE: f64 = 0.3,    // an odd keymode's middle column (the thumb) costs × (1 + this): round 18 residual mining, centre share
     ACC_TARGET: f64 = 0.10, // the rating is the skill whose average note loses this much (skills::accuracy_rating)
+    SUSTAIN_W: f64 = 0.15,     // sustained load: every bin × (1 + this·(keys/7)^SUSTAIN_X·e^(SUSTAIN_L·L)·max(0, long-window rating / overall − SUSTAIN_R)) (0 = off)
+    SUSTAIN_X: f64 = 0.0,
+    SUSTAIN_L: f64 = 0.0,
+    SUSTAIN_R: f64 = 0.61,     // the ratio where sustained load starts to count
+    SUSTAIN_WINDOW: f64 = 180.0, // seconds of demand the sustained rating averages
+    END_REF_Q: f64 = 0.65,   // endurance loads are relative to this quantile of the map's 30 s loads (model::endurance_of; 1 = its peak)
     FATIGUE_W: f64 = 0.2,   // a note's level × (1 + this·fatigue), fatigue from model::endurance (skills::powered)
     FATIGUE_W_KEYS: f64 = 3.0, // that weight as (keys/7)^this: wide keymodes are finger-limited, so fatigue weighs more
     ACC_POWER: f64 = 3.0,   // a note's loss grows as (local level / skill)^this (skills::rating)
+    // The rating's own constants as curves over keymode × level (plan 2026-11-16 curves; skills::rating, second pass): each ×
+    // e^(_L·L + _XL·x·L), L = ln(first-pass rating / LEVEL_REF), x = ln(keys/7). Zero = the constant.
+    ACC_POWER_LVL: f64 = 0.0,  // ACC_POWER (top-50 panels: density spikes play harder at the top, r +.33 4K / +.28 7K)
+    ACC_POWER_XL: f64 = 0.0,
+    ACC_TARGET_L: f64 = 0.0,   // ACC_TARGET (top players score 98–99 %: the loss a rating aims at may shrink with level)
+    ACC_TARGET_XL: f64 = 0.0,
+    LOCAL_WINDOW_L: f64 = 0.0, // LOCAL_WINDOW (how long a burst a note's level reads)
+    LOCAL_WINDOW_XL: f64 = 0.0,
+    FATIGUE_W_L: f64 = 0.0,    // the fatigue weight over level
+    FATIGUE_W_XL: f64 = 0.0,
+    LEVEL_REF: f64 = 12.0,     // the pivot: raw 12, ~8★
+    // Pattern strength surfaces (plan 2026-11-16 curves): demand part p × e^(Σ_j SURF[5p+j]·basis_j), basis = (x, x², L, x·L, L²),
+    // x = ln(keys/7), L = ln(first-pass overall / SURF_REF); parts in demand::P order. Zero = off.
+    SURF: [f64; 200] = [0.0; 200],
+    SURF_REF: f64 = 12.0,
+    // compute.rs level_terms (plan B6/B7), default 0 = off
+    OD_POW: f64 = 0.0,   // bin × (great window / OD 8's)^−(OD_POW + OD_POW_L·L)
+    OD_POW_L: f64 = 0.0,
+    VIB_L: f64 = 0.0,    // vibro bins × e^(VIB_L·L·run share·vibro share): top players' sustained vibro is far easier than rated (panel 2026-11-17)
+    OD_LN: f64 = 0.8,    // LN parts × (great window / OD 8's)^−(OD_LN + OD_LN_L·L): wide windows ease releases (7K panel, OD<5 LN −.24)
+    OD_LN_L: f64 = 0.0,
+    LN_TOP: f64 = 0.0,     // LN parts × e^(−LN_TOP·max(0, L − LN_TOP_L0)·LN share of the last LN_TOP_WIN s): top-only LN ease (compute.rs level_terms)
+    LN_TOP_L0: f64 = 0.0,  // the hinge, L = ln(first-pass overall / LEVEL_REF)
+    LN_TOP_WIN: f64 = 30.0, // s of LN share the ease follows (0 = the whole map, share 1)
+    LN_TOP_P: f64 = 1.0,   // the ease × share^this: only LN-heavy stretches
+    LN_TOP_MIX: f64 = 0.1, // every part × e^(this·max(0, L − LN_TOP_L0)·max(0, 4s(C − s)/C²)): rice with few LNs harder at the top
+    LN_TOP_MIX_X: f64 = -3.0, // LN_TOP_MIX × (keys/7)^this (own audit: 4K plays gain, 7K lose at 0)
+    LN_TOP_MIX_C: f64 = 0.5, // C: the LN share where that stops (7K panel ≥ 10★: share .05–.4 +.03…+.14, .55–.85 −.06…−.08)
+    SWITCH_W: f64 = 0.0, // bin × (1 + SWITCH_W·e^(SWITCH_L·L)·(1 − cos(pattern mix, previous bin's)))
+    SWITCH_L: f64 = 0.0,
     TECH_FULL: f64 = 0.09,
     RT_WIN: usize = 4,
     RT_FULL: f64 = 0.2,
@@ -180,6 +226,10 @@ knobs! {
     DELAY_GAP: f64 = 0.07,
     TRILL_GAP: f64 = 0.2,
     MJ_BURST: usize = 2,
+    MJ_FULL: f64 = 0.11, // demand.rs bursts: a re-hit this fast is a full minijack, fading to none at MJ_NONE
+    MJ_NONE: f64 = 0.18, // demand.rs bursts: no minijack from this re-hit gap on (user 2026-11-16: KORO-KO-LOID 1/2 at ~235 ms, DUN DUN 1/4 chords at ~171 ms read Minijacks first, none seen)
+    MJ_WIDE_LO: f64 = 0.5, // demand.rs bursts: a re-hit sharing up to this share of the keys is a full minijack,
+    MJ_WIDE_HI: f64 = 0.75, // none from this share on (most keys re-hit = chordjack/mash, user 2026-11-17)
     VIBRO_GAP: f64 = 0.098, // structure::vibro_gap: a VIBRO_LEN_REF-hit run is vibro under this re-hit gap (≈153 BPM 1/4; 16 hits ≈165, user 2026-11-14)
     VIBRO_LEN_REF: f64 = 32.0, // structure::vibro_gap: the run length VIBRO_GAP is stated at
     VIBRO_GAP_LONG: f64 = 0.1, // structure::vibro_gap: never slower than this however long the run (150 BPM 1/4: Windows Vs.AGK's long quads and a 157 BPM chord spam are vibro, user 2026-11-14)
@@ -193,9 +243,11 @@ knobs! {
     RAMPS: [f64; 4 * crate::taxonomy::SLICES] = crate::taxonomy::fitted_ramps(), // each slice's [lo, hi, e, g] (skills::ramp), calib/taxonomy.json
     STAMINA_WINDOW: f64 = 60.0, // seconds of demand the stamina rating averages (skills::local_levels)
     BURST_TAG: f64 = 1.5,   // card tag "short burst": the 2 s timeline peaks this far above the overall
-    SV_PIECES: usize = 3,
-    W_WOB: f64 = 2.0,
-    SV_VIS: f64 = 450.0,
+    SV_STUTTER: f64 = 0.5,  // scale on the fitted stutter weight of the scroll reading (scroll::reading)
+    PATTERN_INFO: f64 = 0.2, // demand: a bin's total × e^(PATTERN_INFO · max(0, chord-sequence surprise bits/keys in the bin − PATTERN_INFO_B))
+    PATTERN_INFO_B: f64 = 10.0, // surprise (rows' −log2 ÷ keys) per 0.5 s bin before it counts (~20 novel rows/s)
+    PATTERN_INFO_X: f64 = 3.0, // PATTERN_INFO × (keys/7)^this (plan 2026-11-18 H7: one curve over keymodes)
+    SV_READ: f64 = 1.5,     // scale on every fitted scroll-reading weight (scroll::reading)
     // flow descriptors (flow.rs)
     FLOW_LINK: f64 = 0.25,   // s: a hand's next note further than this starts a new phrase
     FLOW_FLOOR: f64 = 0.04,  // s: faster than this counts the same

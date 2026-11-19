@@ -92,6 +92,24 @@ pub struct Session {
     current: HashSet<i64>, // ids of `events`
 }
 
+impl Session {
+    /// The playlist shuffle's seed: the last offer (or reset) before the current run of offers, a run being offers under
+    /// SESSION_GAP apart up to now. One shuffle per run: a seed that moved on every offer re-drew the whole ranking after each
+    /// pick, and the playlist drops queued rows that leave its top, so rows of a big pool rarely reached the front while a
+    /// small skill's few maps stayed (user 2026-11-18: 10 of 11 4K offers Vibro at a 7 % share; 1 of 15 other 4K rows survived a
+    /// re-draw, 7 of 8 Vibro rows).
+    pub fn shuffle_seed(&self) -> i64 {
+        let mut after = self.now;
+        for e in self.all.iter().rev().filter(|e| matches!(e.kind.as_str(), "offer" | "reset")) {
+            if e.kind == "reset" || after - e.t > SESSION_GAP {
+                return e.id;
+            }
+            after = e.t;
+        }
+        0
+    }
+}
+
 /// Offers and starts of a session's window in time order (Session.__init__'s scan): the index the session begins at.
 fn session_start(ev: &[Arc<Event>], now: f64) -> usize {
     let mut start = 0;

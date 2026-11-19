@@ -263,7 +263,7 @@ fn the_main_window_shows_the_analysis_bar_in_its_status_row_until_the_library_is
     let mut a = app(prefs(), &ctx);
     let analysis = crate::viewer::Analysis {
         path: "x.osu".into(), rate: 1., sv: true, keys: 7, title: "Black Lotus".into(), artist: "wa.".into(), version: "Another".into(), creator: "Blocko".into(),
-        overall: 7.05, notes: 2400, ln_notes: 0., nps: Some(28.1), span: Some((0., 105_000.)), timeline: (0..60).map(|i| 4. + (i as f64 / 6.).sin()).collect(),
+        overall: 7.05, press: 7.05, notes: 2400, ln_notes: 0., nps: Some(28.1), span: Some((0., 105_000.)), timeline: (0..60).map(|i| 4. + (i as f64 / 6.).sin()).collect(),
         entries: Vec::new(), tags: Vec::new(), also: Vec::new(), bars: Vec::new(), peak_nps: None, bid: None, names: Vec::new(), tech: Vec::new(), sv_ignored: false, dan_vibro: Default::default(), o2jam: None,
     };
     a.shown = Some(crate::app::Selected { path: "x.osu".into(), rate: 1., sv: true, result: Ok(std::sync::Arc::new(analysis)) });
@@ -757,7 +757,7 @@ fn a_card_row_carries_its_modifier_tags_beside_the_name() {
     let entry = |name: &str, rating: f64, tags: &[&str]| crate::viewer::Entry { name: name.into(), rating, parts: Vec::new(), tags: tags.iter().map(|t| t.to_string()).collect() };
     let analysis = crate::viewer::Analysis {
         path: "x.osu".into(), rate: 1., sv: true, keys: 7, title: "Cyber Shaman".into(), artist: "Cosmo".into(), version: "Local difficulty".into(), creator: "someone".into(),
-        overall: 6.1, notes: 2400, ln_notes: 900., nps: Some(14.2), span: Some((0., 150_000.)), timeline: (0..60).map(|i| 4. + (i as f64 / 6.).sin()).collect(),
+        overall: 6.1, press: 6.1, notes: 2400, ln_notes: 900., nps: Some(14.2), span: Some((0., 150_000.)), timeline: (0..60).map(|i| 4. + (i as f64 / 6.).sin()).collect(),
         entries: vec![entry("LN Release", 6.0, &["Tech"]), entry("Stream", 5.6, &["Stamina"]), entry("Chordjack", 4.9, &[])], tags: Vec::new(), also: Vec::new(), bars: Vec::new(),
         peak_nps: None, bid: None, names: Vec::new(), tech: Vec::new(), sv_ignored: false, dan_vibro: Default::default(), o2jam: Some(84.4),
     };
@@ -823,7 +823,7 @@ fn closing_details_returns_the_window_to_its_compact_size() {
     a.s.win = (430., 240.);
     let analysis = crate::viewer::Analysis {
         path: "x.osu".into(), rate: 1., sv: true, keys: 7, title: "T".into(), artist: "A".into(), version: "V".into(), creator: "C".into(),
-        overall: 5., notes: 2400, ln_notes: 0., nps: Some(20.), span: Some((0., 105_000.)), timeline: vec![4.; 60],
+        overall: 5., press: 5., notes: 2400, ln_notes: 0., nps: Some(20.), span: Some((0., 105_000.)), timeline: vec![4.; 60],
         entries: Vec::new(), tags: Vec::new(), also: Vec::new(), bars: (0..4).map(|i| (format!("s{i}"), format!("S{i}"), 0.5)).collect(), peak_nps: None, bid: None, names: Vec::new(), tech: Vec::new(), sv_ignored: false, dan_vibro: Default::default(), o2jam: None,
     };
     a.shown = Some(crate::app::Selected { path: "x.osu".into(), rate: 1., sv: true, result: Ok(std::sync::Arc::new(analysis)) });

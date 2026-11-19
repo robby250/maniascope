@@ -21,6 +21,9 @@ pub struct Chart {
     /// (ms, multiplier); empty = constant scroll.
     pub sv: Vec<(f64, f64)>,
     pub od: f64,
+    /// Judgements no press can get (a hold counts head and tail): notes on a note already at that column and time. One
+    /// press takes one note, so even auto misses them (user 2026-11-16: Tentacle VIP [Inertia VIP], 195 stacked, auto ~80 %).
+    pub stacked: f64,
     pub title: String,
     pub artist: String,
     pub version: String,
@@ -33,6 +36,45 @@ impl Chart {
     }
     pub fn last_end(&self) -> f64 {
         self.end.iter().copied().fold(None, |m: Option<f64>, x| Some(match m { Some(m) if m >= x => m, _ => x })).unwrap_or(0.0)
+    }
+
+    /// The chart as played at `rate` (MASH_SPAN of the great window, in real time; see `mashed`). None: as written.
+    pub fn played(&self, rate: f64, k: &crate::params::Knobs) -> Option<Chart> {
+        (k.MASH_SPAN > 0.0).then(|| self.mashed(k.MASH_SPAN * crate::gestures::great_window(self.od) * 1000.0 * rate, k.MASH_COVER)).flatten()
+    }
+
+    /// Consecutive rows on columns not yet hit, all within `span` ms of the first, are one gesture,
+    /// struck at once at the middle of the span (a 7-key chord rolled over 27 ms is mashed as a chord: user 2026-11-15,
+    /// A Fool Moon Night's fake streams and brackets). A column already in the gesture starts the next. Only gestures over `cover` of the keys merge: a 2–3 note flam inside
+    /// a stream merged into fake fast jacks and LN shields. None: nothing merged.
+    pub fn mashed(&self, span: f64, cover: f64) -> Option<Chart> {
+        let n = self.len();
+        let mut rows: Vec<(usize, usize, u64)> = Vec::new(); // (first note, end, columns)
+        for i in 0..n {
+            match rows.last_mut() {
+                Some(r) if self.t[r.0] == self.t[i] => (r.1, r.2) = (i + 1, r.2 | 1 << self.col[i]),
+                _ => rows.push((i, i + 1, 1 << self.col[i])),
+            }
+        }
+        let (mut t, mut merged, mut r) = (self.t.clone(), false, 0);
+        while r < rows.len() {
+            let (start, mut mask, mut q) = (self.t[rows[r].0], rows[r].2, r + 1);
+            while q < rows.len() && self.t[rows[q].0] - start <= span && mask & rows[q].2 == 0 {
+                mask |= rows[q].2;
+                q += 1;
+            }
+            if q > r + 1 && f64::from(mask.count_ones()) >= cover * self.keys as f64 {
+                let mid = 0.5 * (start + self.t[rows[q - 1].0]);
+                t[rows[r].0..rows[q - 1].1].iter_mut().for_each(|x| *x = mid);
+                merged = true;
+            }
+            r = q;
+        }
+        merged.then_some(())?;
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| t[a].total_cmp(&t[b]).then(self.col[a].cmp(&self.col[b])));
+        let end = |x: usize| if self.end[x] > self.t[x] { self.end[x].max(t[x]) } else { t[x] };
+        Some(Chart { t: order.iter().map(|&x| t[x]).collect(), end: order.iter().map(|&x| end(x)).collect(), col: order.iter().map(|&x| self.col[x]).collect(), ..self.clone() })
     }
 }
 
@@ -168,19 +210,19 @@ pub fn parse(data: &[u8]) -> Result<Chart, ChartError> {
         Some(k) if (1..=18).contains(&k) => k,
         k => return Err(ChartError::Chart(format!("unsupported key count: {}", k.map_or("None".into(), |k| k.to_string())))),
     };
-    // Normalise: column, dedupe, order-independent sort, no same-column overlap.
+    // Normalise: column, stacked notes out, order-independent sort, no same-column overlap.
     let mut notes: Vec<(i64, i64, i64)> = raw
         .into_iter()
         .map(|(t, e, x)| (t, e, (keys - 1).min(0i64.max(py::floordiv(x.saturating_mul(keys), 512)))))
         .collect();
     notes.sort_unstable_by_key(|&(t, e, c)| (t, c, e)); // equal keys are equal notes: order among them is moot
-    notes.dedup();
     let mut ch = Chart { keys: keys as usize, ..Default::default() };
     let mut last: Vec<Option<usize>> = vec![None; keys as usize];
     for (t, e, c) in notes {
         if let Some(i) = last[c as usize] {
             if ch.t[i] == t as f64 {
-                continue; // duplicate head
+                ch.stacked += if e > t { 2. } else { 1. };
+                continue; // a stacked note: kept out of the patterns, counted as a sure miss
             }
             if ch.end[i] > t as f64 {
                 ch.end[i] = t as f64; // impossible overlap: cut the earlier hold
@@ -282,5 +324,15 @@ mod tests {
         assert_eq!(super::lines("a\r\nb\rc\n\nd\r\r\ne\n"), ["a", "b", "c", "", "d", "", "e"]);
         assert_eq!(super::lines("a\r"), ["a", ""]);
         assert_eq!(super::lines(""), [""]);
+    }
+
+    #[test]
+    fn stacked_notes_are_sure_misses() {
+        // column 0: a tap, the same tap twice more and a hold on it; column 1: one hold
+        let osu = "osu file format v14\n[General]\nMode: 3\n[Difficulty]\nCircleSize:4\nOverallDifficulty:8\n[HitObjects]\n\
+                   64,192,1000,1,0,0:0:0:0:\n64,192,1000,1,0,0:0:0:0:\n64,192,1000,1,0,0:0:0:0:\n64,192,1000,128,0,1500:0:0:0:0:\n\
+                   192,192,1000,128,0,1500:0:0:0:0:\n";
+        let c = super::parse(osu.as_bytes()).unwrap();
+        assert_eq!((c.t.len(), c.stacked), (2, 4.));
     }
 }

@@ -9,7 +9,7 @@ use crate::store::{kv_get, parse_stats, score_key, timestamp, tracking_allowed, 
 use rusqlite::{params, OptionalExtension, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub const SCHEMA: &str = "
@@ -58,6 +58,16 @@ pub fn archive(db: &Db, raw: &[Value], client: &str) -> Result<usize> {
     // One pass: a json_extract scan per score took 50 s on 12k scores.
     let finished: HashSet<String> = db.prepare("SELECT json_extract(info,'$.key') FROM events WHERE kind='finish'")?
         .query_map([], |r| r.get::<_, Option<String>>(0))?.filter_map(|k| k.ok().flatten()).collect();
+    // Every score's key and fresh flag in one pass (a query per score took .5 s on 12k scores).
+    let (mut by_key, mut by_local): (HashMap<String, i64>, HashMap<String, (String, i64)>) = (HashMap::new(), HashMap::new());
+    for row in db.prepare("SELECT key,local_id,fresh FROM scores")?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<i64>>(2)?.unwrap_or(0))))? {
+        let (key, local, fresh) = row?;
+        if let Some(l) = local {
+            let e = by_local.entry(l).or_insert((key.clone(), fresh));
+            if fresh > e.1 { *e = (key.clone(), fresh); }
+        }
+        by_key.insert(key, fresh);
+    }
     let mut count = 0;
     for item in raw {
         if item.get("map").is_some() || item["user_id"].as_i64() != user {
@@ -69,8 +79,8 @@ pub fn archive(db: &Db, raw: &[Value], client: &str) -> Result<usize> {
             continue;
         }
         let key = score_key(sha, item["total"].as_i64().unwrap_or(0), &stats_of(item), Some(played));
-        let score: Option<(String, i64)> = db.query_row("SELECT key,fresh FROM scores WHERE key=? OR local_id=? ORDER BY fresh DESC LIMIT 1", params![key, item["id"].as_str()],
-                                                        |r| Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0)))).optional()?;
+        let by_local = item["id"].as_str().and_then(|id| by_local.get(id));
+        let score: Option<(String, i64)> = [by_key.get(&key).map(|f| (key.clone(), *f)), by_local.cloned()].into_iter().flatten().max_by_key(|s| s.1);
         let Some((key, fresh)) = score else { continue };
         if fresh == 0 && !finished.contains(&key) {
             continue;
@@ -120,9 +130,24 @@ pub fn archive_stable(db: &Db, game: Option<&Path>) -> Result<usize> {
                                      WHERE (s.src='stable' OR s.client='stable-live') AND (e.status IS NULL OR e.status!='archived')")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)))?.collect::<Result<_>>()?;
     let store = local_origin("stable").1;
+    // One pass each (2026-11-17 audit): the finished keys (a json_extract scan of the event log per score), and Data/r's
+    // replays by chart md5 (the folder was listed once per score).
+    let mut finished: HashMap<String, Option<String>> = HashMap::new();
+    for row in db.prepare("SELECT json_extract(info,'$.key'), info FROM events WHERE kind='finish' ORDER BY id")?.query_map([], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)))? {
+        if let (Some(k), info) = row? {
+            finished.entry(k).or_insert(info); // the first, as LIMIT 1 read it
+        }
+    }
+    let mut by_md5: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    for entry in std::fs::read_dir(long_path(&dir)).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some((md5, _)) = name.strip_suffix(".osr").and_then(|n| n.split_once('-')) {
+            by_md5.entry(md5.to_string()).or_default().push(entry.path());
+        }
+    }
     let mut count = 0;
     for (key, sha, md5, stats, total, fresh, mods, rate, played, _) in rows {
-        let finish: Option<Option<String>> = db.query_row("SELECT info FROM events WHERE kind='finish' AND json_extract(info,'$.key')=? LIMIT 1", [&key], |r| r.get(0)).optional()?;
+        let finish: Option<Option<String>> = finished.get(&key).cloned();
         if fresh.unwrap_or(0) == 0 && finish.is_none() {
             continue; // only observed attempts, as for lazer
         }
@@ -133,12 +158,8 @@ pub fn archive_stable(db: &Db, game: Option<&Path>) -> Result<usize> {
         let Some(md5) = md5 else { continue };
         let want = stats.as_deref().and_then(parse_stats);
         let mut data = None;
-        for entry in std::fs::read_dir(long_path(&dir)).into_iter().flatten().flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !(name.starts_with(&format!("{md5}-")) && name.ends_with(".osr")) {
-                continue;
-            }
-            let Ok(bytes) = std::fs::read(entry.path()) else { continue };
+        for file in by_md5.get(&md5).into_iter().flatten() {
+            let Ok(bytes) = std::fs::read(file) else { continue };
             if osr_header(&bytes).is_ok_and(|h| i64::from(h.score) == total && want.is_some_and(|w| h.stats.map(i64::from) == w)) {
                 data = Some(bytes);
                 break;

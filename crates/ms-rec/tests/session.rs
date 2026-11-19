@@ -2,7 +2,7 @@
 use ms_data::store::{annotate_attempt, connect, log_event, Event};
 use ms_model::personal::{Completion, WarmModels};
 use ms_model::predict::{Consts, Mode, Slopes};
-use ms_model::session::Session;
+use ms_model::session::{Session, SESSION_GAP};
 use ms_model::warmup::{activation, session_minutes, Done, FormPrior, Model};
 use ms_rec::recommender::family_transfer;
 use serde_json::{json, Map, Value};
@@ -337,4 +337,21 @@ fn taste_needs_a_real_completion_and_counts_it_once() {
     assert!(taste(&db).is_empty());
     drop(db);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// User 2026-11-18: the ranking was re-drawn after every pick, and the playlist's queued rows went with it.
+#[test]
+fn the_shuffle_seed_holds_for_a_run_of_offers() {
+    let offer = |id: i64, t: f64| event(id, t, "offer", "md5:m", json!({"mode": "skills"}));
+    let seed = |ev: Vec<Arc<Event>>, now: f64| session(ev, now, None).shuffle_seed();
+    let old = vec![offer(1, 1000.), offer(2, 1300.)];
+    assert_eq!(seed(old.clone(), 1400.), 0, "no offer before this run");
+    let begun = seed(old.clone(), 1300. + SESSION_GAP + 60.);
+    assert_eq!(begun, 2, "a new run: seeded by the last offer before it");
+    let mut run = old;
+    run.push(offer(3, 1300. + SESSION_GAP + 100.));
+    run.push(offer(4, 1300. + SESSION_GAP + 400.));
+    assert_eq!(seed(run.clone(), 1300. + SESSION_GAP + 500.), begun, "its picks keep the seed");
+    run.push(event(5, 1300. + SESSION_GAP + 450., "reset", "", json!({})));
+    assert_eq!(seed(run, 1300. + SESSION_GAP + 500.), 5, "a reset draws again");
 }

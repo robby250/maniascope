@@ -9,34 +9,7 @@ use std::collections::HashMap as StdMap;
 use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 
-/// FxHash (rustc's): SipHash was a fifth of a prediction; these maps are built from our own export.
-#[derive(Default, Clone, Copy)]
-pub struct Fx(u64);
-
-impl std::hash::Hasher for Fx {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for c in bytes.chunks(8) {
-            let mut w = [0u8; 8];
-            w[..c.len()].copy_from_slice(c);
-            self.write_u64(u64::from_le_bytes(w));
-        }
-    }
-    fn write_u64(&mut self, i: u64) {
-        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
-    }
-    fn write_i64(&mut self, i: i64) {
-        self.write_u64(i as u64)
-    }
-    fn write_usize(&mut self, i: usize) {
-        self.write_u64(i as u64)
-    }
-    fn write_u8(&mut self, i: u8) {
-        self.write_u64(i as u64)
-    }
-}
+pub use ms_calc::val::Fx;
 
 pub type HashMap<K, V> = StdMap<K, V, BuildHasherDefault<Fx>>;
 
@@ -325,6 +298,8 @@ pub struct PredModel {
     pub shown: (f64, f64),
     pub judged_ln: f64, // added to log(1 − shown accuracy) per LN share: the client judges holds as stable does, 0 on lazer
     pub retry: f64,
+    pub unread: (f64, f64),
+    pub plays: HashMap<String, f64>,
     pub sd_att: HashMap<i64, f64>,
     // warmup.Model
     pub slopes: Arc<Slopes>,
@@ -333,6 +308,23 @@ pub struct PredModel {
     /// Vibro charts are mashed, so they get their own personal fit (user 2026-11-14: "can't vibro charts have their own
     /// personal vibro fit"): own level on them and their own chart memory; `personal` reads a vibro chart from it.
     pub vibro: Option<Arc<PredModel>>,
+    /// The player's vibro speed (`vibro_pace`): vibro offers stay within VIBRO_PACE of it.
+    pub vibro_pace: Option<f64>,
+}
+
+/// A vibro offer's speed as shares of the player's vibro speed: slowest, fastest.
+pub const VIBRO_PACE: (f64, f64) = (0.96, 1.04);
+
+/// Accuracy a vibro chart's offer aims at, at most (target_for).
+pub const VIBRO_TARGET: f64 = 0.93;
+
+/// The player's vibro speed: median same-column hits/s of their last 30 vibro plays (5 at least), at the played rate.
+pub fn vibro_pace(plays: &[(f64, f64)]) -> Option<f64> {
+    let mut recent: Vec<(f64, f64)> = plays.iter().copied().filter(|p| p.1 > 0.).collect();
+    recent.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut speeds: Vec<f64> = recent.into_iter().take(30).map(|p| p.1).collect();
+    speeds.sort_by(f64::total_cmp);
+    (speeds.len() >= 5).then(|| speeds[speeds.len() / 2])
 }
 
 /// One chart of a builder request.
@@ -345,6 +337,7 @@ pub struct ScoreJob {
     pub installed: bool,
     pub playcount: f64,
     pub convert: bool,
+    pub source_web: bool, // a convert whose source is a website chart
 }
 
 impl PredModel {
@@ -352,9 +345,9 @@ impl PredModel {
     pub fn population(c: Arc<Consts>, pop: Arc<Pop>) -> PredModel {
         PredModel { c, pop, levels: HashMap::default(), level: HashMap::default(), glob: 0., sd_all: 0., shape: HashMap::default(), steep: HashMap::default(),
                     recent: HashMap::default(), aff: HashMap::default(), rate_aff: HashMap::default(), rate_support: HashMap::default(),
-                    rate_bandwidth: [(0, 1.)].into_iter().collect(), tau2_c: 0., kap_c: 1., shown: (0., 1.), judged_ln: 0., retry: 0.,
+                    rate_bandwidth: [(0, 1.)].into_iter().collect(), tau2_c: 0., kap_c: 1., shown: (0., 1.), judged_ln: 0., retry: 0., unread: (0., 0.), plays: HashMap::default(),
                     sd_att: HashMap::default(), slopes: Arc::new(Slopes::default()), modes: ByKeys::default(),
-                    fallback: Mode { tau: 8., log_rate: false, amplitudes: Vec::new(), session: 0., fatigue: 0. }, vibro: None }
+                    fallback: Mode { tau: 8., log_rate: false, amplitudes: Vec::new(), session: 0., fatigue: 0. }, vibro: None, vibro_pace: None }
     }
 
     /// A fitted Personal and its warm-up model.
@@ -366,8 +359,8 @@ impl PredModel {
         }).collect();
         PredModel { c, pop, levels, level, glob: fit.glob, sd_all: fit.sd_all, shape, steep: fit.steep.clone(), recent: fit.recent.clone(), aff: fit.aff.clone(), rate_aff,
                     rate_support: fit.rate_support.clone(), rate_bandwidth: fit.rate_bandwidth.iter().map(|(&k, &v)| (k, v)).collect(), tau2_c: fit.tau2_c,
-                    kap_c: fit.kap_c, shown, judged_ln, retry: fit.retry, sd_att: fit.sd_att.clone(), slopes: Arc::new(warmup.slopes.clone()),
-                    modes: warmup.modes.iter().map(|(&k, v)| (k, v.clone())).collect(), fallback: warmup.fallback.clone(), vibro: None }
+                    kap_c: fit.kap_c, shown, judged_ln, retry: fit.retry, unread: fit.unread, plays: fit.plays.clone(), sd_att: fit.sd_att.clone(), slopes: Arc::new(warmup.slopes.clone()),
+                    modes: warmup.modes.iter().map(|(&k, v)| (k, v.clone())).collect(), fallback: warmup.fallback.clone(), vibro: None, vibro_pace: None }
     }
 
     /// nps.candidates_from's scoring of `jobs` into the request's Choices. `store` keeps the charts' features read
@@ -379,7 +372,7 @@ impl PredModel {
         let ctx = Ctx { target, rates, warm: session.warm, skills, wants_special, preference, version: store.version, nps_weight };
         // each tree reads its own choices (`skills::SCOPES`)
         let views: Vec<Vec<String>> = (0..store.trees.len()).map(|t| crate::skills::for_tree(selected, t)).collect();
-        let sel: Vec<Selection> = store.trees.iter().zip(&views).map(|(t, v)| t.select(v, tuning)).collect();
+        let sel: Vec<Selection> = store.trees.iter().enumerate().map(|(i, t)| t.select_tree(selected, i, tuning)).collect();
         let included: Vec<Vec<&String>> = views.iter().map(|v| v.iter().filter(|k| !k.starts_with('!')).collect()).collect();
         static EMPTY: Vec<Entry> = Vec::new();
         let entries = |sha: &str| store.charts.get(sha).unwrap_or(&EMPTY);
@@ -407,7 +400,7 @@ impl PredModel {
                             Some(Arc::new(Choice {
                                 practice, group: groups()[self.group(feats)].0.to_string(), nps: entry.offer.nps, length: entry.offer.play_span.unwrap_or(0.) / rate,
                                 family: entry.offer.family.clone(), description: entry.offer.description.clone(), profile: entry.profile.clone(), acc_mid: p.acc_mid, matched,
-                                sha: j.sha.clone(), md5: j.md5.clone(), keys: j.keys, rate, value, installed: j.installed, convert: j.convert,
+                                sha: j.sha.clone(), md5: j.md5.clone(), keys: j.keys, rate, value, installed: j.installed, convert: j.convert, source_web: j.source_web,
                                 playcount: j.playcount, pred: p, generated_at: now,
                             }))
                         }
@@ -422,15 +415,25 @@ impl PredModel {
         Ok(())
     }
 
-    /// The tab's accuracy target for this chart. A vibro chart aims where the player's vibro level puts a chart as hard as the
-    /// ones the target picks elsewhere (user 2026-11-14: "automatic from my vibro plays … adapt in time as i get better"): the
-    /// levels are fitted against each play's prediction, so harder offers don't lower it (no spiral from offers that went
-    /// badly), and it rises to the tab's target as the vibro level reaches the rest.
-    pub fn target_for(&self, f: &Feats, target: f64) -> f64 {
-        match self.vibro.as_ref().filter(|_| self.c.vibro_chart(f)) {
-            Some(v) => 1. - (1. - target) * (v.level_of(f.keys) - self.level_of(f.keys)).max(0.).exp(),
-            None => target,
+    /// A vibro chart's rate window is where its runs land within VIBRO_PACE of the player's vibro speed; the accuracy target
+    /// picks inside it (user 2026-11-17: "make the suggestions for vibro follow that rate": offered .75× and .77× to reach
+    /// 96 %, played 1.0× and .9×, both at the ~84 ms a hit, 173–180 BPM, of the vibro charts taken as offered).
+    fn vibro_rates(&self, entries: &[Entry], rates: (f64, f64)) -> (f64, f64) {
+        let Some(pace) = self.vibro_pace else { return rates };
+        let at_one = entries.iter().filter_map(|e| e.feats.as_ref().filter(|f| f.vibro_speed > 0. && self.c.vibro_chart(f)).map(|f| f.vibro_speed / e.offer.rate)).next();
+        match at_one {
+            Some(s) => {
+                let (lo, hi) = (round2(VIBRO_PACE.0 * pace / s).clamp(rates.0, rates.1), round2(VIBRO_PACE.1 * pace / s).clamp(rates.0, rates.1));
+                (lo, hi.max(lo))
+            }
+            None => rates,
         }
+    }
+
+    /// The tab's accuracy target for this chart: a vibro chart aims at VIBRO_TARGET at most (user 2026-11-17: "put it at like
+    /// 93%"; the level-gap target read 96 % for every keymode: the vibro fit sat 0.064 above the rest).
+    pub fn target_for(&self, f: &Feats, target: f64) -> f64 {
+        if self.c.vibro_chart(f) { target.min(VIBRO_TARGET) } else { target }
     }
 
     /// nps.central_target.
@@ -534,6 +537,18 @@ struct Selection {
 }
 
 impl Tree {
+    /// Tree `t`'s selection out of the whole pick list. Skills picked in the other tree only: this tree's charts match
+    /// nothing and come in only as "other maps" (user 2026-11-17: an empty wide tree matched everything, 4K Vibro practice
+    /// offered 28 of 32 7K/10K charts with no vibro; 2026-11-18: leaving those keymodes out emptied 7K/10K from a tab with
+    /// other maps at 1.3).
+    fn select_tree(&self, selected: &[String], t: usize, tuning: &crate::skills::Tuning) -> Selection {
+        let mut s = self.select(&crate::skills::for_tree(selected, t), tuning);
+        if crate::skills::left_out(selected, if t == 0 { 4 } else { 7 }) {
+            s.positive = vec![None];
+        }
+        s
+    }
+
     fn select(&self, selected: &[String], tuning: &crate::skills::Tuning) -> Selection {
         let at = |k: &str| self.dims.iter().position(|d| d == k);
         // A child only the other keymode has (Stream/Dump on 7K) still asks for its family; an exclusion of one stays narrow.
@@ -694,7 +709,7 @@ impl FeatStore {
         let feats = e.feats.as_ref()?;
         let tree = crate::skills::tree_index(feats.keys);
         let view = crate::skills::for_tree(selected, tree);
-        let sel = self.trees[tree].select(&view, tuning);
+        let sel = self.trees[tree].select_tree(selected, tree, tuning);
         let included: Vec<&String> = view.iter().filter(|k| !k.starts_with('!')).collect();
         let skill = e.skill.as_ref().filter(|_| practice);
         Some(crate::choices::Metadata {
@@ -836,6 +851,8 @@ pub struct Feats {
     pub width: f64,
     pub geometry: Option<Vec<f64>>,
     pub vibro: (f64, f64), // share of notes in vibro runs, notes/s outside them (structure v4)
+    pub vibro_speed: f64,  // median same-column hits/s inside the vibro runs at this rate; 0 = none or not analysed yet
+    pub unhittable: f64,   // share of judgements stacked notes lose (structure v6): the shown accuracy's ceiling is 1 − this
 }
 
 impl Feats {
@@ -859,7 +876,7 @@ impl Feats {
 
     /// A chart known by its rating alone (nps.reach's search).
     pub fn bare(keys: i64, overall: f64, od: f64, c: &Consts) -> Feats {
-        Feats { keys, overall, od, length: 0., sk: vec![0.; c.names.len()], dom: c.family("rice"), z_tail: [0.; 5], width: 0., geometry: None, vibro: (0., 0.) }
+        Feats { keys, overall, od, length: 0., sk: vec![0.; c.names.len()], dom: c.family("rice"), z_tail: [0.; 5], width: 0., geometry: None, vibro: (0., 0.), vibro_speed: 0., unhittable: 0. }
     }
 
     pub fn of(f: &Dict, c: &Consts) -> Res<Feats> {
@@ -903,6 +920,8 @@ impl Feats {
             width,
             geometry,
             vibro: (sub("nps", "vibro_runs", 0.), sub("nps", "vibro_rest", 0.)),
+            vibro_speed: sub("nps", "vibro_speed", 0.),
+            unhittable: sub("nps", "unhittable", 0.),
         })
     }
 }
@@ -986,10 +1005,11 @@ impl PredModel {
         let (a, bb, judged) = (self.shown.0, self.shown.1, self.judged_ln * f.z_tail[0]);
         let y = |acc: f64| ((1. - unmash(acc)).max(1e-9).ln() - a - judged) / bb;
         let shown = |y: f64| mash_floor(0f64.max(1f64.min(1. - (20f64.min(a + bb * y + judged)).exp())));
-        let step = 0.5 * (y(acc) - y(p.acc_mid));
+        let ceiling = 1. - f.unhittable; // the per-note forecast reads the hittable notes only
+        let step = 0.5 * (y(acc) - y(p.acc_mid / ceiling));
         (p.mu, p.shift) = (p.mu + step, p.shift + step);
         for v in [&mut p.acc_mid, &mut p.acc_lo, &mut p.acc_hi, &mut p.opening_acc] {
-            *v = shown(y(*v) + step);
+            *v = ceiling * shown(y(*v / ceiling) + step);
         }
     }
 
@@ -998,6 +1018,8 @@ impl PredModel {
     #[allow(clippy::type_complexity)]
     fn score_chart(&self, ctx: &Ctx, sel: &[Selection], entries: &[Entry], key: &str, bid: Option<i64>, session: &PredSession)
                    -> Res<Option<(Option<(f64, f64)>, Option<(f64, f64, &'static str)>, Option<Prediction>)>> {
+        let paced = Ctx { rates: self.vibro_rates(entries, ctx.rates), ..*ctx };
+        let ctx = &paced;
         let mut rated: Vec<(&Offer, &Feats, Prediction, Option<f64>)> = Vec::new();
         for e in entries {
             let (Some(feats), Some(skill)) = (&e.feats, &e.skill) else { continue };
@@ -1177,6 +1199,11 @@ impl PredModel {
         (s * lr + curve * bend + c * (64. - 3. * f.od).max(10.).ln() + mb + self.gap_term(f, level), n_mb)
     }
 
+    /// personal::unread: the deficit of the next own play of a chart not yet learned, (a + UNREAD_SV·SV rating²)/(1 + plays).
+    pub fn unread_deficit(&self, f: &Feats, chart: &str) -> f64 {
+        (self.unread.0 + self.unread.1 * crate::personal::sv_load(f, &self.c)) / (1. + self.plays.get(chart).copied().unwrap_or(0.))
+    }
+
     pub fn chart_affinity(&self, chart: &str, rate: f64, k: i64) -> (f64, f64) {
         let (mut a, mut n_c) = self.aff.get(chart).copied().unwrap_or((0., 0.));
         if let Some((xs, vs, ns)) = self.rate_aff.get(chart) {
@@ -1245,7 +1272,7 @@ impl PredModel {
             mu += dot;
         }
         let (a, n_c) = self.chart_affinity(chart, rate, k);
-        mu += a;
+        mu += a + self.unread_deficit(f, chart);
         let var = lv + self.pop.tau2 * self.pop.kappa / (n_mb + self.pop.kappa) + self.tau2_c * self.kap_c / (n_c + self.kap_c);
         (mu, var.sqrt(), sd)
     }
@@ -1351,7 +1378,7 @@ impl PredModel {
         let shift = correction + cold + self.played(f, chart, rate, st, s, sdm * sdm);
         mu += shift;
         let (a, bb, judged) = (self.shown.0, self.shown.1, self.judged_ln * f.z_tail[0]);
-        let shown = |y: f64| mash_floor(0f64.max(1f64.min(1. - (20f64.min(a + bb * y + judged)).exp())));
+        let shown = |y: f64| (1. - f.unhittable) * mash_floor(0f64.max(1f64.min(1. - (20f64.min(a + bb * y + judged)).exp())));
         let spread = sda.hypot(sdm);
         let opening = historical(0.) + st.rust;
         let activation = if s.warm {
@@ -1426,11 +1453,20 @@ mod model_tests {
         PredModel { c, pop: Arc::new(Pop { tau2: 0.1, kappa: 3., knee: 4., ..pop }), levels: HashMap::default(), level: [(7, (-3., 0.01, 0.2))].into_iter().collect(), glob: -3., sd_all: 0.2,
                     shape: HashMap::default(), steep: HashMap::default(), recent: HashMap::default(), aff: [("known".to_string(), (-0.6, 10.))].into_iter().collect(), rate_aff: HashMap::default(),
                     rate_support: [("known".to_string(), (1., 1.))].into_iter().collect(), rate_bandwidth: ByKeys { map: [(0, 0.18), (7, 0.12)].into_iter().collect() }, tau2_c: 0.12, kap_c: 2.,
-                    shown: (0.75f64.ln(), 1.), judged_ln: 0., retry: 0., sd_att: [(7, 0.2)].into_iter().collect(), slopes: Arc::new(Slopes::default()), modes: ByKeys::default(), fallback: Mode::default(), vibro: None }
+                    shown: (0.75f64.ln(), 1.), judged_ln: 0., retry: 0., unread: (0., 0.), plays: HashMap::default(), sd_att: [(7, 0.2)].into_iter().collect(), slopes: Arc::new(Slopes::default()), modes: ByKeys::default(), fallback: Mode::default(), vibro: None, vibro_pace: None }
     }
 
     fn plain(m: &PredModel) -> Feats {
         Feats::bare(7, 5., 8., &m.c)
+    }
+
+    #[test]
+    fn vibro_pace_is_the_median_of_the_last_30_vibro_plays() {
+        assert_eq!(vibro_pace(&[(1., 12.); 4]), None);
+        let mut plays: Vec<(f64, f64)> = (0..30).map(|i| (100. + i as f64, 12.)).collect();
+        plays.extend((0..40).map(|i| (i as f64, 8.))); // older and slower: outside the last 30
+        plays.push((200., 0.)); // a chart with no runs
+        assert_eq!(vibro_pace(&plays), Some(12.));
     }
 
     #[test]
@@ -1457,11 +1493,8 @@ mod model_tests {
         assert_eq!(m.personal(&plain, "known", None, 1.).0, model(Pop::default()).personal(&plain, "known", None, 1.).0);
         assert_eq!(m.personal(&vibro, "known", None, 1.), own.personal(&vibro, "known", None, 1.));
         assert!(m.personal(&vibro, "known", None, 1.).0 < m.personal(&plain, "known", None, 1.).0 - 1.);
-        // a vibro level 0.5 log-miss under the rest aims vibro charts at 1 − 4 % × e^0.5
-        let mut own = model(Pop::default());
-        own.level.insert(7, (m.level_of(7) + 0.5, 0.01, 0.2));
-        m.vibro = Some(Arc::new(own));
-        assert!((m.target_for(&vibro, 0.96) - (1. - 0.04 * 0.5f64.exp())).abs() < 1e-12 && m.target_for(&plain, 0.96) == 0.96);
+        // vibro charts aim at 93 % at most
+        assert!(m.target_for(&vibro, 0.96) == VIBRO_TARGET && m.target_for(&vibro, 0.9) == 0.9 && m.target_for(&plain, 0.96) == 0.96);
         // the per-note forecast leaves a vibro chart alone
         let mut p = Prediction { acc_mid: 0.96, ..Prediction::default() };
         m.blend(&mut p, &vibro, 0.7);
@@ -1686,6 +1719,18 @@ mod skill_tests {
         let dims = &feat_trees()[usize::from(f.f("keys") as i64 != 4)];
         let t = Tree { dims: dims.iter().map(|d| d.0.clone()).collect(), members: dims.iter().map(|d| d.1.clone()).collect(), tech: Vec::new() };
         SkillValues::of(f, &t).strength(&t.select(&normalize(&strings(selected)), tuning))
+    }
+
+    #[test]
+    fn a_tree_with_nothing_picked_matches_only_as_other_maps() {
+        let dims = &feat_trees()[1];
+        let t = Tree { dims: dims.iter().map(|d| d.0.clone()).collect(), members: dims.iter().map(|d| d.1.clone()).collect(), tech: Vec::new() };
+        let f = feature(7, &[("stream", 1.0)]);
+        let four = strings(&["4k:vibro"]);
+        let with_other = crate::skills::Tuning { other: 1.3, ..Default::default() };
+        assert_eq!(SkillValues::of(&f, &t).strength(&t.select_tree(&four, 1, &with_other)), 1.);
+        assert_eq!(SkillValues::of(&f, &t).strength(&t.select_tree(&four, 1, &crate::skills::Tuning::default())), 0.);
+        assert!(SkillValues::of(&f, &t).matched(&t.select_tree(&four, 1, &with_other)).is_empty());
     }
 
     /// A share at standing p against a top family of 1 (skills::relative).

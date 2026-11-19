@@ -180,6 +180,63 @@ fn mark(p: &egui::Painter, r: Rect, (a, b): (f32, f32), text: String) {
 }
 
 /// Overall level per month, dan lines behind it, peak and today marked; hover for a month's level, its change and plays.
+/// Every keymode's recent plays against their own expectation on one timeline (user 2026-11-17: the form chart in All
+/// keymodes): plays ordered by time, a new session after SESSION_GAP without play, the last FORM sessions kept.
+fn merged_form(pages: &std::collections::BTreeMap<i64, Page>) -> Option<(FormHistory, Vec<Vec<i64>>)> {
+    let mut plays: Vec<(f64, f64, &'static str, i64)> = pages.iter().filter_map(|(k, p)| p.form.as_ref().map(|f| (k, f)))
+        .flat_map(|(k, f)| f.sessions.iter().flat_map(move |s| s.plays.iter().map(move |&(clock, v, m)| (s.t + 60. * clock, v, m, *k)))).collect();
+    plays.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut sessions: Vec<(ms_rec::stats::FormSession, Vec<i64>)> = Vec::new();
+    for (t, v, m, k) in plays {
+        match sessions.last_mut().filter(|s| t - (s.0.t + 60. * s.0.plays.last().map_or(0., |p| p.0)) <= ms_model::session::SESSION_GAP) {
+            Some((s, ks)) => { s.plays.push(((t - s.t) / 60., v, m)); ks.push(k); }
+            None => sessions.push((ms_rec::stats::FormSession { t, hours: 0., plays: vec![(0., v, m)] }, vec![k])),
+        }
+    }
+    let keep = sessions.len().saturating_sub(12);
+    let (sessions, keys): (Vec<_>, Vec<_>) = sessions.into_iter().skip(keep).map(|(mut s, k)| { s.hours = s.plays.last().map_or(0., |p| p.0) / 60.; (s, k) }).unzip();
+    (!sessions.is_empty()).then(|| (FormHistory { sessions, ..FormHistory::default() }, keys))
+}
+
+/// What the skill rows mean for play, each line only when the data supports it (replaces "Profile contrast: X is better
+/// supported at higher difficulty than Y", which said nothing usable, user 2026-11-17):
+/// the gap between the strongest and weakest measured skill in stars, dans and accuracy at the same stars; the skills
+/// clearly under the overall level (what holds it back); skills whose level is not measured at that level or is stale.
+fn skill_insights(keys: i64, page: &Page, parents: &[&Skill]) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(overall) = page.groups.get("overall").and_then(|g| g.value.map(|v| (v, g))) else { return out };
+    let measured: Vec<(&Skill, &Group, f64)> = parents.iter().filter_map(|p| page.groups.get(&p.key).filter(|g| g.maps >= 10 && !g.extrapolated).and_then(|g| g.value.map(|v| (*p, g, v)))).collect();
+    let dan = |p: &Skill, v: f64| dans::ability(keys, v, &p.key).map_or(String::new(), |d| format!(" (≈ {d})"));
+    let by = |a: &&(&Skill, &Group, f64), b: &&(&Skill, &Group, f64)| a.2.total_cmp(&b.2);
+    if let (Some(hi), Some(lo)) = (measured.iter().max_by(by), measured.iter().min_by(by)) {
+        if hi.1.low > lo.1.high {
+            // accuracy on the weak skill at the stars you'd play the strong one at 96 %: miss × (strong/weak)^slope
+            let slope = if lo.1.slope > 0. { lo.1.slope } else { overall.1.slope.max(0.5) };
+            let acc = 100. - 4. * (hi.2 / lo.2).powf(slope);
+            out.push(format!("Widest gap: {} {:.1}★{} vs {} {:.1}★{}. A {} chart at the stars where you get 96 % on {} would land near {:.1} %.",
+                             hi.0.name, st(keys, hi.2), dan(hi.0, hi.2), lo.0.name, st(keys, lo.2), dan(lo.0, lo.2), lo.0.name, hi.0.name, acc.max(0.)));
+        }
+    }
+    let behind: Vec<String> = measured.iter().filter(|m| m.1.high < overall.0).map(|m| format!("{} ({:+.1}★)", m.0.name, st(keys, m.2) - st(keys, overall.0))).collect();
+    if !behind.is_empty() {
+        out.push(format!("Below your overall {:.1}★ even at the top of their range: {}. Charts heavy in these cost you the most accuracy at your level.", st(keys, overall.0), behind.join(", ")));
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0., |d| d.as_secs_f64());
+    let mut open: Vec<String> = Vec::new();
+    for p in parents {
+        let Some(g) = page.groups.get(&p.key) else { continue };
+        if g.extrapolated || (g.value.is_some() && g.tested_to > 0. && g.tested_to < overall.0 * 0.9) {
+            open.push(format!("{} (hardest played {:.1}★)", p.name, st(keys, g.tested_to)));
+        } else if g.newest > 0. && now - g.newest > 90. * 86400. && g.value.is_some() {
+            open.push(format!("{} (last played {} months ago)", p.name, ((now - g.newest) / (30.4 * 86400.)).round()));
+        }
+    }
+    if !open.is_empty() {
+        out.push(format!("Not measured at your level: {}. Their bars are estimates; a few charts near {:.1}★ would pin them down.", open.join(", "), st(keys, overall.0)));
+    }
+    out
+}
+
 fn history_chart(ui: &mut Ui, keys: i64, h: &[(i64, f64, f64)], peak: (i64, f64), page: &Page, hints: &mut u32) {
     let dan = 1.;
     let (r, response, fx, marked) = zoomable(ui, ("history", keys), 110., |r| (r.left() + 8., r.right() - 74.));
@@ -202,7 +259,21 @@ fn history_chart(ui: &mut Ui, keys: i64, h: &[(i64, f64, f64)], peak: (i64, f64)
         p.hline((r.left() + 8.)..=(r.right() - 68.), y(stars), Stroke::new(1., TEXT.gamma_multiply(0.12)));
         p.text(pos2(r.right() - 62., y(stars)), Align2::LEFT_CENTER, name, small_font(), TEXT.gamma_multiply(0.55));
     }
-    plot.add(egui::Shape::line(h.iter().map(|&(m, v, _)| pos2(x(m), y(v))).collect(), Stroke::new(2., ACCENT)));
+    // One tick per calendar month; a month without enough plays keeps its space (user 2026-11-17).
+    for m in m0..=m1 {
+        plot.vline(x(m), (r.bottom() - 18.)..=(r.bottom() - 14.), Stroke::new(1., TEXT.gamma_multiply(0.3)));
+    }
+    // Months without enough plays: a dotted bridge from the last level before to the first after (user 2026-11-17).
+    for gap in h.windows(2).filter(|w| w[1].0 - w[0].0 > 1) {
+        plot.extend(egui::Shape::dashed_line(&[pos2(x(gap[0].0), y(gap[0].1)), pos2(x(gap[1].0), y(gap[1].1))], Stroke::new(1.5, ACCENT.gamma_multiply(0.6)), 2., 4.));
+    }
+    for run in h.chunk_by(|a, b| b.0 - a.0 == 1) {
+        if run.len() == 1 {
+            plot.circle_filled(pos2(x(run[0].0), y(run[0].1)), 2., ACCENT);
+        } else {
+            plot.add(egui::Shape::line(run.iter().map(|&(m, v, _)| pos2(x(m), y(v))).collect(), Stroke::new(2., ACCENT)));
+        }
+    }
     plot.circle_stroke(pos2(x(peak.0), y(peak.1)), 4., Stroke::new(2., ACCENT));
     let end = h[h.len() - 1];
     plot.circle_filled(pos2(x(end.0), y(end.1)), 4., ACCENT);
@@ -238,13 +309,15 @@ fn history_chart(ui: &mut Ui, keys: i64, h: &[(i64, f64, f64)], peak: (i64, f64)
 
 /// The last sessions play by play, against the rested expectation; hover a dot for its session and mark: the session
 /// lights up, the others dim.
-fn form_chart(ui: &mut Ui, form: &FormHistory, hints: &mut u32) {
+/// `keys`: each play's keymode when sessions mix them (All keymodes), shown in its tooltip.
+fn form_chart(ui: &mut Ui, form: &FormHistory, keys: Option<&[Vec<i64>]>, hints: &mut u32) {
     let (mut dots, mut gaps, mut count) = (Vec::new(), Vec::new(), 0usize);
     for (s, session) in form.sessions.iter().enumerate() {
         gaps.push(count);
         let day = date(session.t, "%d %b %H:%M");
-        for &(clock, value, mark) in &session.plays {
-            dots.push((count, value, mark, format!("{day} · {clock:.0} min in · {value:+.1}%{}", if mark.is_empty() { String::new() } else { format!(" · {mark}") }), s));
+        for (j, &(clock, value, mark)) in session.plays.iter().enumerate() {
+            let k = keys.and_then(|k| k.get(s)?.get(j)).map_or(String::new(), |k| format!("{k}K · "));
+            dots.push((count, value, mark, format!("{k}{day} · {clock:.0} min in · {value:+.1}%{}", if mark.is_empty() { String::new() } else { format!(" · {mark}") }), s));
             count += 1;
         }
         count += 2;
@@ -402,7 +475,7 @@ impl App {
         }
         if let Some(form) = page.form.as_ref().filter(|f| !f.sessions.is_empty()) {
             ui.label("Form, play by play (last sessions)");
-            form_chart(ui, form, &mut self.s.chart_hints);
+            form_chart(ui, form, None, &mut self.s.chart_hints);
             ui.horizontal(|ui| {
                 for (name, colour) in FORM {
                     ui.label(RichText::new("●").color(colour).size(theme::SMALL));
@@ -471,13 +544,9 @@ impl App {
             });
             ui.ctx().request_repaint();
         }
-        let reliable: Vec<(&str, &Group)> = parents.iter().filter_map(|p| groups.get(&p.key).filter(|g| g.value.is_some() && g.maps >= 10).map(|g| (p.name, g))).collect();
         if value.is_some() {
-            let by = |a: &&(&str, &Group), b: &&(&str, &Group)| a.1.value.total_cmp_opt(&b.1.value);
-            if let (Some(high), Some(low)) = (reliable.iter().max_by(by), reliable.iter().min_by(by)) {
-                if high.1.low > low.1.high {
-                    ui.label(format!("Profile contrast: {} is better supported at higher difficulty than {}.", high.0, low.0));
-                }
+            for line in skill_insights(keys, page, &parents) {
+                ui.label(line);
             }
         }
         egui::CollapsingHeader::new("Prediction strengths & blind spots").show(ui, |ui| {
@@ -532,6 +601,16 @@ impl App {
                             self.request_save();
                         }
                     }
+                    if let Some((form, keys)) = merged_form(&data.pages) {
+                        ui.label("Form, play by play (last sessions, every keymode against its own expectation)");
+                        form_chart(ui, &form, Some(&keys), &mut self.s.chart_hints);
+                        ui.horizontal(|ui| {
+                            for (name, colour) in FORM {
+                                ui.label(RichText::new("●").color(colour).size(theme::SMALL));
+                                theme::dim_small(ui, name);
+                            }
+                        });
+                    }
                 }
                 Some(k) => {
                     if let Some(page) = data.pages.get(&k) {
@@ -546,20 +625,23 @@ impl App {
     }
 }
 
-trait Cmp {
-    fn total_cmp_opt(&self, other: &Self) -> std::cmp::Ordering;
-}
-
-impl Cmp for Option<f64> {
-    fn total_cmp_opt(&self, other: &Self) -> std::cmp::Ordering {
-        self.unwrap_or(0.).total_cmp(&other.unwrap_or(0.))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use egui_kittest::Harness;
+
+    #[test]
+    fn all_keymodes_form_merges_by_time_and_splits_on_long_breaks() {
+        let session = |t: f64, plays: Vec<(f64, f64, &'static str)>| ms_rec::stats::FormSession { t, hours: 0., plays };
+        let page = |sessions| Page { form: Some(FormHistory { sessions, ..FormHistory::default() }), ..Page::default() };
+        let mut pages = std::collections::BTreeMap::new();
+        pages.insert(4, page(vec![session(0., vec![(0., 1., "warm-up"), (10., 2., "")]), session(20000., vec![(0., 5., "")])]));
+        pages.insert(7, page(vec![session(300., vec![(0., -1., "peak")])])); // 5 min in, between the 4K plays
+        let (form, keys) = merged_form(&pages).unwrap();
+        assert_eq!(form.sessions.len(), 2, "a 5.5 h break starts a new session");
+        assert_eq!(keys, vec![vec![4, 7, 4], vec![4]]);
+        assert_eq!(form.sessions[0].plays.iter().map(|p| p.0).collect::<Vec<_>>(), vec![0., 5., 10.]);
+    }
 
     #[test]
     fn a_chart_zooms_at_the_cursor_and_pans_once_zoomed() {

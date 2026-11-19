@@ -32,18 +32,25 @@ impl Tree {
 pub struct Model {
     pub features: Vec<String>,
     pub base: f64,
+    /// level per ln(overall) under the trees: trees stay flat past the labelled top (O2Jam levels end near 180), so harder
+    /// charts kept reading the same level (user 2026-11-18: a 14★ and an 11.8★ map both Lv. 161)
+    pub lin: f64,
     pub rate: f64,
     pub trees: Vec<Tree>,
 }
 
 impl Model {
     pub fn predict(&self, x: &[f64]) -> f64 {
-        self.base + self.rate * self.trees.iter().map(|t| t.eval(x)).sum::<f64>()
+        self.base + self.lin * self.ln_overall(x) + self.rate * self.trees.iter().map(|t| t.eval(x)).sum::<f64>()
+    }
+
+    pub fn ln_overall(&self, x: &[f64]) -> f64 {
+        self.features.iter().position(|f| f == "overall").map_or(0., |i| x[i].max(0.1).ln())
     }
 
     pub fn to_json(&self) -> Value {
         let trees: Vec<Value> = self.trees.iter().map(|t| serde_json::json!({"feat": t.feat, "thr": t.thr, "left": t.left, "right": t.right, "value": t.value})).collect();
-        serde_json::json!({"features": self.features, "base": self.base, "rate": self.rate, "trees": trees})
+        serde_json::json!({"features": self.features, "base": self.base, "lin": self.lin, "rate": self.rate, "trees": trees})
     }
 
     pub fn from_json(v: &Value) -> Option<Model> {
@@ -55,7 +62,7 @@ impl Model {
             right: nums(t, "right")?.into_iter().map(|x| x as u32).collect(),
             value: nums(t, "value")?,
         })).collect::<Option<Vec<_>>>()?;
-        Some(Model { features: v["features"].as_array()?.iter().map(|f| f.as_str().map(str::to_string)).collect::<Option<_>>()?, base: v["base"].as_f64()?, rate: v["rate"].as_f64()?, trees })
+        Some(Model { features: v["features"].as_array()?.iter().map(|f| f.as_str().map(str::to_string)).collect::<Option<_>>()?, base: v["base"].as_f64()?, lin: v["lin"].as_f64().unwrap_or(0.), rate: v["rate"].as_f64()?, trees })
     }
 
     /// The feature row: each named calc score (0 when the calc doesn't report it), then EXTRA.
@@ -86,7 +93,7 @@ mod tests {
         let m = super::model();
         assert!(!m.trees.is_empty() && m.features.iter().any(|f| f == "overall"));
         let at = |o: f64| super::level(7, |k| if k == "overall" { o } else { o * 0.6 }, 0.5, 150., 2000.).unwrap();
-        assert!(at(6.) < at(11.) && at(11.) < at(16.), "{} {} {}", at(6.), at(11.), at(16.));
+        assert!(at(6.) < at(11.) && at(11.) < at(16.) && at(16.) < at(24.), "{} {} {} {}", at(6.), at(11.), at(16.), at(24.));
         assert_eq!(super::level(4, |_| 10., 0.5, 150., 2000.), None);
     }
 }

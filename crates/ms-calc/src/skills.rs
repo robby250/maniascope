@@ -362,13 +362,31 @@ pub fn local_levels(series: &[f64], window: f64, k: &Knobs) -> Vec<f64> {
 /// The skill whose expected accuracy over the notes reaches the target, as MinaCalc searches the rating that reaches its
 /// goal accuracy. A note at level l loses 1 − exp(−(l/skill)^p) of its accuracy: little far below the skill, at most a
 /// miss far above it, so a short hard burst costs its own notes and not the whole chart (a peak model's error).
+/// With any of the level curves on (ACC_POWER_LVL … FATIGUE_W_XL), a second pass reads the power, target, window and fatigue
+/// weight at the first pass's level (plan 2026-11-16 curves).
 pub fn rating(series: &[f64], judged: &Judged, keys: usize, k: &Knobs) -> f64 {
-    search(&powered(series, k.LOCAL_WINDOW, judged, keys, k), &judged.notes, k)
+    let first = search(&powered(series, k.LOCAL_WINDOW, judged, keys, k), &judged.notes, k);
+    let curves = [k.ACC_POWER_LVL, k.ACC_POWER_XL, k.ACC_TARGET_L, k.ACC_TARGET_XL, k.LOCAL_WINDOW_L, k.LOCAL_WINDOW_XL, k.FATIGUE_W_L, k.FATIGUE_W_XL];
+    if curves.iter().all(|&c| c == 0.0) || !(first > 0.0) {
+        return first;
+    }
+    let (l, x) = ((first / k.LEVEL_REF).ln(), (keys as f64 / 7.0).ln());
+    let at = |a: f64, b: f64| (a * l + b * x * l).exp();
+    let p = k.ACC_POWER * at(k.ACC_POWER_LVL, k.ACC_POWER_XL);
+    let fw = fatigue_weight(keys, k) * at(k.FATIGUE_W_L, k.FATIGUE_W_XL);
+    let factor: Vec<f64> = (0..judged.notes.len()).map(|i| pow(1.0 + fw * judged.fatigue.get(i).copied().unwrap_or(0.0), p)).collect();
+    let lp = powered_with(series, k.LOCAL_WINDOW * at(k.LOCAL_WINDOW_L, k.LOCAL_WINDOW_XL), &judged.notes, &factor, p, k);
+    solve(&lp, &judged.notes, p, (k.ACC_TARGET * at(k.ACC_TARGET_L, k.ACC_TARGET_XL)).clamp(1e-3, 0.5))
 }
 
 /// The stamina rating: the same accuracy level with the sustained demand (STAMINA_WINDOW) in place of the local one.
 pub fn stamina_rating(series: &[f64], judged: &Judged, keys: usize, k: &Knobs) -> f64 {
-    search(&powered(series, k.STAMINA_WINDOW, judged, keys, k), &judged.notes, k)
+    window_rating(series, judged, keys, k.STAMINA_WINDOW, k)
+}
+
+/// The rating with the demand averaged over `window` seconds.
+pub fn window_rating(series: &[f64], judged: &Judged, keys: usize, window: f64, k: &Knobs) -> f64 {
+    search(&powered(series, window, judged, keys, k), &judged.notes, k)
 }
 
 /// x^p, exact multiplications for a whole p.
@@ -379,14 +397,18 @@ fn pow(x: f64, p: f64) -> f64 {
 /// (level^p, judgements) of each bin with notes and demand, where level = `fatigued(local_levels(..))`, straight from the
 /// demand: star(c·√m)^p = (A·c^B)^p · m^(B·p/2), one powf per bin and no level vector (most of a rating's cost was there).
 fn powered(series: &[f64], window: f64, judged: &Judged, keys: usize, k: &Knobs) -> Vec<(f64, f64)> {
+    powered_with(series, window, &judged.notes, judged.factor(keys, k), k.ACC_POWER, k)
+}
+
+/// `powered` at power `p` with each bin's fatigue factor (1 + w·fatigue)^p given.
+fn powered_with(series: &[f64], window: f64, notes: &[f64], factor: &[f64], p: f64, k: &Knobs) -> Vec<(f64, f64)> {
     let w = 1usize.max((window / k.BIN) as usize);
-    let (p, factor) = (k.ACC_POWER, judged.factor(keys, k));
     let unit = pow(k.STAR_A * (k.SCALE / k.LOCAL_TOL).powf(k.STAR_B), p);
     let mut out = Vec::new();
     let mut acc = 0.0f64;
     for i in 0..series.len() {
         acc = 0f64.max(acc + series[i] - if i >= w { series[i - w] } else { 0.0 });
-        let n = judged.notes.get(i).copied().unwrap_or(0.0);
+        let n = notes.get(i).copied().unwrap_or(0.0);
         if acc > 0.0 && n > 0.0 {
             out.push((unit * (acc / w as f64).powf(k.STAR_B * p / 2.0) * factor[i], n));
         }
@@ -408,6 +430,7 @@ pub fn fatigued(mut levels: Vec<f64>, fatigue: &[f64], w: f64) -> Vec<f64> {
 }
 
 /// `rating` from levels already made (the SV-reading calibration builds them from its own window sums).
+/// ponytail: one pass, the level curves (ACC_POWER_LVL …) don't reach it; give it `rating`'s second pass if they ship.
 pub fn accuracy_rating(levels: &[f64], notes: &[f64], k: &Knobs) -> f64 {
     let lp: Vec<(f64, f64)> = levels.iter().zip(notes).filter(|(l, n)| **l > 0.0 && **n > 0.0).map(|(l, n)| (pow(*l, k.ACC_POWER), *n)).collect();
     search(&lp, notes, k)
@@ -415,8 +438,11 @@ pub fn accuracy_rating(levels: &[f64], notes: &[f64], k: &Knobs) -> f64 {
 
 /// The search behind every rating, on (level^p, judgements) of the bins with notes; `notes` holds every bin's judgements.
 fn search(lp: &[(f64, f64)], notes: &[f64], k: &Knobs) -> f64 {
+    solve(lp, notes, k.ACC_POWER, k.ACC_TARGET)
+}
+
+fn solve(lp: &[(f64, f64)], notes: &[f64], p: f64, target: f64) -> f64 {
     let den: f64 = notes.iter().sum();
-    let p = k.ACC_POWER;
     let mean = lp.iter().map(|(x, n)| n * x).sum::<f64>() / den.max(1e-9);
     if den <= 0.0 || mean <= 0.0 {
         return 0.0;
@@ -435,17 +461,17 @@ fn search(lp: &[(f64, f64)], notes: &[f64], k: &Knobs) -> f64 {
         (loss / den, -slope / den)
     };
     let (mut lo, mut hi) = (mean.ln() - 3.0 * p * 10f64.ln(), mean.ln() + 3.0 * p * 10f64.ln());
-    if lp.iter().map(|(_, n)| n).sum::<f64>() / den <= k.ACC_TARGET {
+    if lp.iter().map(|(_, n)| n).sum::<f64>() / den <= target {
         return (lo / p).exp(); // too few of the chart's notes to lose the target even all missed: the search's floor (it bisected 43 times to it)
     }
-    if at(lo).0 <= k.ACC_TARGET {
+    if at(lo).0 <= target {
         return (lo / p).exp(); // under the target even at the floor: the search bisected ~43 times to within 1e-10 of it (a tenth of all searches)
     }
-    let mut v = mean.ln() - (-(1.0 - k.ACC_TARGET).ln()).ln(); // exact when every note meets the same level
+    let mut v = mean.ln() - (-(1.0 - target).ln()).ln(); // exact when every note meets the same level
     for _ in 0..100 {
         let (loss, slope) = at(v);
-        if loss > k.ACC_TARGET { lo = v } else { hi = v }
-        let step = if loss > 0.0 && slope < 0.0 { ((loss / k.ACC_TARGET).ln() * loss / slope).clamp(-3.0, 3.0) } else { 3.0 }; // no loss: skill far too high
+        if loss > target { lo = v } else { hi = v }
+        let step = if loss > 0.0 && slope < 0.0 { ((loss / target).ln() * loss / slope).clamp(-3.0, 3.0) } else { 3.0 }; // no loss: skill far too high
         if step.abs() < 1e-6 {
             v -= step; // Newton is quadratic here: what this step leaves is ~step², below 1e-12
             break;

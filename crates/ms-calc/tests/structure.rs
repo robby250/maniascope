@@ -40,8 +40,8 @@ fn endurance_recovers_and_depends_on_the_rest() {
         let n = fine.len();
         [fine.clone(), fine, vec![0.; n]]
     };
-    let ((continuous, _), _) = endurance(&[&run(vec![10.; 240])], 1., 8);
-    let ((rested, _), timeline) = endurance(&[&run([vec![10.; 120], vec![0.; 60], vec![10.; 120]].concat())], 1., 8);
+    let ((continuous, _), _) = endurance(&[&run(vec![10.; 240])], 1., 8, 1.);
+    let ((rested, _), timeline) = endurance(&[&run([vec![10.; 120], vec![0.; 60], vec![10.; 120]].concat())], 1., 8, 1.);
     assert!(continuous > rested);
     assert!(timeline[179] < timeline[119] / 5.);
 }

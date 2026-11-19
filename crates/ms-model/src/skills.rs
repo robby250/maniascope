@@ -198,6 +198,12 @@ pub fn for_tree(selected: &[String], t: usize) -> Vec<String> {
     normalize_plain(&mine)
 }
 
+/// Skills picked in the other tree only: `keys`' tree takes no part (an empty tree would match every chart).
+pub fn left_out(selected: &[String], keys: i64) -> bool {
+    let picked = |t: usize| for_tree(selected, t).iter().any(|k| !k.starts_with('!'));
+    !picked(tree_index(keys)) && picked(1 - tree_index(keys))
+}
+
 /// Both trees' choices as one list: what both share unscoped, the rest under its tree's scope.
 fn join(views: [Vec<String>; 2]) -> Vec<String> {
     let shared: Vec<String> = views[0].iter().filter(|k| views[1].contains(k)).cloned().collect();
@@ -384,6 +390,13 @@ mod tests {
     }
 
     /// One rule for every skill, the card's: a skill counts at SHOW of the chart's strongest family (Technical aside).
+    #[test]
+    fn a_tree_with_nothing_picked_is_left_out_while_the_other_has_picks() {
+        let four = vec!["4k:vibro".to_string()];
+        assert!(!left_out(&four, 4) && left_out(&four, 7) && left_out(&four, 10));
+        assert!(!left_out(&[], 7) && !left_out(&["vibro".to_string()], 7));
+    }
+
     #[test]
     fn each_tree_picks_its_own_skills() {
         let both = normalize(&v(&["vibro", "stream"]));

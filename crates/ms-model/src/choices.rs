@@ -15,6 +15,7 @@ pub struct Choice {
     pub value: f64, // base_value
     pub installed: bool,
     pub convert: bool, // a keymode convert, imported or not
+    pub source_web: bool, // a convert of a website chart
     pub playcount: f64,
     pub family: String,
     pub description: String,
@@ -32,11 +33,14 @@ pub struct Choice {
 pub const REAL: u8 = 0;
 pub const WEB: u8 = 1;
 pub const CONVERT: u8 = 2;
+/// A convert of a website chart: it answers to both sliders (user 2026-11-18: at web 0.3 half the convert offers were website
+/// sourced, as half the convert pool is).
+pub const WEB_CONVERT: u8 = 3;
 
 impl Choice {
     /// Which how-often slider the chart answers to. An imported convert is still a convert.
     pub fn stream(&self) -> u8 {
-        if self.convert { CONVERT } else if self.installed { REAL } else { WEB }
+        if self.convert { if self.source_web { WEB_CONVERT } else { CONVERT } } else if self.installed { REAL } else { WEB }
     }
 
     /// recommend.event_key
@@ -259,7 +263,7 @@ impl Prepared {
         let mut family_at: HashMap<(i64, &str), usize> = HashMap::default();
         for &i in &self.kept {
             let c = &items[i];
-            if !keys.contains(&c.keys) || (web <= 0. && c.stream() == WEB) || (convert <= 0. && c.stream() == CONVERT) {
+            if !keys.contains(&c.keys) || (web <= 0. && matches!(c.stream(), WEB | WEB_CONVERT)) || (convert <= 0. && matches!(c.stream(), CONVERT | WEB_CONVERT)) {
                 continue;
             }
             match family_at.get(&(c.keys, c.family.as_str())) {
@@ -290,7 +294,7 @@ impl Prepared {
     /// the old nps.weighted_candidates (family best, quality weights), the unconsumed filter, the NPS shuffle and the web mix (Worker._pool) →
     /// ([(entry index, value, weight, category_share)], freshness relaxed), in shown order.
     #[allow(clippy::type_complexity)]
-    pub fn rank(&self, r: Ranking<'_>) -> (Vec<(usize, f64, f64, f64)>, bool, [f64; 3]) {
+    pub fn rank(&self, r: Ranking<'_>) -> (Vec<(usize, f64, f64, f64)>, bool, [f64; 4]) {
         let items = &self.list.items;
         let mut rows = self.family_best(&r.keys, r.web, r.convert);
         // The floor follows each keymode's eligible pool and the Variety ↔ NPS slider: far below it is not NPS practice
@@ -308,7 +312,7 @@ impl Prepared {
             });
         }
         if rows.is_empty() {
-            return (Vec::new(), false, [1., 0., 0.]);
+            return (Vec::new(), false, [1., 0., 0., 0.]);
         }
         let mut counts: HashMap<(i64, &str), usize> = HashMap::default();
         rows.iter().for_each(|&i| *counts.entry((items[i].keys, items[i].group.as_str())).or_insert(0) += 1);
@@ -373,8 +377,16 @@ impl Prepared {
             let order = shuffle_order(&ids, &weights, seed, *focus);
             available = order.into_iter().map(|i| available[i]).collect();
             if let Some(shares) = &r.skill_weights {
-                let at: Vec<(i64, &str)> = available.iter().map(|x| (items[x.0].keys, slot(&items[x.0], Some(shares)).0 .1)).collect();
-                available = skill_order(&at, shares, &r.key_shares, &r.recent_skills).into_iter().map(|i| available[i]).collect();
+                // Skill turns within each stream: `mix_order` deals the streams after this and holds website rows back, so over one
+                // sequence the turns that fell on them were lost and the installed rows alternated other/vibro (user 2026-11-18:
+                // 10 of 11 4K offers Vibro at a 7 % share; the list's installed 4K rows read other, vibro, other, vibro).
+                let mut by_stream = Vec::with_capacity(available.len());
+                for stream in [REAL, WEB, CONVERT, WEB_CONVERT] {
+                    let rows: Vec<(usize, f64, f64, f64)> = available.iter().filter(|x| items[x.0].stream() == stream).copied().collect();
+                    let at: Vec<(i64, &str)> = rows.iter().map(|x| (items[x.0].keys, slot(&items[x.0], Some(shares)).0 .1)).collect();
+                    by_stream.extend(skill_order(&at, shares, &r.key_shares, &r.recent_skills).into_iter().map(|i| rows[i]));
+                }
+                available = by_stream;
             }
         }
         let streams: Vec<u8> = available.iter().map(|x| items[x.0].stream()).collect();
@@ -504,10 +516,14 @@ fn skill_order(at: &[(i64, &str)], shares: &std::collections::HashMap<String, f6
 /// The odds of each stream against your own maps. Weighted, the sliders set a chance per map: at the middle every map
 /// is equally likely, so twice as many converts the list can offer now means twice as many convert picks (user
 /// 2026-11-01). Off, they are plain shares of the picks.
-pub fn stream_odds(sliders: [f64; 2], weighted: [bool; 2], streams: &[u8]) -> [f64; 3] {
+pub fn stream_odds(sliders: [f64; 2], weighted: [bool; 2], streams: &[u8]) -> [f64; 4] {
     let count = |k: u8| streams.iter().filter(|&&s| s == k).count() as f64;
-    let per_map = |k: usize, stream: u8| if weighted[k] { sliders[k] * count(stream) / count(REAL).max(1.) } else { sliders[k] };
-    [1., per_map(0, WEB), per_map(1, CONVERT)]
+    let per_map = |k: usize, maps: f64| if weighted[k] { sliders[k] * maps / count(REAL).max(1.) } else { sliders[k] };
+    // a convert of a website chart counts as the website slider's part of a map: the converts' odds split by that
+    let (own, web) = (count(CONVERT), sliders[0] * count(WEB_CONVERT));
+    let converts = per_map(1, own + web);
+    let of_web = if own + web > 0. { web / (own + web) } else { 0. };
+    [1., per_map(0, count(WEB)), converts * (1. - of_web), converts * of_web]
 }
 
 /// A stream's share still owed after a tab's recent offers, oldest first: the mix keeps the slider's share across
@@ -533,7 +549,7 @@ pub fn mix_shares<K: Ord + Clone>(entries: &[(K, f64, usize)], by_count: bool) -
 
 /// Indices interleaved by keymode, each keymode owed its share (`key_shares`; equal when missing) after its recent offers
 /// (as `credit`), its own entries in `mix_order` with odds against its own maps.
-pub fn keymode_order(keys: &[i64], streams: &[u8], odds: impl Fn(&[u8]) -> [f64; 3], recent: &[(u8, i64)], shares: &std::collections::BTreeMap<i64, f64>) -> Vec<usize> {
+pub fn keymode_order(keys: &[i64], streams: &[u8], odds: impl Fn(&[u8]) -> [f64; 4], recent: &[(u8, i64)], shares: &std::collections::BTreeMap<i64, f64>) -> Vec<usize> {
     let mut modes: Vec<i64> = keys.to_vec();
     modes.sort_unstable();
     modes.dedup();
@@ -560,19 +576,19 @@ pub fn keymode_order(keys: &[i64], streams: &[u8], odds: impl Fn(&[u8]) -> [f64;
 /// nps.mix: your maps, website charts and converts interleaved, each stream in its ranked order, at its share of the
 /// odds plus `credit` (sampling all from one weighted pool let whichever had more mass fill the list, user 2026-10-25).
 /// recent: as Ranking.recent.
-pub fn mix_order(streams: &[u8], odds: [f64; 3], recent: &[u8]) -> Vec<usize> {
-    let mut pools: [std::collections::VecDeque<usize>; 3] = Default::default();
+pub fn mix_order(streams: &[u8], odds: [f64; 4], recent: &[u8]) -> Vec<usize> {
+    let mut pools: [std::collections::VecDeque<usize>; 4] = Default::default();
     for (i, &s) in streams.iter().enumerate() {
         pools[s as usize].push_back(i);
     }
     let total: f64 = odds.iter().sum();
     let share = odds.map(|o| o / total);
-    let credits = [0., credit(recent, WEB, share[1]), credit(recent, CONVERT, share[2])];
-    let mut taken = [0.; 3];
+    let credits = [0., credit(recent, WEB, share[1]), credit(recent, CONVERT, share[2]), credit(recent, WEB_CONVERT, share[3])];
+    let mut taken = [0.; 4];
     (0..streams.len()).map(|i| {
         let owed = |k: usize| credits[k] + share[k] * (i + 1) as f64 - taken[k];
         // A website chart or a convert only once its share is due; the one owed most goes first.
-        let due = [WEB as usize, CONVERT as usize].into_iter().filter(|&k| !pools[k].is_empty() && (pools[0].is_empty() || owed(k) >= 1. - 1e-9))
+        let due = [WEB as usize, CONVERT as usize, WEB_CONVERT as usize].into_iter().filter(|&k| !pools[k].is_empty() && (pools[0].is_empty() || owed(k) >= 1. - 1e-9))
             .fold(None::<usize>, |best, k| if best.is_none_or(|b| owed(k) > owed(b)) { Some(k) } else { best });
         let side = due.unwrap_or(REAL as usize);
         taken[side] += 1.;
@@ -668,8 +684,8 @@ mod tests {
 mod stream_tests {
     use super::*;
 
-    fn picks(streams: &[u8], odds: [f64; 3], rounds: usize) -> [usize; 3] {
-        let (mut recent, mut got) = (Vec::new(), [0; 3]);
+    fn picks(streams: &[u8], odds: [f64; 4], rounds: usize) -> [usize; 4] {
+        let (mut recent, mut got) = (Vec::new(), [0; 4]);
         for _ in 0..rounds {
             let first = streams[mix_order(streams, odds, &recent)[0]];
             got[first as usize] += 1;
@@ -693,27 +709,35 @@ mod stream_tests {
     fn the_middle_of_a_weighted_slider_is_the_same_chance_per_map() {
         let streams = pool(5000, 0, 10000);
         let odds = stream_odds([0., 1.], [true, true], &streams);
-        assert_eq!(odds, [1., 0., 2.]);
+        assert_eq!(odds, [1., 0., 2., 0.]);
         let got = picks(&streams, odds, 300);
         assert!((got[2] as i64 - 200).abs() <= 4, "{got:?}"); // the spacing window is 40 offers
-        assert_eq!(stream_odds([0., 1.], [false, false], &streams), [1., 0., 1.]);
+        assert_eq!(stream_odds([0., 1.], [false, false], &streams), [1., 0., 1., 0.]);
+        // converts of website charts answer to the website slider too: a third of a map each at 1/3
+        let mut mixed = pool(100, 0, 100);
+        mixed.extend(vec![WEB_CONVERT; 300]);
+        let odds = stream_odds([1. / 3., 1.], [true, true], &mixed);
+        assert!((odds[2] - 1.).abs() < 1e-9 && (odds[3] - 1.).abs() < 1e-9, "{odds:?}");
+        let got = picks(&mixed, odds, 300);
+        assert!((got[2] as i64 - 100).abs() <= 8 && got[2].abs_diff(got[3]) <= 2, "{got:?}"); // equal odds: equal picks, about a third each
+        assert_eq!(stream_odds([0., 1.], [true, true], &mixed)[3], 0., "website off: none of them");
     }
 
     #[test]
     fn each_stream_keeps_its_share_across_picks() {
         for share in [0.15, 0.5, 0.8] {
-            let odds = [1., 0., share / (1. - share)];
+            let odds = [1., 0., share / (1. - share), 0.];
             let got = picks(&pool(100, 0, 100), odds, 40);
             assert!((got[2] as f64 - 40. * share).abs() <= 1., "{share} {got:?}");
         }
-        let got = picks(&pool(50, 50, 50), [1., 1., 2.], 40);
+        let got = picks(&pool(50, 50, 50), [1., 1., 2., 0.], 40);
         assert!((got[1] as i64 - 10).abs() <= 1 && (got[2] as i64 - 20).abs() <= 1, "{got:?}");
     }
 
     #[test]
     fn two_streams_order_as_before() {
         // nps.mix's order at 1:1 from zero: a website chart once its share is due.
-        assert_eq!(mix_order(&[REAL, REAL, WEB, WEB], [1., 1., 0.], &[]), [0, 2, 1, 3]);
+        assert_eq!(mix_order(&[REAL, REAL, WEB, WEB], [1., 1., 0., 0.], &[]), [0, 2, 1, 3]);
     }
 
     #[test]
@@ -721,12 +745,12 @@ mod stream_tests {
         let keys = [10, 10, 10, 10, 10, 10, 7, 7, 7];
         let counts = [(7, 3), (10, 6)].into_iter().collect();
         let order = |w: &[(i64, f64)], recent: &[(u8, i64)]| -> Vec<i64> {
-            keymode_order(&keys, &[REAL; 9], |_| [1., 0., 0.], recent, &key_shares(&[7, 10], &w.iter().copied().collect(), &counts, true)).iter().map(|&i| keys[i]).collect()
+            keymode_order(&keys, &[REAL; 9], |_| [1., 0., 0., 0.], recent, &key_shares(&[7, 10], &w.iter().copied().collect(), &counts, true)).iter().map(|&i| keys[i]).collect()
         };
         assert_eq!(&order(&[], &[])[..6], [10, 7, 10, 10, 7, 10]); // 6 of 9 maps are 10K: two thirds of the picks
         assert_eq!(&order(&[(7, 2.)], &[])[..4], [7, 10, 7, 10]); // 7K's slider at 2× evens 3 maps against 6
         assert_eq!(order(&[], &[(REAL, 10), (REAL, 10)])[0], 7); // 10K was just offered twice: 7K is owed
-        let even: Vec<i64> = keymode_order(&keys, &[REAL; 9], |_| [1., 0., 0.], &[], &key_shares(&[7, 10], &Default::default(), &counts, false)).iter().map(|&i| keys[i]).collect();
+        let even: Vec<i64> = keymode_order(&keys, &[REAL; 9], |_| [1., 0., 0., 0.], &[], &key_shares(&[7, 10], &Default::default(), &counts, false)).iter().map(|&i| keys[i]).collect();
         assert_eq!(&even[..4], [7, 10, 7, 10]); // the toggle off: even turns
     }
 }
@@ -737,7 +761,7 @@ mod list_tests {
     use super::*;
 
     fn choice(sha: &str, nps: f64, group: &str) -> Choice {
-        Choice { sha: sha.into(), md5: sha.into(), keys: 7, rate: 1., value: 0., installed: true, convert: false, playcount: -1., family: sha.into(), description: "Mixed".into(),
+        Choice { sha: sha.into(), md5: sha.into(), keys: 7, rate: 1., value: 0., installed: true, convert: false, source_web: false, playcount: -1., family: sha.into(), description: "Mixed".into(),
                  group: group.into(), nps, length: 180., profile: vec![1.], acc_mid: 0.94, matched: Vec::new(), practice: String::new(), pred: Prediction::default(), generated_at: 0. }
     }
 
@@ -867,7 +891,7 @@ mod list_tests {
     #[test]
     fn the_website_slider_mixes_both_kinds() {
         let streams: Vec<u8> = std::iter::repeat_n(WEB, 30).chain(std::iter::repeat_n(REAL, 10)).collect();
-        let order = |web: f64| mix_order(&streams, [1., web, 0.], &[]);
+        let order = |web: f64| mix_order(&streams, [1., web, 0., 0.], &[]);
         let half = order(1.);
         assert_eq!(half.len(), 40);
         assert_eq!(half[..20].iter().map(|&i| streams[i]).collect::<Vec<_>>(), [REAL, WEB].repeat(10));
@@ -948,6 +972,22 @@ mod list_tests {
         }
         let vibro = recent.iter().filter(|s| s.0 == "vibro").count();
         assert!((10..=21).contains(&vibro) && tens.1 <= 2, "{vibro} of 120 vibro, {} of {} 10K picks", tens.1, tens.0);
+    }
+
+    /// User 2026-11-18: website rows took the other maps' turns, and the installed rows left alternated with Vibro.
+    #[test]
+    fn website_rows_leave_the_skill_turns_of_installed_maps_alone() {
+        let rows: Vec<Choice> = (0..600).map(|i| {
+            let mut c = choice(&format!("a{i}"), 30., "chords");
+            c.matched = if i < 40 { vec!["vibro".to_string()] } else { Vec::new() };
+            (c.installed, c.playcount) = (i < 200, 1000.); // 40 vibro + 160 other installed, 400 other on the website
+            c
+        }).collect();
+        let p = prepared(rows, &[7]);
+        let weights: std::collections::HashMap<String, f64> = [("vibro".to_string(), 0.25), (String::new(), 0.75)].into();
+        let vibro = (0..20).map(|seed| ranked(&p, Ask { nps: false, web: 0.2, shuffle: Some((seed.to_string(), 0.8)), weights: Some(weights.clone()), ..Ask::default() })
+            .iter().filter(|c| c.0.installed).take(12).filter(|c| !c.0.matched.is_empty()).count()).sum::<usize>() as f64 / 240.;
+        assert!((vibro - 0.25).abs() < 0.03, "{vibro} of the installed rows");
     }
 
     #[test]

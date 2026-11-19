@@ -201,9 +201,10 @@ pub fn evidence_rows(db: &Db, source: &mut FeatureSource, c: &Consts) -> Result<
         let mods: Value = r.mods.as_deref().and_then(|m| serde_json::from_str(m).ok()).unwrap_or(Value::Array(Vec::new()));
         let stable = stable_judged(&r.key, r.client.as_deref(), &mods);
         let shift = if stable { ln } else { 0. };
+        let ceiling = 1. - out.feats[at].unhittable; // stacked notes are sure misses: the fit reads the hittable notes
         out.rows.push(Evidence {
-            y: y_of(acc) - STABLE_LN_Y320 * shift,
-            y_lazer: y_of(stats.as_ref().map_or(0., acc_lazer)) - STABLE_LN_Y * shift,
+            y: y_of(acc / ceiling) - STABLE_LN_Y320 * shift,
+            y_lazer: y_of(stats.as_ref().map_or(0., acc_lazer) / ceiling) - STABLE_LN_Y * shift,
             keys: out.feats[at].keys,
             t,
             chart,

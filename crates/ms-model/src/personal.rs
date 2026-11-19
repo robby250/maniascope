@@ -397,6 +397,43 @@ fn retry(rows: &[Row], u: &[f64], session_gap: f64) -> f64 {
     if diffs.len() < 20 { 0. } else { (mean(&diffs) * diffs.len() as f64 / (diffs.len() as f64 + 50.)).clamp(0., 0.15) }
 }
 
+/// The chart's SV rating (its SV share × overall) squared: what an unread chart's first plays lose grows with how hard its SV
+/// is, little on light SV and much on the hardest (own first plays since 2026-09-01: Carry me away 4K/7K at SV 6.0/5.9 −7/−10 pp,
+/// SV under 1 about ±1 pp; squared fit the curve better than linear; SV share instead fitted 0).
+pub fn sv_load(f: &Feats, c: &Consts) -> f64 {
+    c.names.iter().position(|n| n == "sv").map_or(0., |j| (f.sk[j] * f.overall).powi(2))
+}
+
+/// Unread-chart deficit (user 2026-11-16: SV maps with no local scores play far under their forecast, accuracy rises with
+/// retries): extra error on a chart's (n+1)-th own play, (a + UNREAD_SV·sv_load)/(1 + n). `a` is ridge-fitted on the context
+/// residual `u`; both are taken out of it, so chart affinity keeps only what stays after the chart is learned.
+fn unread(rows: &[Row], feats: &[Feats], c: &Consts, u: &mut [f64]) -> (f64, f64) {
+    let mut seq: Vec<usize> = (0..rows.len()).filter(|&i| !rows[i].public && rows[i].ts > 0.).collect();
+    seq.sort_by(|&a, &b| rows[a].ts.total_cmp(&rows[b].ts));
+    let mut seen: HashMap<&str, f64> = HashMap::default();
+    let x: Vec<(usize, f64, f64)> = seq.iter().map(|&i| {
+        let n = seen.entry(rows[i].chart.as_str()).or_insert(0.);
+        let w = 1. / (1. + *n);
+        *n += 1.;
+        (i, w, w * feats.get(rows[i].f).map_or(0., |f| sv_load(f, c)))
+    }).collect();
+    if x.len() < 50 {
+        return (0., 0.);
+    }
+    let (pp, pu) = x.iter().fold((UNREAD_RIDGE, 0.), |(pp, pu), &(i, p, q)| (pp + p * p, pu + p * (u[i] - UNREAD_SV * q)));
+    let a = (pu / pp).clamp(0., 0.3);
+    for &(i, p, q) in &x {
+        u[i] -= a * p + UNREAD_SV * q;
+    }
+    (a, UNREAD_SV)
+}
+
+const UNREAD_RIDGE: f64 = 20.;
+/// Log error per SV rating² on a chart's first play. ponytail: speculative (user 2026-11-16: "make a speculative value, we'll
+/// change it later"); own history holds only two hard-SV first plays (Carry me away 4K/7K, SV ~6: −7/−10 pp, this gives ~−5/−11).
+/// Fit it once more SV first plays and retries exist.
+const UNREAD_SV: f64 = 0.03;
+
 /// Personal._rate_anchors
 fn rate_anchors(stats: &[(f64, f64, f64)], bandwidth: f64, shrinkage: f64) -> Vec<(f64, f64, f64)> {
     let mut anchors: Vec<(f64, f64, f64)> = stats.iter().map(|&(rate, total, count)| {
@@ -1021,6 +1058,8 @@ pub struct Fit {
     pub kap_c: f64,
     pub sd_all: f64,
     pub retry: f64,
+    pub unread: (f64, f64),             // `unread`: (a, b) of the deficit on a chart's first own plays
+    pub plays: HashMap<String, f64>,    // own plays per chart
     pub n_rows: usize,
     pub warmup: WarmModels,
 }
@@ -1191,6 +1230,10 @@ pub fn personal_fit(c: &Consts, mut rows: Vec<Row>, feats: &[Feats], now: f64, l
     // its own context, and retries in one session are one block of affinity evidence.
     let (context, session_ids, ctx) = session_context(c, &rows, feats, &u);
     u.iter_mut().zip(&context).for_each(|(x, a)| *x -= a);
+    out.unread = unread(&rows, feats, c, &mut u);
+    for r in rows.iter().filter(|r| !r.public) {
+        *out.plays.entry(r.chart.clone()).or_insert(0.) += 1.;
+    }
     let blocks = chart_blocks(&rows, &chart, charts.len(), &u, &session_ids, now);
     let within = |ix: &Vec<usize>| -> Vec<f64> {
         let m = mean(&ix.iter().map(|&i| u[i]).collect::<Vec<_>>());
@@ -1375,6 +1418,21 @@ mod tests {
         }
         // An intervening RD attempt keeps the previous normal attempt as the anchor.
         assert!((retried(&[(false, 0.6), (true, 3.), (false, 0.2)]) - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn an_unread_chart_loses_its_deficit_as_it_is_learned() {
+        // 100 charts, each played twice: first play 0.1 worse, second 0.05 — (1/(1 + n)) × 0.1
+        let rows: Vec<Row> = (0..200).map(|i| row(&format!("c{}", i % 100), 1., 1. + i as f64, false)).collect();
+        let mut u: Vec<f64> = (0..200).map(|i| if i < 100 { 0.1 } else { 0.05 }).collect();
+        let c = Consts::standard();
+        let (a, b) = unread(&rows, &[], &c, &mut u);
+        assert!((a - 12.5 / 145.).abs() < 1e-12 && b == UNREAD_SV, "{a} {b}");
+        assert!(u[0] < 0.1 && u[100] < 0.05);
+        // a chart rated 10 with half of it SV carries SV 5: load 25
+        let mut f = Feats::bare(4, 10., 8., &c);
+        f.sk[c.names.iter().position(|n| n == "sv").unwrap()] = 0.5;
+        assert!((sv_load(&f, &c) - 25.).abs() < 1e-12);
     }
 
     #[test]

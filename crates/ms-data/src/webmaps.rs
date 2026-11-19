@@ -16,7 +16,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -335,25 +335,24 @@ pub fn estimate(db: &Connection, wants: &[Want], calc: &str) -> rusqlite::Result
 /// Newest-first per status; an incremental crawl stops a day past the last watermark.
 /// Where a listing for these keymodes stopped: (status index, offset, sets, newest). A pause or a closed app lost a full pass
 /// before this, so a keymode that needs one never got listed (user 2026-11-01: "it always checks the whole listing").
-fn listing_at(db: &Connection, keys: &HashSet<i64>, order: &[i64]) -> Option<(usize, i64, i64, String)> {
-    let mut wanted: Vec<i64> = keys.iter().copied().collect();
-    wanted.sort_unstable();
-    let l = kv_get(db, "listing").filter(|l| l["keys"] == json!(wanted) && l["statuses"] == json!(order))?;
+fn listing_at(db: &Connection, need: &BTreeMap<i64, BTreeSet<i64>>, order: &[i64]) -> Option<(usize, i64, i64, String)> {
+    let l = kv_get(db, "listing").filter(|l| l["need"] == json!(need) && l["statuses"] == json!(order))?;
     Some((l["status"].as_u64()? as usize, l["offset"].as_i64()?, l["sets"].as_i64()?, l["newest"].as_str()?.to_string()))
 }
 
-fn save_listing(db: &Connection, keys: &HashSet<i64>, order: &[i64], at: (usize, i64, i64, &str)) -> rusqlite::Result<()> {
-    let mut wanted: Vec<i64> = keys.iter().copied().collect();
-    wanted.sort_unstable();
-    kv_set(db, "listing", &json!({"keys": wanted, "statuses": order, "status": at.0, "offset": at.1, "sets": at.2, "newest": at.3}))
+fn save_listing(db: &Connection, need: &BTreeMap<i64, BTreeSet<i64>>, order: &[i64], at: (usize, i64, i64, &str)) -> rusqlite::Result<()> {
+    kv_set(db, "listing", &json!({"need": need, "statuses": order, "status": at.0, "offset": at.1, "sets": at.2, "newest": at.3}))
 }
 
-fn crawl_meta(db: &Connection, keys: &HashSet<i64>, statuses: &[i64], full: bool) -> Result<(), CrawlError> {
-    let order: Vec<i64> = STATUSES.into_iter().filter(|s| statuses.contains(s)).collect();
+/// `need`: each status's keymodes, only those whose choice lists that status (user 2026-11-15: a 4K choice of ranked–loved
+/// forced a whole graveyard listing, ~15k sets, because every status needed every chosen keymode).
+fn crawl_meta(db: &Connection, need: &BTreeMap<i64, BTreeSet<i64>>, full: bool) -> Result<(), CrawlError> {
+    let order: Vec<i64> = STATUSES.into_iter().filter(|s| need.contains_key(s)).collect();
     // Rows crawled before the stars column need one full pass to learn their rating.
     let backfill = kv_get(db, "stars_backfilled").is_none_or(|v| !v.as_bool().unwrap_or(false));
-    let stopped = listing_at(db, keys, &order);
-    let whole = |status: i64| -> rusqlite::Result<bool> { Ok(full || backfill || stopped.is_some() || !keys.is_subset(&listed_keys(db, status)?)) };
+    let stopped = listing_at(db, need, &order);
+    let keys_of = |status: i64| -> HashSet<i64> { need[&status].iter().copied().collect() };
+    let whole = |status: i64| -> rusqlite::Result<bool> { Ok(full || backfill || stopped.is_some() || !keys_of(status).is_subset(&listed_keys(db, status)?)) };
     let mut sets = stopped.as_ref().map_or(0, |s| s.2 as usize);
     let any_whole = order.iter().map(|&s| whole(s)).collect::<rusqlite::Result<Vec<bool>>>()?.contains(&true);
     progress(db, json!({"phase": "check", "sets": sets, "full": any_whole}))?;
@@ -362,6 +361,7 @@ fn crawl_meta(db: &Connection, keys: &HashSet<i64>, statuses: &[i64], full: bool
             continue;
         }
         let full = whole(status)?;
+        let keys = &keys_of(status);
         let mark: String = db.query_row("SELECT v FROM kv WHERE k=?", [format!("mark{status}")], |r| r.get(0)).optional()?.unwrap_or_default();
         let stop = if full || mark.is_empty() { None } else {
             chrono::DateTime::parse_from_rfc3339(&mark.replace('Z', "+00:00")).ok().map(|t| (t - chrono::Duration::days(1)).format("%Y-%m-%dT%H:%M:%SZ").to_string())
@@ -419,12 +419,12 @@ fn crawl_meta(db: &Connection, keys: &HashSet<i64>, statuses: &[i64], full: bool
             }
             offset += 100 * PAGES;
             if full {
-                save_listing(db, keys, &order, (index, offset, sets as i64, &newest))?;
+                save_listing(db, need, &order, (index, offset, sets as i64, &newest))?;
             }
         }
         db.execute("INSERT OR REPLACE INTO kv VALUES(?,?)", params![format!("mark{status}"), newest])?;
         if full {
-            save_listing(db, keys, &order, (index + 1, 0, sets as i64, ""))?;
+            save_listing(db, need, &order, (index + 1, 0, sets as i64, ""))?;
         }
         let mut done: Vec<i64> = keys.union(&listed_keys(db, status)?).copied().collect();
         done.sort_unstable();
@@ -593,6 +593,26 @@ pub struct WebMap {
 }
 
 /// Stored website features moved to the calculator `to`, web.msp with them: a calculator change would else crawl everything again.
+/// Rows of every other calculator go once `calc` has its own, as in the player's store (`store::prune_feats`): each release
+/// left a copy (G835LX 2026-11-19: 25 calculators, 8.4 GB). A VACUUM another connection blocks is finished by the next call.
+pub fn prune(calc: &str) -> Result<(), String> {
+    if !web_dir().join("state.db").is_file() {
+        return Ok(());
+    }
+    state_db().and_then(|db| prune_in(&db, calc)).map_err(|e| e.to_string())
+}
+
+fn prune_in(db: &Connection, calc: &str) -> rusqlite::Result<()> {
+    if db.query_row("SELECT 1 FROM feats WHERE calc=? LIMIT 1", [calc], |_| Ok(())).optional()?.is_none() {
+        return Ok(()); // nothing carried: a failed carry can't cost the analyses
+    }
+    if db.execute("DELETE FROM feats WHERE calc<>?", [calc])? > 0 {
+        db.execute_batch("VACUUM")?;
+        db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+    }
+    Ok(())
+}
+
 pub fn carry(from: &str, to: &str, after: &Params, chart: &(dyn Fn(&str) -> Option<ms_calc::chart::Chart> + Sync)) -> Result<(), String> {
     let text = |e: rusqlite::Error| e.to_string();
     if !web_dir().join("state.db").is_file() {
@@ -601,7 +621,6 @@ pub fn carry(from: &str, to: &str, after: &Params, chart: &(dyn Fn(&str) -> Opti
     let db = state_db().map_err(text)?;
     let todo: Vec<String> = db.prepare("SELECT sha FROM feats WHERE calc=? AND sha NOT IN (SELECT sha FROM feats WHERE calc=?)").map_err(text)?
         .query_map([from, to], |r| r.get(0)).map_err(text)?.collect::<rusqlite::Result<_>>().map_err(text)?;
-    let threads = (std::thread::available_parallelism().map_or(2, |x| x.get()) / 2).max(1);
     crate::store::CARRIED[1].fetch_add(todo.len(), std::sync::atomic::Ordering::Relaxed);
     for chunk in todo.chunks(500) {
         crate::store::CARRIED[0].fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed);
@@ -609,7 +628,7 @@ pub fn carry(from: &str, to: &str, after: &Params, chart: &(dyn Fn(&str) -> Opti
         for sha in chunk {
             stored.push((sha, db.query_row("SELECT data FROM feats WHERE sha=? AND calc=?", [sha.as_str(), from], |r| r.get(0)).map_err(text)?));
         }
-        let cells = ms_calc::background::background_map(&stored, threads, |(sha, data)| {
+        let cells = ms_calc::background::background_map(&stored, crate::store::carry_threads(), |(sha, data)| {
             let file = std::cell::OnceCell::new();
             let chart = || file.get_or_init(|| chart(sha).map(std::rc::Rc::new)).clone();
             let fs = read_cell(data).unwrap_or_default();
@@ -823,26 +842,26 @@ pub fn crawl(wants: &[Want], check: bool, full: bool, threads: Option<usize>, ca
     let db = state_db()?;
     let Some(_held) = lock() else { return Err(CrawlError::Failed("another crawl is running".into())) };
     let _ = std::fs::remove_file(web_dir().join("stop"));
-    let (keys, list, fetching): (HashSet<i64>, Vec<i64>, Vec<Want>) = match &pp {
+    let (need, fetching): (BTreeMap<i64, BTreeSet<i64>>, Vec<Want>) = match &pp {
         Some(a) => {
             kv_set(&db, "pp_auto", &json!(a))?;
-            (a.keys.iter().copied().collect(), crate::store::RANKED_STATUS.to_vec(), Vec::new())
+            (crate::store::RANKED_STATUS.iter().map(|&s| (s, a.keys.iter().copied().collect())).collect(), Vec::new())
         }
         None => {
             kv_set(&db, "wants", &json!(wants))?;
             kv_set(&db, "command", &json!(if check { "check" } else { "crawl" }))?;
             db.execute("DELETE FROM kv WHERE k='reopen'", [])?;
-            let on: Vec<&Want> = wants.iter().filter(|w| w.on).collect();
-            let mut list: Vec<i64> = on.iter().flat_map(|w| w.statuses.iter().copied()).collect();
-            list.sort_unstable();
-            list.dedup();
-            (on.iter().map(|w| w.keys).collect(), list, wants.to_vec())
+            let mut need: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+            for w in wants.iter().filter(|w| w.on) {
+                w.statuses.iter().for_each(|&s| { need.entry(s).or_default().insert(w.keys); });
+            }
+            (need, wants.to_vec())
         }
     };
     let all = self::wants(&db); // saved above: the window's whole choice, also for a PP run
-    let (keys, fetching, all) = (&keys, &fetching[..], &all[..]);
+    let (fetching, all) = (&fetching[..], &all[..]);
     let run = || -> Result<(), CrawlError> {
-        crawl_meta(&db, keys, &list, full)?;
+        crawl_meta(&db, &need, full)?;
         forget(&db, &InClient::read(), &web_dir().join("osu"))?;
         if check {
             progress(&db, json!({"phase": "checked"}))?;
@@ -948,13 +967,26 @@ mod tests {
     fn a_stopped_listing_continues_only_for_the_same_keymodes() {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT);").unwrap();
-        let (ten, seven): (HashSet<i64>, HashSet<i64>) = ([10].into(), [7, 10].into());
         let (ranked, all) = (statuses(&["ranked"]), statuses(&["ranked", "unranked"]));
+        let need = |keys: &[i64], of: &[i64]| -> BTreeMap<i64, BTreeSet<i64>> { of.iter().map(|&s| (s, keys.iter().copied().collect())).collect() };
+        let (ten, seven) = (need(&[10], &ranked), need(&[7, 10], &ranked));
         assert_eq!(listing_at(&db, &ten, &ranked), None);
         save_listing(&db, &ten, &ranked, (3, 4800, 52800, "2026-11-01T08:37:21Z")).unwrap();
         assert_eq!(listing_at(&db, &ten, &ranked), Some((3, 4800, 52800, "2026-11-01T08:37:21Z".to_string())));
         assert_eq!(listing_at(&db, &seven, &ranked), None, "other keymodes read the listing for themselves");
-        assert_eq!(listing_at(&db, &ten, &all), None, "and other statuses");
+        assert_eq!(listing_at(&db, &need(&[10], &all), &all), None, "and other statuses");
+    }
+
+    #[test]
+    fn older_calculators_rows_go_once_this_one_has_its_own() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE feats(sha TEXT, calc TEXT, data BLOB, PRIMARY KEY(sha, calc)); INSERT INTO feats VALUES ('a','old',x''),('b','old',x'')").unwrap();
+        let rows = |db: &Connection| db.query_row("SELECT group_concat(sha||calc, ' ') FROM (SELECT * FROM feats ORDER BY sha, calc)", [], |r| r.get::<_, String>(0)).unwrap();
+        prune_in(&db, "new").unwrap();
+        assert_eq!(rows(&db), "aold bold", "not carried yet: the old rows are all there is");
+        db.execute("INSERT INTO feats VALUES ('a','new',x'')", []).unwrap();
+        prune_in(&db, "new").unwrap();
+        assert_eq!(rows(&db), "anew");
     }
 
     #[test]

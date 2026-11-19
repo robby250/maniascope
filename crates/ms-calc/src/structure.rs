@@ -6,7 +6,7 @@ use crate::val::{Dict, Val};
 use sha2::{Digest, Sha256};
 
 /// A stored analysis of another version is redone: 3 = rows carry the LN types in `sk` (2026-11-06).
-pub const STRUCTURE_VERSION: i64 = 5; // 4: vibro_runs / vibro_rest (2026-11-11); 5: one vibro run rule (2026-11-13)
+pub const STRUCTURE_VERSION: i64 = 6; // 4: vibro_runs / vibro_rest (2026-11-11); 5: one vibro run rule (2026-11-13); 6: unhittable (2026-11-16)
 
 /// numpy pairwise summation (np.add.reduce on a contiguous float64 array).
 pub fn np_sum(a: &[f64]) -> f64 {
@@ -167,7 +167,9 @@ pub fn structure(chart: &Chart, rate: f64, k: &Knobs) -> Dict {
     d.set("rhythm", rhythm);
     d.set("vibro_share", fast_count as f64 / n as f64);
     let v = vibro_runs(chart, rate, k);
-    (d.set("vibro_runs", v.share), d.set("vibro_rest", v.rest));
+    (d.set("vibro_runs", v.share), d.set("vibro_rest", v.rest), d.set("vibro_speed", v.speed));
+    let judged = n as f64 + (0..n).filter(|&i| chart.end[i] > chart.t[i]).count() as f64;
+    d.set("unhittable", chart.stacked / (chart.stacked + judged)); // share of judgements stacked notes lose (Chart::stacked)
     d.set("vibro_longest", longest);
     d.set("vibro_focused", fast_count as f64 / n as f64 > 0.6 && repeated > 0.65 && longest > 3.0);
     d.set("periodicity", cycles);
@@ -246,15 +248,21 @@ fn column_runs_of(chart: &Chart, rate: f64, k: &Knobs) -> Vec<Run> {
     let mut open: Vec<Vec<usize>> = vec![Vec::new(); chart.keys];
     let mut chord: Vec<Vec<u32>> = vec![Vec::new(); chart.keys]; // the hand's chord at each hit of the open run
     let mut left = vec![false; chart.keys]; // a row without this column was struck since this column's last hit
+    // another finger of the hand played between two of this column's hits: not one finger's repetition, so never Longjacks;
+    // a vibro run stays (a mashed roll, the hand vibrating over two columns; user 2026-11-15: REFORM Kappa Speed's 16–30 ms rows)
+    let (mut between, mut alternated) = (vec![false; chart.keys], vec![false; chart.keys]);
     let mut out = Vec::new();
-    let close = |notes: Vec<usize>, chords: Vec<u32>, out: &mut Vec<Run>| {
+    let close = |notes: Vec<usize>, chords: Vec<u32>, alternated: bool, out: &mut Vec<Run>| {
         if notes.len() < k.VIBRO_MIN {
             return;
         }
         let mut gaps: Vec<f64> = notes.windows(2).map(|w| chart.t[w[1]] - chart.t[w[0]]).collect();
         gaps.sort_by(f64::total_cmp);
         let r = chords.windows(2).filter(|w| w[0] == w[1]).count() as f64 / (chords.len() - 1) as f64;
-        out.push(Run { vibro: gaps[gaps.len() / 2] < 1000.0 * rate * vibro_gap(notes.len() as f64, k) * r.powf(k.VIBRO_P), notes });
+        let vibro = gaps[gaps.len() / 2] < 1000.0 * rate * vibro_gap(notes.len() as f64, k) * r.powf(k.VIBRO_P);
+        if vibro || !alternated {
+            out.push(Run { vibro, notes });
+        }
     };
     let mut i = 0;
     while i < chart.len() {
@@ -266,21 +274,27 @@ fn column_runs_of(chart: &Chart, rate: f64, k: &Knobs) -> Vec<Run> {
         for x in i..m {
             let c = chart.col[x] as usize;
             if open[c].last().is_some_and(|&a| (left[c] && chart.t[x] - chart.t[a] >= hand_gap) || chart.t[x] - chart.t[a] >= gap) {
-                close(std::mem::take(&mut open[c]), std::mem::take(&mut chord[c]), &mut out);
+                close(std::mem::take(&mut open[c]), std::mem::take(&mut chord[c]), std::mem::take(&mut alternated[c]), &mut out);
+            }
+            if !open[c].is_empty() {
+                alternated[c] |= between[c];
             }
             open[c].push(x);
             chord[c].push((0..chart.keys).filter(|&o| row >> o & 1 == 1 && hand[o] == hand[c]).fold(0u32, |a, o| a | 1 << o));
-            left[c] = false;
+            (left[c], between[c]) = (false, false);
         }
         for c in 0..chart.keys {
             if row >> c & 1 == 0 {
                 left[c] = true;
+                // a hit by another finger of the hand between two of this column's ends the run: repetition is one finger
+                // (user 2026-11-15: REFORM Eta–Kappa speed and stamina maps read Longjacks first at 1.1–1.5×)
+                between[c] |= (0..chart.keys).any(|o| o != c && row >> o & 1 == 1 && hand[o] == hand[c]);
             }
         }
         i = m;
     }
     for c in 0..chart.keys {
-        close(std::mem::take(&mut open[c]), std::mem::take(&mut chord[c]), &mut out);
+        close(std::mem::take(&mut open[c]), std::mem::take(&mut chord[c]), alternated[c], &mut out);
     }
     out
 }

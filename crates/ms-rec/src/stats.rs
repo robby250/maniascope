@@ -19,10 +19,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub const TARGET: f64 = 0.96; // user 2026-11-10: "we should put this at like 96%" (was .94)
-// A dan is cleared on a good attempt: the player's top-30 % attempt (z of 0.70) on their own attempt-to-attempt spread
-// (user 2026-11-13: halfway between the average attempt and a tester's "top 15 %"). Average attempts read 7K Reg 10th
-// with the Gamma course predicted 94.9 % stable and played at 95.0–95.1 %.
-const GOOD_Z: f64 = 0.524;
+// Stats reads the best of 3 attempts on a good day (user 2026-11-17; was one top-30 % attempt at recent form): the expected
+// best of three draws on the player's attempt-to-attempt spread (E max of 3 N(0,1)), on a top-40 % day of the keymode's
+// fitted day-to-day form (FormPrior). Own 7K rice 10th+ → Gamma, LN Gamma → Azimuth−, 4K Gamma− → Gamma+; tester LN 9th− kept.
+const BEST_OF_3_Z: f64 = 0.846;
+const GOOD_DAY_Z: f64 = 0.253; // top-40 % day (user: "a tiny bit worse" than top 30 %)
 
 /// Per keymode, the sd of log lazer miss between completed attempts of one chart at one rate (pooled, degrees-of-freedom
 /// corrected): how much better than its average a good attempt goes. Keymodes with under 20 repeated charts take every
@@ -82,7 +83,7 @@ pub struct FormHistory {
     pub sessions: Vec<FormSession>,
     pub warmup: f64,
     pub fatigue: f64,
-    pub warm_form: f64, // the shown sessions' warmed-up form, log miss against the model (+ = worse), shrunk by the fitted FormPrior
+    pub good_day: f64, // the form a good day adds to the shown level, log miss against the model (− = better): −GOOD_DAY_Z·√(day-to-day form variance)
 }
 
 #[derive(Clone, Default)]
@@ -174,6 +175,70 @@ fn dan_crossing(y: &[Option<(f64, f64)>]) -> Option<(f64, Option<f64>)> {
         prev = (x, v);
     }
     Some((at, Some(prev.1 .1)))
+}
+
+/// Piecewise-linear through (at, value) anchors, flat past the ends.
+fn anchored(anchors: &[(f64, f64)], at: f64) -> f64 {
+    if at <= anchors[0].0 {
+        return anchors[0].1;
+    }
+    anchors.windows(2).find(|w| at <= w[1].0).map_or(anchors[anchors.len() - 1].1, |w| w[0].1 + (w[1].1 - w[0].1) * (at - w[0].0) / (w[1].0 - w[0].0).max(1e-12))
+}
+
+/// A dan chart's credit in tiers at accuracy `acc` against its pass mark `bar`, mania-tracker's rule (MIT, aleju03/mania-hub
+/// `algorithms/player/dan-credit.ts`): over the mark up to +1.5 tiers by the share of the headroom to 100 % used (7K rice on
+/// its own accuracy curve, 4K LN by the margin itself); under it down to −1.5 (LN −1.75) within 5 % (LN 3 %, 4K LN 6 %),
+/// further under none. Rice forgives a near miss (1 % under: −0.51), LN hardly (−1.25).
+/// ponytail: its half bonus for 4K jack-led rice charts is left out: a reading sits at or under the mark, where it never applies.
+fn dan_credit(acc: f64, bar: f64, ln: bool, keys: i64) -> Option<f64> {
+    const ABOVE: [(f64, f64); 6] = [(0., 0.), (0.25, 0.), (0.675, 0.2), (0.75, 0.7), (0.875, 1.1), (1., 1.5)];
+    const BELOW: &[(f64, f64)] = &[(0., 0.), (0.2, -0.5075), (0.8, -1.25), (1., -1.5)];
+    const LN_BELOW: &[(f64, f64)] = &[(0., 0.), (1. / 3., -1.25), (2. / 3., -1.5), (1., -1.75)];
+    const LN4_ABOVE: [(f64, f64); 6] = [(0., 0.), (0.01, 0.), (0.015, 0.15), (0.02, 0.3), (0.025, 0.5), (0.027, 0.7)];
+    const LN4_BELOW: &[(f64, f64)] = &[(0., 0.), (1. / 6., -0.5075), (4. / 6., -1.25), (5. / 6., -1.5), (1., -1.75)];
+    const RICE7_ACC: [(f64, f64); 9] = [(0.96, 0.96), (0.965, 0.973), (0.97, 0.9782), (0.975, 0.9829), (0.98, 0.988), (0.985, 0.9919), (0.99, 0.995), (0.995, 0.9984), (1., 1.)];
+    let (window, below) = match (ln, keys) {
+        (true, 4) => (0.06, LN4_BELOW),
+        (true, _) => (0.03, LN_BELOW),
+        _ => (0.05, BELOW),
+    };
+    let delta = acc - bar;
+    if delta < -window - 1e-9 {
+        return None;
+    }
+    if delta < -1e-9 {
+        return Some(anchored(below, (-delta / window).min(1.)));
+    }
+    if ln && keys == 4 {
+        return Some(anchored(&LN4_ABOVE, delta));
+    }
+    let delta = if !ln && keys == 7 && acc >= RICE7_ACC[0].0 { anchored(&RICE7_ACC, acc) - bar } else { delta };
+    Some(anchored(&ABOVE, (delta.max(0.) / (1. - bar).max(0.04)).min(1.)))
+}
+
+/// How far under the mark a dan reading still credits (`dan_reading`).
+const NEAR_MISS: f64 = 0.01;
+
+/// mania-tracker's near-miss credit on the ladder's fitted accuracy curve: the best tier + credit along it, down to 1 % under
+/// the mark (its first anchor on rice, LN and 4K LN alike). Rice forgives that 1 % for half a tier, LN hardly, so rice reads
+/// up to a third of a tier past the mark's crossing and LN at it (user 2026-11-15: rice read a third to half a tier under
+/// mania-tracker while LN matched). Further under, its credits come from rare real passes; predicted, every hard song
+/// would credit there and rice read Azimuth. Off the ladder's ends the crossing stays.
+/// → (credited tier, the fit's slope at the chosen point in log miss per tier).
+fn dan_reading(y: &[Option<(f64, f64)>], bar: f64, ln: bool, keys: i64) -> Option<(f64, Option<f64>)> {
+    let (at, slope) = dan_crossing(y)?;
+    if slope.is_none() {
+        return Some((at, None));
+    }
+    let (first, last) = (y.iter().position(Option::is_some)?, y.iter().rposition(Option::is_some)?);
+    let best = (0..=(last - first) * 100).filter_map(|i| {
+        let x = first as f64 + i as f64 / 100.;
+        let (v, s) = local_line(y, x);
+        let acc = 1. - (1. - bar) * v.exp();
+        (acc >= bar - NEAR_MISS).then_some(())?;
+        Some((x + dan_credit(acc, bar, ln, keys)?, s))
+    }).max_by(|a, b| a.0.total_cmp(&b.0));
+    Some(best.map_or((at, slope), |(p, s)| (p.max(at), Some(s))))
 }
 
 /// The tiers' weighted local-linear fit at tier `x` → (value, slope per tier).
@@ -276,7 +341,7 @@ impl Ctx<'_> {
         Some((dans::rating_at(series, at)?, slope.filter(|s| *s > 0. && step > 0.).map(|s| s / step)))
     }
 
-    /// The fractional tier where the player's predicted accuracy on the series' songs for `group` crosses each tier's pass mark.
+    /// The player's fractional tier on the series for `group`, read from the predicted accuracy on its songs (`dan_reading`).
     fn dan_position(&self, series: &str, group: &str) -> Option<(f64, Option<f64>)> {
         let tiers = dans::tiers(series)?;
         // Each tier's own pass mark, y = log miss against it (crossing at 0). A stable mark is met in stable units: each song's
@@ -284,7 +349,7 @@ impl Ctx<'_> {
         // "doing the acc targets for all dans for stable then converting the acc to lazer").
         let pass = |tier: &str| dans::pass(series, tier);
         let songs = dans::songs(series, &self.rec.c);
-        let mut y = Vec::new();
+        let (mut y, mut bar) = (Vec::new(), None);
         // Each song counts by its standing in the skill (user 2026-11-13: every 7K skill read the same 7.7): dan songs hold every
         // skill above the card's cut, so counting each counted song fully made every skill's songs the same set.
         let weight = |skills: &[(&str, f64)]| if group == "overall" { 1. } else { skills.iter().find(|s| s.0 == group).map_or(0., |s| s.1).powi(2) };
@@ -293,14 +358,15 @@ impl Ctx<'_> {
             let picked: Vec<(String, &Feats, f64)> = songs.get(tier).into_iter().flatten().enumerate()
                 .map(|(i, (f, skills))| (format!("dan:{series}:{tier}:{i}"), f, weight(skills))).filter(|p| p.2 >= floor).collect();
             let Some((mark, stable)) = pass(tier) else { y.push(None); continue };
+            bar.get_or_insert(mark);
             let misses: Vec<(f64, f64)> = picked.iter().filter_map(|(id, f, w)| {
-                let lazer = self.miss(f, id, 1.)? * (-GOOD_Z * self.attempt_sd.get(&f.keys).copied().unwrap_or(0.)).exp();
+                let lazer = self.miss(f, id, 1.)? * (-BEST_OF_3_Z * self.attempt_sd.get(&f.keys).copied().unwrap_or(0.)).exp();
                 Some((if stable { lazer * self.stable_ratio(mark) * (crate::evidence::STABLE_LN_Y * f.z_tail[0]).exp() } else { lazer }, *w))
             }).collect();
             let mass: f64 = misses.iter().map(|m| m.1).sum();
             y.push((mass > 0.).then(|| ((misses.iter().map(|m| m.0 * m.1).sum::<f64>() / mass).max(1e-6).ln() - (1. - mark).ln(), mass)));
         }
-        dan_crossing(&y)
+        dan_reading(&y, bar?, series.contains("LN"), series.split('K').next().and_then(|k| k.parse().ok()).unwrap_or(7))
     }
 
     /// [(month, ability)]: today's overall ability moved by how much better or worse each month's recorded plays went
@@ -345,7 +411,6 @@ impl Ctx<'_> {
         if sessions.is_empty() {
             return None;
         }
-        let mut warm: Vec<f64> = Vec::new();
         let out = sessions.into_iter().map(|(_, plays)| {
             let at = |s: &personal::Step| local[s.row];
             let first = at(plays[0]).ts.unwrap_or(0.) - plays[0].seconds;
@@ -356,9 +421,6 @@ impl Ctx<'_> {
                 let r = at(s);
                 let m = self.model.personal(self.feats(r), &r.chart, r.b, round_digits(r.rate, 3)).0;
                 let clock = (r.ts.unwrap_or(0.) - s.seconds - first) / 60.;
-                if !cold {
-                    warm.push((r.y_lazer - m).clamp(-3., 3.));
-                }
                 (clock, points(r.y_lazer - m), cold)
             }).collect();
             let n = values.len() as f64;
@@ -371,13 +433,9 @@ impl Ctx<'_> {
             FormSession { t: first, hours: marked[marked.len() - 1].0 / 60., plays: marked }
         }).collect();
         let mean = p.amplitudes.iter().sum::<f64>() / p.amplitudes.len() as f64;
-        // Stats shows the warmed-up level you played at recently (user 2026-11-11): the warm plays of the sessions the Form chart
-        // shows, shrunk as the session model shrinks form (FormPrior: the keymode's form variance against a play's noise).
         let prior = &self.warmup.prior;
         let tau = prior.by_key.get(&keys).map_or(prior.global_variance, |b| b.0);
-        let n = warm.len() as f64;
-        let warm_form = if n == 0. { 0. } else { warm.iter().sum::<f64>() / (n + prior.noise_variance / tau.max(1e-9)) };
-        Some(FormHistory { sessions: out, warmup: -points(unit * (p.session + mean)), fatigue: -points(unit * p.fatigue), warm_form })
+        Some(FormHistory { sessions: out, warmup: -points(unit * (p.session + mean)), fatigue: -points(unit * p.fatigue), good_day: -GOOD_DAY_Z * tau.max(0.).sqrt() })
     }
 }
 
@@ -470,9 +528,9 @@ pub fn build(rec: &Engine, db: &Db) -> Result<Profile> {
         }
         let local: Vec<&Evidence> = rows.iter().filter(|r| r.src != "public").copied().collect();
         let form = ctx.form_history(keys, &local);
-        if let Some(f) = form.as_ref().filter(|f| f.warm_form != 0.) {
+        if let Some(f) = form.as_ref().filter(|f| f.good_day != 0.) {
             for (_, g) in groups.iter_mut().filter(|(n, g)| g.value.is_some() && g.slope > 0. && n.as_str() != VIBRO) {
-                let k = (-f.warm_form / g.slope).exp();
+                let k = (-f.good_day / g.slope).exp();
                 (g.value, g.low, g.high) = (g.value.map(|v| v * k), g.low * k, g.high * k);
             }
         }
@@ -525,7 +583,7 @@ pub fn current(profile: &Profile, n: &Now, rec: &Engine) -> Current {
     for (keys, old) in &profile.pages {
         let keys = *keys;
         let mut page = old.clone();
-        let shown_form = page.form.as_ref().map_or(0., |f| f.warm_form); // already in the level: the session moves it from there
+        let shown_form = page.form.as_ref().map_or(0., |f| f.good_day); // already in the level: the session moves it from there
         for (group, row) in &mut page.groups {
             let skill = if group == "overall" { None } else { skills::session_skill(group, keys) };
             let family = skill.map(|s| rec.c.family(s));
@@ -566,7 +624,7 @@ mod tests {
         assert_eq!(warm_up_marks([120., 120., 120., 120., 120.].into_iter()), [true, true, true, false, false]);
         assert_eq!(warm_up_marks([300., 300., 120.].into_iter()), [true, true, false]);
     }
-    use super::{crossing, dan_crossing, pooled};
+    use super::{crossing, dan_credit, dan_crossing, dan_reading, pooled};
 
     #[test]
     fn a_level_is_where_the_pooled_rating_bins_cross_the_target() {
@@ -603,6 +661,21 @@ mod tests {
         let flat = |shift: f64| -> Vec<_> { [-1.4, -1.38, -1.16, -0.47, -0.2, 0.1, -0.02, 0.1, 0.17, 0.03, 0.46, 0.71, 1.13, 1.6, 1.79].iter().map(|v| under(v + shift)).collect() };
         let (low, mid, high) = (dan_crossing(&flat(0.05)).unwrap().0, dan_crossing(&flat(0.)).unwrap().0, dan_crossing(&flat(-0.05)).unwrap().0);
         assert!((4.5..9.).contains(&mid) && high - low < 1.5, "{low} {mid} {high}");
+    }
+
+    #[test]
+    fn a_dan_reads_like_mania_tracker_rice_forgives_a_near_miss_and_ln_hardly() {
+        assert_eq!(dan_credit(0.96, 0.96, false, 7), Some(0.));
+        assert!((dan_credit(0.95, 0.96, false, 7).unwrap() + 0.5075).abs() < 1e-9);
+        assert!((dan_credit(0.94, 0.95, true, 7).unwrap() + 1.25).abs() < 1e-9);
+        assert_eq!(dan_credit(0.90, 0.96, false, 7), None);
+        assert_eq!(dan_credit(1., 0.96, false, 7), Some(1.5));
+        // accuracy falls 1.5 % a tier through the 96 % mark at tier 5: rice reads past the crossing, LN (95 %) about at it
+        let y: Vec<_> = (0..12).map(|t| Some(((0.04 + 0.015 * (t as f64 - 5.)).max(0.002).ln() - 0.04f64.ln(), 2.))).collect();
+        let lny: Vec<_> = y.iter().map(|v| v.map(|v| (v.0 + 0.04f64.ln() - 0.05f64.ln(), v.1))).collect();
+        let lift = |y: &[Option<(f64, f64)>], bar: f64, ln: bool| dan_reading(y, bar, ln, 7).unwrap().0 - dan_crossing(y).unwrap().0;
+        let (rice, ln) = (lift(&y, 0.96, false), lift(&lny, 0.95, true));
+        assert!((0.05..0.6).contains(&rice) && ln.abs() < 0.05, "{rice} {ln}");
     }
 
     #[test]

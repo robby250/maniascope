@@ -35,6 +35,7 @@ pub struct Analysis {
     pub version: String,
     pub creator: String,
     pub overall: f64,
+    pub press: f64, // overall with holds as taps: the regular dans read it
     pub notes: usize,
     pub ln_notes: f64,
     pub nps: Option<f64>,
@@ -125,7 +126,7 @@ pub fn analyse(path: &Path, rate: f64, sv: bool, prm: &Params) -> Result<Analysi
         _ => Vec::new(),
     };
     Ok(Analysis {
-        path: path.to_path_buf(), rate, sv, keys, overall: sc.f("overall"), notes: res.fget("notes", 0.) as usize, ln_notes: res.fget("ln_notes", 0.), nps: raw_nps(&chart, rate), peak_nps: peak_nps(&chart, rate), bid: beatmap_id(&data),
+        path: path.to_path_buf(), rate, sv, keys, overall: sc.f("overall"), press: res.fget("press_overall", sc.f("overall")), notes: res.fget("notes", 0.) as usize, ln_notes: res.fget("ln_notes", 0.), nps: raw_nps(&chart, rate), peak_nps: peak_nps(&chart, rate), bid: beatmap_id(&data),
         span: (chart.len() >= 2).then(|| (chart.t[0], chart.last_end())), timeline: res.get("timeline").map_or_else(Vec::new, Val::list_f), entries, tags: describe(&res, &prm.k).1.into_iter().filter(|t| !t.starts_with("also ")).collect(), also: ms_calc::card::also(&res),
         bars: bars(&names, sc), names, tech, sv_ignored: matches!(res.get("sv"), Some(Val::Str(s)) if s == "ignored"),
         dan_vibro: ms_rec::dans::vibro_runs(&chart, rate, &prm.k), title: chart.title.clone(), artist: chart.artist.clone(), version: chart.version.clone(), creator: chart.creator.clone(),

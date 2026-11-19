@@ -46,6 +46,17 @@ pub const DESCRIBE_PAIR: f64 = 0.85;
 
 /// The tags a row can carry.
 pub const TAGS: [&str; 2] = ["Tech", "Stamina"];
+/// SV that lifts the rating by MEMORIZE_LIFT × √(the chart without it) reads as one to learn, whatever its trajectory (user
+/// 2026-11-15: maps rated much higher than their no-SV version are memorization; Slowjam named one with every kind of SV).
+/// Between a fixed lift and a ratio (user 2026-11-16): a 1.5× ratio let Carry me away's same SV pass on 4K (+3.34 over 5.47)
+/// and fail on 7K (+2.96 over 6.27). Labelled: 7K 1.18 and the six VIPs 1.43–2.35 are; Check this out 1.13 is not.
+pub const MEMORIZE_LIFT: f64 = 1.15;
+pub const MEMORIZATION_SV: &str = "Memorization SV";
+
+pub fn memorized(res: &Dict) -> bool {
+    let (with, without) = (res.dict("scores").map_or(0.0, |s| s.fget("overall", 0.0)), res.fget("no_sv_overall", 0.0));
+    without > 0.0 && with - without >= MEMORIZE_LIFT * without.sqrt()
+}
 
 /// A card candidate: (row skill that rates it, its name, rating).
 type Cand = (Sk, &'static str, f64);
@@ -64,6 +75,7 @@ pub fn ranked(res: &Dict, name_at: f64) -> Vec<Cand> {
         let typed = rows.iter().filter(|x| x.child.is_some()).max_by(|a, b| sc.f(a.sk.name()).total_cmp(&sc.f(b.sk.name())));
         let plain = rows.iter().find(|x| x.child.is_none()).map_or(label, |x| x.name);
         let name = typed.filter(|t| sc.f(t.sk.name()) >= name_at * r).map_or(plain, |t| t.name);
+        let name = if key == "sv" && memorized(res) { MEMORIZATION_SV } else { name };
         out.push((lead.sk, name, r));
     }
     if taxonomy::measured(Sk::mash, keys) && sc.f("mash") > 0.0 {

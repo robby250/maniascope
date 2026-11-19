@@ -161,7 +161,10 @@ pub fn rows(chart: &Chart, rate: f64) -> Vec<(f64, u32)> {
     rows
 }
 
-pub fn flow(chart: &Chart, rate: f64, k: &Knobs) -> Flow {
+/// Of the chart as written: read as played (`Chart::played`), flams on the written notes (a mashed roll's spread).
+pub fn flow(written: &Chart, rate: f64, k: &Knobs) -> Flow {
+    let played = written.played(rate, k);
+    let chart = played.as_ref().unwrap_or(written);
     let scale = 0.001 / rate;
     let rows = rows(chart, rate);
     let splits: &[bool] = if chart.keys % 2 == 1 { &[true, false] } else { &[true] };
@@ -186,7 +189,7 @@ pub fn flow(chart: &Chart, rate: f64, k: &Knobs) -> Flow {
         (0..2).for_each(|i| hold_tap[i] += h.hold_tap[i] / part);
     }
     let even = evenness(chart, scale, k);
-    let (coupling, roll, flam) = (coupling(chart, scale, k), rolls(chart, scale, k), flams(chart, scale, k));
+    let (coupling, roll, flam) = (coupling(chart, scale, k), rolls(chart, scale, k), flams(written, scale, k));
     let (isolated, vibro_run, jack_comp) = (isolation(&rows), vibro_runs(chart, rate, k), jack_compensation(chart, scale, k));
     let (mut changed, mut seen) = (0usize, Vec::with_capacity(k.FLOW_MEMORY));
     for pair in rows.windows(2) {

@@ -288,7 +288,7 @@ impl App {
     fn context_line(&self, ui: &mut Ui, a: &Arc<Analysis>) {
         let (_, _, known) = self.effective();
         let ln_share = a.ln_notes / a.notes.max(1) as f64;
-        let dan = ms_rec::dans::label(a.keys, a.overall, ln_share, Some(&a.dan_vibro), a.seconds());
+        let dan = ms_rec::dans::label(a.keys, a.overall, a.press, ln_share, Some(&a.dan_vibro), a.seconds());
         let mut parts: Vec<(String, String)> = vec![(format!("{}K", a.keys), "Keymode".into())];
         if let Some(d) = dan {
             parts.push((d, "The dan this map's difficulty matches. Tap dans under 22% LN, LN dans from 50%, both in between; a 4K map with 10% of its notes in fast same-column runs reads on the Vibro dans too.".into()));

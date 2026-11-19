@@ -32,19 +32,33 @@ fn present(v: &Value) -> bool {
 }
 
 /// Hand-local fatigue (difficulty_model.endurance): ({load, peak}, timeline).
-pub fn endurance(fines: &[&[Vec<f64>; 3]], bin_seconds: f64, phases: usize) -> ((f64, f64), Vec<f64>) {
+pub fn endurance(fines: &[&[Vec<f64>; 3]], bin_seconds: f64, phases: usize, ref_q: f64) -> ((f64, f64), Vec<f64>) {
+    endurance_of(&endurance_series(fines, phases), bin_seconds, ref_q)
+}
+
+/// Each run side's load per bin, the endurance's only input (calib curves keeps it to re-rate endurance knobs).
+pub fn endurance_series(fines: &[&[Vec<f64>; 3]], phases: usize) -> Vec<Vec<f64>> {
+    fines.iter().flat_map(|fine| fine[..2].iter().map(|side| side.chunks(phases).map(|c| py::sum(c.iter().copied())).collect())).collect()
+}
+
+/// `ref_q`: the quantile of the side's 30 s rolling loads its loads are measured against (1 = its hardest 30 s).
+pub fn endurance_of(series: &[Vec<f64>], bin_seconds: f64, ref_q: f64) -> ((f64, f64), Vec<f64>) {
     let mut summaries: Vec<f64> = Vec::new();
     let mut tracks: Vec<Vec<f64>> = Vec::new();
-    for fine in fines {
-        for side in &fine[..2] {
-            let values: Vec<f64> = side.chunks(phases).map(|c| py::sum(c.iter().copied())).collect();
+    for values in series {
+        {
             let n = 1i64.max(py::round(30.0 / bin_seconds) as i64) as usize;
             let mut rolling = 0.0f64;
-            let mut peak = 0.0f64;
+            let mut means = Vec::with_capacity(values.len());
             for (i, &v) in values.iter().enumerate() {
                 rolling += v - if i >= n { values[i - n] } else { 0.0 };
-                peak = peak.max(rolling / n as f64);
+                means.push(rolling / n as f64);
             }
+            let peak = if ref_q >= 1. { means.iter().copied().fold(0.0f64, f64::max) } else {
+                let mut m: Vec<f64> = means.into_iter().filter(|&x| x > 0.).collect();
+                m.sort_by(f64::total_cmp);
+                m.get(((m.len() as f64 - 1.) * ref_q).round().max(0.) as usize).copied().unwrap_or(0.)
+            };
             if peak <= 0.0 {
                 tracks.push(vec![0.0; values.len()]);
                 summaries.push(0.0);
@@ -52,7 +66,7 @@ pub fn endurance(fines: &[&[Vec<f64>; 3]], bin_seconds: f64, phases: usize) -> (
             }
             let (mut state, mut weighted, mut total) = (0.0f64, 0.0f64, 0.0f64);
             let mut track = Vec::with_capacity(values.len());
-            for &v in &values {
+            for &v in values {
                 let load = 3f64.min(0f64.max(v / peak));
                 let target = 0f64.max(load - 0.2).powf(1.3);
                 let tau = if target > state { 45.0 } else { 7.0 + 20.0 * 1f64.min(load) };
@@ -70,7 +84,7 @@ pub fn endurance(fines: &[&[Vec<f64>; 3]], bin_seconds: f64, phases: usize) -> (
         return ((0.0, 0.0), Vec::new());
     }
     let per: Vec<f64> = summaries.chunks(2).map(|c| c.iter().cloned().fold(f64::NEG_INFINITY, |m, x| if x > m { x } else { m })).collect();
-    let nruns = fines.len();
+    let nruns = series.len() / 2;
     let timeline: Vec<f64> = (0..tracks[0].len())
         .map(|i| py::sum((0..tracks.len()).step_by(2).map(|j| tracks[j][i].max(tracks[j + 1][i]))) / 1usize.max(nruns) as f64)
         .collect();
@@ -148,11 +162,27 @@ fn final_from_base(base: f64, execution: Option<&Dict>) -> f64 {
 /// The joint stage: stages fitted one over another each kept its credit, so one refit over all their inputs corrects what they
 /// left (calib joint). Sparse: `columns` index `flow::joint_row`.
 /// Share of the families correction a chart at `level` keeps: all of it up to `width` under its keymode's fitted `top`
-/// (99.5 % of the keymode's levels; a pooled top faded 10K's ordinary charts), none from the top on. The public scores hardly reach the top, so there the correction extrapolates and reordered the hardest
+/// (99.5 % of the keymode's levels; a pooled top faded 10K's ordinary charts), none from the top on, where the fitted
+/// constant (`top_shift`) takes over. The public scores hardly reach the top, so there the correction extrapolates and reordered the hardest
 /// charts (REFORM Iota under Theta, 2026-11-14; user: "at that difficulty … osu star rating rates them well"): above it the
 /// raw demand alone orders them. `width` 0: no fade.
 pub fn family_fade(level: f64, top: f64, width: f64) -> f64 {
     if width <= 0. { 1. } else { ((top - level) / width).clamp(0., 1.) }
+}
+
+/// Share of the fitted top constant a chart at `level` keeps: all of it up to the top, then less over `width` levels
+/// past it, where no public score reaches (user 2026-11-16: "a curve at the top where you slowly remove the lift").
+/// `width` 0: held.
+pub fn top_taper(level: f64, top: f64, width: f64) -> f64 {
+    if width <= 0. { 1. } else { (1. - (level - top).max(0.) / width).clamp(0., 1.) }
+}
+
+/// Share of the top constant a chart played at log rate `log_rate` gets when the bundle ties it to speed (`top_rate` = the
+/// share kept at 1.0× and slower): from that share at 1.0× to all of it at DT. Over each keymode's top the public scores are DT plays of shorter charts (4K dev:
+/// no 1.0× row past level 1.07), so the constant they fit is what speeding a hard chart up costs, not what a 1.0× marathon
+/// past them does (REFORM finals 2026-11-16).
+pub fn top_rate_weight(log_rate: f64, floor: f64) -> f64 {
+    floor + (1. - floor) * (log_rate / 1.5f64.ln()).clamp(0., 1.)
 }
 
 pub fn joint_shift(model: &Value, row: &[f64]) -> f64 {
@@ -169,7 +199,14 @@ pub fn joint_shift(model: &Value, row: &[f64]) -> f64 {
     let row = if model["spec"].is_object() { wide = crate::flow::extended_with(row, &pin, &model["spec"]); &wide[..] } else { row };
     let shift: f64 = (0..at.len()).filter(|&i| sd[i] >= 1e-9).map(|i| coeff[i] * (row[at[i]].clamp(lo[i], hi[i]) - mean[i]) / sd[i]).sum(); // a column flat in the fit reads 0
     let top = model["top"].as_f64(); // the keymode's own top level (the families fit writes it with `fade`)
-    let shift = shift * top.zip(model["fade"].as_f64()).map_or(1., |(top, w)| family_fade(row[crate::flow::LEVEL], top, w));
+    // faded toward the fitted top constant (`top_shift`, calib joint's "top" column), not 0: Eta under 4K's top kept ×1.15 while Theta over it got
+    // ×1.0, so the order of the hardest REFORM courses followed how much correction each kept (user 2026-11-15)
+    let keep = top.zip(model["fade"].as_f64()).map_or(1., |(top, w)| family_fade(row[crate::flow::LEVEL], top, w));
+    let mut taper = top.zip(model["taper"].as_f64()).map_or(1., |(top, w)| top_taper(row[crate::flow::LEVEL], top, w));
+    if let Some(floor) = model["top_rate"].as_f64() {
+        taper *= row.get(crate::flow::LEVEL + 1 + crate::flow::EXTRA.len()).map_or(1., |&r| top_rate_weight(r, floor));
+    }
+    let shift = keep * shift + (1. - keep) * taper * model["top_shift"].as_f64().unwrap_or(0.);
     model["limit"].as_f64().map_or(shift, |l| shift.clamp(-l, l)) // the families fit writes its limit (calib joint FAMILY_LIMIT)
 }
 

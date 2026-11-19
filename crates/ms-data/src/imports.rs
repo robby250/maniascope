@@ -104,19 +104,53 @@ fn set_origin(db: &Db, host: &str, root: &Path) -> rusqlite::Result<()> {
     kv_set(db, "manifest_error", &Value::Null)
 }
 
+/// The installed tables follow the client's library by difference (a full rewrite of ~54k rows took .35 s a check);
+/// → whether anything changed (the worker refits on it).
 fn replace_library(db: &Db, maps: &[(String, i64, i64, Option<String>, Option<i64>, i64, Option<f64>, Option<f64>, Option<String>, Option<String>, Option<String>)],
-                   local: &[(String, Option<String>, Option<String>, i64, Option<String>)]) -> rusqlite::Result<()> {
-    db.execute("DELETE FROM installed", [])?;
+                   local: &[(String, Option<String>, Option<String>, i64, Option<String>)]) -> rusqlite::Result<bool> {
+    let mut changed = false;
+    let have: HashMap<String, String> = db.prepare("SELECT sha256,beatmap_id,set_id,md5,status,keys,od,length,title,artist,version FROM installed")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, format!("{:?}", (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, Option<String>>(3)?, r.get::<_, Option<i64>>(4)?, r.get::<_, i64>(5)?,
+                                                                         r.get::<_, Option<f64>>(6)?, r.get::<_, Option<f64>>(7)?, r.get::<_, Option<String>>(8)?, r.get::<_, Option<String>>(9)?, r.get::<_, Option<String>>(10)?)))))?
+        .collect::<rusqlite::Result<_>>()?;
+    // the client can list a chart twice: the last entry wins, as INSERT OR REPLACE over the whole list did
+    let last: HashMap<&str, usize> = maps.iter().enumerate().map(|(i, m)| (m.0.as_str(), i)).collect();
     let mut q = db.prepare("INSERT OR REPLACE INTO installed VALUES (?,?,?,?,?,?,?,?,?,?,?)")?;
-    for m in maps {
-        q.execute(params![m.0, m.1, m.2, m.3, m.4, m.5, m.6, m.7, m.8, m.9, m.10])?;
+    for m in maps.iter().enumerate().filter(|(i, m)| last[m.0.as_str()] == *i).map(|x| x.1) {
+        if have.get(&m.0) != Some(&format!("{:?}", (m.1, m.2, &m.3, m.4, m.5, m.6, m.7, &m.8, &m.9, &m.10))) {
+            q.execute(params![m.0, m.1, m.2, m.3, m.4, m.5, m.6, m.7, m.8, m.9, m.10])?;
+            changed = true;
+        }
     }
-    db.execute("DELETE FROM installed_local", [])?;
+    let keep: HashSet<&str> = maps.iter().map(|m| m.0.as_str()).collect();
+    let mut del = db.prepare("DELETE FROM installed WHERE sha256=?")?;
+    for gone in have.keys().filter(|k| !keep.contains(k.as_str())) {
+        del.execute([gone])?;
+        changed = true;
+    }
+    let have: HashMap<String, String> = db.prepare("SELECT sha256,online_md5,audio_sha,audio_required,creator FROM installed_local")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, format!("{:?}", (r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<i64>>(3)?, r.get::<_, Option<String>>(4)?)))))?
+        .collect::<rusqlite::Result<_>>()?;
+    let last: HashMap<&str, usize> = local.iter().enumerate().map(|(i, l)| (l.0.as_str(), i)).collect();
     let mut q = db.prepare("INSERT OR REPLACE INTO installed_local VALUES (?,?,?,?,?)")?;
-    for l in local {
-        q.execute(params![l.0, l.1, l.2, l.3, l.4])?;
+    for l in local.iter().enumerate().filter(|(i, l)| last[l.0.as_str()] == *i).map(|x| x.1) {
+        if have.get(&l.0) != Some(&format!("{:?}", (&l.1, &l.2, Some(l.3), &l.4))) {
+            q.execute(params![l.0, l.1, l.2, l.3, l.4])?;
+            changed = true;
+        }
     }
-    Ok(())
+    let keep: HashSet<&str> = local.iter().map(|l| l.0.as_str()).collect();
+    let mut del = db.prepare("DELETE FROM installed_local WHERE sha256=?")?;
+    for gone in have.keys().filter(|k| !keep.contains(k.as_str())) {
+        del.execute([gone])?;
+        changed = true;
+    }
+    if changed {
+        // what caches over the library key on (the playlist catalogue re-read ~100k feature rows on every import's time)
+        let v = kv_get(db, "library_version").and_then(|v| v.as_i64()).unwrap_or(0);
+        kv_set(db, "library_version", &json!(v + 1))?;
+    }
+    Ok(changed)
 }
 
 pub struct Imported {
@@ -125,10 +159,21 @@ pub struct Imported {
     pub new: i64,
     pub installed: usize,
     pub miss_ratio: Option<f64>,
+    /// the installed library changed (maps added, removed or re-ranked)
+    pub changed: bool,
 }
 
 pub fn import_realm(db: &Db, realm: Option<&Path>, user_id: Option<i64>) -> R<Imported> {
-    let raw = snapshot(realm, true, None).inspect_err(|e| {
+    // Unchanged client.realm (size + mtime as of the last import): nothing to read. A check that found nothing copied and
+    // decoded ~200 MB and rewrote every score and map, 2.2 s and 670 MB a time (2026-11-17).
+    let source = realm.map_or_else(|| paths::lazer_data().join("client.realm"), Path::to_path_buf);
+    let stamp = file_stamp(&source);
+    let last = kv_get(db, "realm_stamp").unwrap_or(Value::Null);
+    if stamp.is_some() && last.get("file") == stamp.as_ref() {
+        let installed = last["maps"].as_u64().unwrap_or(0) as usize; // as the full read counted them
+        return Ok(Imported { user_id: kv_get(db, "user_id").and_then(|v| v.as_i64()), seen: 0, new: 0, installed, miss_ratio: None, changed: false });
+    }
+    let raw = snapshot(Some(&source), true, None).inspect_err(|e| {
         let _ = kv_set(db, "manifest_error", &json!(e.lines().next().unwrap_or("").chars().take(160).collect::<String>()));
     })?;
     let mut user_id = user_id;
@@ -161,7 +206,7 @@ pub fn import_realm(db: &Db, realm: Option<&Path>, user_id: Option<i64>) -> R<Im
         upsert_score(db, r.clone()).map_err(sql)?;
     }
     // dump requires a whole file: a successful empty manifest really is empty.
-    replace_library(db, &maps, &local).map_err(sql)?;
+    let changed = replace_library(db, &maps, &local).map_err(sql)?;
     let after = count(db).map_err(sql)?;
     tx.commit().map_err(sql)?;
     kv_set(db, "realm_import", &json!({"t": now(), "scores": scores.len(), "new": after - before, "maps": maps.len()})).map_err(sql)?;
@@ -174,7 +219,11 @@ pub fn import_realm(db: &Db, realm: Option<&Path>, user_id: Option<i64>) -> R<Im
     }
     set_origin(db, &host, &root).map_err(sql)?;
     replays::archive(db, &raw, "lazer").map_err(sql)?;
-    Ok(Imported { user_id, seen: scores.len(), new: after - before, installed: maps.len(), miss_ratio: None })
+    if let Some(stamp) = stamp {
+        kv_set(db, "realm_stamp", &json!({"file": stamp, "maps": maps.len()})).map_err(sql)?; // last: a failed import retries
+        kv_set(db, "stable_stamp", &Value::Null).map_err(sql)?; // the library is lazer's now
+    }
+    Ok(Imported { user_id, seen: scores.len(), new: after - before, installed: maps.len(), miss_ratio: None, changed })
 }
 
 /// The Songs folder: osu!.<user>.cfg's BeatmapDirectory when it exists here, else <root>/Songs.
@@ -221,8 +270,21 @@ fn stable_status(byte: u8) -> i64 {
 }
 
 /// stable's osu!.db (mania charts) and scores.db (the account's mania scores), the import_realm of stable.
+/// Size and modified time (ns) of a file, the "unchanged since the last full read" test of both importers.
+fn file_stamp(path: &Path) -> Option<Value> {
+    std::fs::metadata(path).ok().map(|m| json!([m.len(), m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as u64)]))
+}
+
 pub fn import_stable(db: &Db, root: Option<&Path>) -> R<Imported> {
     let root = root.map_or_else(paths::stable_data, Path::to_path_buf);
+    // Unchanged osu!.db and scores.db: nothing to read (a check re-read both, every chart's metadata and every score; the
+    // lazer import's realm_stamp, 2026-11-17 audit).
+    let stamp = json!([file_stamp(&root.join("osu!.db")), file_stamp(&root.join("scores.db"))]);
+    let last = kv_get(db, "stable_stamp").unwrap_or(Value::Null);
+    if stamp[0].is_array() && last.get("files") == Some(&stamp) {
+        return Ok(Imported { user_id: kv_get(db, "user_id").and_then(|v| v.as_i64()), seen: 0, new: 0, installed: last["maps"].as_u64().unwrap_or(0) as usize,
+                             miss_ratio: kv_get(db, "stable_miss_ratio").and_then(|v| v.as_f64()), changed: false });
+    }
     // stable writes osu!.db when it first closes; until then its library is empty here, not an error
     let read = (root.join("osu!.db").is_file() || !root.join("osu!.exe").is_file())
         .then(|| std::fs::read(root.join("osu!.db")).map_err(|e| e.to_string()).and_then(|b| stable::library(&b)));
@@ -304,7 +366,7 @@ pub fn import_stable(db: &Db, root: Option<&Path>) -> R<Imported> {
     for r in &scores {
         upsert_score(db, r.clone()).map_err(sql)?;
     }
-    replace_library(db, &maps, &local).map_err(sql)?;
+    let changed = replace_library(db, &maps, &local).map_err(sql)?;
     db.execute("DELETE FROM stable_files", []).map_err(sql)?;
     {
         let mut q = db.prepare("INSERT INTO stable_files VALUES (?,?,?,?)").map_err(sql)?;
@@ -318,12 +380,14 @@ pub fn import_stable(db: &Db, root: Option<&Path>) -> R<Imported> {
     tx.commit().map_err(sql)?;
     kv_set(db, "realm_import", &json!({"t": now(), "scores": scores.len(), "new": after - before, "maps": maps.len()})).map_err(sql)?;
     kv_set(db, "stable_player", &json!(player)).map_err(sql)?;
+    kv_set(db, "realm_stamp", &Value::Null).map_err(sql)?; // the library is stable's now: the next lazer import reads it all
     replays::archive_stable(db, Some(&root)).map_err(sql)?;
     let ratio = stable_miss_ratio(db).map_err(sql)?;
     kv_set(db, "stable_miss_ratio", &json!(ratio)).map_err(sql)?;
     let (host, store) = local_origin("stable");
     set_origin(db, &host, &store).map_err(sql)?;
-    Ok(Imported { user_id, seen: scores.len(), new: after - before, installed: maps.len(), miss_ratio: Some(ratio) })
+    kv_set(db, "stable_stamp", &json!({"files": stamp, "maps": maps.len()})).map_err(sql)?; // last: a failed import retries
+    Ok(Imported { user_id, seen: scores.len(), new: after - before, installed: maps.len(), miss_ratio: Some(ratio), changed })
 }
 
 /// The active client's scores and installed maps.
