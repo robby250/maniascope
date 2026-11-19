@@ -1,6 +1,6 @@
 # ManiaScope
 
-> **Warning:** untested on Windows, osu!stable and 4K. There could be a lot of bugs, especially in those cases.
+> **Warning:** untested on Windows and osu!stable. There could be a lot of bugs, especially in those cases.
 
 osu!mania difficulty viewer and practice playlists for **osu!lazer** and **osu!stable**. It follows the map
 and rate you select in the game and shows its difficulty, skills, dan equivalent and NPS. Its playlists suggest
