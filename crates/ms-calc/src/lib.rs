@@ -1,4 +1,5 @@
 //! ManiaScope difficulty calculator. calc_id is a constant: moving source files must not re-analyse a library.
+pub mod anchor;
 pub mod background;
 pub mod card;
 pub mod chart;

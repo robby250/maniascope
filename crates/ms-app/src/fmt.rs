@@ -38,7 +38,7 @@ pub type Line = Vec<Span>;
 pub fn map_line(title: &str, artist: Option<&str>, song: Option<&str>, version: Option<&str>, keys: i64) -> Line {
     let (mut name, mut diff) = (title.to_string(), version.map(str::to_string));
     if let Some(song) = song.filter(|s| !s.is_empty()) {
-        name = [artist.filter(|a| !a.is_empty()), Some(song)].into_iter().flatten().collect::<Vec<_>>().join(" — ");
+        name = [artist.filter(|a| !a.is_empty()), Some(song)].into_iter().flatten().collect::<Vec<_>>().join(" - ");
     } else if let (Some(i), true) = (name.find(" ["), name.trim_end().ends_with(']')) {
         let tail = name[i + 2..].trim_end();
         diff = Some(tail[..tail.len() - 1].to_string());
@@ -75,7 +75,12 @@ pub fn set_check(c: &Pick, obs: &Obs) -> (bool, bool, Vec<String>) {
             off.push(format!("osu! plays it at {a:.2}×, the pick is {:.2}×", c.rate));
         }
         if !mod_ok {
-            off.push(match wanted { "NM" => "take off the speed mod".to_string(), "HT" => "it needs HT (or DC)".to_string(), _ => "it needs DT (or NC)".to_string() });
+            off.push(match wanted { "NM" => "take off the speed mod".to_string(), "HT" => "it needs HT (or Daycore)".to_string(), _ => "it needs DT (or Nightcore)".to_string() });
+        }
+        // The pick is rated with Invert on or off; the other way is another chart (user 2026-11-21). stable's Invert pick is
+        // its own written chart: selected, it needs no mod.
+        if has(&["IN"]) != (c.invert_of.is_some() && c.sha.as_deref() != Some(observed.as_str())) {
+            off.push(if c.invert_of.is_some() { "it needs Invert (IN)" } else { "take off Invert" }.to_string());
         }
     }
     (known, known && off.is_empty(), off)
@@ -87,7 +92,7 @@ pub fn pick_acc(c: &Pick, obs: &Obs, card: Option<&Card>) -> f64 {
     card.filter(|_| set_check(c, obs).1).map_or(c.pred.acc_mid, |k| k.acc_mid)
 }
 
-/// The pick's unread-SV note ("first read −5.2"), the card's once the pick is set.
+/// The pick's unread-SV note ("first read −5.2"), the card's once the pick is set; tooltip only.
 pub fn pick_note(c: &Pick, obs: &Obs, card: Option<&Card>) -> Option<String> {
     match card.filter(|_| set_check(c, obs).1) {
         Some(k) => k.unread.clone(),
@@ -102,15 +107,12 @@ pub fn target_lines(c: &Pick, obs: &Obs, card: Option<&Card>, shown: &Shown) -> 
     let same = same_map(c, Some(&observed), None, obs.bid);
     let (known, correct, _) = set_check(c, obs);
     let colour = if correct { GREEN } else if known { RED } else { GREY };
-    let expected = if same && c.sha.as_deref().is_some_and(|s| s != observed) { "Updated chart selected".to_string() } else { format!("~{:.1}%", 100. * shown.acc(pick_acc(c, obs, card))) };
-    let mut first = vec![Span { text: format!("{} SET {:.2}× · {wanted}", if correct { "✓" } else { "→" }, c.rate), bold: true, small: false, color: Some(colour) }, plain("  "), bold(expected)];
-    if let Some(note) = pick_note(c, obs, card) {
-        first.extend([plain("  "), small(note)]);
-    }
+    let expected = if same && c.sha.as_deref() != Some(observed.as_str()) && c.invert_of.as_deref() != Some(observed.as_str()) { "Updated chart selected".to_string() } else { format!("~{:.1}%", 100. * shown.acc(pick_acc(c, obs, card))) };
+    let first = vec![Span { text: format!("{} SET {:.2}× · {wanted}{}", if correct { "✓" } else { "→" }, c.rate, if c.invert_of.is_some() && shown.client != "stable" { " + IN" } else { "" }), bold: true, small: false, color: Some(colour) }, plain("  "), bold(expected)];
     vec![first, pick_line(c)]
 }
 
-/// 'warming up −1.2%': the form reason and what it does to this map's expected accuracy.
+/// 'warming up −1.2%': the form reason and what it does to this map's expected accuracy (tooltip only).
 pub fn form_text(form: (Option<&str>, f64), acc_mid: f64, shown: &Shown) -> String {
     let (Some(reason), shift) = form else { return String::new() };
     let rested = 1. - (1. - acc_mid) * (-shift).exp();
@@ -135,13 +137,6 @@ pub fn prediction_line(c: &Card, pp: bool, shown: &Shown) -> (Line, String) {
     if !c.without.is_empty() {
         parts.push(vec![small(format!("without {}", c.without.join(", ")))]); // mods nothing models: the number is the chart's without them
     }
-    let form = form_text(c.form, c.acc_mid, shown);
-    if !form.is_empty() {
-        parts.push(vec![Span { bold: true, ..small(form.clone()) }]);
-    }
-    if let Some(note) = &c.unread {
-        parts.push(vec![Span { bold: true, ..small(note.clone()) }]);
-    }
     if let Some(v) = c.pp_expected {
         parts.push(vec![bold(format!("~{v:.0}pp"))]);
     }
@@ -159,6 +154,8 @@ pub fn prediction_line(c: &Card, pp: bool, shown: &Shown) -> (Line, String) {
     if !c.without.is_empty() {
         tip.push(format!("{} can't be forecast: this is the chart without {}", c.without.join(", "), if c.without.len() == 1 { "it" } else { "them" }));
     }
+    // form and first read: in the tooltip, not on the card (user 2026-11-21)
+    let form = form_text(c.form, c.acc_mid, shown);
     if !form.is_empty() {
         tip.push(format!("Form now: {form} against your rested level on this map"));
     }
@@ -285,7 +282,7 @@ mod tests {
     fn a_title_keeps_its_difficulty_apart() {
         assert_eq!(line_text(&map_line("A - B [Hard]", None, None, None, 7)), "A - B [Hard] 7K");
         assert_eq!(map_line("A - B [Hard]", None, None, None, 7)[0].text, "A - B");
-        assert_eq!(line_text(&map_line("x.osu", Some("Art"), Some("Song"), Some("V"), 4)), "Art — Song [V] 4K");
+        assert_eq!(line_text(&map_line("x.osu", Some("Art"), Some("Song"), Some("V"), 4)), "Art - Song [V] 4K");
     }
 
     #[test]
@@ -323,4 +320,22 @@ mod tests {
         assert_eq!(form_text((Some("warming up"), 0.2), 0.95, &shown), "warming up −0.9%");
         assert_eq!(form_text((None, 0.), 0.95, &shown), "");
     }
+
+    #[test]
+    fn an_invert_pick_is_set_on_its_source_with_invert() {
+        let c = Pick { sha: Some("i".repeat(64)), invert_of: Some("a".repeat(64)), rate: 1., ..Pick::default() };
+        let shown = Shown { client: "lazer".into(), miss_ratio: 0.88 };
+        let off = Obs { source: Some("game"), path: Some("a".repeat(64).into()), rate: Some(1.), ..Obs::default() };
+        let on = Obs { mods: Some(vec![serde_json::json!({"acronym": "IN"})]), ..off.clone() };
+        assert!(!set_check(&c, &off).1 && set_check(&c, &on).1);
+        let first = line_text(&target_lines(&c, &off, None, &shown)[0]);
+        assert!(first.starts_with("→ SET 1.00× · NM + IN") && !first.contains("Updated"), "{first}");
+        // stable: the written Invert chart selected is the pick, no mod
+        let written = Obs { path: Some("i".repeat(64).into()), ..off.clone() };
+        assert!(set_check(&c, &written).1);
+        let stable = Shown { client: "stable".into(), miss_ratio: 0.88 };
+        let first = line_text(&target_lines(&c, &written, None, &stable)[0]);
+        assert!(first.starts_with("✓ SET 1.00× · NM ") && !first.contains("IN") && !first.contains("Updated"), "{first}");
+    }
+
 }

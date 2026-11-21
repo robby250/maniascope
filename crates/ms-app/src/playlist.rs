@@ -227,7 +227,11 @@ fn badges(c: &Pick) -> Vec<(String, Color32, &'static str)> {
         out.push((format!("{}K→{}K", c.source_keys, c.keys), theme::CONVERT, "A keymode convert, written and imported when picked"));
     }
     if c.invert_of.is_some() {
-        out.push(("INVERT".to_string(), theme::CONVERT, "Play it with the Invert mod on: rated that way"));
+        out.push(("INVERT".to_string(), theme::INVERT, "Play it with the Invert mod on: rated that way"));
+    }
+    // the picked skill whose slot the row fills (`Choices::tags`); other maps have none (user 2026-11-21)
+    if let Some(name) = c.matched_skills.first().filter(|s| *s != skills::INVERT_MOD).map(|s| skills::name(s)).filter(|n| !n.is_empty()) {
+        out.push((name.to_string(), theme::SKILL, "Picked for this skill"));
     }
     out
 }
@@ -296,7 +300,8 @@ impl App {
             let at = |s: &crate::settings::Ui, k: i64| s.key_weights.get(mode).and_then(|t| t.get(&k)).copied().unwrap_or(1.);
             // Computed here from the worker's counts, so the % follows the slider at once (user 2026-11-09).
             let counts = self.views.get(mode).map(|v| v.key_counts.clone()).unwrap_or_default();
-            let shares = ms_model::choices::key_shares(&keys, &self.s.key_weights.get(mode).cloned().unwrap_or_default(), &counts, on);
+            // No % until the counts arrive: before that they'd show even shares (user 2026-11-21).
+            let shares = if on && counts.is_empty() { Default::default() } else { ms_model::choices::key_shares(&keys, &self.s.key_weights.get(mode).cloned().unwrap_or_default(), &counts, on) };
             for &k in &keys {
                 let mut v = at(&self.s, k);
                 let share = shares.get(&k).copied();
@@ -467,10 +472,8 @@ impl App {
             }
             let mut units: Vec<Option<&Skill>> = if at == 0 { vec![None] } else { Vec::new() };
             units.extend(skills::tree(mode).iter().map(Some));
-            // Last: the Invert mod on any map at your level (user 2026-11-20); osu!stable has no Invert.
-            if self.units.client != "stable" {
-                units.push(skills::node(skills::INVERT_MOD));
-            }
+            // Last: the Invert mod on any map at your level (user 2026-11-20); on osu!stable a written chart (2026-11-21).
+            units.push(skills::node(skills::INVERT_MOD));
             self.chip_rows(ui, &units, |ui, u| u.map_or(chip_width(ui, "Any"), |p| chip_width(ui, p.name) + if p.children.is_empty() { 0. } else { chip_width(ui, "▾") }), |app, ui, u| {
                 let Some(parent) = u else { return app.any_chip(ui) };
                 // Together: a chip and its ▾ wrap as one.
@@ -517,7 +520,7 @@ impl App {
             let counts = self.views.get("skills").map(|v| v.skill_counts.clone()).unwrap_or_default();
             let entries: Vec<(String, f64, usize)> = skills::sliders(&self.s.practice, &self.s.skill_weights, self.s.skill_other)
                 .unwrap_or_default().into_iter().map(|(k, w)| { let n = counts.get(&k).copied().unwrap_or(0); (k, w, n) }).collect();
-            let shares = ms_model::choices::mix_shares(&entries, on);
+            let shares = if on && counts.is_empty() { Default::default() } else { ms_model::choices::mix_shares(&entries, on) };
             for key in included {
                 let mut v = self.s.skill_weights.get(&key).copied().unwrap_or(1.);
                 let share = shares.get(&key).copied();
@@ -674,13 +677,17 @@ impl App {
             let number = pp_row(c, mode).then(|| row_text(c, mode, &self.units).0);
             // A red SET says what osu! still shows differently.
             let off = fmt::set_check(c, &self.obs).2;
-            let tip = [v.target_tip.clone(), (!off.is_empty()).then(|| format!("Not set yet: {}.", off.join("; ")))].into_iter().flatten().reduce(|a, b| format!("{a}\n{b}"));
+            // form and first read: tooltip only (user 2026-11-21)
+            let tip = [v.target_tip.clone(), (!off.is_empty()).then(|| format!("Not set yet: {}.", off.join("; "))), (!v.phase.is_empty()).then(|| v.phase.clone()),
+                       fmt::pick_note(c, &self.obs, self.card.as_deref()).map(|n| format!("{n}%: you haven't learned to read this map's SV yet"))]
+                .into_iter().flatten().reduce(|a, b| format!("{a}\n{b}"));
             egui::Frame::new().fill(theme::ROW_CURRENT).inner_margin(egui::Margin::symmetric(6, 5)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                let marked = !badges(c).is_empty();
+                // the number and the badges under it: a long skill name widens the column (≈5.5 px a character at 9.5 pt)
+                let marks: f32 = badges(c).iter().map(|b| 9. + 5.5 * b.0.chars().count() as f32).sum();
                 ui.horizontal(|ui| {
                     ui.scope(|ui| {
-                        ui.set_max_width((ui.available_width() - if number.is_some() || marked { 104. } else { 0. }).max(60.));
+                        ui.set_max_width((ui.available_width() - if number.is_some() || marks > 0. { marks.max(104.) } else { 0. }).max(60.));
                         theme::block(ui, &[(lines[0].clone(), 1), (lines[1].clone(), 2)], tip.as_deref());
                     });
                     ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
@@ -1040,8 +1047,9 @@ impl App {
             }
             // Top right, away from the playlist tabs (user 2026-11-09: "so that it doesnt compete with the tabs").
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Clicked again: back to the playlist that was open (user 2026-11-21).
                 if ui.selectable_label(self.stats_open, "Stats").clicked() {
-                    self.set_stats(true);
+                    self.set_stats(!self.stats_open);
                 }
             });
         });
@@ -1123,5 +1131,8 @@ mod tests {
         let convert = Pick { convert_of: Some("src".into()), source_keys: 7, keys: 10, ..Pick::default() };
         assert_eq!(text(Pick { installed: true, ..convert.clone() }), "7K→10K", "an imported convert stays one");
         assert_eq!(text(Pick { source_web: true, ..convert }), "WEB 7K→10K");
+        let skill = |m: &[&str]| text(Pick { installed: true, matched_skills: m.iter().map(|s| s.to_string()).collect(), ..Pick::default() });
+        assert_eq!(skill(&["vibro", "jackspeed"]), "Vibro", "the skill whose slot it fills");
+        assert_eq!(skill(&[skills::INVERT_MOD]), "", "Invert has its own badge");
     }
 }

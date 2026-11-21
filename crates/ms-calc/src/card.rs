@@ -16,7 +16,7 @@ pub fn display_name(s: Sk) -> &'static str {
     taxonomy::of(s).name
 }
 
-fn fitted(key: &str) -> f64 {
+pub fn fitted(key: &str) -> f64 {
     let v: serde_json::Value = serde_json::from_str(include_str!("../../../calib/taxonomy.json")).expect("calib/taxonomy.json");
     v["card"][key].as_f64().unwrap_or_else(|| panic!("calib/taxonomy.json: card.{key}"))
 }
@@ -25,6 +25,20 @@ fn fitted(key: &str) -> f64 {
 pub fn fitted_tag() -> f64 {
     static C: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *C.get_or_init(|| fitted("tag"))
+}
+
+/// TAG at a chart's shown stars: `base` at `tag_from`, moving by `tag_rise` × ln(stars / tag_from) (stars under 1 read as 1),
+/// so Tech shows on about the same share of charts at every level (user 2026-11-21: "on the hardest maps (10*+) basically
+/// every map shows the tech tag", "make it show up on about 20% throughout"). Fitted by `calib labels --tech-levels`.
+pub fn tag_at(base: f64, stars: f64) -> f64 {
+    static C: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
+    let (from, rise) = *C.get_or_init(|| (fitted("tag_from"), fitted("tag_rise")));
+    tag_curve(base, from, rise, stars)
+}
+
+/// `tag_at` with explicit knobs.
+pub fn tag_curve(base: f64, from: f64, rise: f64, stars: f64) -> f64 {
+    base + rise * (stars.max(1.0) / from).ln()
 }
 
 /// NAME from calib/taxonomy.json: a type names its family's row from this share of the row's rating.
@@ -142,10 +156,22 @@ pub fn card(res: &Dict) -> Vec<Val> {
 /// The card with up to `n` rows. The stored `unit_card` is taken before the unit conversion: rebuilding from the converted
 /// result dropped entries.
 pub fn card_top(res: &Dict, n: usize) -> Vec<Val> {
-    card_with(res, n, fitted_tag(), fitted_name())
+    card_base(res, n, fitted_tag(), fitted_name())
 }
 
-/// `card_top` with an explicit TAG and NAME (their fits, `calib labels --fit`).
+/// The chart's stars as the player sees them (osu!'s scale, `anchor`): the Tech curve is set in those (user 2026-11-21:
+/// "i meant 10* on the stars that i see").
+pub fn shown_stars(res: &Dict) -> f64 {
+    crate::anchor::stars(res.f("keys") as i64, res.dict("scores").map_or(0.0, |s| s.f("overall")))
+}
+
+/// The card with TAG `base` at `tag_from` shown stars, rising above (`tag_at`).
+pub fn card_base(res: &Dict, n: usize, base: f64, name_at: f64) -> Vec<Val> {
+    let stars = shown_stars(res);
+    card_with(res, n, tag_at(base, stars), name_at)
+}
+
+/// `card_top` with an explicit TAG (at this chart's stars) and NAME (their fits, `calib labels --fit`).
 pub fn card_with(res: &Dict, n: usize, tag: f64, name_at: f64) -> Vec<Val> {
     if let Some(Val::List(uc)) = res.get("unit_card") {
         return uc.iter().take(n).cloned().collect();

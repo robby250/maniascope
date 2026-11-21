@@ -56,6 +56,7 @@ pub struct View {
     pub target_tip: Option<String>,
     pub note: String,
     pub note_tip: String,
+    pub phase: String, // the form phase, for the SET line's tooltip
     pub loaded: bool,
     pub analysing: Option<(String, usize, usize)>,
     pub big: bool, // this analysis run began with most of the library left (a first launch or a calculator change)
@@ -152,7 +153,7 @@ pub struct App {
 }
 
 fn view() -> View {
-    View { shown: Vec::new(), pending: None, ready: false, target: None, target_msg: String::new(), target_tip: None, note: String::new(), note_tip: String::new(), loaded: false, analysing: None, big: false, revision: 0, hover: false, settings: false, warmup: false, played: false, key_counts: Default::default(), skill_counts: Default::default(), nps_pool: Default::default() }
+    View { shown: Vec::new(), pending: None, ready: false, target: None, target_msg: String::new(), target_tip: None, note: String::new(), note_tip: String::new(), phase: String::new(), loaded: false, analysing: None, big: false, revision: 0, hover: false, settings: false, warmup: false, played: false, key_counts: Default::default(), skill_counts: Default::default(), nps_pool: Default::default() }
 }
 
 /// Only source/debug runs get the pause switch (user 2026-10-01). Release builds have no way back on, so an old pause is
@@ -379,9 +380,11 @@ impl App {
             self.blocker = None;
         }
         view.warmup = phase == "warmup";
+        // the form phase only in the tooltip, not on the playlist (user 2026-11-21)
         let phase = match phase.as_str() { "warmup" => "Warming up", "build" => "Warmed up", "push" => "Strong form", "recover" => "Easing off", "fading" => "Fading", other => other };
-        view.note = if note.is_empty() { phase.to_string() } else { format!("{phase} · {note}") };
-        view.note_tip = [view.note.as_str(), summary.as_str()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n");
+        view.note = note;
+        view.phase = phase.to_string();
+        view.note_tip = [phase, view.note.as_str(), summary.as_str()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n");
         view.analyse(progress);
         view.ready = !shown.is_empty();
         view.shown = shown;
@@ -412,7 +415,7 @@ impl App {
                 if blocking {
                     self.blocker = Some(text.clone());
                     // the playlist window carries the reason; the main window only notes it for a while
-                    self.flash = Some(("Recommendations unavailable — see the playlist window".into(), Instant::now() + Duration::from_secs(15)));
+                    self.flash = Some(("Recommendations unavailable: see the playlist window".into(), Instant::now() + Duration::from_secs(15)));
                 }
                 // A later import/replay note must not hide why there are no recommendations at all.
                 let joined: Vec<&str> = self.blocker.iter().map(String::as_str).chain([text.as_str()]).filter(|t| !t.is_empty()).collect();
@@ -422,7 +425,7 @@ impl App {
                 self.bg_main = learning != Some(false);
                 if let Some(on) = learning { // Stats has no list to show meanwhile: it keeps its own banner
                     let eta = text.rsplit_once(" · ~").map(|x| format!(" · ~{}", x.1)).unwrap_or_default();
-                    self.stats_wait = (on && total > 0).then(|| (format!("Learning your level from your plays · {} / {} charts analysed{eta} — your stats fill in as this runs", ms_rec::engine::commas(done), ms_rec::engine::commas(total)), done, total));
+                    self.stats_wait = (on && total > 0).then(|| (format!("Learning your level from your plays · {} / {} charts analysed{eta}: your stats fill in as this runs", ms_rec::engine::commas(done), ms_rec::engine::commas(total)), done, total));
                 }
             }
             Out::Pool { mode, revision, selection_id, phase, shown, note, summary, progress, key_counts, skill_counts, nps_pool } => {
@@ -527,7 +530,7 @@ impl App {
         let start = self.play.lock().unwrap().as_ref().and_then(|p| p["t"].as_f64());
         let _ = set_tracking(&self.db, enabled, None, start);
         self.q.put(Task::Tracking);
-        self.status_text = if enabled { "Tracking resumed for the next play" } else { "Tracking paused — controller plays will be excluded" }.into();
+        self.status_text = if enabled { "Tracking resumed for the next play" } else { "Tracking paused: controller plays will be excluded" }.into();
     }
 
     /// → (path, rate, rate known) for what should be on display now.
@@ -591,7 +594,7 @@ impl App {
     }
 
     fn header(&self, path: &std::path::Path, rate: f64) -> Pending {
-        let meta = ms_data::lazer_index::metadata(path).unwrap_or_default();
+        let meta = std::fs::read(path).ok().and_then(|d| ms_data::lazer_index::metadata(&d)).unwrap_or_default();
         let get = |a: &str, b: &str| meta.get(a).or_else(|| meta.get(b)).cloned().unwrap_or_default();
         let keys = get("CircleSize", "CircleSize").split('.').next().unwrap_or("").to_string();
         let mut title = get("TitleUnicode", "Title");
@@ -619,7 +622,7 @@ impl App {
             // Working is silent: this line is for what needs a look (user 2026-11-01).
             [o.note.as_str(), if o.rate.is_none() { "showing 1.00×" } else { "" }].iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join(" · ")
         } else if o.source == Some("log") {
-            format!("lazer via log — {}{}", o.note, if o.path.is_some() { " · showing 1.00×" } else { "" })
+            format!("lazer via log: {}{}", o.note, if o.path.is_some() { " · showing 1.00×" } else { "" })
         } else {
             o.note.clone()
         };
@@ -644,7 +647,7 @@ impl App {
         }
         if let Some(c) = &self.card {
             state["expected"] = json!(format!("~{:.1}%", 100. * self.units.acc(c.acc_mid)));
-            let notes: Vec<String> = [Some(fmt::form_text(c.form, c.acc_mid, &self.units)), c.unread.clone(), c.random.then(|| "≈ with Random".to_string())].into_iter().flatten().filter(|t| !t.is_empty()).collect();
+            let notes: Vec<String> = c.random.then(|| "≈ with Random".to_string()).into_iter().collect();
             state["form"] = json!(notes.join(" · "));
         }
         if let Some(p) = &self.views[self.mode()].target {

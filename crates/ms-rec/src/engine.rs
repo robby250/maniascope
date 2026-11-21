@@ -141,14 +141,14 @@ pub struct Card {
     pub mods: Vec<String>,
     pub without: Vec<String>,
     pub sure: bool, // enough of the player's own plays on this keymode to show acc_mid unasked
-    pub form: (Option<&'static str>, f64),
+    pub form: (Option<&'static str>, f64), // tooltip only (user 2026-11-21)
     pub length: f64,
     pub skill: Option<String>,
     pub nps: Option<f64>,
     pub pp: Option<(f64, f64, Option<f64>, f64, f64)>, // pp_lo, pp_hi, best, gain, p_up
     pub pp_expected: Option<f64>, // shown on every map with stars, unranked too
     pub plays_like: Option<(f64, i64)>,
-    pub unread: Option<String>, // `Prediction::read_note`: acc_mid/lo/hi carry the deficit
+    pub unread: Option<String>, // `Prediction::read_note`, tooltip only: acc_mid/lo/hi carry the deficit
     pub random: bool, // Random before its seed: the mean over three shuffles (worker::mean_card)
 }
 
@@ -322,7 +322,7 @@ impl Engine {
         let order = preview_order(&ids, &n.session.shuffle_seed().to_string(), 0.);
         let shown: Vec<Pick> = order.into_iter().map(|i| rows[i].clone()).collect();
         let top = rows.iter().filter(|c| c.best_rank <= 100).count();
-        let mut note = if rows.is_empty() { "No likely PP gains at this readiness — try Skills or an easier map".to_string() } else { format!("{} eligible · {top} top-100", commas(rows.len())) };
+        let mut note = if rows.is_empty() { "No likely PP gains at this readiness: try Skills or an easier map".to_string() } else { format!("{} eligible · {top} top-100", commas(rows.len())) };
         if relaxed {
             note += " · all cycled, repeats allowed";
         }
@@ -358,9 +358,8 @@ impl Engine {
     }
 
     /// Stats for the chart the game has selected, at its rate: the same numbers a list entry shows.
-    pub fn card(&mut self, db: &Db, path: &Path, rate: f64, n: &Now) -> Result<Option<Card>> {
-        let Ok(data) = std::fs::read(path) else { return Ok(None) };
-        let (sha, md5) = hashes(&data);
+    pub fn card(&mut self, db: &Db, data: &[u8], rate: f64, n: &Now) -> Result<Option<Card>> {
+        let (sha, md5) = hashes(data);
         // a modded chart goes by its sha, as its plays do (evidence_rows): its affinity and reads are found under it
         let chart = if crate::modcharts::source_of(db, &sha).is_some() { sha.clone() } else { md5.clone() };
         let Some((e, f, feats, b)) = self.expectation(db, &sha, &chart, rate, n)? else { return Ok(None) };
@@ -370,17 +369,17 @@ impl Engine {
         let stars = f.get("stars").map(Val::f).or_else(|| b.and_then(|b| self.public.feature(b, round_digits(rate, 3)))
             .and_then(|v| if let Val::Dict(d) = v { d.get("stars").map(Val::f) } else { None }));
         // Off 0.75×/1×/1.5× the analysis has no stars: computed here for the card's pp (user 2026-11-08: 1.10× showed none).
-        let at = if stars.is_none() { ms_calc::features::stars_at(&data, rate) } else { None };
+        let at = if stars.is_none() { ms_calc::features::stars_at(data, rate) } else { None };
         let stars = stars.or(at.map(|a| a.0));
         let hits = f.get("hits").map(Val::f).or(at.map(|a| f64::from(a.1))).unwrap_or_else(|| f.fget("notes", 0.));
         let ranked = (approved || inst.as_ref().is_some_and(|i| i.status.is_some_and(|s| RANKED_STATUS.contains(&s)))) && [0.75, 1., 1.5].contains(&round_digits(rate, 2)) && stars.is_some();
-        let meta = if inst.is_none() { ms_data::lazer_index::metadata(path) } else { None };
+        let meta = if inst.is_none() { ms_data::lazer_index::metadata(data) } else { None };
         let get = |k: &str| meta.as_ref().and_then(|m| m.get(k).cloned());
         let (artist, song, version) = inst.as_ref().map_or_else(|| (get("Artist"), get("Title"), get("Version")), |i| (Some(i.artist.clone()), Some(i.title.clone()), Some(i.version.clone())));
         let title = if inst.is_some() || meta.is_some() {
             format!("{} - {} [{}]", artist.as_deref().unwrap_or(""), song.as_deref().unwrap_or(""), version.as_deref().unwrap_or(""))
         } else {
-            path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+            sha.clone() // a store file is named by its sha
         };
         let pp = ranked.then(|| estimates(&e.pp, stars.unwrap(), hits, bid, &self.r.ledger));
         let plays_like = self.plays_like(&f, b, rate);
@@ -399,9 +398,8 @@ impl Engine {
     }
 
     /// Selected-chart analysis: a panic in one chart loses that chart, not the app.
-    pub fn analyse(path: &Path, rate: f64, prm: &Params) -> std::result::Result<Vec<(f64, Dict)>, String> {
-        let data = std::fs::read(path).map_err(|e| e.to_string())?;
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ms_calc::features::selected_features(&data, rate, prm))).map_err(|_| "the analysis crashed on this chart".to_string())?
+    pub fn analyse(data: &[u8], rate: f64, prm: &Params) -> std::result::Result<Vec<(f64, Dict)>, String> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ms_calc::features::selected_features(data, rate, prm))).map_err(|_| "the analysis crashed on this chart".to_string())?
     }
 }
 
@@ -513,7 +511,6 @@ impl Charts {
         // Stable's store too: a stable player's charts all read as missing and kept the old calculator's analysis (a player
         // 2026-11-05: every LN skill at 0 charts, v1.4.0).
         crate::pp::chart_path(Some(sha)).and_then(|p| std::fs::read(p).ok()).or_else(|| std::fs::read(web).ok()).or_else(|| crate::converts::bytes(self.converts.get(sha)?, &self.root))
-            .or_else(|| std::fs::read(crate::modcharts::file(sha)).ok())
     }
 
     /// `chart`, counting the ones missing.

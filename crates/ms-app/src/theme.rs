@@ -15,6 +15,8 @@ pub const ACCENT: Color32 = Color32::from_rgb(0x3d, 0xae, 0xe9);
 pub const CHIP_ON: Color32 = Color32::from_rgb(0x57, 0xc2, 0x6e);
 pub const CHIP_OFF: Color32 = Color32::from_rgb(0xe5, 0x53, 0x4b);
 pub const CONVERT: Color32 = Color32::from_rgb(0xf0, 0xa8, 0x3c); // the keymode-convert badge, beside ACCENT's website one
+pub const SKILL: Color32 = Color32::from_rgb(0x4f, 0xb8, 0x9e); // the picked-skill badge
+pub const INVERT: Color32 = Color32::from_rgb(0xb5, 0x8c, 0xf0); // the Invert badge, apart from the convert one
 pub const BODY: f32 = 13.33; // GTK's 10 pt
 pub const SMALL: f32 = 11.33; // its 0.85 scale
 

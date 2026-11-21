@@ -109,6 +109,9 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     if chart.window_shift != 0.0 {
         res.set("window_shift", chart.window_shift); // a mod moved the hit windows: the forecast's window law reads it
     }
+    if chart.invert {
+        res.set("invert", 1.); // the Skills tab's "Inverse mod" dimension (ms_model::skills::INVERT_MOD)
+    }
     let mut sc = Dict::new();
     sc.set("overall", 0.0);
     for s in crate::taxonomy::rated(keys) {

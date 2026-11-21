@@ -78,7 +78,7 @@ pub fn one_by_sha(db: &Db, sha: &str) -> Result<Option<Inst>> {
 /// The charts in the client's library: installed ones, and each installed chart rated under Invert (played as its source with the
 /// mod on; its own file is ManiaScope's, so without it every Invert row left the list: user 2026-11-21 "dont see any").
 pub fn local_shas(db: &Db) -> Result<std::collections::HashSet<String>> {
-    let mut q = db.prepare("SELECT sha256 FROM installed UNION SELECT m.sha FROM mod_charts m JOIN installed i ON i.sha256 = m.source WHERE m.tag = 'IN'")?;
+    let mut q = db.prepare("SELECT sha256 FROM installed UNION SELECT m.sha FROM mod_charts m JOIN installed i ON i.sha256 = m.source WHERE m.tag IN ('IN', 'INW')")?;
     let rows = q.query_map([], |r| r.get(0))?;
     rows.collect()
 }
@@ -90,7 +90,7 @@ pub fn library(db: &Db, client: &str) -> Result<(Vec<Inst>, String)> {
     let (host, root) = local_origin(client);
     if let Some(origin) = kv_get(db, "manifest_origin") {
         if origin["host"].as_str() != Some(&host) || origin["root"].as_str().map(Path::new) != Some(root.as_path()) {
-            return Ok((Vec::new(), "Library belongs to another location — import local maps".to_string()));
+            return Ok((Vec::new(), "Library belongs to another location: import local maps".to_string()));
         }
     }
     // Exhausted before the file checks, which can wait on disk while another connection needs to commit a live event.

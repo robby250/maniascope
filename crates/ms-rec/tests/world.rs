@@ -230,14 +230,15 @@ fn the_card_matches_its_list_entry_and_a_custom_rate_shows_no_pp() {
     let rows = e.scored(&w.db, &[7], &n).unwrap();
     let c = rows.iter().find(|c| c.rate == 1. && c.gain.unwrap_or(0.) > 0. && shas.iter().any(|s| Some(&s.1) == c.md5.as_ref())).expect("an improvable chart");
     let path = ms_data::paths::local_file(c.sha.as_ref().unwrap(), &sandbox()).unwrap();
-    let card = e.card(&w.db, &path, c.rate, &n).unwrap().unwrap();
+    let data = std::fs::read(&path).unwrap();
+    let card = e.card(&w.db, &data, c.rate, &n).unwrap().unwrap();
     let close = |a: f64, b: f64| (a - b).abs() < 1e-6 * b.abs().max(1.);
     assert!(close(card.acc_mid, c.pred.acc_mid), "{} {}", card.acc_mid, c.pred.acc_mid);
     let (lo, hi, _, gain, chance) = card.pp.unwrap();
     assert!(close(gain, c.gain.unwrap()) && close(chance, c.p_up.unwrap()) && close(lo, c.pp_lo.unwrap()) && close(hi, c.pp_hi.unwrap()));
     // The PP gain comes from the PP target, the shown accuracy from the display target.
     assert!(c.pp_pred.as_ref().unwrap().mu != c.pred.mu);
-    let fs = Engine::analyse(&path, 1.2, &e.prm).unwrap();
+    let fs = Engine::analyse(&data, 1.2, &e.prm).unwrap();
     e.store(&w.db, c.sha.as_ref().unwrap(), &fs).unwrap();
-    assert!(!e.card(&w.db, &path, 1.2, &n).unwrap().unwrap().ranked);
+    assert!(!e.card(&w.db, &data, 1.2, &n).unwrap().unwrap().ranked);
 }

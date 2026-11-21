@@ -415,7 +415,7 @@ impl App {
                                 theme::dim_small(ui, format!("≈ {d}"));
                             }
                         }
-                        None => { ui.label("—"); }
+                        None => { ui.label("-"); }
                     }
                 });
             });
@@ -594,7 +594,7 @@ impl App {
                     theme::dim(ui, "Each rating uses its own keymode's difficulty scale. There is no cross-keymode average.");
                     for k in SUPPORTED_KEYS {
                         let page = data.pages.get(&k);
-                        let value = page.and_then(|p| p.groups.get("overall")).and_then(|g| g.value).map_or("—".to_string(), |v| format!("{:.1}", st(k, v)));
+                        let value = page.and_then(|p| p.groups.get("overall")).and_then(|g| g.value).map_or("-".to_string(), |v| format!("{:.1}", st(k, v)));
                         let (maps, plays) = page.map_or((0, 0), |p| (p.maps, p.plays));
                         if ui.add(egui::Button::new(format!("{k}K     {value}    ·    {} charts / {} plays", ms_rec::engine::commas(maps), ms_rec::engine::commas(plays))).frame(false)).clicked() {
                             self.s.stats_keys = Some(k);

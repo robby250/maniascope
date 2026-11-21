@@ -79,6 +79,8 @@ pub struct WebView {
     pp_due: Option<Instant>, // next new-ranked-PP-maps check (None: at start)
     pp: bool, // the child is the PP fetch, not the player's batch: closing the app doesn't mark it for the next launch
     estimated: Option<Vec<Want>>, // the choice the shown counts are for: recounted only when it or the lists change
+    delete_asked: bool,
+    deleted: Option<String>,
 }
 
 impl WebView {
@@ -389,6 +391,27 @@ impl App {
                 self.web_run("check", &self.web.wants.clone());
             }
         });
+        // deleting them: a second click confirms (user 2026-11-21: with an "are you sure")
+        let disk = self.web.info.as_ref().and_then(|i| i.estimate.as_ref()).map_or(0, |e| e.disk);
+        if self.web.delete_asked {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Delete every downloaded website map and its analysis ({})? Start downloads them again.", fmt::size(disk as f64))).color(theme::CHIP_OFF));
+                if ui.button("Yes, delete").clicked() {
+                    self.web.delete_asked = false;
+                    self.web.deleted = Some(webmaps::delete_all().map_or_else(|e| e, |n| format!("{} website maps deleted", ms_rec::engine::commas(n))));
+                    self.q.put(Task::WebUpdated);
+                    self.web_poll();
+                }
+                if ui.button("Cancel").clicked() {
+                    self.web.delete_asked = false;
+                }
+            });
+        } else if ui.add_enabled(!running && disk > 0, egui::Button::new(format!("Delete website maps ({})…", fmt::size(disk as f64)))).on_hover_text("Frees the disk space of the downloaded website charts (text and analyses, no audio). Maps already in osu! stay.").clicked() {
+            self.web.delete_asked = true;
+        }
+        if let Some(text) = &self.web.deleted {
+            theme::dim(ui, text);
+        }
     }
 
     /// The keymode's want, made with the ★ range its plays suggest the first time.
@@ -510,13 +533,13 @@ impl App {
             self.open.profile = None;
         }
         if self.open.menu {
-            self.open.menu &= !window(ctx, "menu", "ManiaScope — Settings", [430., 470.], above, |ui| self.menu_ui(ui));
+            self.open.menu &= !window(ctx, "menu", "ManiaScope · Settings", [430., 470.], above, |ui| self.menu_ui(ui));
             if !self.open.menu {
                 self.open.profile = self.open.profile.filter(|first| *first);
             }
         }
         if self.open.web {
-            self.open.web = !window(ctx, "web", "ManiaScope — Website charts", [480., 300.], above, |ui| self.web_ui(ui));
+            self.open.web = !window(ctx, "web", "ManiaScope · Website charts", [480., 300.], above, |ui| self.web_ui(ui));
             if !self.open.web {
                 self.web.saved = false;
             }

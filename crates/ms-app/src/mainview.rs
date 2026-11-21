@@ -149,7 +149,7 @@ impl App {
         }
         if e.parts.iter().any(|p| p == "technical") && !a.tech.is_empty() {
             lines.push("Tech passages (song time):".into());
-            lines.extend(a.tech.iter().map(|w| format!("  {}  pattern {:.0}% / rhythm {:.0}%{}", at_rate(w.t * 1000., a.rate), 100. * w.pattern, 100. * w.rhythm, if w.why.is_empty() { String::new() } else { format!(" — {}", w.why) })));
+            lines.extend(a.tech.iter().map(|w| format!("  {}  pattern {:.0}% / rhythm {:.0}%{}", at_rate(w.t * 1000., a.rate), 100. * w.pattern, 100. * w.rhythm, if w.why.is_empty() { String::new() } else { format!(": {}", w.why) })));
         }
         lines.join("\n")
     }
@@ -167,7 +167,7 @@ impl App {
             let you = self.you(a.keys).and_then(|p| Some((p.groups.get("overall")?.value?, p)));
             let versus = you.map_or(String::new(), |(y, _)| format!("\n{:+.1} vs your {}K {:.1}{}", v - ms_rec::shown::stars(a.keys, y), a.keys, ms_rec::shown::stars(a.keys, y), ms_rec::dans::ability(a.keys, y, "overall").map_or(String::new(), |d| format!(" · ≈ {d}"))));
             theme::gradient(&mut ui, &format!("{v:.2}"), BODY * 2.4, None, &text, Some(pill))
-                .on_hover_text(format!("Overall difficulty: level a well-rounded player needs for controlled, accurate play. Provisional calibration — one decimal is already generous.{versus}"));
+                .on_hover_text(format!("Overall difficulty: level a well-rounded player needs for controlled, accurate play. Provisional calibration: one decimal is already generous.{versus}"));
             ui.add_space(4.);
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -280,7 +280,7 @@ impl App {
                 let x = track.left() + track.width() * (y as f32 / BAR_FULL).clamp(0., 1.);
                 p.vline(x, (track.top() - 3.)..=(track.bottom() + 3.), Stroke::new(2., TEXT.gamma_multiply(0.6)));
             }
-            hover.on_hover_text(format!("{name} {:.2}{}{}\n\n{BARS_TIP}", ms_rec::shown::stars(a.keys, *value), versus(a.keys, *value, you), if you.is_some() { " — the tick is you" } else { "" }));
+            hover.on_hover_text(format!("{name} {:.2}{}{}\n\n{BARS_TIP}", ms_rec::shown::stars(a.keys, *value), versus(a.keys, *value, you), if you.is_some() { " (the tick is you)" } else { "" }));
         }
     }
 
@@ -328,7 +328,8 @@ impl App {
             self.copy(search_text(a));
             ui.close();
         }
-        if ui.button("Open folder").on_hover_text("The folder holding this .osu file").clicked() {
+        // lazer keeps files by hash (files/0/04/…): its folder is no map's set, so stable only (user 2026-11-21)
+        if self.units.client.starts_with("stable") && ui.button("Open folder").on_hover_text("The map's set folder in Songs").clicked() {
             if let Some(dir) = a.path.parent() {
                 open_external(&dir.to_string_lossy());
             }

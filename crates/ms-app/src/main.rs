@@ -168,7 +168,7 @@ impl eframe::App for Shell {
             // Kept from opening: fed the tracked values, egui re-sends every change as a resize or move on each repaint, and
             // repaints run constantly in game (a player: only this window, only in game, only once moved and resized).
             let ((w, h), at) = *app.recs_opened.get_or_insert((app.s.recs_win, app.s.recs_pos));
-            let mut b = ViewportBuilder::default().with_title("ManiaScope — Playlist").with_inner_size([w, h]).with_app_id("maniascope");
+            let mut b = ViewportBuilder::default().with_title("ManiaScope · Playlist").with_inner_size([w, h]).with_app_id("maniascope");
             if let Some(p) = at {
                 b = b.with_position(p); // Windows/X11 only: Wayland ignores it (a compositor window rule places them there)
             }

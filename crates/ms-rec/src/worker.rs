@@ -298,7 +298,7 @@ pub struct Worker {
     replay_retries: u32,
     jobs: Arc<Jobs>,
     feature_errors: Arc<Mutex<std::collections::HashMap<(String, u64), (Instant, String)>>>,
-    feature_pending: Arc<Mutex<(std::collections::VecDeque<(String, PathBuf, f64, bool)>, bool)>>,
+    feature_pending: Arc<Mutex<(std::collections::VecDeque<(String, Vec<u8>, f64, bool)>, bool)>>,
     stats_visible: bool,
     stats_cache: Option<(u64, Arc<stats::Profile>)>,
     current: Option<String>,
@@ -348,20 +348,20 @@ fn parse_mods(v: Option<&Value>) -> Option<Vec<Value>> {
 struct Played {
     sha: String,
     md5: String,
-    path: PathBuf,
+    data: Vec<u8>,
     /// The rate to rate it at: the mods' constant rate, 1× where the rate follows the player (Adaptive Speed).
     rate: f64,
     m: ms_calc::mods::Mods,
 }
 
-fn as_played(db: &Db, path: &Path, data: &[u8], rate: Option<f64>, mods: &[Value]) -> Played {
+fn as_played(db: &Db, data: &[u8], rate: Option<f64>, mods: &[Value]) -> Played {
     let m = ms_calc::mods::plan(mods);
     let (sha, md5) = hashes(data);
     let rate = rate.or(m.rate).unwrap_or(1.);
     let tag = m.tag();
     match (!tag.is_empty()).then(|| crate::modcharts::ensure(db, &sha, data, &tag).ok()).flatten() {
-        Some((sha, md5, path)) => Played { sha, md5, path, rate, m },
-        None => Played { sha, md5, path: path.to_path_buf(), rate, m },
+        Some((sha, md5, data)) => Played { sha, md5, data, rate, m },
+        None => Played { sha, md5, data: data.to_vec(), rate, m },
     }
 }
 
@@ -373,8 +373,8 @@ fn shuffles(db: &Db, data: &[u8], played: &Played) -> Vec<Played> {
     let source = hashes(data).0;
     ms_calc::mods::RANDOM_SEEDS.iter().filter_map(|&seed| {
         let m = ms_calc::mods::Mods { random: Some(Some(seed)), ..played.m.clone() };
-        let (sha, md5, path) = crate::modcharts::ensure(db, &source, data, &m.tag()).ok()?;
-        Some(Played { sha, md5, path, rate: played.rate, m })
+        let (sha, md5, data) = crate::modcharts::ensure(db, &source, data, &m.tag()).ok()?;
+        Some(Played { sha, md5, data, rate: played.rate, m })
     }).collect()
 }
 
@@ -438,8 +438,13 @@ impl Worker {
 
     /// What startup is waiting on: the status line, its progress bar, and the selected map's card.
     fn stage(&mut self, text: Option<String>, blocking: bool) {
+        self.stage_at(text, blocking, None);
+    }
+
+    /// `stage` with a bar: step `done` of `total` (the start's steps, user 2026-11-21: "that needs a loading bar too").
+    fn stage_at(&mut self, text: Option<String>, blocking: bool, progress: Option<(usize, usize)>) {
         self.loading.clone_from(&text);
-        (self.h.emit)(Out::Status { text: text.unwrap_or_default(), progress: None, blocking, learning: None });
+        (self.h.emit)(Out::Status { text: text.unwrap_or_default(), progress, blocking, learning: None });
         if self.rec.is_none() && self.sel.0.is_some() {
             self.card();
         }
@@ -490,7 +495,7 @@ impl Worker {
             self.last_idle_check = Instant::now();
             if now() - kv_get(&self.db, "snapshot_check").and_then(|v| v["t"].as_f64()).unwrap_or(0.) > 86400. {
                 if let Ok(Some(newest)) = ms_data::public::check_index(&self.db) {
-                    self.status(format!("newer public snapshot {} — refresh --download (personal analysis; see licence)", &newest[..10]));
+                    self.status(format!("newer public snapshot {}: refresh --download (personal analysis; see licence)", &newest[..10]));
                 }
             }
         }
@@ -509,7 +514,12 @@ impl Worker {
     }
 
     fn startup(&mut self, public: impl FnOnce(&Hooks) -> std::result::Result<Arc<Public>, String>) -> std::result::Result<(), String> {
+        let start = Instant::now();
+        let mut laps: Vec<(&str, f64)> = Vec::new();
+        let lap = |name, laps: &mut Vec<(&str, f64)>| laps.push((name, start.elapsed().as_secs_f64()));
+        std::thread::spawn(crate::modcharts::remove_old_files);
         let public = public(&self.h)?;
+        lap("public", &mut laps);
         // the per-note abilities need only the plays and the net: solved beside the carry and the fit, done before any list
         let pernote = crate::pernote::PerNote::load().map(Arc::new);
         let filling = pernote.clone().map(|p| {
@@ -517,26 +527,39 @@ impl Worker {
             std::thread::spawn(move || connect(&path).and_then(|db| p.fill(&db, crate::pernote::today() - crate::pernote::WINDOW)))
         });
         let carrying = self.carry_played()?;
+        crate::modcharts::restore_invert_flags(&self.db).map_err(|e| e.to_string())?;
+        lap("carry", &mut laps);
         self.prune_calculators();
-        self.stage(Some("Fitting your prediction model to your scores…".into()), false);
+        const STEPS: usize = 4;
+        self.stage_at(Some("Fitting your prediction model to your scores…".into()), false, Some((0, STEPS)));
         ms_data::imports::import_public_user(&self.db, &public).map_err(|e| e.to_string())?;
         let r = refit(&self.db, &public, &self.c).map_err(|e| e.to_string())?;
+        lap("fit", &mut laps);
         self.public = Some(public.clone());
         self.rec = Some(Engine::new(public, self.c.clone(), r, self.settings.clone()));
         self.rec.as_mut().unwrap().pernote = pernote;
         if carrying {
+            self.stage_at(Some("Rating the charts near your level…".into()), false, Some((1, STEPS)));
             self.carry_near()?;
         }
+        lap("near", &mut laps);
+        self.stage_at(Some("Loading the per-note model…".into()), false, Some((2, STEPS)));
         if let Some(Ok(Err(e))) = filling.map(std::thread::JoinHandle::join) {
             eprintln!("per-note abilities: {e}");
         }
+        lap("per-note", &mut laps);
         self.save_pp_floor();
         self.generation += 1;
         self.spawn_builder();
+        self.stage_at(Some("Loading your saved playlist…".into()), false, Some((3, STEPS)));
         self.restore_local(&self.mode.clone()).map_err(|e| e.to_string())?;
+        lap("restore", &mut laps);
         self.request_nps();
         self.publish(None).map_err(|e| e.to_string())?;
         self.start_fill();
+        lap("list", &mut laps);
+        // where a slow start goes (user 2026-11-21: "Fitting your prediction model" long on every launch)
+        eprintln!("startup {}", laps.iter().map(|(n, t)| format!("{n} {t:.1} s")).collect::<Vec<_>>().join(" · "));
         // the first list is made from the near rows alone, so two starts of the same data give the same list (audit 2026-11-20:
         // carried beside the build, the list's order changed run to run); a closed window builds nothing, so nothing waits
         if carrying && (self.h.list_open)() {
@@ -1506,12 +1529,12 @@ impl Worker {
         let md5 = data.as_ref().map(|d| hashes(d).1);
         let predictable = self.rec.is_some() && mods.as_ref().is_some_and(|m| rate.is_some_and(|r| predictable_context(m, r)));
         let mut exp = None;
-        if let (true, Some(p), Some(data), Some(m)) = (predictable, path.as_deref(), data.as_deref(), mods.as_deref()) {
-            let (n, played) = (self.session()?, as_played(&self.db, p, data, rate, m)); // the forecast of the chart as played with its mods
+        if let (true, Some(data), Some(m)) = (predictable, data.as_deref(), mods.as_deref()) {
+            let (n, played) = (self.session()?, as_played(&self.db, data, rate, m)); // the forecast of the chart as played with its mods
             exp = self.rec.as_mut().unwrap().expectation(&self.db, &played.sha, &played.md5, played.rate, &n)?;
         }
         let inst = one_by_sha(&self.db, &sha)?;
-        let meta = if inst.is_none() { path.as_deref().and_then(ms_data::lazer_index::metadata) } else { None };
+        let meta = if inst.is_none() { data.as_deref().and_then(ms_data::lazer_index::metadata) } else { None };
         let title = inst.as_ref().map(Inst::name).or_else(|| meta.as_ref().filter(|m| m.contains_key("Title")).map(|m| {
             let g = |k: &str| m.get(k).map_or("", String::as_str);
             format!("{} - {} [{}]", g("Artist"), g("Title"), g("Version"))
@@ -1658,9 +1681,9 @@ impl Worker {
         if self.rec.is_some() && (new || fresh) {
             let mods = parse_mods(score.get("mods_list"));
             // A play asks for one new list: after its chart's features when they are still being computed.
-            let played = mods.as_ref().filter(|m| rate.is_some_and(|r| predictable_context(m, r))).and_then(|m| Some(as_played(&self.db, path, &std::fs::read(path).ok()?, rate, m)));
+            let played = mods.as_ref().filter(|m| rate.is_some_and(|r| predictable_context(m, r))).and_then(|m| Some(as_played(&self.db, &std::fs::read(path).ok()?, rate, m)));
             let waiting = match played {
-                Some(p) => self.request_feature(&p.sha, &p.path, Some(p.rate), true, false)?,
+                Some(p) => self.request_feature(&p.sha, &p.data, Some(p.rate), true, false)?,
                 None => false,
             };
             self.rec.as_mut().unwrap().observe(&self.db, &key)?;
@@ -1721,8 +1744,8 @@ impl Worker {
             let ph1 = self.session()?.session.phase();
             if ph1 != ph0 {
                 news.push(match ph1 {
-                    "build" => "warmed up — building",
-                    "push" => "in form — pushing",
+                    "build" => "warmed up: building",
+                    "push" => "in form: pushing",
                     "recover" => "easing off",
                     "fading" => "fading",
                     _ => "warming up",
@@ -1746,16 +1769,16 @@ impl Worker {
                 Err(_) => note = Some("Selected chart file is unavailable".to_string()),
                 Ok(data) => {
                     // Every mod list gets a forecast: of the chart as its modelled mods make it, without the others (named on the card).
-                    let played = as_played(&self.db, &path, &data, rate, &m);
+                    let played = as_played(&self.db, &data, rate, &m);
                     let r = played.rate;
                     if let Ok(n) = self.session() {
-                        c = self.rec.as_mut().unwrap().card(&self.db, &played.path, r, &n).ok().flatten();
+                        c = self.rec.as_mut().unwrap().card(&self.db, &played.data, r, &n).ok().flatten();
                     }
                     // unseeded Random: the plain card until the three shuffles are rated, then their mean
                     let shuffled = shuffles(&self.db, &data, &played);
                     if let (false, Some(plain), Ok(n)) = (shuffled.is_empty(), c.as_ref(), self.session()) {
                         let rec = self.rec.as_mut().unwrap();
-                        let cards: Vec<Card> = shuffled.iter().filter_map(|p| rec.card(&self.db, &p.path, p.rate, &n).ok().flatten()).collect();
+                        let cards: Vec<Card> = shuffled.iter().filter_map(|p| rec.card(&self.db, &p.data, p.rate, &n).ok().flatten()).collect();
                         if cards.len() == shuffled.len() {
                             let plain = Card { mods: played.m.labels(), without: played.m.without.clone(), ..plain.clone() };
                             c = Some(mean_card(plain, &cards));
@@ -1874,10 +1897,7 @@ impl Worker {
         // A chart not yet in the game's store (a convert built here, a website download) is read here: the per-note blend
         // reads it too, as the card does once it's imported (user 2026-11-14: convert SET ~96.0 % while the card showed
         // 93.5 %; 2026-11-15: website SET 1.05× ~96.2 % while the card showed 96.4 %, 1.06× 96.0 %).
-        let local = (!inst.installed).then(|| match inst.convert_of {
-            Some(_) => crate::converts::bytes(&inst, &root),
-            None => inst.path.as_ref().and_then(|p| std::fs::read(p).ok()),
-        }).flatten();
+        let local = (!inst.installed || inst.invert_of.is_some()).then(|| crate::builder::chart_bytes(&self.db, &inst, &root)).flatten();
         // The prediction at `rate` with its features, analysing the chart there first if needed.
         let mut at = |w: &mut Self, rate: f64| -> Result<Option<(Arc<ms_model::predict::Feats>, crate::engine::Expected)>> {
             if !w.store.read().unwrap().has_rate(&sha, rate) {
@@ -1983,7 +2003,8 @@ impl Worker {
         self.target = Some(boxed.clone());
         self.targets.insert(mode.to_string(), boxed.clone());
         self.convert_turn.fetch_add(1, Ordering::SeqCst); // a delivery still running for the previous pick stops
-        if crate::navigation::delivers(&boxed, auto) {
+        // stable has no Invert mod: its Invert pick is written into the source's folder, as a convert is
+        if crate::navigation::delivers(&boxed, auto) || (boxed.invert_of.is_some() && self.shown.client == "stable") {
             self.deliver(boxed.clone(), mode.to_string(), skipped);
         }
         if done.sent {
@@ -2049,19 +2070,18 @@ impl Worker {
             if error.as_deref() == Some(converts::CANCELLED) {
                 return;
             }
-            (h.emit)(Out::Delivery { identity, text: error.clone().map_or_else(String::new, |e| format!("Couldn't get it into osu!: {e} — Next skips it")), progress: None, failed: error.is_some() });
+            (h.emit)(Out::Delivery { identity, text: error.clone().map_or_else(String::new, |e| format!("Couldn't get it into osu!: {e}. Next skips it")), progress: None, failed: error.is_some() });
             q.put(Task::ConvertDone { pick, mode, error });
         });
     }
 
     /// The map selected in osu! as a convert, on request and outside any list: delivered like a list's.
     fn t_convert_selected(&mut self, path: PathBuf, target: i64) {
-        let converted = std::fs::read(&path).map_err(|e| e.to_string()).and_then(|data| Ok((hashes(&data).0, ms_convert::convert(&data, target as usize).map_err(|e| e.to_string())?)));
-        let (source, out) = match converted {
+        let converted = std::fs::read(&path).map_err(|e| e.to_string()).and_then(|data| Ok((hashes(&data).0, ms_convert::convert(&data, target as usize).map_err(|e| e.to_string())?, ms_data::lazer_index::metadata(&data).unwrap_or_default())));
+        let (source, out, m) = match converted {
             Ok(done) => done,
             Err(e) => return self.status(format!("Couldn't convert that map: {e}")),
         };
-        let m = ms_data::lazer_index::metadata(&path).unwrap_or_default();
         let (sha, md5) = hashes(&out.osu);
         let text = |k: &str| m.get(k).cloned();
         let pick = Pick { sha: Some(sha), md5: Some(md5), title: text("Title").unwrap_or_default(), artist: text("Artist"), song: text("Title"), version: Some(out.version), creator: text("Creator"),
@@ -2075,7 +2095,7 @@ impl Worker {
         match error {
             None if mode == SELECTED => {
                 let first = if self.shown.client == "stable" { "press F5 in song select, then Ctrl+V" } else { "press Ctrl+V in song select" };
-                (self.h.emit)(Out::Copy { text: crate::navigation::song_search(&pick, &self.shown.client), msg: format!("Ready — {first}") });
+                (self.h.emit)(Out::Copy { text: crate::navigation::song_search(&pick, &self.shown.client), msg: format!("Ready: {first}") });
             }
             None if current => {
                 let mut c = pick;
@@ -2083,17 +2103,17 @@ impl Worker {
                 c.installed = true;
                 let copy = Some(crate::navigation::song_search(&c, &self.shown.client));
                 let first = if self.shown.client == "stable" { "press F5 in song select, then Ctrl+V" } else { "press Ctrl+V in song select" };
-                let msg = format!("Ready — {first} · set {} manually", c.var);
+                let msg = format!("Ready: {first} · set {} manually", c.var);
                 self.targets.insert(mode.clone(), c.clone());
                 self.target = Some(c.clone());
                 (self.h.emit)(Out::Target { mode, revision: self.revision, selection_id: self.selection_id, c: Some(c), msg, copy });
             }
             None => {}
-            Some(e) if e == NOT_RUNNING => self.status(format!("{e} — start it, then press Next")),
+            Some(e) if e == NOT_RUNNING => self.status(format!("{e}. Start it, then press Next")),
             Some(e) => {
                 eprintln!("delivery failed: {} {e}", pick.title);
                 // The pick stays: moving on by itself pulled the map from under the player (user 2026-11-11). Next skips it.
-                self.status(format!("Couldn't {} that map: {e} — press Next to skip it", if pick.convert_of.is_some() { "convert" } else { "download" }));
+                self.status(format!("Couldn't {} that map: {e}. Press Next to skip it", if pick.convert_of.is_some() { "convert" } else if pick.invert_of.is_some() { "write" } else { "download" }));
             }
         }
         Ok(())
@@ -2107,32 +2127,32 @@ impl Worker {
             if let Ok(data) = std::fs::read(p) {
                 let (sha, md5) = hashes(&data);
                 if let Some(m) = &mods {
-                    let played = as_played(&self.db, p, &data, rate, m); // any mods: the forecast is of what the calculator can build
-                    self.request_feature(&played.sha, &played.path, Some(played.rate), false, false)?;
+                    let played = as_played(&self.db, &data, rate, m); // any mods: the forecast is of what the calculator can build
+                    self.request_feature(&played.sha, &played.data, Some(played.rate), false, false)?;
                     for s in shuffles(&self.db, &data, &played) {
-                        self.request_feature(&s.sha, &s.path, Some(s.rate), false, true)?;
+                        self.request_feature(&s.sha, &s.data, Some(s.rate), false, true)?;
                     }
                 }
                 if self.rec.is_some() && previous.as_ref() != Some(p) && !self.local_shas().contains(&sha) {
                     self.begin_import();
                 }
-                hashed = Some((sha, md5));
+                let bid: Option<i64> = ms_data::lazer_index::metadata(&data).and_then(|m| m.get("BeatmapID")?.parse().ok());
+                hashed = Some((sha, md5, bid));
             }
         }
         self.card();
-        let (Some(target), Some(p), Some((sha, md5))) = (self.target.clone(), path, hashed) else { return Ok(()) };
-        let bid = ms_data::lazer_index::metadata(&p).and_then(|m| m.get("BeatmapID")?.parse().ok());
+        let (Some(target), Some((sha, md5, bid))) = (self.target.clone(), hashed) else { return Ok(()) };
         if same_map(&target, Some(&sha), Some(&md5), bid) {
-            let updated = target.md5.as_deref() != Some(md5.as_str());
+            let updated = match &target.invert_of { Some(source) => *source != sha && target.sha.as_deref() != Some(sha.as_str()), None => target.md5.as_deref() != Some(md5.as_str()) }; // Invert: played as its source
             log_event(&self.db, "selected", Some(&format!("md5:{md5}")), None, &json!({"offered_revision": target.identity(), "updated": updated}))?;
-            let msg = format!("✓ {}chart selected — intended {}; {}", if updated { "updated " } else { "" }, target.var, rate.map_or_else(|| "actual rate unknown".to_string(), |r| format!("observed {r:.2}×")));
+            let msg = format!("✓ {}chart selected: intended {}; {}", if updated { "updated " } else { "" }, target.var, rate.map_or_else(|| "actual rate unknown".to_string(), |r| format!("observed {r:.2}×")));
             (self.h.emit)(Out::Target { mode: target.mode.clone(), revision: self.revision, selection_id: self.selection_id, c: Some(target), msg, copy: None });
         }
         Ok(())
     }
 
     /// True: a FeatureReady follows. `keep`: beside the pending requests (a selection's Random shuffles), else in their place.
-    fn request_feature(&mut self, sha: &str, path: &Path, rate: Option<f64>, refit: bool, keep: bool) -> Result<bool> {
+    fn request_feature(&mut self, sha: &str, data: &[u8], rate: Option<f64>, refit: bool, keep: bool) -> Result<bool> {
         let (Some(rate), Some(rec)) = (rate, self.rec.as_mut()) else { return Ok(false) };
         if sha.is_empty() || rec.features(&self.db, Some(sha), None, None, rate)?.0.is_some() {
             return Ok(false);
@@ -2150,7 +2170,7 @@ impl Worker {
         if !keep {
             pending.0.clear();
         }
-        pending.0.push_back((sha.to_string(), path.to_path_buf(), rate, refit));
+        pending.0.push_back((sha.to_string(), data.to_vec(), rate, refit));
         if pending.1 {
             return Ok(true); // the newest request replaces a pending old selection
         }
@@ -2168,9 +2188,9 @@ impl Worker {
             };
             // Not deferred during play: waiting left the card on "Calculating…" for the whole song after an in-game
             // rate change (2026-10-10).
-            let (sha, path, rate, refit) = task;
+            let (sha, data, rate, refit) = task;
             let id = (sha.clone(), ms_calc::py::round_digits(rate, 3).to_bits());
-            match Engine::analyse(&path, ms_calc::py::round_digits(rate, 3), &prm) {
+            match Engine::analyse(&data, ms_calc::py::round_digits(rate, 3), &prm) {
                 Ok(fs) => {
                     errors.lock().unwrap().remove(&id);
                     queue.put(Task::FeatureReady { sha, features: Some(fs), refit });
@@ -2327,7 +2347,7 @@ impl Worker {
                 let mut want = |source: &mut crate::evidence::FeatureSource, sha: &str, md5: Option<&str>, bid: Option<i64>, rate: f64| -> Result<()> {
                     // An analysis of another structure version is redone too (2026-11-06: rows without the LN types).
                     let stale = source.of(&db, Some(sha), md5, bid, Some(rate))?.0.is_none_or(|f| f.dict("nps").and_then(|n| n.get("version")).map(ms_calc::val::Val::f) != Some(STRUCTURE_VERSION as f64));
-                    if stale && crate::modcharts::chart_file(&db, sha).is_some() {
+                    if stale && crate::modcharts::bytes(&db, sha).is_some() {
                         let rate = ms_calc::py::round_digits(rate, 3);
                         let list = need.entry(sha.to_string()).or_default();
                         if !list.contains(&rate) {
@@ -2373,7 +2393,7 @@ impl Worker {
                     if halt.load(Ordering::Relaxed) {
                         return Ok(());
                     }
-                    let data: Vec<(Vec<u8>, Vec<f64>)> = part.iter().map(|(sha, rates)| (crate::modcharts::chart_file(&db, sha).and_then(|p| std::fs::read(p).ok()).unwrap_or_default(), rates.clone())).collect();
+                    let data: Vec<(Vec<u8>, Vec<f64>)> = part.iter().map(|(sha, rates)| (crate::modcharts::bytes(&db, sha).unwrap_or_default(), rates.clone())).collect();
                     for ((sha, _), res) in part.iter().zip(features_batch(&data, workers, &prm)) {
                         let Ok(fs) = res else { continue };
                         let tx = db.unchecked_transaction()?;

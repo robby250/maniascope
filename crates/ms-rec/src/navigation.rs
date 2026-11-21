@@ -11,7 +11,8 @@ pub const ACTIONS: [&str; 3] = ["auto", "copy", "link"];
 
 /// A submitted chart can update its bytes without changing its map ID.
 pub fn same_map(p: &Pick, sha: Option<&str>, md5: Option<&str>, bid: Option<i64>) -> bool {
-    (sha.is_some() && sha == p.sha.as_deref()) || (md5.is_some() && md5 == p.md5.as_deref()) || (bid.is_some_and(|b| b > 0) && bid == p.bid)
+    // An Invert pick is played as its source file.
+    (sha.is_some() && (sha == p.sha.as_deref() || sha == p.invert_of.as_deref())) || (md5.is_some() && md5 == p.md5.as_deref()) || (bid.is_some_and(|b| b > 0) && bid == p.bid)
 }
 
 fn field(name: &str, value: &str) -> String {
@@ -195,7 +196,7 @@ pub fn perform(p: &mut Pick, action: &str, client: &str, auto: bool) -> Performe
         let path = p.invert_of.as_deref().or(p.sha.as_deref()).and_then(|s| crate::pp::chart_path(Some(s))); // Invert: its source is the file
         if path.is_none() {
             if p.mode == "nps" || p.mode == "skills" {
-                return Performed { msg: "Chart is no longer installed — refresh the library".to_string(), unavailable: true, ..Performed::default() };
+                return Performed { msg: "Chart is no longer installed: refresh the library".to_string(), unavailable: true, ..Performed::default() };
             }
             p.installed = false;
         }
@@ -210,27 +211,27 @@ pub fn perform(p: &mut Pick, action: &str, client: &str, auto: bool) -> Performe
             return Performed { msg: "No searchable metadata for this chart".to_string(), ..Performed::default() };
         }
         let msg = if !p.installed {
-            "Search copied, but you don't have this map — download it, then Ctrl+V in song select"
+            "Search copied, but you don't have this map: download it, then Ctrl+V in song select"
         } else if action == "link" && !trusted {
-            "No matching online map — search copied, press Ctrl+V in song select"
+            "No matching online map: search copied, press Ctrl+V in song select"
         } else {
-            "Search copied — press Ctrl+V in song select"
+            "Search copied: press Ctrl+V in song select"
         };
         return Performed { copy: Some(query), msg: with_invert(p, msg.to_string()), ..Performed::default() };
     }
     let url = format!("osu://b/{}", bid.unwrap());
     if !game_running(client) {
-        return Performed { copy: Some(url), msg: with_invert(p, "osu! is not running — copied beatmap link".to_string()), ..Performed::default() };
+        return Performed { copy: Some(url), msg: with_invert(p, "osu! is not running: copied beatmap link".to_string()), ..Performed::default() };
     }
     if let Err(e) = open_url(&url, client) {
-        return Performed { copy: Some(url), msg: format!("Could not open beatmap panel ({e}) — copied link"), ..Performed::default() };
+        return Performed { copy: Some(url), msg: format!("Could not open beatmap panel ({e}), copied link"), ..Performed::default() };
     }
     // Auto still copies the search, so after downloading it can be pasted in song select (user 2026-10-09).
     let query = (action == "auto").then(|| song_search(p, client)).filter(|q| !q.is_empty());
     let msg = if original {
-        format!("Opened the original in osu! — download it, then ⋯ → Convert this map to {}K", p.keys)
+        format!("Opened the original in osu!: download it, then ⋯ → Convert this map to {}K", p.keys)
     } else {
-        format!("Sent beatmap link to osu! — choose Go to beatmap; mods unchanged{}", if query.is_some() { " · search copied, Ctrl+V in song select" } else { "" })
+        format!("Sent beatmap link to osu!: choose Go to beatmap; mods unchanged{}", if query.is_some() { " · search copied, Ctrl+V in song select" } else { "" })
     };
     Performed { copy: query, msg: with_invert(p, msg), sent: true, unavailable: false }
 }

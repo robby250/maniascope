@@ -22,11 +22,14 @@ pub const DEFAULT_TARGET: f64 = 0.95;
 const STABLE_RATES: [f64; 3] = [0.75, 1., 1.5]; // stable has HT/NM/DT only (user 2026-10-31)
 /// The skills of a chart's pattern profile: every shown skill (the skill table's rows).
 /// The Invert mod's tag (`ms_calc::mods`).
-const INVERT_TAG: &str = "IN";
+/// lazer plays Invert as a mod on the source; stable gets a written chart (`modcharts::STABLE_INVERT`).
+fn invert_tag(client: &str) -> &'static str {
+    if client.starts_with("stable") { crate::modcharts::STABLE_INVERT } else { "IN" }
+}
 
-/// The Inverse mod skill is picked on this tab and the client has the mod (osu!lazer).
+/// The Inverse mod skill is picked on this tab.
 fn wants_invert(r: &Request) -> bool {
-    r.mode == "skills" && !r.client.starts_with("stable") && skills::normalize(&r.selected_skills).iter().any(|k| k == skills::INVERT_MOD)
+    r.mode == "skills" && skills::normalize(&r.selected_skills).iter().any(|k| k == skills::INVERT_MOD)
 }
 
 /// A chart's 1× rating under Invert from its own: ln inverted = a + b·ln source per keymode, fitted on 38k pairs the
@@ -40,11 +43,26 @@ fn invert_rating(keys: i64, overall: f64) -> f64 {
 /// The fit's p10–p90 residual of `invert_rating` (ln ±0.2).
 const INVERT_SPREAD: f64 = 1.2214;
 
-/// `source` as rated under Invert: its metadata, the modded chart's sha and file.
-/// Its online map is the source's (opened, then Invert turned on).
-fn invert_inst(source: &Inst, sha: &str, md5: String, path: Option<std::path::PathBuf>) -> Inst {
-    let online = source.online_md5.is_some() && source.online_md5 == source.md5;
-    Inst { sha256: sha.to_string(), online_md5: online.then(|| md5.clone()), md5: Some(md5), path, invert_of: Some(source.sha256.clone()), ..source.clone() }
+/// `source` as rated under Invert: its metadata and the modded chart's sha, no file (`chart_bytes` builds it).
+/// lazer: its online map is the source's (opened, then Invert turned on); stable: a chart of its own, named as written.
+fn invert_inst(source: &Inst, sha: &str, md5: String, tag: &str) -> Inst {
+    let online = tag != crate::modcharts::STABLE_INVERT && source.online_md5.is_some() && source.online_md5 == source.md5;
+    let stable = tag == crate::modcharts::STABLE_INVERT; // the written chart has no online id: the source selected isn't it
+    let version = if stable { format!("{} (Invert)", source.version) } else { source.version.clone() };
+    let beatmap_id = if stable { None } else { source.beatmap_id };
+    Inst { sha256: sha.to_string(), online_md5: online.then(|| md5.clone()), md5: Some(md5), path: None, invert_of: Some(source.sha256.clone()), version, beatmap_id, ..source.clone() }
+}
+
+/// A catalogue chart's bytes: a convert not yet imported from its kept copy, an Invert chart built from its source, else its
+/// file (`root`: the client's store).
+pub(crate) fn chart_bytes(db: &Db, inst: &Inst, root: &std::path::Path) -> Option<Vec<u8>> {
+    if inst.convert_of.is_some() && !inst.installed {
+        return crate::converts::bytes(inst, root);
+    }
+    if inst.invert_of.is_some() {
+        return crate::modcharts::bytes(db, &inst.sha256);
+    }
+    inst.path.clone().or_else(|| ms_data::paths::local_file(&inst.sha256, root)).and_then(|p| std::fs::read(p).ok())
 }
 
 pub fn profile() -> Vec<String> {
@@ -252,7 +270,7 @@ impl Builder {
     pub fn restore(&mut self, db: &Db, r: &Request, refs: &[(String, f64)], installed: &[Arc<Inst>]) -> Result<(Arc<ChoiceList>, Arc<HashMap<String, Arc<Inst>>>)> {
         self.catalog = installed.iter().map(|i| (i.sha256.clone(), i.clone())).collect();
         self.apply_converts(db, &r.converts)?; // a saved list is half converts on 10K, none with a library row
-        self.apply_inverts(db, wants_invert(r))?;
+        self.apply_inverts(db, wants_invert(r).then(|| invert_tag(&r.client)))?;
         let mut source = crate::evidence::FeatureSource { public: r.public.clone(), calc: r.calc.clone(), cache: Default::default() };
         let mut store = FeatStore::new(skills::feat_trees(), profile(), r.model.c.clone(), STRUCTURE_VERSION).expect("skill trees");
         let (mut catalog, mut order): (HashMap<String, Arc<Inst>>, Vec<String>) = Default::default();
@@ -384,22 +402,31 @@ impl Builder {
     }
 
     /// Charts already rated under Invert join the catalogue while the Inverse mod skill is picked, each beside its source.
-    fn apply_inverts(&mut self, db: &Db, on: bool) -> Result<()> {
+    fn apply_inverts(&mut self, db: &Db, tag: Option<&str>) -> Result<()> {
         self.catalog.retain(|_, i| i.invert_of.is_none());
         let catalog = &self.catalog;
         self.order.retain(|s| catalog.contains_key(s));
-        if !on {
-            return Ok(());
-        }
-        let rows: Vec<(String, String)> = db.prepare("SELECT sha, source FROM mod_charts WHERE tag=?")?.query_map([INVERT_TAG], |x| Ok((x.get(0)?, x.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
-        for (sha, source) in rows {
+        let Some(tag) = tag else { return Ok(()) };
+        let rows: Vec<(String, String, Option<String>)> = db.prepare("SELECT sha, source, md5 FROM mod_charts WHERE tag=?")?.query_map([tag], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+        let mut hashed = Vec::new();
+        for (sha, source, md5) in rows {
             let Some(src) = self.catalog.get(&source).filter(|i| i.installed && i.convert_of.is_none()) else { continue };
-            let path = crate::modcharts::chart_file(db, &sha);
-            // its md5 is what a play of it records (worker::as_played)
-            let Some(md5) = path.as_ref().and_then(|p| std::fs::read(p).ok()).map(|d| crate::engine::hashes(&d).1) else { continue };
-            let inst = invert_inst(src, &sha, md5, path);
+            // its md5 is what a play of it records (worker::as_played); rows from before the md5 column are hashed once
+            let Some(md5) = md5.or_else(|| {
+                let md5 = crate::engine::hashes(&crate::modcharts::bytes(db, &sha)?).1;
+                hashed.push((md5.clone(), sha.clone()));
+                Some(md5)
+            }) else { continue };
+            let inst = invert_inst(src, &sha, md5, tag);
             self.order.push(sha.clone());
             self.catalog.insert(sha, Arc::new(inst));
+        }
+        if !hashed.is_empty() {
+            let tx = db.unchecked_transaction()?;
+            for (md5, sha) in &hashed {
+                tx.execute("UPDATE mod_charts SET md5=? WHERE sha=?", [md5, sha])?;
+            }
+            tx.commit()?;
         }
         Ok(())
     }
@@ -409,7 +436,8 @@ impl Builder {
         if !wants_invert(r) {
             return Ok(false);
         }
-        let done: HashSet<String> = db.prepare("SELECT source FROM mod_charts WHERE tag=?")?.query_map([INVERT_TAG], |x| x.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let tag = invert_tag(&r.client);
+        let done: HashSet<String> = db.prepare("SELECT source FROM mod_charts WHERE tag=?")?.query_map([tag], |x| x.get(0))?.collect::<rusqlite::Result<_>>()?;
         let mut source = crate::evidence::FeatureSource { public: r.public.clone(), calc: r.calc.clone(), cache: Default::default() };
         let mut jobs: Vec<(Arc<Inst>, Vec<u8>)> = Vec::new();
         let root = crate::catalog::local_origin(&r.client).1;
@@ -418,13 +446,14 @@ impl Builder {
             if !inst.installed || inst.convert_of.is_some() || inst.invert_of.is_some() || done.contains(sha) {
                 continue;
             }
-            // Invert turns gaps into holds: its rating is the source's under `invert_rating`, ±its spread
+            // Invert turns gaps into holds: its rating is the source's under `invert_rating`, ±its spread, at this tab's rates
+            // (0.55-2× let 98 % of the library through: 52k charts rated, user 2026-11-21)
             let window = reaches.and_then(|x| x.get(&inst.keys)).copied();
             let rated = source.lookup(db, &source.key(sha, 1.))?.map(|f| invert_rating(inst.keys, f.f("overall")));
-            if window.zip(rated).is_some_and(|(w, r)| !crate::converts::in_window(r * INVERT_SPREAD, w) && !crate::converts::in_window(r / INVERT_SPREAD, w)) {
+            if window.zip(rated).is_some_and(|(w, v)| v * r.rates.1 * INVERT_SPREAD < w.0 || v * r.rates.0 / INVERT_SPREAD > w.1) {
                 continue;
             }
-            let Some(data) = inst.path.clone().or_else(|| ms_data::paths::local_file(sha, &root)).and_then(|p| std::fs::read(p).ok()) else { continue };
+            let Some(data) = chart_bytes(db, inst, &root).and_then(|d| crate::modcharts::build(&d, tag)) else { continue };
             jobs.push((inst.clone(), data));
             if jobs.len() == self.index_size {
                 break;
@@ -436,12 +465,12 @@ impl Builder {
         self.index_size = (self.index_size * 4).min(4096);
         let cores = std::thread::available_parallelism().map_or(4, |x| x.get());
         let threads = if (self.game)() { (cores / 4).max(1) } else { workers(None) };
-        let data: Vec<(Vec<u8>, Vec<f64>)> = jobs.iter().map(|(_, d)| (ms_calc::mods::tagged(d, INVERT_TAG), vec![1.])).collect();
+        let data: Vec<(Vec<u8>, Vec<f64>)> = jobs.iter().map(|(_, d)| (d.clone(), vec![1.])).collect();
         let done = features_batch(&data, threads, &self.prm);
         let tx = db.unchecked_transaction()?;
         let mut store = self.store.write().unwrap();
         for ((inst, bytes), result) in jobs.iter().zip(done) {
-            let (sha, md5, path) = crate::modcharts::ensure(db, &inst.sha256, bytes, INVERT_TAG)?;
+            let (sha, md5) = crate::modcharts::register(db, &inst.sha256, tag, bytes)?;
             let Ok(fs) = result else { continue };
             for (rate, f) in fs {
                 tx.execute("INSERT OR REPLACE INTO feats VALUES (?,?)", rusqlite::params![format!("{sha}@{rate:.3}|{}", r.calc), codec::encode(&Val::Dict(f.clone()))])?;
@@ -449,7 +478,7 @@ impl Builder {
             }
             if !self.catalog.contains_key(&sha) {
                 self.order.push(sha.clone());
-                self.catalog.insert(sha.clone(), Arc::new(invert_inst(inst, &sha, md5, Some(path))));
+                self.catalog.insert(sha.clone(), Arc::new(invert_inst(inst, &sha, md5, tag)));
             }
         }
         drop(store);
@@ -579,7 +608,7 @@ impl Builder {
             self.order = full.iter().filter(|i| allowed.contains(&i.keys)).map(|i| i.sha256.clone()).collect();
             self.catalog = full.into_iter().filter(|i| allowed.contains(&i.keys)).map(|i| (i.sha256.clone(), Arc::new(i))).collect();
             self.apply_converts(db, &r.converts)?;
-            self.apply_inverts(db, wants_invert(r))?;
+            self.apply_inverts(db, wants_invert(r).then(|| invert_tag(&r.client)))?;
             self.index_size = 256;
             self.catalog_key = catalog_key;
             *self.store.write().unwrap() = FeatStore::new(skills::feat_trees(), profile(), r.model.c.clone(), STRUCTURE_VERSION).expect("skill trees");
@@ -757,12 +786,7 @@ impl Builder {
                     return Ok(());
                 }
                 let root = crate::catalog::local_origin(&r.client).1;
-                let data: Vec<(Vec<u8>, Vec<f64>)> = jobs.iter().map(|(sha, rate)| {
-                    let inst = &self.catalog[sha];
-                    let converted = inst.convert_of.is_some() && !inst.installed;
-                    let path = inst.path.clone().or_else(|| ms_data::paths::local_file(sha, &root));
-                    (if converted { crate::converts::bytes(inst, &root) } else { path.and_then(|p| std::fs::read(p).ok()) }.unwrap_or_default(), vec![*rate])
-                }).collect();
+                let data: Vec<(Vec<u8>, Vec<f64>)> = jobs.iter().map(|(sha, rate)| (chart_bytes(db, &self.catalog[sha], &root).unwrap_or_default(), vec![*rate])).collect();
                 // Beside a running game a full-core batch costs a laptop its turbo and heat headroom.
                 let cores = std::thread::available_parallelism().map_or(4, |x| x.get());
                 let threads = if (self.game)() { (cores / 4).max(1) } else { workers(None) };

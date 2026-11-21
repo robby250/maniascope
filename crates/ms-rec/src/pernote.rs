@@ -127,7 +127,7 @@ impl PerNote {
         let got = match hit {
             Some(g) => g,
             None => {
-                let c = ms_calc::chart::parse(&match data { Some(d) => d.to_vec(), None => std::fs::read(crate::modcharts::chart_file(db, sha)?).ok()? }).ok()?;
+                let c = ms_calc::chart::parse(&match data { Some(d) => d.to_vec(), None => crate::modcharts::bytes(db, sha)? }).ok()?;
                 let past = self.history(db, now - WINDOW - 1., now).ok()?;
                 let theta = self.forecast(&past, now, c.keys as i64, sha)?;
                 let g = std::sync::Arc::new((c, past, theta));

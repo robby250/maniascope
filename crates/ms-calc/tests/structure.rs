@@ -10,7 +10,7 @@ use ms_calc::val::Val;
 fn density_is_rate_aware_and_vibro_needs_one_repeated_hand() {
     use ms_calc::structure::structure;
     let k = &standard_params().k;
-    let s = |c: &Chart| structure(c, 1., k);
+    let s = |c: &Chart| structure(c, 1., &ms_calc::demand::rows(c, 1.), None, k);
     let plain = chart(vec![(0., 0., 0), (0., 500., 1), (1000., 3000., 2)], 7, 8.);
     let st = s(&plain);
     assert_eq!((st.f("head_span"), st.f("play_span"), st.f("nps")), (1., 3., 3.));
@@ -29,7 +29,7 @@ fn short_repeated_drills_are_marked_without_banning_specialists() {
     let k = &standard_params().k;
     let chords: [&[u8]; 2] = [&[3, 4, 5, 6], &[0, 1, 2]];
     let c = rice((0..1000).flat_map(|i: usize| chords[i % 2].iter().map(move |&col| (80. * i as f64, col))), 7, 8.);
-    assert!(structure(&c, 1., k).f("drill") > 0.7);
+    assert!(structure(&c, 1., &ms_calc::demand::rows(&c, 1.), None, k).f("drill") > 0.7);
 }
 
 #[test]

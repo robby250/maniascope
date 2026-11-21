@@ -23,8 +23,12 @@ fn repeated(pattern: &[&[u8]], gap: f64, n: usize) -> Chart {
     rice((0..n).flat_map(|i| pattern[i % pattern.len()].iter().map(move |&c| (1000. + i as f64 * gap, c))), 4, 5.)
 }
 
+fn at(c: &Chart, rate: f64) -> Analysis {
+    analyse(c, rate, &ms_calc::demand::rows(c, rate), &standard_params().k)
+}
+
 fn g(c: &Chart) -> Analysis {
-    analyse(c, 1., &standard_params().k)
+    at(c, 1.)
 }
 
 fn mean(a: &[f64]) -> f64 {
@@ -86,7 +90,7 @@ fn slow_rice_and_timing_infeasible_groups_do_not_become_jumptrills() {
 fn rate_is_applied_once_and_offsets_do_not_change_gestures() {
     let c = roll4(&[0, 1, 3, 2], 30.);
     let moved = |f: &dyn Fn(f64) -> f64| chart(notes(&c).into_iter().map(|(t, e, k)| (f(t), f(e), k)).collect(), 4, c.od);
-    let (a, b, z) = (analyse(&c, 1.5, &standard_params().k), g(&moved(&|x| x / 1.5)), analyse(&moved(&|x| x + 91234.), 1.5, &standard_params().k));
+    let (a, b, z) = (at(&c, 1.5), g(&moved(&|x| x / 1.5)), at(&moved(&|x| x + 91234.), 1.5));
     for i in 0..FEATURES.len() {
         assert!((a.features[i] - b.features[i]).abs() < 1e-8 && (a.features[i] - z.features[i]).abs() < 1e-8);
     }
@@ -152,7 +156,7 @@ fn bursts(gap_between: f64) -> Chart {
 #[test]
 fn vibro_support_does_not_jump_when_a_slower_gap_crosses_the_speed_gate() {
     let c = bursts(434.);
-    let (a, b) = (analyse(&c, 1.0259, &standard_params().k), analyse(&c, 1.0261, &standard_params().k));
+    let (a, b) = (at(&c, 1.0259), at(&c, 1.0261));
     for name in ["vibro_easy", "vibro_control", "vibro_sustain"] {
         assert!((feature(&a, name) - feature(&b, name)).abs() < 0.01);
     }

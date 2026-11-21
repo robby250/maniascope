@@ -25,7 +25,7 @@ fn harness(a: App) -> Harness<'static, App> {
 }
 
 fn pick(sha: char) -> Pick {
-    Pick { sha: Some(sha.to_string().repeat(64)), md5: Some(sha.to_string().repeat(32)), title: format!("Cosmo — Cyber Shaman {sha}"), artist: Some("Cosmo".into()), song: Some("Cyber Shaman".into()),
+    Pick { sha: Some(sha.to_string().repeat(64)), md5: Some(sha.to_string().repeat(32)), title: format!("Cosmo: Cyber Shaman {sha}"), artist: Some("Cosmo".into()), song: Some("Cyber Shaman".into()),
            version: Some("Local difficulty".into()), keys: 7, rate: 0.87, var: "HT 0.87×".into(), purpose: "nps".into(), ..Pick::default() }
 }
 

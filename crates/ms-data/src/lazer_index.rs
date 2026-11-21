@@ -15,12 +15,11 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// The [Metadata] fields of an .osu, if it is one.
-pub fn metadata(path: &Path) -> Option<HashMap<String, String>> {
-    let data = std::fs::read(path).ok()?;
+pub fn metadata(data: &[u8]) -> Option<HashMap<String, String>> {
     if !data.starts_with(b"osu file format v") {
         return None;
     }
-    let text = String::from_utf8_lossy(&data);
+    let text = String::from_utf8_lossy(data);
     let (mut md, mut inside): (HashMap<String, String>, bool) = Default::default();
     for line in text.lines() {
         if line.starts_with('[') {
@@ -39,7 +38,7 @@ pub fn metadata(path: &Path) -> Option<HashMap<String, String>> {
 
 /// The display strings of an .osu, if it is one.
 fn names(path: &Path) -> Option<Vec<String>> {
-    let md = metadata(path)?;
+    let md = metadata(&std::fs::read(path).ok()?)?;
     let get = |k: &str| md.get(k).map_or("", String::as_str);
     let or = |k: &str, b: &str| md.get(k).map(String::as_str).filter(|v| !v.is_empty()).unwrap_or(b).to_string();
     let (title, artist) = (get("Title"), get("Artist"));

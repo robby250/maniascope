@@ -686,6 +686,7 @@ fn a_menu_convert_is_taken_out_of_the_queue_with_its_own_map_and_the_rest_keep_t
 fn inverse_mod_rates_your_maps_under_invert_while_picked_on_lazer() {
     let mut l = live("invert", 240, busy(false));
     l.w.practice_skills = vec![skills::INVERT_MOD.into()];
+    l.w.rates.insert("skills", (0.5, 2.)); // this world's charts rate 10+ under Invert, the player 2.5-5: only half speed fits
     let (b, _) = built(&mut l, "skills", |_| {});
     let inverted: Vec<&Arc<Inst>> = b.catalog.values().filter(|i| i.invert_of.is_some()).collect();
     assert!(!inverted.is_empty());

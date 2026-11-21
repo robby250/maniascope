@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS converts(source_sha TEXT, target INTEGER, converter T
   web INTEGER, PRIMARY KEY(source_sha, target, converter));
 CREATE INDEX IF NOT EXISTS converts_sha ON converts(sha);
 CREATE TABLE IF NOT EXISTS feats(key TEXT PRIMARY KEY, data TEXT);
-CREATE TABLE IF NOT EXISTS mod_charts(sha TEXT PRIMARY KEY, source TEXT, tag TEXT);
+CREATE TABLE IF NOT EXISTS mod_charts(sha TEXT PRIMARY KEY, source TEXT, tag TEXT, md5 TEXT);
 CREATE INDEX IF NOT EXISTS mod_charts_source ON mod_charts(source, tag);
 CREATE TABLE IF NOT EXISTS installed(sha256 TEXT PRIMARY KEY, beatmap_id INTEGER, set_id INTEGER, md5 TEXT,
   status INTEGER, keys INTEGER, od REAL, length REAL, title TEXT, artist TEXT, version TEXT);
@@ -157,6 +157,10 @@ pub fn connect(path: &Path) -> Result<Db> {
     db.busy_timeout(std::time::Duration::from_secs(30))?;
     db.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
     db.execute_batch(SCHEMA)?;
+    // md5 joined mod_charts 2026-11-21: restore read and hashed all 52k Invert files on every launch (22 s on G835LX)
+    if !db.prepare("PRAGMA table_info(mod_charts)")?.query_map([], |r| r.get::<_, String>(1))?.flatten().any(|n| n == "md5") {
+        db.execute("ALTER TABLE mod_charts ADD COLUMN md5 TEXT", [])?;
+    }
     Ok(db)
 }
 

@@ -384,6 +384,9 @@ fn needs_original(p: &Pick, db: &Db, stable: bool) -> bool {
 pub fn deliver(p: &Pick, db: &Db, client: &str, root: &Path, picked: Instant, report: Report) -> std::result::Result<(), String> {
     let stage = |what: &str| eprintln!("convert {}: {what} at {} ms", p.title, picked.elapsed().as_millis()); // where the wait after Next goes
     stage("start");
+    if let (Some(source), true) = (p.invert_of.as_deref(), client == "stable") {
+        return deliver_invert(p, source, db, root);
+    }
     let Some(source) = p.convert_of.as_deref() else { return deliver_website(p, client, report) };
     let set = p.set_id.unwrap_or(0);
     let data = std::fs::read(source_path(source, p.source_web, root).ok_or("the source chart is gone")?).map_err(|e| e.to_string())?;
@@ -435,6 +438,21 @@ pub fn deliver(p: &Pick, db: &Db, client: &str, root: &Path, picked: Instant, re
     stage("in osu!'s store");
     let _ = std::fs::remove_file(&path);
     Ok(())
+}
+
+/// stable's Invert pick: the inverted chart beside its source in Songs (F5 shows it), as a convert of a local map is.
+fn deliver_invert(p: &Pick, source: &str, db: &Db, root: &Path) -> std::result::Result<(), String> {
+    let data = std::fs::read(source_path(source, false, root).ok_or("the source chart is gone")?).map_err(|e| e.to_string())?;
+    let out = ms_convert::invert(&data).map_err(|e| e.to_string())?;
+    if p.sha.as_deref() != Some(&hashes(&out.osu).0) {
+        return Err("the Invert chart changed: the list will catch up".to_string());
+    }
+    let folder = stable_folder(p, source, db)?.ok_or_else(|| format!("{} is no longer in Songs", p.title))?;
+    let path = paths::long_path(&folder.join(&out.file_name));
+    if std::fs::read(&path).is_ok_and(|d| d == out.osu) {
+        return Ok(()); // written for an earlier offer
+    }
+    std::fs::write(path, &out.osu).map_err(|e| e.to_string())
 }
 
 /// A website chart that isn't a convert: its set from the mirror into the client, as a convert's original arrives
@@ -590,6 +608,32 @@ mod tests {
         deliver(&p, &db, "stable", &store, Instant::now(), &|_, _| true).unwrap();
         assert_eq!(std::fs::read(folder.join(&out.file_name)).unwrap(), out.osu);
         assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 1, "no archive beside it");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_stable_invert_is_written_beside_its_source() {
+        let dir = std::env::temp_dir().join(format!("ms-stable-invert-{}", std::process::id()));
+        let (store, folder) = (dir.join("store"), dir.join("Songs/1 A - T"));
+        std::fs::create_dir_all(&folder).unwrap();
+        let source = hashes(chart().as_bytes()).0;
+        let linked = paths::local_file(&source, &store).unwrap();
+        std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        std::fs::write(&linked, chart()).unwrap();
+        let db = ms_data::store::connect(&dir.join("rec.db")).unwrap();
+        db.execute("CREATE TABLE IF NOT EXISTS stable_files(path TEXT PRIMARY KEY, mtime REAL, size INTEGER, sha256 TEXT)", []).unwrap();
+        db.execute("INSERT INTO stable_files VALUES (?,0,0,?)", rusqlite::params![folder.join("a.osu").to_str().unwrap(), source]).unwrap();
+        let out = ms_convert::invert(chart().as_bytes()).unwrap();
+        let p = Pick { invert_of: Some(source), sha: Some(hashes(&out.osu).0), set_id: Some(1), title: "T".into(), installed: true, ..Pick::default() };
+        deliver(&p, &db, "stable", &store, Instant::now(), &|_, _| true).unwrap();
+        assert_eq!(std::fs::read(folder.join(&out.file_name)).unwrap(), out.osu);
+        deliver(&p, &db, "stable", &store, Instant::now(), &|_, _| true).unwrap(); // offered again: the same file
+        assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 1);
+        // the written chart rates as lazer's Invert mod does
+        let prm = standard_params();
+        let rate = |d: &[u8]| chart_features(d, &[1.], &prm).unwrap()[0].1.f("overall");
+        let (written, modded) = (rate(&out.osu), rate(&ms_calc::mods::tagged(chart().as_bytes(), "IN")));
+        assert!((written / modded - 1.).abs() < 0.01, "{written} {modded}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

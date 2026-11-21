@@ -977,15 +977,17 @@ pub struct Prediction {
     /// The unread deficit (ln, `PredModel::unread_deficit`), inside `mu` and every accuracy: an offer's rate lands on the target
     /// with the first read counted (user 2026-11-20: "first read −0.2 … give me the end result 96% not 95.8%").
     pub unread: f64,
-    pub learned_acc: f64, // acc_mid once the chart is learned (no deficit): the note's gap
+    /// What the deficit costs in accuracy (learned minus first-read, at construction): the per-note blend later moves acc_mid,
+    /// so the note never subtracts a blended number from a plain one ("read 19× −0.3" on a no-SV map, 2026-11-21).
+    pub read_cost: f64,
     pub reads: crate::personal::Read,
 }
 
 impl Prediction {
-    /// The card's note on what reading the chart costs (no deficit: None): "first read −5.2", "read 2× −1.7", "last read 2018
-    /// −3.1" (a last read over a year before `now`, months).
+    /// The tooltip's note on what reading the chart costs (no deficit: None): "first read −5.2", "read 2× −1.7", "last read
+    /// 2018 −3.1" (a last read over a year before `now`, months).
     pub fn read_note(&self, now: f64) -> Option<String> {
-        let cost = 100. * (self.learned_acc - self.acc_mid);
+        let cost = 100. * self.read_cost;
         let r = self.reads;
         let what = if r.count == 0 { "first read".to_string() } else if now - r.last > 12. { format!("last read {}", 2000 + (r.last / 12.).floor() as i64) } else { format!("read {}×", r.count) };
         (cost >= 0.05).then(|| format!("{what} −{cost:.1}"))
@@ -1428,7 +1430,7 @@ impl PredModel {
             tau: mode.tau,
             ln: f.z_tail[0],
             unread,
-            learned_acc: shown(mu - unread),
+            read_cost: shown(mu - unread) - shown(mu),
             reads: {
                 let mut r = self.plays.get(chart).copied().unwrap_or_default();
                 let now = s.charts.get(chart).map_or(0., |c| c.reads);
@@ -1590,7 +1592,7 @@ mod model_tests {
         assert!(learned.unread == 0. && new.unread > twice.unread && twice.unread > 0.);
         assert!((new.mu - learned.mu - new.unread).abs() < 1e-12); // what the offer's rate is solved on
         assert!(new.acc_mid < twice.acc_mid && twice.acc_mid < learned.acc_mid);
-        assert!((new.learned_acc - learned.acc_mid).abs() < 1e-12); // the note's "−x" is the learned chart's gap
+        assert!((new.read_cost - (learned.acc_mid - new.acc_mid)).abs() < 1e-12); // the note's "−x" is the learned chart's gap
         assert_eq!(new.read_note(301.).unwrap().split(" −").next(), Some("first read"));
         assert_eq!(twice.read_note(301.).unwrap().split(" −").next(), Some("read 2×"));
         assert_eq!(twice.read_note(330.).unwrap().split(" −").next(), Some("last read 2025"));

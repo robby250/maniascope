@@ -173,7 +173,10 @@ impl Tracker {
                 }
             }
             p["paused_now"] = json!(paused);
-            self.paused = paused && live > first;
+            // stable's lead-in reads paused with its clock running; a clock held since the last frame is a real pause (lazer
+            // pauses itself on losing focus, often in the lead-in: read as play, it held every background job, 2026-11-21)
+            let held = !stale && live == num(&p["pos"]);
+            self.paused = paused && (live > first || held);
             p["partial_stats"] = d["play"]["hits"].clone();
             p["pos"] = json!(live);
             p["progress"] = json!(((live - first) / (last - first).max(1.)).clamp(0., 1.));
@@ -314,7 +317,7 @@ impl LogTail {
         if path.is_none() && self.job.is_none() && self.reindexed.is_none_or(|t| t.elapsed() > Duration::from_secs(600)) {
             self.reindexed = Some(Instant::now());
             let force = self.index.is_some();
-            let _ = tx.send(Event::Status("Can't read osu! — indexing library in background; recovering scores from lazer".into()));
+            let _ = tx.send(Event::Status("Can't read osu!: indexing library in background; recovering scores from lazer".into()));
             let display = display.to_string();
             self.job = Some(std::thread::spawn(move || {
                 let index = ms_data::lazer_index::load_or_build(force);
@@ -494,6 +497,18 @@ mod tests {
         assert_eq!(t.play.lock().unwrap().as_ref().unwrap()["pauses"], json!([2100, 5000]));
         t.frame(&state("resultScreen", 5000., &c));
         assert_eq!(t.done.as_ref().unwrap()["pauses"], json!([2100, 5000]));
+    }
+
+    #[test]
+    fn a_pause_held_in_the_lead_in_frees_the_cpu() {
+        let (mut t, _rx, _q) = tracker();
+        let c = chart();
+        for (live, freed) in [(-1600., false), (-1500., false), (-669., false), (-669., true), (-669., true)] {
+            let mut f = state("play", live, &c);
+            f["game"]["paused"] = json!(true);
+            t.frame(&f);
+            assert_eq!(t.paused, freed, "{live}");
+        }
     }
 
     #[test]

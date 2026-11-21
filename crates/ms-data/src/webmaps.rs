@@ -297,6 +297,20 @@ fn forget(db: &Connection, client: &InClient, osu: &Path) -> rusqlite::Result<us
     Ok(held.len())
 }
 
+/// Every downloaded website chart and its analyses deleted (user 2026-11-21: "an option to delete website maps"); the listing
+/// and the window's choices stay, so Start downloads them again. Refused while a crawl runs. The charts deleted.
+pub fn delete_all() -> Result<usize, String> {
+    let _held = lock().ok_or("a website download is running: pause it first")?;
+    let db = state_db().map_err(|e| e.to_string())?;
+    let n = db.execute("UPDATE diffs SET sha=NULL, fetched=NULL WHERE sha IS NOT NULL", []).map_err(|e| e.to_string())?;
+    db.execute_batch("DELETE FROM feats; VACUUM").map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_dir_all(web_dir().join("osu"));
+    for f in ["web.msp", "web.pkl"] {
+        let _ = std::fs::remove_file(web_dir().join(f));
+    }
+    Ok(n)
+}
+
 /// What a crawl of the keymodes that download still has to do.
 pub fn estimate(db: &Connection, wants: &[Want], calc: &str) -> rusqlite::Result<Estimate> {
     let (mut fetch, mut analyse, mut ready, mut per_key) = (0, 0, 0, BTreeMap::new());
@@ -467,6 +481,9 @@ fn fetch(db: &Connection, wants: &[Want], limit: usize) -> Result<usize, CrawlEr
                 }
             }
         });
+        // owned here: a pause's early return drops it before the scope joins the downloader, whose send then fails instead
+        // of waiting forever (closing the app at 13:51 hung the crawl for hours, holding its lock, user 2026-11-21)
+        let receive = receive;
         for (i, (bid, data)) in receive.iter().enumerate() {
             store(db, bid, &data)?;
             progress(db, json!({"phase": "download", "fetched": done + i + 1}))?;

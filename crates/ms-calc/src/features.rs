@@ -191,8 +191,12 @@ pub fn features_of(res: &Dict, prm: &Params) -> Dict {
     f.set("keys", res.get("keys").cloned().unwrap_or(Val::Int(0)));
     f.set("overall", o);
     f.set("od", res.get("od").cloned().unwrap_or(Val::F(0.)));
-    if let Some(w) = res.get("window_shift") {
-        f.set("window_shift", w.clone());
+    // a re-rating (`carried`) keeps them too: the calc 14be → cc36 carry dropped "invert" from 52k Invert charts, which
+    // then read as their source's skills (Vibro offered inverted, user 2026-11-21)
+    for kept in ["window_shift", "invert"] {
+        if let Some(v) = res.get(kept) {
+            f.set(kept, v.clone());
+        }
     }
     f.set("ln", res.f("ln_notes") / notes.f().max(1.));
     f.set("notes", notes);
@@ -269,11 +273,8 @@ fn features_with(data: &[u8], rates: &[f64], prm: &Params, calculate: &dyn Fn(&c
     for &rate in rates {
         let res = calculate(&parsed, rate)?;
         crate::tick::lap("compute tail");
-        let mut f = features_of(&res, prm);
+        let f = features_of(&res, prm);
         crate::tick::lap("features_of");
-        if parsed.invert {
-            f.set("invert", 1.); // the Skills tab's "Inverse mod" dimension (ms_model::skills::INVERT_MOD)
-        }
         out.push((rate, f));
     }
     if out.iter().any(|x| matches!(x.0, r if r == 0.75 || r == 1. || r == 1.5)) {
