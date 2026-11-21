@@ -41,7 +41,7 @@ impl Layer {
 fn gelu(x: f32) -> f32 {
     let z = x * std::f32::consts::FRAC_1_SQRT_2;
     let t = 1. / (1. + 0.3275911 * z.abs());
-    let poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+    let poly = ((((1.061_405_4 * t - 1.453_152_1) * t + 1.421_413_8) * t - 0.284_496_72) * t + 0.254_829_6) * t;
     let y = 1. - poly * exp_neg(z * z);
     0.5 * x * (1. + y.copysign(z))
 }
@@ -157,7 +157,7 @@ mod tests {
     fn the_batched_net_matches_a_row_by_row_pass() {
         // a 3-input, width-5 net with arbitrary weights, 2,500 records (over two blocks), against plain loops per judgement
         let (k, h) = (3 + 1 + 2, 5);
-        let w = |n: usize, seed: f32| (0..n).map(|i| ((i as f32 * 0.37 + seed).sin() * 0.8)).collect::<Vec<f32>>();
+        let w = |n: usize, seed: f32| (0..n).map(|i| (i as f32 * 0.37 + seed).sin() * 0.8).collect::<Vec<f32>>();
         let (w1, b1, w2, b2, w3) = (w(k * h, 0.1), w(h, 0.2), w(h * h, 0.3), w(h, 0.4), w(h, 0.5));
         let text = serde_json::json!({"inputs": ["size", "row_gap", "kept"], "mu": [0.5, 0.1, 1.0], "sd": [2.0, 0.3, 1.5], "session": true,
             "l1": {"in": k, "out": h, "w": w1, "b": b1}, "l2": {"in": h, "out": h, "w": w2, "b": b2}, "l3": {"in": h, "out": 1, "w": w3, "b": [0.25]}}).to_string();

@@ -1,6 +1,6 @@
 //! Local execution patterns used for recognition (pattern_control.py).
 use crate::chart::Chart;
-use crate::demand::{Row, Trill};
+use crate::demand::Row;
 use crate::execution::Info;
 use crate::kern::off_grid;
 use crate::params::Knobs;
@@ -13,22 +13,16 @@ fn smooth(x: f64, lo: f64, hi: f64) -> f64 {
 }
 
 /// Full-column chords between single notes: (per-bin coverage × support, whole-chart share).
-pub fn quadstream(chart: &Chart, rate: f64, bin_seconds: f64) -> (Vec<f64>, f64) {
+pub fn quadstream(chart: &Chart, rate: f64, rows: &[Row], bin_seconds: f64) -> (Vec<f64>, f64) {
     if chart.len() == 0 {
         return (Vec::new(), 0.0);
     }
     let first = chart.t[0];
-    let mut rows: Vec<(f64, u32, bool)> = Vec::new();
-    for i in 0..chart.len() {
-        let (t, e, c) = (chart.t[i], chart.end[i], chart.col[i]);
-        match rows.last_mut() {
-            Some(r) if t - r.0 <= 3.0 => {
-                r.1 |= 1 << c;
-                r.2 |= e - t > 3.0;
-            }
-            _ => rows.push((t, 1 << c, e - t > 3.0)),
-        }
-    }
+    // (chart ms, columns, holds a long note: over 3 ms of real time, the LN rule of demand)
+    let rows: Vec<(f64, u32, bool)> = rows
+        .iter()
+        .map(|r| (chart.t[r.start], r.mask, (r.start..r.end).any(|i| chart.end[i] - chart.t[i] > 3.0 * rate)))
+        .collect();
     let conv = |d: f64| d * 0.001 / rate / bin_seconds;
     let bins = conv(chart.last_end() - first) as usize + 1;
     let mut hits = vec![0.0f64; bins];
@@ -70,19 +64,13 @@ pub fn quadstream(chart: &Chart, rate: f64, bin_seconds: f64) -> (Vec<f64>, f64)
 
 /// Notes inside stable adjacent-finger rolls, per hand: [hand][row].
 pub fn smooth_rolls(rows: &[Row], keys: usize) -> [Vec<f64>; 2] {
-    let assignments: &[bool] = if keys % 2 == 1 { &[false, true] } else { &[false] };
+    let assignments = crate::demand::splits(keys);
     let share = 1.0 / assignments.len() as f64;
     let mut output = [vec![0.0f64; rows.len()], vec![0.0f64; rows.len()]];
-    let half = keys / 2;
     for &cl in assignments {
-        let hand: Vec<usize> = (0..keys).map(|c| if c < half || (cl && c == half) { 0 } else { 1 }).collect();
+        let masks = crate::demand::hand_masks(keys, cl);
         for h in 0..2 {
-            let mut hm = 0u32;
-            for c in 0..keys {
-                if hand[c] == h {
-                    hm |= 1 << c;
-                }
-            }
+            let hm = masks[h];
             // (row index, t, lowest column, count)
             let local: Vec<(usize, f64, i64, u32)> = rows
                 .iter()
@@ -138,45 +126,23 @@ pub fn smooth_rolls(rows: &[Row], keys: usize) -> [Vec<f64>; 2] {
 pub const TECH_PROFILE_VERSION: i64 = 2;
 
 /// Whole-map technical character: [technical, patterntech, rhythmtech] (zeros without rows).
-pub fn tech_profile(chart: &Chart, rate: f64, info: &Info, k: &Knobs) -> [f64; 3] {
+pub fn tech_profile(chart: &Chart, rows: &[Row], info: &Info, k: &Knobs) -> [f64; 3] {
     let counts = &info.count;
     if counts.is_empty() || py::sum(counts.iter().copied()) == 0.0 {
         return [0.0; 3];
     }
-    let mut rows: Vec<Row> = Vec::new();
-    for i in 0..chart.len() {
-        let t = chart.t[i] * 0.001 / rate;
-        match rows.last_mut() {
-            Some(r) if t - r.t <= 0.003 => r.mask |= 1 << chart.col[i],
-            _ => rows.push(Row { t, mask: 1 << chart.col[i], start: 0, end: 0 }),
-        }
-    }
     let n = rows.len();
-    let mut trills = vec![Trill::None; n];
-    let half = chart.keys / 2;
-    let lo_mask = ((1u64 << half) - 1) as u32;
-    let hands = |m: u32| ((m & lo_mask != 0) as u8) | (((m & !lo_mask) != 0) as u8) << 1;
-    for i in 3..n {
-        let w = &rows[i - 3..=i];
-        if w.iter().map(|r| r.mask.count_ones()).min().unwrap() < 2 || w[3].t - w[0].t >= 3.0 * k.TRILL_GAP {
-            continue;
-        }
-        let hs: Vec<u8> = w.iter().map(|r| hands(r.mask)).collect();
-        let (a, b, c, d) = (w[0].mask, w[1].mask, w[2].mask, w[3].mask);
-        let kind = if hs[0].count_ones() == 1 && hs[1].count_ones() == 1 && hs[0] != hs[1] && hs[0] == hs[2] && hs[1] == hs[3] {
-            Trill::Jumptrill
-        } else if crate::taxonomy::measured(crate::skills::Sk::splittrill, chart.keys) && a == c && b == d && a & b == 0 {
-            Trill::Splittrill
-        } else {
-            Trill::None
-        };
-        if kind != Trill::None {
-            for x in &mut trills[i - 3..=i] {
-                *x = kind;
-            }
+    // both hand splits of an odd keymode, averaged, as demand reads them (the middle key sat with the right hand only)
+    let splits = crate::demand::splits(chart.keys);
+    let (mut inserted, mut switched) = (vec![0.0f64; n], vec![0.0f64; n]);
+    for &cl in splits {
+        let trills = crate::demand::trills(&rows, chart.keys, cl, k);
+        let (ins, sw) = crate::demand::pattern_evidence(&rows, &trills, k);
+        for r in 0..n {
+            inserted[r] += ins[r] / splits.len() as f64;
+            switched[r] += sw[r] / splits.len() as f64;
         }
     }
-    let (inserted, switched) = crate::demand::pattern_evidence(&rows, &trills, k);
     let nb = counts.len();
     let mut pattern = vec![0.0f64; nb];
     let mut global_rhythm = vec![0.0f64; nb];
@@ -211,7 +177,7 @@ pub fn tech_profile(chart: &Chart, rate: f64, info: &Info, k: &Knobs) -> [f64; 3
             if i < values.len() {
                 total += values[i];
             }
-            if i >= 2 * h + 1 {
+            if i > 2 * h {
                 total -= values[i - 2 * h - 1];
             }
             if i >= h {

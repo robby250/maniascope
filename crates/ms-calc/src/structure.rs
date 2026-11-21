@@ -69,7 +69,8 @@ pub fn np_percentile(a: &[f64], q: f64) -> f64 {
     }
 }
 
-pub fn structure(chart: &Chart, rate: f64, k: &Knobs) -> Dict {
+/// `family`: the chart's `family_of` when the layout holds it.
+pub fn structure(chart: &Chart, rate: f64, rows: &[crate::demand::Row], family: Option<&str>, k: &Knobs) -> Dict {
     let mut d = Dict::new();
     d.set("version", STRUCTURE_VERSION);
     let n = chart.len();
@@ -85,19 +86,8 @@ pub fn structure(chart: &Chart, rate: f64, k: &Knobs) -> Dict {
         d.set("nps", Val::None);
         return d;
     }
-    let mut row_times: Vec<f64> = Vec::new();
-    let mut masks: Vec<u32> = Vec::new();
-    for i in 0..n {
-        let t = heads[i];
-        // defaultdict keyed by time: notes are time-sorted, so a new key is a new last row
-        match row_times.last() {
-            Some(&x) if x == t => *masks.last_mut().unwrap() |= 1 << chart.col[i],
-            _ => {
-                row_times.push(t);
-                masks.push(1 << chart.col[i]);
-            }
-        }
-    }
+    let row_times: Vec<f64> = rows.iter().map(|r| heads[r.start]).collect(); // chart ms
+    let masks: Vec<u32> = rows.iter().map(|r| r.mask).collect();
     let sizes: Vec<f64> = masks.iter().map(|m| m.count_ones() as f64).collect();
     let overlap: Vec<f64> = masks
         .windows(2)
@@ -107,20 +97,7 @@ pub fn structure(chart: &Chart, rate: f64, k: &Knobs) -> Dict {
     let runs = vibro_notes(chart, rate, k);
     let fast_count: usize = runs.iter().map(Vec::len).sum();
     let longest = runs.iter().map(|r| (heads[r[r.len() - 1]] - heads[r[0]]) / 1000.0 / rate).fold(0.0f64, f64::max);
-    // Layout plus coarse normalized phrase timing (variety only, never accuracy merging).
-    let num = 64usize.min(n);
-    let step = (n - 1) as f64 / (num - 1) as f64;
-    let mut sample: Vec<usize> = (0..num).map(|i| (i as f64 * step + 0.0) as usize).collect();
-    *sample.last_mut().unwrap() = n - 1;
-    let mut h = Sha256::new();
-    h.update([chart.keys as u8]);
-    h.update(&chart.col);
-    h.update(chart.t.iter().zip(&chart.end).map(|(t, e)| (e > t) as u8).collect::<Vec<u8>>());
-    for &i in &sample {
-        let v = py::round((heads[i] - heads[0]) / span * 200.0) as i16;
-        h.update(v.to_le_bytes());
-    }
-    let family: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()[..24].to_string();
+    let family = family.map_or_else(|| family_of(chart), str::to_string);
     let idx: Vec<usize> = heads.iter().map(|&x| ((x - heads[0]) / 5000.0) as usize).collect();
     let nb = idx.iter().copied().max().unwrap() + 1;
     let mut bin_counts = vec![0.0f64; nb];
@@ -167,7 +144,7 @@ pub fn structure(chart: &Chart, rate: f64, k: &Knobs) -> Dict {
     d.set("rhythm", rhythm);
     d.set("vibro_share", fast_count as f64 / n as f64);
     let v = vibro_runs(chart, rate, k);
-    (d.set("vibro_runs", v.share), d.set("vibro_rest", v.rest), d.set("vibro_speed", v.speed));
+    d.set("vibro_runs", v.share); d.set("vibro_rest", v.rest); d.set("vibro_speed", v.speed);
     let judged = n as f64 + (0..n).filter(|&i| chart.end[i] > chart.t[i]).count() as f64;
     d.set("unhittable", chart.stacked / (chart.stacked + judged)); // share of judgements stacked notes lose (Chart::stacked)
     d.set("vibro_longest", longest);
@@ -246,7 +223,7 @@ fn column_runs_of(chart: &Chart, rate: f64, k: &Knobs) -> Vec<Run> {
     let (gap, hand_gap) = (1000.0 * k.LJ_GAP * rate, 1000.0 * k.VIBRO_GAP * rate); // chart ms
     let keys = chart.keys;
     // each hand's columns as a mask, the per-column flags as bits: a row is a few mask operations (it looped keys × keys)
-    let hm = (0..keys).fold([0u32; 2], |mut m, c| { m[crate::flow::hand(c, keys, true).0] |= 1 << c; m });
+    let hm = crate::demand::hand_masks(keys, true);
     let mine = |c: usize| hm[(hm[1] >> c & 1) as usize];
     let mut open: Vec<Vec<usize>> = vec![Vec::new(); keys];
     let mut chord: Vec<Vec<u32>> = vec![Vec::new(); keys]; // the hand's chord at each hit of the open run
@@ -271,13 +248,7 @@ fn column_runs_of(chart: &Chart, rate: f64, k: &Knobs) -> Vec<Run> {
         notes.clear();
         chords.clear();
     };
-    let mut i = 0;
-    while i < chart.len() {
-        let mut m = i + 1;
-        while m < chart.len() && chart.t[m] - chart.t[i] <= 3.0 {
-            m += 1;
-        }
-        let row = chart.col[i..m].iter().fold(0u32, |a, &c| a | 1 << c);
+    for &crate::demand::Row { mask: row, start: i, end: m, .. } in &crate::demand::rows(chart, rate) {
         for x in i..m {
             let c = chart.col[x] as usize;
             let bit = 1u32 << c;
@@ -301,7 +272,6 @@ fn column_runs_of(chart: &Chart, rate: f64, k: &Knobs) -> Vec<Run> {
                 between |= h & !row;
             }
         }
-        i = m;
     }
     for c in 0..keys {
         close(&mut open[c], &mut chord[c], alternated >> c & 1 == 1, &mut out);
@@ -349,3 +319,22 @@ pub fn vibro_only(v: &Vibro) -> bool {
     v.share >= VIBRO_ONLY && v.rest < VIBRO_REST
 }
 
+/// The chart's pattern family: layout plus coarse normalized phrase timing (variety only, never accuracy merging). No rate
+/// enters it: `Layout` makes it once per chart.
+pub fn family_of(chart: &Chart) -> String {
+    let (n, heads) = (chart.len(), &chart.t);
+    let span = heads[n - 1] - heads[0];
+    let num = 64usize.min(n);
+    let step = (n - 1) as f64 / (num - 1) as f64;
+    let mut sample: Vec<usize> = (0..num).map(|i| (i as f64 * step + 0.0) as usize).collect();
+    *sample.last_mut().unwrap() = n - 1;
+    let mut h = Sha256::new();
+    h.update([chart.keys as u8]);
+    h.update(&chart.col);
+    h.update(chart.t.iter().zip(&chart.end).map(|(t, e)| (e > t) as u8).collect::<Vec<u8>>());
+    for &i in &sample {
+        let v = py::round((heads[i] - heads[0]) / span * 200.0) as i16;
+        h.update(v.to_le_bytes());
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()[..24].to_string()
+}

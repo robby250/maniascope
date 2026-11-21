@@ -91,7 +91,7 @@ pub fn library(b: &[u8]) -> Result<(String, Vec<Chart>), String> {
     r.i64()?; // unlock date
     let player = r.string()?;
     let n = r.count()?;
-    let mut out = Vec::with_capacity(n);
+    let mut out = Vec::with_capacity(n.min(b.len() / 64)); // a count from the file; an entry is well over 64 bytes
     for _ in 0..n {
         let artist = r.string()?;
         r.string()?;

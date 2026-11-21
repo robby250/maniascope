@@ -344,7 +344,8 @@ fn changing_jumptrill() {
         for k in ["overall", "stamina"] {
             assert_eq!(score(&result, k), score(&plain, k));
         }
-        for k in ["timeline"] {
+        {
+            let k = "timeline";
             assert_eq!(result.get(k), plain.get(k));
         }
     }
@@ -367,7 +368,7 @@ fn fast_changing_chords_lose_mirror_discount() {
     let changing = rows(&[&[1, 2, 5, 6], &[0, 1, 4, 5]], 110, 400);
     let fixed = rows(&[&[0, 1, 4, 5]], 110, 400);
     let slow: Vec<Note> = changing.iter().map(|n| (n.0 * 2, n.1, None)).collect();
-    let mirror = Params::new(standard_params().model.clone(), &json!({"MIRROR": 1.0})).unwrap();
+    let mirror = Params::new(standard_params().model, &json!({"MIRROR": 1.0})).unwrap();
     let with = |notes: &[Note]| score(&run_with(&file(notes, 7), 1., &mirror), "overall");
     assert_eq!(with(&changing), sc(&changing, 7).f("overall"), "fast partial repeats are separate movements");
     assert!(with(&fixed) > sc(&fixed, 7).f("overall"), "complete repeats still share one bounce");
@@ -413,7 +414,7 @@ fn pattern_tech() {
     let switching: Vec<&[usize]> = (0..160).flat_map(|i| if i % 2 == 1 { single } else { chords }).collect();
     let sw = sc(&row(&switching), 4);
     assert!(sw.f("patterntech") < 0.1 * sw.f("overall"));
-    let jt: Vec<&[usize]> = std::iter::repeat([&[0, 1][..], &[2, 3][..]]).take(320).flatten().collect();
+    let jt: Vec<&[usize]> = std::iter::repeat_n([&[0, 1][..], &[2, 3][..]], 320).flatten().collect();
     assert_eq!(sc(&row(&jt), 4).f("patterntech"), 0.);
 }
 

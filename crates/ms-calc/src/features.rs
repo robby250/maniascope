@@ -50,7 +50,7 @@ static SELECTED: Recent<Result<Arc<Dict>, String>> = Recent::new(4);
 pub fn compute_selected(data: &[u8], parsed: &chart::Chart, rate: f64, sv: bool, prm: &Params) -> Result<Arc<Dict>, String> {
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     (data, rate.to_bits(), sv, prm.id()).hash(&mut hash);
-    SELECTED.get(hash.finish(), || compute::compute(parsed, rate, sv, prm).map(Arc::new))
+    SELECTED.get(hash.finish(), || compute::compute_card(parsed, rate, sv, prm).map(Arc::new))
 }
 
 /// Skills whose share of the overall a chart row stores (`sk`): what Stats, skill picks and the card read.
@@ -149,9 +149,13 @@ pub fn carried(f: &Dict, after: &Params, rate: f64, chart: &dyn Fn() -> Option<s
 
 /// The rules a row was analysed under: the rule knobs' hash (calibration moves without a new analysis).
 pub fn rules_stamp(prm: &Params) -> String {
-    use sha2::Digest;
-    let knobs = serde_json::to_string(&prm.k.dump()).unwrap_or_default();
-    sha2::Sha256::digest(knobs.as_bytes()).iter().take(6).map(|b| format!("{b:02x}")).collect()
+    prm.rules
+        .get_or_init(|| {
+            use sha2::Digest;
+            let knobs = serde_json::to_string(&prm.k.dump()).unwrap_or_default();
+            sha2::Sha256::digest(knobs.as_bytes()).iter().take(6).map(|b| format!("{b:02x}")).collect()
+        })
+        .clone()
 }
 
 fn with_joint(f: &mut Dict, after: &Params, rate: f64, raw: f64, flow: &dyn Fn() -> Option<crate::flow::Flow>) {
@@ -198,43 +202,58 @@ pub fn features_of(res: &Dict, prm: &Params) -> Dict {
     f.set("stam", stamina);
     f.set("sk", Val::Dict(sk));
     // the card's whole-Stream rating as a share of the overall, beside `sk` (the model's inputs and top_skill read every `sk` key)
-    if let Some(v) = scores.get(crate::card::STREAM_FAMILY).filter(|_| overall != 0.) {
-        f.set(crate::card::STREAM_FAMILY, round_digits(v.f() / overall, 4));
+    for key in [crate::card::STREAM_FAMILY, crate::card::CHORDJACK_CARD] {
+        if let Some(v) = scores.get(key).filter(|_| overall != 0.) {
+            f.set(key, round_digits(v.f() / overall, 4));
+        }
     }
     f.set("description", if res.fget("notes", 0.) >= 2. { crate::card::describe(res, &prm.k).0 } else { "Sparse".to_string() });
     let or_empty = |k: &str| res.get(k).cloned().unwrap_or_else(|| Val::Dict(Dict::new()));
     f.set("endurance", or_empty("endurance"));
-    f.set("raw_overall", res.get("raw_overall").cloned().unwrap_or_else(|| Val::F(overall)));
+    f.set("raw_overall", res.get("raw_overall").cloned().unwrap_or(Val::F(overall)));
     f.set("calibration_features", res.get("calibration_features").cloned().unwrap_or(Val::List(Vec::new())));
     f.set("execution", or_empty("execution"));
     if let Some(s) = res.get("structure").filter(|v| v.truthy()) {
         f.set("nps", s.clone());
     }
-    f.set("baseline_overall", demand.get("baseline_overall").cloned().unwrap_or_else(|| Val::F(overall)));
+    f.set("baseline_overall", demand.get("baseline_overall").cloned().unwrap_or(Val::F(overall)));
     f.set("tech_profile", or_empty("tech_profile"));
     f.set("archetype_profile", or_empty("archetype_profile"));
     f.set("rules", rules_stamp(prm));
     f
 }
 
-/// (lazer stars, judgement count) at a ranked rate; None for a chart rosu-pp cannot read.
-fn lazer_stars(map: &rosu_pp::Beatmap, rate: f64) -> Option<(f64, u32)> {
-    let mods = if rate == 0.75 { 256 } else if rate == 1.5 { 64 } else { 0 };
-    let d = rosu_pp::Difficulty::new().mods(mods).lazer(true);
-    match if [0.75, 1., 1.5].contains(&rate) { d } else { d.clock_rate(rate) }.calculate(map) {
-        rosu_pp::any::DifficultyAttributes::Mania(a) => Some((a.stars, a.n_objects + a.n_hold_notes)),
-        _ => None,
-    }
+/// lazer's notes from the hit objects `chart::parse_with_objects` kept, as rosu's own parse reads them (x truncated, a hold's
+/// end at least its start, a stable sort by time): lazer's stars without reading the file twice.
+pub fn lazer_notes(keys: usize, objects: &[chart::Object]) -> crate::lazer::Notes {
+    crate::lazer::Notes::new(keys as f32, objects.iter().map(|&(t, e, x, hold)| (t as f64, (e.max(t) - t) as f64, x as i32 as f32, hold)))
+}
+
+/// lazer's notes from rosu's parse of the file (a value the chart doesn't keep whole); None for a file that isn't a mania map.
+fn lazer_notes_of(data: &[u8]) -> Option<crate::lazer::Notes> {
+    use rosu_pp::model::hit_object::HitObjectKind;
+    let map = rosu_pp::Beatmap::from_bytes(data).ok().filter(|m| m.mode == rosu_pp::model::mode::GameMode::Mania)?;
+    let objects: Option<Vec<_>> = map.hit_objects.iter().map(|h| match &h.kind {
+        HitObjectKind::Circle => Some((h.start_time, 0.0, h.pos.x, false)),
+        HitObjectKind::Hold(d) => Some((h.start_time, d.duration, h.pos.x, true)),
+        HitObjectKind::Spinner(d) => Some((h.start_time, d.duration, h.pos.x, true)),
+        HitObjectKind::Slider(_) => None, // ponytail: a slider in a mania file (never seen) has no stars; port rosu's slider length if one turns up
+    }).collect();
+    Some(crate::lazer::Notes::new(map.cs, objects?.into_iter()))
 }
 
 /// lazer's star rating and hit count of a chart at any rate (the card's pp at a rate the analysis didn't star).
 pub fn stars_at(data: &[u8], rate: f64) -> Option<(f64, u32)> {
-    lazer_stars(&rosu_pp::Beatmap::from_bytes(data).ok()?, rate)
+    Some(lazer_notes_of(data)?.stars(rate))
 }
 
 /// {rate: features} of one chart's bytes.
 pub fn chart_features(data: &[u8], rates: &[f64], prm: &Params) -> Result<Vec<(f64, Dict)>, String> {
-    features_with(data, rates, prm, &|parsed, rate| compute::compute(parsed, rate, true, prm).map(Arc::new))
+    let layout = std::sync::OnceLock::new();
+    features_with(data, rates, prm, &|parsed, rate| {
+        let l = layout.get_or_init(|| Arc::new(crate::layout::Layout::new(parsed)));
+        compute::compute_stored(parsed, rate, true, Some(l), prm).map(Arc::new)
+    })
 }
 
 /// chart_features of the selected chart, on the card's calculation.
@@ -243,22 +262,28 @@ pub fn selected_features(data: &[u8], rate: f64, prm: &Params) -> Result<Vec<(f6
 }
 
 fn features_with(data: &[u8], rates: &[f64], prm: &Params, calculate: &dyn Fn(&chart::Chart, f64) -> Result<Arc<Dict>, String>) -> Result<Vec<(f64, Dict)>, String> {
-    let parsed = chart::parse(data).map_err(|e| match e {
+    let (parsed, objects) = chart::parse_with_objects(data).map_err(|e| match e {
         chart::ChartError::Chart(m) | chart::ChartError::Value(m) => m,
     })?;
     let mut out = Vec::with_capacity(rates.len());
     for &rate in rates {
         let res = calculate(&parsed, rate)?;
-        out.push((rate, features_of(&res, prm)));
+        crate::tick::lap("compute tail");
+        let mut f = features_of(&res, prm);
+        crate::tick::lap("features_of");
+        if parsed.invert {
+            f.set("invert", 1.); // the Skills tab's "Inverse mod" dimension (ms_model::skills::INVERT_MOD)
+        }
+        out.push((rate, f));
     }
     if out.iter().any(|x| matches!(x.0, r if r == 0.75 || r == 1. || r == 1.5)) {
-        if let Ok(map) = rosu_pp::Beatmap::from_bytes(data) {
+        if let Some(notes) = objects.map(|o| lazer_notes(parsed.keys, &o)).or_else(|| lazer_notes_of(data)) {
             for (rate, f) in &mut out {
-                if let Some((stars, hits)) = lazer_stars(&map, *rate) {
-                    f.set("stars", stars);
-                    f.set("hits", Val::Int(i64::from(hits)));
-                }
+                let (stars, hits) = notes.stars(*rate);
+                f.set("stars", stars);
+                f.set("hits", Val::Int(i64::from(hits)));
             }
+            crate::tick::lap("lazer stars");
         }
     }
     Ok(out)
@@ -273,6 +298,37 @@ pub fn features_batch(jobs: &[(Vec<u8>, Vec<f64>)], threads: usize, prm: &Params
 mod shared_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Same-time notes out of column order, an unsorted line, holds of every length, a fractional time: the port's stars and
+    /// judgement counts equal rosu-pp's at every rate, from the kept objects and from the file.
+    #[test]
+    fn lazer_stars_equal_rosus() {
+        let mut text = "osu file format v14\n[General]\nMode:3\n[Difficulty]\nCircleSize:7\nOverallDifficulty:8\n[HitObjects]\n".to_string();
+        for i in 0..300 {
+            let t = 1000 + i * 150;
+            // a hold listed before the notes at its time, on a higher column (Chart sorts these by column)
+            text += &format!("{},192,{t},128,0,{}:0:0:0:0:\n", [448, 320][i % 2], t + [0, 300, 700][i % 3]);
+            text += &format!("{},192,{t},1,0,0:0:0:0:\n", [192, 64][i % 2]);
+            text += &format!("{},192,{t},1,0,0:0:0:0:\n", [36, 256, 100][i % 3]);
+        }
+        text += "200,192,500,1,0,0:0:0:0:\n"; // a line out of time order
+        let rosu = |data: &[u8], rate: f64| {
+            let d = rosu_pp::Difficulty::new().mods(if rate == 0.75 { 256 } else if rate == 1.5 { 64 } else { 0 }).lazer(true);
+            match if [0.75, 1., 1.5].contains(&rate) { d } else { d.clock_rate(rate) }.calculate(&rosu_pp::Beatmap::from_bytes(data).unwrap()) {
+                rosu_pp::any::DifficultyAttributes::Mania(a) => (a.stars, a.n_objects + a.n_hold_notes),
+                _ => unreachable!(),
+            }
+        };
+        let data = text.as_bytes();
+        let kept = lazer_notes(7, &chart::parse_with_objects(data).unwrap().1.unwrap());
+        let fractional = text.replace(",500,1,", ",500.5,1,");
+        for rate in [0.75, 1.0, 1.5, 1.15] {
+            assert_eq!(kept.stars(rate), rosu(data, rate));
+            assert_eq!(stars_at(fractional.as_bytes(), rate), Some(rosu(fractional.as_bytes(), rate)));
+        }
+        // a fractional time: rosu keeps it, the chart truncates it, so the file is read again
+        assert!(chart::parse_with_objects(text.replace(",500,1,", ",500.5,1,").as_bytes()).unwrap().1.is_none());
+    }
 
     #[test]
     fn callers_at_the_same_moment_share_one_calculation() {
@@ -342,3 +398,4 @@ mod shared_tests {
         }
     }
 }
+

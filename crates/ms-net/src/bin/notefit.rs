@@ -4,7 +4,7 @@
 //! rating of the play, keymode, rate, OD) through the same MLP and ability model, so the two compare chart difficulty only.
 use burn::module::{Module, Param};
 use burn::nn::{Linear, LinearConfig};
-use burn::optim::{AdamConfig, GradientsParams, Optimizer};
+use burn::optim::{AdamConfig, GradientsParams};
 use burn::prelude::*;
 use burn::tensor::activation::{gelu, log_sigmoid};
 
@@ -111,7 +111,7 @@ fn main() {
     let samples = |p: usize| (start[p]..start[p + 1]).flat_map(move |i| std::iter::once(i as u64).chain(ct.filter(|&c| row(i)[c] < 5.5).map(|_| i as u64 | TAIL)));
     // --all-songs: the shipped model trains on every play (no held-out half)
     let all_songs = args.iter().any(|a| a == "--all-songs");
-    let train: Vec<u64> = (0..plays.len()).filter(|&p| all_songs || half[p] == 0).flat_map(|p| samples(p)).collect();
+    let train: Vec<u64> = (0..plays.len()).filter(|&p| all_songs || half[p] == 0).flat_map(&samples).collect();
     let train_n = train.len();
     let pick = |r: u64| train[(r % train_n as u64) as usize];
     eprintln!("{train_n} train judgements ({} releases)", train.iter().filter(|s| **s & TAIL != 0).count());
@@ -183,14 +183,14 @@ fn main() {
     let net = net.valid();
     // --save FILE: the difficulty net for ms-calc::notenet (inputs by column name, standardisation, layers as [in][out] rows)
     if let Some(i) = args.iter().position(|a| a == "--save") {
-        let lin = |l: &Linear| { let w: Vec<f32> = l.weight.val().into_data().to_vec().unwrap(); let b: Vec<f32> = l.bias.as_ref().unwrap().val().into_data().to_vec().unwrap();
+        let lin = |l: &Linear| { let w: Vec<f32> = l.weight.val().into_data().try_to_vec::<f32>().unwrap(); let b: Vec<f32> = l.bias.as_ref().unwrap().val().into_data().try_to_vec::<f32>().unwrap();
             let [i, o] = l.weight.val().dims(); serde_json::json!({"in": i, "out": o, "w": w, "b": b}) };
         let names: Vec<&str> = inputs.iter().map(|&c| cols[c]).collect();
         let j = serde_json::json!({"inputs": names, "mu": inputs.iter().map(|&c| mu[c]).collect::<Vec<f64>>(), "sd": inputs.iter().map(|&c| sd[c]).collect::<Vec<f64>>(),
             "tail": true, "session": session, "others": others, "l1": lin(&net.l1), "l2": lin(&net.l2), "l3": lin(&net.l3)});
         std::fs::write(&args[i + 1], serde_json::to_string(&j).unwrap()).unwrap();
     }
-    let theta: Vec<f32> = net.theta.val().into_data().to_vec().unwrap();
+    let theta: Vec<f32> = net.theta.val().into_data().try_to_vec::<f32>().unwrap();
     let dv = Device::wgpu(burn::tensor::DeviceKind::DiscreteGpu(0));
     let mut by_time: Vec<usize> = (0..plays.len()).filter(|&p| half[p] == 0 && start[p + 1] > start[p]).collect();
     by_time.sort_by(by_player_time);
@@ -226,7 +226,7 @@ fn main() {
         let ss: Vec<u64> = samples(p).collect();
         let mut x = Vec::with_capacity(ss.len() * k);
         ss.iter().for_each(|&s| feats(s, &mut x));
-        let dd: Vec<f32> = net.difficulty(Tensor::<2>::from_data(TensorData::new(x, [ss.len(), k]), &dv)).into_data().to_vec().unwrap();
+        let dd: Vec<f32> = net.difficulty(Tensor::<2>::from_data(TensorData::new(x, [ss.len(), k]), &dv)).into_data().try_to_vec::<f32>().unwrap();
         let act = ss.iter().map(|&s| loss_of(s) as f64).sum::<f64>() / ss.len() as f64;
         if let Some(w) = dump.as_mut() {
             use std::io::Write;

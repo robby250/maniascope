@@ -238,7 +238,7 @@ pub fn reading(chart: &Chart, rate: f64, prm: &Params) -> Result<(Vec<f64>, Vec<
     for (vector, kind) in info.vectors.iter().zip(&info.kinds) {
         let values: [f64; 4] = std::array::from_fn(|j| vector[j] * weights[j]);
         let total = py::sum(values);
-        out.push(total);
+        out.push(if prm.k.SV_Q == 1.0 || total <= 0.0 { total } else { total.powf(prm.k.SV_Q) });
         let ks = [values[0], values[1], if kind[2] != 0.0 { values[2] } else { 0.0 }, values[3], if kind[4] != 0.0 { values[2] } else { 0.0 }];
         kinds.push(if total > 0.0 { ks.map(|v| v / total) } else { [0.0; 5] });
     }

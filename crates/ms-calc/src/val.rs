@@ -201,3 +201,38 @@ impl std::hash::Hasher for Fx {
         self.write_u64(i as u64)
     }
 }
+
+/// The mean of results with one shape (Random's three shuffles, plan 2026-11-20 D): numbers averaged, dicts by key, lists of
+/// one length element by element; anything else (text, lists of other lengths) is the first's.
+pub fn mean(vals: &[&Val]) -> Val {
+    let first = vals[0];
+    match first {
+        Val::F(_) | Val::Int(_) if vals.iter().all(|v| matches!(v, Val::F(_) | Val::Int(_))) => {
+            let m = vals.iter().map(|v| v.f()).sum::<f64>() / vals.len() as f64;
+            if matches!(first, Val::Int(_)) && vals.iter().all(|v| *v == first) { first.clone() } else { Val::F(m) }
+        }
+        Val::Dict(d) if vals.iter().all(|v| matches!(v, Val::Dict(_))) => Val::Dict(Dict(d.0.iter().map(|(k, x)| {
+            let at: Vec<&Val> = vals.iter().filter_map(|v| if let Val::Dict(o) = v { o.0.iter().find(|e| e.0 == *k).map(|e| &e.1) } else { None }).collect();
+            (k.clone(), if at.len() == vals.len() { mean(&at) } else { x.clone() })
+        }).collect())),
+        Val::List(l) if vals.iter().all(|v| matches!(v, Val::List(o) if o.len() == l.len())) => {
+            Val::List((0..l.len()).map(|i| mean(&vals.iter().map(|v| if let Val::List(o) = v { &o[i] } else { unreachable!() }).collect::<Vec<_>>())).collect())
+        }
+        _ => first.clone(),
+    }
+}
+
+#[cfg(test)]
+mod mean_tests {
+    use super::*;
+
+    #[test]
+    fn results_average_by_shape() {
+        let r = |x: f64, n: usize| { let mut d = Dict::new(); d.set("overall", x); d.set("keys", 7i64); d.set("timeline", Val::floats(&vec![x; n])); d.set("why", "a"); Val::Dict(d) };
+        let m = mean(&[&r(1., 3), &r(2., 3), &r(6., 3)]);
+        let Val::Dict(d) = m else { panic!() };
+        assert_eq!((d.f("overall"), d.get("keys"), d.get("timeline").map(Val::list_f)), (3., Some(&Val::Int(7)), Some(vec![3.; 3])));
+        let Val::Dict(d) = mean(&[&r(1., 3), &r(2., 4)]) else { panic!() };
+        assert_eq!(d.get("timeline").map(Val::list_f), Some(vec![1.; 3])); // lengths differ: the first's
+    }
+}

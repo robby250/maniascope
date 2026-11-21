@@ -178,7 +178,7 @@ fn paired(pp_y: f64, y_lazer: f64) -> Vec<Arc<Event>> {
 fn each_session_head_compares_its_own_frozen_target() {
     let m = cold(Vec::new());
     let s = session(paired(-2.4, -3.1), 1120., Some(m.clone()));
-    let view = s.display_view(m.clone());
+    let view = s.display_view(m);
     let family = s.consts.family("chordstream");
     assert!(s.correction(7, Some("chordstream")) > 0.);
     assert!(view.correction(7, Some("chordstream")).abs() < 1e-12);
@@ -242,7 +242,7 @@ fn the_session_clock_counts_every_keymode_and_restarts_after_a_gap() {
     let mut later = history.clone();
     later.push(done(1500. + gap + 200., 7));
     assert!((session_minutes(&later, 1500. + gap + 200.) - 2.).abs() < 1e-9);
-    assert_eq!(activation(&history, 1600., 7, None, &[]) > 0., true);
+    assert!(activation(&history, 1600., 7, None, &[]) > 0.);
 }
 
 #[test]
@@ -345,7 +345,7 @@ fn taste_needs_a_real_completion_and_counts_it_once() {
     }
     let t = taste(&db);
     let (chords, ln) = (t[&(7, "chords".to_string())], t[&(7, "ln".to_string())]);
-    assert!(0. < chords && chords <= 0.25 && -0.25 <= ln && ln < 0., "{chords} {ln}");
+    assert!(0. < chords && chords <= 0.25 && (-0.25..0.).contains(&ln), "{chords} {ln}");
     log_event(&db, "taste_reset", None, Some(ms_data::store::now()), &json!({})).unwrap();
     assert!(taste(&db).is_empty());
     drop(db);

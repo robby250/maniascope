@@ -312,31 +312,37 @@ impl<'a> Table<'a> {
 }
 
 pub struct Realm {
-    map: Mmap,
+    map: Box<dyn AsRef<[u8]>>,
 }
 
 impl Realm {
     pub fn open(path: &Path) -> R<Realm> {
         let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         // SAFETY: a private snapshot (dump's copy); nothing else writes it.
-        let map = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
-        if map.len() < 24 || &map[16..20] != b"T-DB" {
+        Realm::of(Box::new(unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?))
+    }
+
+    /// A Realm file's bytes (the fuzz harness reads mutated copies from memory).
+    pub fn of(map: Box<dyn AsRef<[u8]>>) -> R<Realm> {
+        let bytes = (*map).as_ref();
+        if bytes.len() < 24 || &bytes[16..20] != b"T-DB" {
             return Err("not a Realm file".to_string());
         }
-        let select = (map[23] & 1) as usize;
-        if map[20 + select] != FORMAT {
-            return Err(format!("client.realm uses Realm file format {}, this version reads {FORMAT}: update ManiaScope", map[20 + select]));
+        let select = (bytes[23] & 1) as usize;
+        if bytes[20 + select] != FORMAT {
+            return Err(format!("client.realm uses Realm file format {}, this version reads {FORMAT}: update ManiaScope", bytes[20 + select]));
         }
         Ok(Realm { map })
     }
 
     fn top(&self) -> R<Node<'_>> {
-        let select = (self.map[23] & 1) as usize;
-        let at = u64::from_le_bytes(self.map[select * 8..select * 8 + 8].try_into().unwrap());
+        let map = (*self.map).as_ref();
+        let select = (map[23] & 1) as usize;
+        let at = u64::from_le_bytes(map[select * 8..select * 8 + 8].try_into().unwrap());
         if at == u64::MAX {
             return Err("streaming-form Realm file".to_string());
         }
-        Node::at(&self.map, at)
+        Node::at(map, at)
     }
 
     pub fn table(&self, name: &str) -> R<Table<'_>> {
@@ -374,7 +380,10 @@ pub fn set_files(path: &Path, sha: &str) -> R<Vec<(String, String)>> {
 }
 
 pub fn dump(path: &Path, maps: bool, recent: Option<(i64, i64)>) -> R<Vec<Value>> {
-    let realm = Realm::open(path)?;
+    dump_realm(&Realm::open(path)?, maps, recent)
+}
+
+pub fn dump_realm(realm: &Realm, maps: bool, recent: Option<(i64, i64)>) -> R<Vec<Value>> {
     let rules = realm.table("Ruleset")?;
     let names = rules.strings("ShortName")?;
     let mania = names.iter().position(|n| n.as_deref() == Some("mania")).map(|i| rules.keys[i]);
@@ -422,7 +431,7 @@ pub fn dump(path: &Path, maps: bool, recent: Option<(i64, i64)>) -> R<Vec<Value>
     let (b_hash, b_online_md5, b_length, b_name, b_last) = (beatmap.strings("Hash")?, beatmap.strings("OnlineMD5Hash")?, beatmap.floats("Length")?, beatmap.strings("DifficultyName")?, beatmap.times("LastPlayed")?);
     for i in 0..beatmap.len() {
         let set = b_set[i].and_then(|k| sets.row(k));
-        if b_rule[i] != Some(mania) || b_hidden[i] || !set.is_some_and(|s| !set_deleted[s]) {
+        if b_rule[i] != Some(mania) || b_hidden[i] || set.is_none_or(|s| set_deleted[s]) {
             continue;
         }
         let set = set.unwrap();

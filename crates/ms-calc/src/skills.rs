@@ -88,18 +88,16 @@ impl Series {
 
 /// ±h bins sums.
 pub fn win(v: &[f64], h: usize) -> Vec<f64> {
-    let nb = v.len();
-    let mut out = vec![0.0; nb];
-    let mut acc = 0.0f64;
-    for i in 0..nb + h {
-        if i < nb {
-            acc += v[i];
-        }
-        if i >= 2 * h + 1 {
-            acc -= v[i - 2 * h - 1];
-        }
-        if i >= h {
-            out[i - h] = acc;
+    // summed afresh per bin (2h+1 ≤ 9 values): a running sum kept ~1e-17 of what left it, and a ratio of two windows (SV kinds
+    // over their SV part) read 4 or 8 where both were empty (audit A7: Fast SV never shown). Same order for every series, so
+    // a part ≤ its base bin by bin stays ≤ it in the window.
+    let n = v.len();
+    let mut out = vec![0.0; n];
+    for j in 0..=2 * h {
+        // out[i] += v[i + j − h] for every i with that bin inside the chart (one offset at a time: vector adds)
+        let (lo, hi) = (h.saturating_sub(j), (n + h).saturating_sub(j).min(n));
+        if lo < hi {
+            out[lo..hi].iter_mut().zip(&v[lo + j - h..hi + j - h]).for_each(|(o, x)| *o += x);
         }
     }
     out
@@ -594,6 +592,18 @@ mod rating_tests {
         let (e, b, h) = (r(&easy, &k), r(&burst, &k), r(&hard, &k));
         // A peak model rates the burst chart near the hard one; on accuracy it sits much closer to the easy one.
         assert!(e < b && b < h && (b / e).ln() < 0.5 * (h / e).ln(), "{e} {b} {h}");
+    }
+
+    #[test]
+    fn an_empty_window_sums_to_exactly_zero() {
+        let w = win(&[0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 0.0], 1);
+        assert_eq!(&w[5..], &[0.0, 0.0]); // the running sum left 1.1e-16 here
+        assert!((w[1] - 0.6).abs() < 1e-12);
+        let v: Vec<f64> = (0..23).map(|i| ((i * 37 % 11) as f64).sqrt()).collect();
+        for h in [0, 2, 4, 30] {
+            let naive: Vec<f64> = (0..v.len()).map(|i| v[i.saturating_sub(h)..(i + h + 1).min(v.len())].iter().sum()).collect();
+            assert_eq!(win(&v, h), naive);
+        }
     }
 
     #[test]

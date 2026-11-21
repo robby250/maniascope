@@ -286,6 +286,7 @@ pub struct Worker {
     learning: Arc<Mutex<Option<String>>>,
     first_import: bool,
     refresh_queued: bool,
+    rest_pending: bool, // `carry_rest` waits for the first list: built beside it, that list read whatever rows had landed
     refit_due: bool,
     refit_running: bool,
     refit_again: bool,
@@ -297,7 +298,7 @@ pub struct Worker {
     replay_retries: u32,
     jobs: Arc<Jobs>,
     feature_errors: Arc<Mutex<std::collections::HashMap<(String, u64), (Instant, String)>>>,
-    feature_pending: Arc<Mutex<(Option<(String, PathBuf, f64, bool)>, bool)>>,
+    feature_pending: Arc<Mutex<(std::collections::VecDeque<(String, PathBuf, f64, bool)>, bool)>>,
     stats_visible: bool,
     stats_cache: Option<(u64, Arc<stats::Profile>)>,
     current: Option<String>,
@@ -309,7 +310,6 @@ struct Jobs {
     importing: AtomicBool,
     archiving: AtomicBool,
     filling: AtomicBool,
-    solving: AtomicBool,
 }
 
 /// "0.75–1.50×", or "1.00× only" when HT/DT is off.
@@ -365,6 +365,36 @@ fn as_played(db: &Db, path: &Path, data: &[u8], rate: Option<f64>, mods: &[Value
     }
 }
 
+/// Random before its seed is drawn (plan 2026-11-20 D): the chart under each of the three fixed shuffles; empty otherwise.
+fn shuffles(db: &Db, data: &[u8], played: &Played) -> Vec<Played> {
+    if played.m.random != Some(None) {
+        return Vec::new();
+    }
+    let source = hashes(data).0;
+    ms_calc::mods::RANDOM_SEEDS.iter().filter_map(|&seed| {
+        let m = ms_calc::mods::Mods { random: Some(Some(seed)), ..played.m.clone() };
+        let (sha, md5, path) = crate::modcharts::ensure(db, &source, data, &m.tag()).ok()?;
+        Some(Played { sha, md5, path, rate: played.rate, m })
+    }).collect()
+}
+
+/// The unseeded-Random card: the three shuffles' forecasts averaged (accuracy, pp), the skill most of them lead with.
+fn mean_card(mut plain: Card, cards: &[Card]) -> Card {
+    let n = cards.len() as f64;
+    let mean = |f: &dyn Fn(&Card) -> f64| cards.iter().map(f).sum::<f64>() / n;
+    (plain.acc_mid, plain.acc_lo, plain.acc_hi) = (mean(&|c| c.acc_mid), mean(&|c| c.acc_lo), mean(&|c| c.acc_hi));
+    plain.pp_expected = cards.iter().map(|c| c.pp_expected).collect::<Option<Vec<f64>>>().map(|v| v.iter().sum::<f64>() / n);
+    plain.pp = cards.iter().map(|c| c.pp).collect::<Option<Vec<_>>>().map(|v| {
+        let m = |f: fn(&(f64, f64, Option<f64>, f64, f64)) -> f64| v.iter().map(f).sum::<f64>() / n;
+        (m(|p| p.0), m(|p| p.1), v[0].2, m(|p| p.3), m(|p| p.4))
+    });
+    plain.skill = cards.iter().map(|c| &c.skill).max_by_key(|s| cards.iter().filter(|c| &c.skill == *s).count()).cloned().flatten();
+    plain.unread = cards[0].unread.clone(); // the same SV and reads under every shuffle
+    plain.without.retain(|w| w != "RD");
+    plain.random = true;
+    plain
+}
+
 /// Spawned on its own thread: runs until `stop`. `public` is opened by the caller (the UI thread never waits on it).
 pub fn spawn(public: impl FnOnce(&Hooks) -> std::result::Result<Arc<Public>, String> + Send + 'static, q: Arc<Queue>, h: Hooks, halt: Arc<AtomicBool>, db_path: PathBuf) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new().name("recommend".into()).spawn(move || {
@@ -396,7 +426,7 @@ impl Worker {
             converts: [("nps", BTreeMap::new()), ("skills", BTreeMap::new())].into_iter().collect(), mix_logged: HashMap::default(), ahead: None, convert_turn: Arc::new(AtomicU64::new(0)),
             acc_targets: [("nps", DEFAULT_TARGET), ("skills", DEFAULT_TARGET)].into_iter().collect(), rates: [("nps", builder::DEFAULT_RATES), ("skills", builder::DEFAULT_RATES)].into_iter().collect(), pp_mix: PpMix::default(), settings: PpSettings::default(), practice_skills: Vec::new(),
             states: [("nps", ListState::default()), ("skills", ListState::default())].into_iter().collect(), restored: HashSet::new(),
-            shown: Shown { client, miss_ratio }, session_cache: None, events_cache: None, taste_cache: (None, HashMap::default()), nps_pool: HashMap::default(), sel: (None, None, None), loading: None, learning: Arc::default(), first_import, refresh_queued: false,
+            shown: Shown { client, miss_ratio }, session_cache: None, events_cache: None, taste_cache: (None, HashMap::default()), nps_pool: HashMap::default(), sel: (None, None, None), loading: None, learning: Arc::default(), first_import, refresh_queued: false, rest_pending: false,
             refit_due: false, refit_running: false, refit_again: false, last_refit: now(), last_idle_check: Instant::now(), nps_requested: Instant::now(), clock_due: true, replay_due: Some(Instant::now() + Duration::from_secs(10)),
             replay_retries: 0, jobs: Arc::default(), feature_errors: Arc::default(), feature_pending: Arc::default(), stats_visible: false, stats_cache: None, current: None, yielding: false,
         }
@@ -460,7 +490,7 @@ impl Worker {
             self.last_idle_check = Instant::now();
             if now() - kv_get(&self.db, "snapshot_check").and_then(|v| v["t"].as_f64()).unwrap_or(0.) > 86400. {
                 if let Ok(Some(newest)) = ms_data::public::check_index(&self.db) {
-                    self.status(&format!("newer public snapshot {} — refresh --download (personal analysis; see licence)", &newest[..10]));
+                    self.status(format!("newer public snapshot {} — refresh --download (personal analysis; see licence)", &newest[..10]));
                 }
             }
         }
@@ -480,6 +510,12 @@ impl Worker {
 
     fn startup(&mut self, public: impl FnOnce(&Hooks) -> std::result::Result<Arc<Public>, String>) -> std::result::Result<(), String> {
         let public = public(&self.h)?;
+        // the per-note abilities need only the plays and the net: solved beside the carry and the fit, done before any list
+        let pernote = crate::pernote::PerNote::load().map(Arc::new);
+        let filling = pernote.clone().map(|p| {
+            let path = self.db_path.clone();
+            std::thread::spawn(move || connect(&path).and_then(|db| p.fill(&db, crate::pernote::today() - crate::pernote::WINDOW)))
+        });
         let carrying = self.carry_played()?;
         self.prune_calculators();
         self.stage(Some("Fitting your prediction model to your scores…".into()), false);
@@ -487,11 +523,13 @@ impl Worker {
         let r = refit(&self.db, &public, &self.c).map_err(|e| e.to_string())?;
         self.public = Some(public.clone());
         self.rec = Some(Engine::new(public, self.c.clone(), r, self.settings.clone()));
-        self.rec.as_mut().unwrap().pernote = crate::pernote::PerNote::load().map(Arc::new);
+        self.rec.as_mut().unwrap().pernote = pernote;
         if carrying {
             self.carry_near()?;
         }
-        self.solve_abilities();
+        if let Some(Ok(Err(e))) = filling.map(std::thread::JoinHandle::join) {
+            eprintln!("per-note abilities: {e}");
+        }
         self.save_pp_floor();
         self.generation += 1;
         self.spawn_builder();
@@ -499,7 +537,11 @@ impl Worker {
         self.request_nps();
         self.publish(None).map_err(|e| e.to_string())?;
         self.start_fill();
-        if carrying {
+        // the first list is made from the near rows alone, so two starts of the same data give the same list (audit 2026-11-20:
+        // carried beside the build, the list's order changed run to run); a closed window builds nothing, so nothing waits
+        if carrying && (self.h.list_open)() {
+            self.rest_pending = true;
+        } else if carrying {
             self.carry_rest();
         }
         Ok(())
@@ -534,7 +576,7 @@ impl Worker {
         for mode in ["nps", "skills"] {
             let target = self.acc_targets.get(mode).copied().unwrap_or(DEFAULT_TARGET);
             for &k in self.keys[mode].iter().filter(|k| model.level.contains_key(k)) {
-                let at = builder::level_rating(&model, k, target, &self.c);
+                let at = builder::level_rating(model, k, target, &self.c);
                 let w = near.entry(k).or_insert((at - NEAR, at + NEAR));
                 *w = (w.0.min(at - NEAR), w.1.max(at + NEAR));
             }
@@ -1263,6 +1305,10 @@ impl Worker {
     }
 
     fn t_nps_update(&mut self, update: Update) -> Result<()> {
+        if self.rest_pending && matches!(update, Update::Ready(_) | Update::Failed { .. }) {
+            self.rest_pending = false;
+            self.carry_rest();
+        }
         match update {
             Update::Failed { error, mode, revision, generation } => {
                 if generation != self.generation || revision != self.local_request {
@@ -1614,7 +1660,7 @@ impl Worker {
             // A play asks for one new list: after its chart's features when they are still being computed.
             let played = mods.as_ref().filter(|m| rate.is_some_and(|r| predictable_context(m, r))).and_then(|m| Some(as_played(&self.db, path, &std::fs::read(path).ok()?, rate, m)));
             let waiting = match played {
-                Some(p) => self.request_feature(&p.sha, &p.path, Some(p.rate), true)?,
+                Some(p) => self.request_feature(&p.sha, &p.path, Some(p.rate), true, false)?,
                 None => false,
             };
             self.rec.as_mut().unwrap().observe(&self.db, &key)?;
@@ -1705,8 +1751,19 @@ impl Worker {
                     if let Ok(n) = self.session() {
                         c = self.rec.as_mut().unwrap().card(&self.db, &played.path, r, &n).ok().flatten();
                     }
+                    // unseeded Random: the plain card until the three shuffles are rated, then their mean
+                    let shuffled = shuffles(&self.db, &data, &played);
+                    if let (false, Some(plain), Ok(n)) = (shuffled.is_empty(), c.as_ref(), self.session()) {
+                        let rec = self.rec.as_mut().unwrap();
+                        let cards: Vec<Card> = shuffled.iter().filter_map(|p| rec.card(&self.db, &p.path, p.rate, &n).ok().flatten()).collect();
+                        if cards.len() == shuffled.len() {
+                            let plain = Card { mods: played.m.labels(), without: played.m.without.clone(), ..plain.clone() };
+                            c = Some(mean_card(plain, &cards));
+                        }
+                    }
                     match c.as_mut() {
-                        Some(c) => (c.mods, c.without) = (played.m.labels(), played.m.without.clone()),
+                        Some(c) if c.random => {}
+                        Some(c) => (c.mods, c.without) = (played.m.labels(), played.m.without),
                         None => {
                             let failed = self.feature_errors.lock().unwrap().get(&(played.sha, ms_calc::py::round_digits(r, 3).to_bits())).map(|x| x.1.clone());
                             note = Some(failed.map_or_else(|| format!("Calculating prediction at {r:.2}×…"), |f| format!("Prediction unavailable at {r:.2}×: {f}")));
@@ -2051,7 +2108,10 @@ impl Worker {
                 let (sha, md5) = hashes(&data);
                 if let Some(m) = &mods {
                     let played = as_played(&self.db, p, &data, rate, m); // any mods: the forecast is of what the calculator can build
-                    self.request_feature(&played.sha, &played.path, Some(played.rate), false)?;
+                    self.request_feature(&played.sha, &played.path, Some(played.rate), false, false)?;
+                    for s in shuffles(&self.db, &data, &played) {
+                        self.request_feature(&s.sha, &s.path, Some(s.rate), false, true)?;
+                    }
                 }
                 if self.rec.is_some() && previous.as_ref() != Some(p) && !self.local_shas().contains(&sha) {
                     self.begin_import();
@@ -2071,8 +2131,8 @@ impl Worker {
         Ok(())
     }
 
-    /// True: a FeatureReady follows.
-    fn request_feature(&mut self, sha: &str, path: &Path, rate: Option<f64>, refit: bool) -> Result<bool> {
+    /// True: a FeatureReady follows. `keep`: beside the pending requests (a selection's Random shuffles), else in their place.
+    fn request_feature(&mut self, sha: &str, path: &Path, rate: Option<f64>, refit: bool, keep: bool) -> Result<bool> {
         let (Some(rate), Some(rec)) = (rate, self.rec.as_mut()) else { return Ok(false) };
         if sha.is_empty() || rec.features(&self.db, Some(sha), None, None, rate)?.0.is_some() {
             return Ok(false);
@@ -2086,8 +2146,11 @@ impl Worker {
             errors.remove(&id);
         }
         let mut pending = self.feature_pending.lock().unwrap();
-        let refit = refit || pending.0.as_ref().is_some_and(|p| p.3); // a replaced play's list request rides on the newest
-        pending.0 = Some((sha.to_string(), path.to_path_buf(), rate, refit));
+        let refit = refit || pending.0.iter().any(|p| p.3); // a replaced play's list request rides on the newest
+        if !keep {
+            pending.0.clear();
+        }
+        pending.0.push_back((sha.to_string(), path.to_path_buf(), rate, refit));
         if pending.1 {
             return Ok(true); // the newest request replaces a pending old selection
         }
@@ -2096,7 +2159,7 @@ impl Worker {
         std::thread::Builder::new().name("selected-feature".into()).spawn(move || loop {
             let task = {
                 let mut p = slot.lock().unwrap();
-                let task = p.0.take();
+                let task = p.0.pop_front();
                 if task.is_none() || halt.load(Ordering::Relaxed) {
                     p.1 = false;
                     return;
@@ -2386,19 +2449,13 @@ impl Worker {
         }).expect("replay thread");
     }
 
-    /// The per-note forecast's ability history (pernote::PerNote::fill) off the queue: a chart parse and a net pass per new play.
+    /// The per-note forecast's ability history (pernote::PerNote::fill) before anything reads it: on a thread it raced the
+    /// lists, which read whatever plays were solved so far (audit 2026-11-20: two pinned starts gave different forecasts).
     fn solve_abilities(&self) {
         let Some(p) = self.rec.as_ref().and_then(|r| r.pernote.clone()) else { return };
-        if self.jobs.solving.swap(true, Ordering::SeqCst) {
-            return;
+        if let Err(e) = p.fill(&self.db, crate::pernote::today() - crate::pernote::WINDOW) {
+            eprintln!("per-note abilities: {e}");
         }
-        let (jobs, path) = (self.jobs.clone(), self.db_path.clone());
-        std::thread::Builder::new().name("abilities".into()).spawn(move || {
-            if let Err(e) = connect(&path).and_then(|db| p.fill(&db, crate::pernote::today() - crate::pernote::WINDOW)) {
-                eprintln!("per-note abilities: {e}");
-            }
-            jobs.solving.store(false, Ordering::SeqCst);
-        }).expect("abilities thread");
     }
 
     fn t_replay_done(&mut self, pending: bool, error: Option<String>, fresh: Vec<String>) -> Result<()> {

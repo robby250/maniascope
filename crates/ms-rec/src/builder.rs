@@ -21,6 +21,32 @@ pub use ms_calc::structure::STRUCTURE_VERSION; // offers of another version are 
 pub const DEFAULT_TARGET: f64 = 0.95;
 const STABLE_RATES: [f64; 3] = [0.75, 1., 1.5]; // stable has HT/NM/DT only (user 2026-10-31)
 /// The skills of a chart's pattern profile: every shown skill (the skill table's rows).
+/// The Invert mod's tag (`ms_calc::mods`).
+const INVERT_TAG: &str = "IN";
+
+/// The Inverse mod skill is picked on this tab and the client has the mod (osu!lazer).
+fn wants_invert(r: &Request) -> bool {
+    r.mode == "skills" && !r.client.starts_with("stable") && skills::normalize(&r.selected_skills).iter().any(|k| k == skills::INVERT_MOD)
+}
+
+/// A chart's 1× rating under Invert from its own: ln inverted = a + b·ln source per keymode, fitted on 38k pairs the
+/// app rated (2026-11-21, calc 14be): Invert fills every gap with a hold, so an easy source lands far higher (7K: 2★ → 8.6, 7★
+/// → 13.8; the guessed ×1.5 picked sources that came out far over the player and skipped the easy ones that fit).
+fn invert_rating(keys: i64, overall: f64) -> f64 {
+    let (a, b) = match keys { 4 => (1.483, 0.465), 5 => (1.800, 0.365), 6 => (1.792, 0.356), 8 => (2.113, 0.361), 9 => (2.148, 0.368), 10 => (1.946, 0.557), _ => (1.904, 0.371) };
+    (a + b * overall.max(0.05).ln()).exp()
+}
+
+/// The fit's p10–p90 residual of `invert_rating` (ln ±0.2).
+const INVERT_SPREAD: f64 = 1.2214;
+
+/// `source` as rated under Invert: its metadata, the modded chart's sha and file.
+/// Its online map is the source's (opened, then Invert turned on).
+fn invert_inst(source: &Inst, sha: &str, md5: String, path: Option<std::path::PathBuf>) -> Inst {
+    let online = source.online_md5.is_some() && source.online_md5 == source.md5;
+    Inst { sha256: sha.to_string(), online_md5: online.then(|| md5.clone()), md5: Some(md5), path, invert_of: Some(source.sha256.clone()), ..source.clone() }
+}
+
 pub fn profile() -> Vec<String> {
     ms_calc::taxonomy::kept().filter(|s| ms_calc::taxonomy::shown(*s)).map(|s| s.name().to_string()).collect()
 }
@@ -183,11 +209,11 @@ pub enum Update {
 
 pub struct Builder {
     pub store: Arc<RwLock<FeatStore>>,
-    catalog: HashMap<String, Arc<Inst>>,
+    pub(crate) catalog: HashMap<String, Arc<Inst>>,
     order: Vec<String>, // catalogue order: library, then website; equal-valued copies of a chart resolve by it
     rated: HashMap<String, f64>,
     rated_calc: String,
-    catalog_key: Option<(String, Vec<i64>, Option<i64>, Option<std::time::SystemTime>, String, Vec<(i64, Vec<i64>)>)>,
+    catalog_key: Option<(String, Vec<i64>, Option<i64>, Option<std::time::SystemTime>, String, Vec<(i64, Vec<i64>)>, bool)>,
     index_size: usize, // converts indexed before the next publication; grows, so the first show up quickly
     catalog_error: String,
     loaded_rowid: i64,
@@ -226,6 +252,7 @@ impl Builder {
     pub fn restore(&mut self, db: &Db, r: &Request, refs: &[(String, f64)], installed: &[Arc<Inst>]) -> Result<(Arc<ChoiceList>, Arc<HashMap<String, Arc<Inst>>>)> {
         self.catalog = installed.iter().map(|i| (i.sha256.clone(), i.clone())).collect();
         self.apply_converts(db, &r.converts)?; // a saved list is half converts on 10K, none with a library row
+        self.apply_inverts(db, wants_invert(r))?;
         let mut source = crate::evidence::FeatureSource { public: r.public.clone(), calc: r.calc.clone(), cache: Default::default() };
         let mut store = FeatStore::new(skills::feat_trees(), profile(), r.model.c.clone(), STRUCTURE_VERSION).expect("skill trees");
         let (mut catalog, mut order): (HashMap<String, Arc<Inst>>, Vec<String>) = Default::default();
@@ -356,6 +383,80 @@ impl Builder {
         Ok(())
     }
 
+    /// Charts already rated under Invert join the catalogue while the Inverse mod skill is picked, each beside its source.
+    fn apply_inverts(&mut self, db: &Db, on: bool) -> Result<()> {
+        self.catalog.retain(|_, i| i.invert_of.is_none());
+        let catalog = &self.catalog;
+        self.order.retain(|s| catalog.contains_key(s));
+        if !on {
+            return Ok(());
+        }
+        let rows: Vec<(String, String)> = db.prepare("SELECT sha, source FROM mod_charts WHERE tag=?")?.query_map([INVERT_TAG], |x| Ok((x.get(0)?, x.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        for (sha, source) in rows {
+            let Some(src) = self.catalog.get(&source).filter(|i| i.installed && i.convert_of.is_none()) else { continue };
+            let path = crate::modcharts::chart_file(db, &sha);
+            // its md5 is what a play of it records (worker::as_played)
+            let Some(md5) = path.as_ref().and_then(|p| std::fs::read(p).ok()).map(|d| crate::engine::hashes(&d).1) else { continue };
+            let inst = invert_inst(src, &sha, md5, path);
+            self.order.push(sha.clone());
+            self.catalog.insert(sha, Arc::new(inst));
+        }
+        Ok(())
+    }
+
+    /// Rates the next installed charts near the target under Invert and adds them to the catalogue; false: nothing left.
+    fn index_inverts(&mut self, db: &Db, r: &Request, reaches: Option<&HashMap<i64, (f64, f64)>>) -> Result<bool> {
+        if !wants_invert(r) {
+            return Ok(false);
+        }
+        let done: HashSet<String> = db.prepare("SELECT source FROM mod_charts WHERE tag=?")?.query_map([INVERT_TAG], |x| x.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let mut source = crate::evidence::FeatureSource { public: r.public.clone(), calc: r.calc.clone(), cache: Default::default() };
+        let mut jobs: Vec<(Arc<Inst>, Vec<u8>)> = Vec::new();
+        let root = crate::catalog::local_origin(&r.client).1;
+        for sha in &self.order {
+            let inst = &self.catalog[sha];
+            if !inst.installed || inst.convert_of.is_some() || inst.invert_of.is_some() || done.contains(sha) {
+                continue;
+            }
+            // Invert turns gaps into holds: its rating is the source's under `invert_rating`, ±its spread
+            let window = reaches.and_then(|x| x.get(&inst.keys)).copied();
+            let rated = source.lookup(db, &source.key(sha, 1.))?.map(|f| invert_rating(inst.keys, f.f("overall")));
+            if window.zip(rated).is_some_and(|(w, r)| !crate::converts::in_window(r * INVERT_SPREAD, w) && !crate::converts::in_window(r / INVERT_SPREAD, w)) {
+                continue;
+            }
+            let Some(data) = inst.path.clone().or_else(|| ms_data::paths::local_file(sha, &root)).and_then(|p| std::fs::read(p).ok()) else { continue };
+            jobs.push((inst.clone(), data));
+            if jobs.len() == self.index_size {
+                break;
+            }
+        }
+        if jobs.is_empty() {
+            return Ok(false);
+        }
+        self.index_size = (self.index_size * 4).min(4096);
+        let cores = std::thread::available_parallelism().map_or(4, |x| x.get());
+        let threads = if (self.game)() { (cores / 4).max(1) } else { workers(None) };
+        let data: Vec<(Vec<u8>, Vec<f64>)> = jobs.iter().map(|(_, d)| (ms_calc::mods::tagged(d, INVERT_TAG), vec![1.])).collect();
+        let done = features_batch(&data, threads, &self.prm);
+        let tx = db.unchecked_transaction()?;
+        let mut store = self.store.write().unwrap();
+        for ((inst, bytes), result) in jobs.iter().zip(done) {
+            let (sha, md5, path) = crate::modcharts::ensure(db, &inst.sha256, bytes, INVERT_TAG)?;
+            let Ok(fs) = result else { continue };
+            for (rate, f) in fs {
+                tx.execute("INSERT OR REPLACE INTO feats VALUES (?,?)", rusqlite::params![format!("{sha}@{rate:.3}|{}", r.calc), codec::encode(&Val::Dict(f.clone()))])?;
+                store.put(&sha, rate, &f);
+            }
+            if !self.catalog.contains_key(&sha) {
+                self.order.push(sha.clone());
+                self.catalog.insert(sha.clone(), Arc::new(invert_inst(inst, &sha, md5, Some(path))));
+            }
+        }
+        drop(store);
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Converts the next charts, analyses them at 1× and adds them to the catalogue; false: nothing left.
     fn index_converts(&mut self, db: &Db, r: &Request, web: Option<&Web>, reaches: Option<&HashMap<i64, (f64, f64)>>) -> Result<bool> {
         if r.converts.is_empty() {
@@ -462,7 +563,7 @@ impl Builder {
         let web_mtime = std::fs::metadata(&web_path).and_then(|m| m.modified()).ok();
         // another calculator's website list (the background carry hasn't reached it yet) offers nothing: its ratings aren't ours
         let web = web_mtime.and_then(|_| Web::open(&web_path).ok()).filter(|w| w.calc == r.calc);
-        let reaches = (web_mtime.is_some() || !r.converts.is_empty()).then(|| reach(&r.model, &allowed, r.target, &r.model.c));
+        let reaches = (web_mtime.is_some() || !r.converts.is_empty() || wants_invert(r)).then(|| reach(&r.model, &allowed, r.target, &r.model.c));
         let window = reaches.as_ref().map(|x| {
             let mut v: Vec<(i64, u64, u64)> = x.iter().map(|(k, (a, b))| (*k, a.to_bits(), b.to_bits())).collect();
             v.sort_unstable();
@@ -470,7 +571,7 @@ impl Builder {
         });
         // The website window follows the accuracy target: a target change swaps only the website charts. Keying the
         // whole catalogue on it re-decoded every analysed chart (user 2026-10-31).
-        let catalog_key = Some((r.calc.clone(), allowed.clone(), imported, web_mtime, r.client.clone(), r.converts.clone()));
+        let catalog_key = Some((r.calc.clone(), allowed.clone(), imported, web_mtime, r.client.clone(), r.converts.clone(), wants_invert(r)));
         if catalog_key != self.catalog_key {
             let (full, error) = library(db, &r.client)?;
             self.catalog_error = error;
@@ -478,6 +579,7 @@ impl Builder {
             self.order = full.iter().filter(|i| allowed.contains(&i.keys)).map(|i| i.sha256.clone()).collect();
             self.catalog = full.into_iter().filter(|i| allowed.contains(&i.keys)).map(|i| (i.sha256.clone(), Arc::new(i))).collect();
             self.apply_converts(db, &r.converts)?;
+            self.apply_inverts(db, wants_invert(r))?;
             self.index_size = 256;
             self.catalog_key = catalog_key;
             *self.store.write().unwrap() = FeatStore::new(skills::feat_trees(), profile(), r.model.c.clone(), STRUCTURE_VERSION).expect("skill trees");
@@ -568,7 +670,7 @@ impl Builder {
             let mut front = {
                 let store = self.store.read().unwrap();
                 let unscored = memo.unscored();
-                score(&mut memo, &unscored, &self.catalog, &store, ms_data::store::now()).map_err(|e| rusqlite::Error::InvalidParameterName(e))?;
+                score(&mut memo, &unscored, &self.catalog, &store, ms_data::store::now()).map_err(rusqlite::Error::InvalidParameterName)?;
                 let blocked: HashSet<String> = refined_counts.iter().filter(|x| *x.1 >= 6).map(|x| x.0.clone()).chain(bad.keys().cloned()).collect();
                 memo.proposals(&refined, &blocked)
             };
@@ -641,7 +743,7 @@ impl Builder {
                     let analyzed = { let store = self.store.read().unwrap(); self.catalog.keys().filter(|s| store.current(s)).count() };
                     (self.emit)(Update::Progress { mode: r.mode.clone(), revision: r.revision, generation: r.generation, total: self.catalog.len(), analyzed, failed: bad.len() });
                 }
-                if !self.wait_idle() || !self.index_converts(db, r, web.as_ref(), reaches.as_ref())? {
+                if !self.wait_idle() || !(self.index_converts(db, r, web.as_ref(), reaches.as_ref())? || self.index_inverts(db, r, reaches.as_ref())?) {
                     return Ok(());
                 }
                 memo = Choices::new(self.order.clone(), memo_forecast.clone());
@@ -781,7 +883,7 @@ pub fn prepared_pick(prepared: &ms_model::choices::Prepared, i: usize, catalog: 
         description: c.description.clone(), family: Some(c.family.clone()), group: Some(c.group.clone()), profile: c.profile.clone(), playcount: inst.playcount, value: c.value,
         practice_skills: if mode == "skills" { skills::normalize(selected) } else { Vec::new() }, matched_skills: c.matched.clone(), practice_description: c.practice.clone(),
         f: store.feats(&c.sha, c.rate).cloned().map(Arc::new), pred: c.pred.clone(), generated_at: c.generated_at, best_rank: 100000, convert_of: inst.convert_of.clone(), source_keys: inst.source_keys,
-        source_web: inst.source_web, set_id: inst.set_id, ..Pick::default()
+        source_web: inst.source_web, set_id: inst.set_id, invert_of: inst.invert_of.clone(), ..Pick::default()
     })
 }
 

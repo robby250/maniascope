@@ -113,7 +113,7 @@ pub struct Done {
     pub identity: String,               // key, else (beatmap, round(end, 1))
 }
 
-fn distinct<'a>(history: &'a [Done], now: f64) -> Vec<&'a Done> {
+fn distinct(history: &[Done], now: f64) -> Vec<&Done> {
     let mut sorted: Vec<&Done> = history.iter().filter(|a| a.end <= now).collect();
     sorted.sort_by(|a, b| a.end.total_cmp(&b.end));
     let mut seen = HashSet::new();

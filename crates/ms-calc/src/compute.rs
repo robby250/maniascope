@@ -41,6 +41,12 @@ pub struct Shared {
     /// The physical pass of an SV chart: only its rating, calibration features and execution are read, so the card's parts
     /// (tags, where the tech is, the timeline, the press rating) are left out.
     pub lean: bool,
+    pub stored: bool, // a stored row: no card-only parts (where the tech sits, the timeline, the press rating)
+    /// One chart on idle cores (the card): the chart-only analyses run on a second thread beside the demand pass. Bulk paths
+    /// fill every core with charts and leave it off.
+    pub parallel: bool,
+    /// The chart's rate-free layout (`features_with` builds one per chart for all its rates).
+    pub layout: Option<std::sync::Arc<crate::layout::Layout>>,
 }
 
 /// Rates every skill series. A series `rated` already holds unchanged keeps its rating: the pass after
@@ -89,6 +95,11 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     let chart = played.as_ref().map_or(chart, |p| &p.0);
     let n = chart.len();
     let keys = chart.keys;
+    // the pass's one row list: every analysis reads it; the layout's atoms when no times merge at this rate
+    let laid = played.is_none().then(|| shared.layout.as_ref().and_then(|l| l.rows_at(chart, rate))).flatten();
+    let atoms = laid.is_some();
+    let fam = if played.is_none() { shared.layout.as_ref().map(|l| l.family.clone()) } else { None };
+    let rows = laid.unwrap_or_else(|| demand::rows(chart, rate));
     let mut res = Dict::new();
     res.set("model", MODEL_VERSION);
     res.set("keys", keys);
@@ -109,11 +120,38 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     if n < 2 {
         // The structure stamp marks the analysis current: without it a 0/1-note chart was analysed again forever and the
         // library bar stopped short (a player 2026-11-06: "10,099 / 10,126" in every version).
-        res.set("structure", structure::structure(chart, rate, k));
+        res.set("structure", structure::structure(chart, rate, &rows, fam.as_deref(), k));
         return Ok(res);
     }
     crate::tick::lap("played+head");
-    let (read, runs) = demand_pass(chart, rate, sv, keys, shared, prm)?;
+    let (read, runs) = if shared.parallel && shared.gestures.is_none() {
+        // what reads only the chart, beside the demand pass (a card's wall time; the same work as one thread)
+        let flow_at = written as *const Chart as usize;
+        let want_flow = prm.model["joint"]["modes"][keys.to_string()].is_object() && !matches!(shared.flow, Some((at, _)) if at == flow_at);
+        let want_structure = shared.structure.is_none();
+        let (side, demand) = std::thread::scope(|s| {
+            let side = s.spawn(|| {
+                let _runs = crate::structure::RunScope::open();
+                let g = if prm.off("gestures") { gestures::Analysis::default() } else { gestures::analyse(chart, rate, &rows, k) };
+                let q = (!prm.off("quadstream")).then(|| pattern::quadstream(chart, rate, &rows, k.BIN));
+                let st = want_structure.then(|| structure::structure(chart, rate, &rows, fam.as_deref(), k));
+                let f = want_flow.then(|| crate::flow::flow_of(written, chart, rate, &rows, k));
+                (g, q, st, f)
+            });
+            let demand = demand_pass(chart, rate, &rows, atoms, sv, keys, shared, prm);
+            (side.join(), demand)
+        });
+        let (g, q, st, f) = side.map_err(|_| "the analysis crashed on this chart".to_string())?;
+        shared.gestures = Some(g);
+        shared.quadstream = shared.quadstream.take().or(q);
+        shared.structure = shared.structure.take().or(st);
+        if let Some(f) = f {
+            shared.flow = Some((flow_at, f));
+        }
+        demand?
+    } else {
+        demand_pass(chart, rate, &rows, atoms, sv, keys, shared, prm)?
+    };
     crate::tick::lap("demand_pass.rest");
     let any_strain = read.as_ref().is_some_and(|r| r.0.iter().any(|&x| x != 0.0));
     if shared.end_series.is_none() {
@@ -127,6 +165,7 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     crate::tick::lap("endurance");
     let (mut total, mut parts) = sides(runs);
     crate::tick::lap("merge runs");
+
     if shared.execution.is_none() {
         shared.execution = Some(execution::analyse(chart, shared.geometry.as_ref().unwrap(), k.BIN));
     }
@@ -156,7 +195,7 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
         }
         // Until then the passage is part read as written: its demand lies between the two charts' by the same share.
         if k.MASH_RAMP > 0.0 && gone.iter().zip(&all).any(|(g, a)| g < a) {
-            let (wt, wp) = sides(demand_pass(written, rate, sv, keys, &mut Shared::default(), prm)?.1);
+            let (wt, wp) = sides(demand_pass(written, rate, &demand::rows(written, rate), false, sv, keys, &mut Shared::default(), prm)?.1);
             for b in (0..total.len().min(wt.len())).filter(|&b| gone[b] < all[b]) {
                 let w = gone[b] / all[b];
                 total[b] = wt[b] + w * (total[b] - wt[b]);
@@ -176,6 +215,7 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
         }
     }
     crate::tick::lap("mash ease");
+
     let tracing = shared.trace.is_some();
     let g = shared.geometry.as_ref().unwrap();
     let judged = skills::Judged::new(&g.times, if chart.no_release { &g.times } else { &g.ends }, total.len(), shared.endurance.as_ref().unwrap().1.clone(), k);
@@ -189,19 +229,21 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
         level_terms(&mut total, &mut parts, first, chart.great_window() / crate::gestures::great_window(8.0), run_share, sustain, keys, k);
     }
     crate::tick::lap("first+surfaces+level_terms");
+
     let overall = skills::rating(&total, &judged, keys, k);
     sc.set("overall", overall);
     // The press rating: the chart with its holds as taps (each bin without the LN parts' share, releases not judged). The regular
     // dans read it: an LN chart's regular dan is what hitting its notes asks, not its hold control (user 2026-11-19: the LN
     // Stellium course read "Reg Stellium+"). No second analysis: one more rating of the series.
     let lean = shared.lean;
-    let press = if !lean && parts.keys.contains(&P::ln) && parts.get(P::ln).iter().any(|&v| v != 0.0) {
+    let press = if !lean && !shared.stored && parts.keys.contains(&P::ln) && parts.get(P::ln).iter().any(|&v| v != 0.0) {
         let rice: Vec<f64> = total.iter().zip(parts.get(P::ln)).map(|(t, l)| (t - l).max(0.0)).collect();
         skills::rating(&rice, &skills::Judged::new(&g.times, &g.times, total.len(), judged.fatigue.clone(), k), keys, k)
     } else {
         overall
     };
     res.set("press_overall", press);
+    crate::tick::lap("overall+press");
     // Sustained demand: the same rating on minutes-long windows, so a uniformly hard chart keeps it near the overall.
     sc.set("stamina", skills::stamina_rating(&total, &judged, keys, k));
     crate::tick::lap("overall+press+stamina ratings");
@@ -213,13 +255,13 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
         shared.gestures = Some(if prm.off("gestures") {
             gestures::Analysis::default()
         } else {
-            gestures::analyse(chart, rate, k)
+            gestures::analyse(chart, rate, &rows, k)
         });
     }
     crate::tick::lap("gestures");
     if shared.quadstream.is_none() {
         shared.quadstream =
-            Some(if prm.off("quadstream") { (vec![0.0; total.len()], 0.0) } else { pattern::quadstream(chart, rate, k.BIN) });
+            Some(if prm.off("quadstream") { (vec![0.0; total.len()], 0.0) } else { pattern::quadstream(chart, rate, &rows, k.BIN) });
     }
     crate::tick::lap("quadstream");
     let (changed, extra, own) = if prm.off("execution") {
@@ -231,9 +273,10 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
         )
     };
     crate::tick::lap("execution::attribute");
+
     parts = changed;
     let quad: &[f64] = shared.quadstream.as_ref().map_or(&[], |q| &q.0);
-    let densities = skills::slice(&mut series, &parts, &total, &skills::Evidence { own: &own, quad, shift: shared.gestures.as_ref().map_or(&[][..], |g| &g.series[crate::gestures::s::VIBRO_SHIFT]), interleaved: interleaved(chart) }, keys, overall, k);
+    let densities = skills::slice(&mut series, &parts, &total, &skills::Evidence { own: &own, quad, shift: shared.gestures.as_ref().map_or(&[][..], |g| &g.series[crate::gestures::s::VIBRO_SHIFT]), interleaved: interleaved(chart, &g.rows) }, keys, overall, k);
     crate::tick::lap("slice");
     series_dict_scores(&mut sc, &series, &judged, keys, prm, &mut rated, Some(&model::VECTOR_SKILLS));
     crate::tick::lap("series ratings 1");
@@ -252,7 +295,7 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     }
     res.set("execution", ex);
     if shared.tech_profile.is_none() {
-        shared.tech_profile = Some(pattern::tech_profile(chart, rate, shared.execution.as_ref().unwrap(), k));
+        shared.tech_profile = Some(pattern::tech_profile(chart, &rows, shared.execution.as_ref().unwrap(), k));
     }
     let tp = shared.tech_profile.unwrap_or([0.0; 3]);
     let mut tpd = Dict::new();
@@ -268,16 +311,26 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     series_dict_scores(&mut sc, &series, &judged, keys, prm, &mut rated, None);
     crate::tick::lap("series ratings 2");
     // 5K+ split Stream into a fast and a slow base (`delay`, `stream`) and the card ranked the family by the stronger half.
-    // The card's Stream row is the family as a whole, × STREAM_FAMILY so it leads as often as it did; the model keeps the halves.
+    // The card's Stream row is the family as a whole, × STREAM_FAMILY (the hardest charts lead with it as often as with the
+    // stronger half); the model keeps the halves.
     if k.STREAM_FAMILY != 0.0 && series.has(Sk::delay) && series.has(Sk::stream) {
         sc.set(card::STREAM_FAMILY, k.STREAM_FAMILY * skills::rating(&card::stream_family(&series), &judged, keys, k));
     }
+    if k.CHORDJACK_CARD != 1.0 && sc.f("chordjack") > 0.0 {
+        sc.set(card::CHORDJACK_CARD, k.CHORDJACK_CARD * sc.f("chordjack"));
+    }
     if !lean {
         res.set("tags", card::tags(&series, &sc, &judged, keys, k));
+    }
+    crate::tick::lap("tags");
+    if !lean && !shared.stored {
         res.set("tech_where", Val::List(card::tech_where(&series, &parts, chart.t[0] / 1000.0, rate, k)));
+    }
+    crate::tick::lap("tech_where");
+    if !lean && !shared.stored {
         res.set("timeline", Val::floats(&skills::local_levels(&total, k.LOCAL_WINDOW, k)));
     }
-    crate::tick::lap("tags+tech_where+timeline");
+    crate::tick::lap("timeline");
     res.set("scores", sc);
     let ((load, peak), ftl) = shared.endurance.clone().unwrap();
     let mut en = Dict::new();
@@ -285,14 +338,7 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     en.set("peak", peak);
     res.set("endurance", en);
     res.set("fatigue_timeline", Val::floats(&ftl));
-    let mut rs: Vec<(f64, u32)> = Vec::with_capacity(n);
-    for i in 0..n {
-        let t = chart.t[i];
-        match rs.last_mut() {
-            Some(x) if x.0 == t => x.1 |= 1 << chart.col[i],
-            _ => rs.push((t, 1 << chart.col[i])),
-        }
-    }
+    let rs: Vec<(f64, u32)> = g.rows.iter().map(|r| (chart.t[r.start], r.mask)).collect();
     let mut pressure = 0.0f64;
     let mut pairs = 0usize;
     for w2 in rs.windows(2) {
@@ -307,7 +353,7 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     let sv_physical = sv && !chart.sv.is_empty() && any_strain;
     if sv_physical {
         shared.lean = !tracing; // a trace keeps the whole result
-        let physical = compute_inner(chart, rate, false, shared, prm);
+        let physical = compute_inner(written, rate, false, shared, prm); // the written chart: this pass mashes it the same way
         shared.lean = lean;
         let physical = physical?;
         res.set("no_sv_overall", physical.dict("scores").unwrap().f("overall"));
@@ -325,7 +371,7 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     }
     crate::tick::lap("(physical pass glue)");
     if shared.structure.is_none() {
-        shared.structure = Some(structure::structure(chart, rate, k));
+        shared.structure = Some(structure::structure(chart, rate, &rows, fam.as_deref(), k));
     }
     res.set("structure", shared.structure.clone().unwrap());
     crate::tick::lap("structure");
@@ -334,7 +380,7 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     if prm.model["joint"]["modes"][chart.keys.to_string()].is_object() {
         if let Some(e) = res.dict_mut("execution") {
             let at = written as *const Chart as usize;
-            let f = match shared.flow { Some((from, f)) if from == at => f, _ => crate::flow::flow(written, rate, &prm.k) };
+            let f = match shared.flow { Some((from, f)) if from == at => f, _ => crate::flow::flow_of(written, chart, rate, &rows, &prm.k) };
             f.store(e);
             shared.flow = Some((at, f));
         }
@@ -354,19 +400,10 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
 /// The share of a hand's disjoint chord-group moves that interleave (one group's fingers inside the other's span), averaged
 /// over the hand splits (odd keymodes: the middle key with each hand in turn, user 2026-11-03: "a thumb is a finger"); 1 with
 /// no such moves. Disjoint moves that never interleave are chordstream (user 2026-10-11: cigarettes).
-pub fn interleaved(chart: &Chart) -> f64 {
+pub fn interleaved(chart: &Chart, rows: &[demand::Row]) -> f64 {
     let keys = chart.keys;
-    let mut rs: Vec<(f64, u32)> = Vec::with_capacity(chart.len());
-    for i in 0..chart.len() {
-        match rs.last_mut() {
-            Some(x) if x.0 == chart.t[i] => x.1 |= 1 << chart.col[i],
-            _ => rs.push((chart.t[i], 1 << chart.col[i])),
-        }
-    }
-    let half = keys / 2;
-    let all = ((1u64 << keys) - 1) as u32;
-    let lo = ((1u64 << half) - 1) as u32;
-    let lefts: Vec<[u32; 2]> = if keys % 2 == 1 { vec![[(lo << 1) | 1, all & !((lo << 1) | 1)], [lo, all & !lo]] } else { vec![[lo, lo << (keys - half)]] };
+    let rs: Vec<(f64, u32)> = rows.iter().map(|r| (r.t, r.mask)).collect();
+    let lefts: Vec<[u32; 2]> = demand::splits(keys).iter().map(|&cl| demand::hand_masks(keys, cl)).collect();
     let mut out = 0.0;
     for &hands in &lefts {
         let (mut moves, mut inter) = (0usize, 0usize);
@@ -386,7 +423,21 @@ pub fn interleaved(chart: &Chart) -> f64 {
 
 /// Full analysis of a parsed chart at a constant rate (skill_calc.compute).
 pub fn compute(chart: &Chart, rate: f64, sv: bool, prm: &Params) -> Result<Dict, String> {
-    let mut result = compute_inner(chart, rate, sv, &mut Shared::default(), prm)?;
+    compute_with(chart, rate, sv, &mut Shared::default(), prm)
+}
+
+/// `compute` for the card: one chart, its chart-only analyses on a second thread.
+pub fn compute_card(chart: &Chart, rate: f64, sv: bool, prm: &Params) -> Result<Dict, String> {
+    compute_with(chart, rate, sv, &mut Shared { parallel: true, ..Shared::default() }, prm)
+}
+
+/// `compute` for a stored row (`features::features_of`): without where the tech sits, which no row keeps.
+pub fn compute_stored(chart: &Chart, rate: f64, sv: bool, layout: Option<&std::sync::Arc<crate::layout::Layout>>, prm: &Params) -> Result<Dict, String> {
+    compute_with(chart, rate, sv, &mut Shared { stored: true, layout: layout.cloned(), ..Shared::default() }, prm)
+}
+
+fn compute_with(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, prm: &Params) -> Result<Dict, String> {
+    let mut result = compute_inner(chart, rate, sv, shared, prm)?;
     let mut ap = Dict::new();
     ap.set("version", 3i64);
     result.set("archetype_profile", ap);
@@ -396,7 +447,7 @@ pub fn compute(chart: &Chart, rate: f64, sv: bool, prm: &Params) -> Result<Dict,
 type Reading = (Vec<f64>, Vec<[f64; 5]>, [f64; 4]);
 
 /// The SV reading and the demand runs of a pass (the plain pass takes the runs the SV pass left).
-fn demand_pass(chart: &Chart, rate: f64, sv: bool, keys: usize, shared: &mut Shared, prm: &Params) -> Result<(Option<Reading>, Vec<Run>), String> {
+fn demand_pass(chart: &Chart, rate: f64, rows: &[demand::Row], atoms: bool, sv: bool, keys: usize, shared: &mut Shared, prm: &Params) -> Result<(Option<Reading>, Vec<Run>), String> {
     let k = &prm.k;
     let read = if sv && !prm.off("sv_reading") { Some(scroll::reading(chart, rate, prm)?) } else { None };
     let any_strain = read.as_ref().is_some_and(|r| r.0.iter().any(|&x| x != 0.0));
@@ -405,16 +456,19 @@ fn demand_pass(chart: &Chart, rate: f64, sv: bool, keys: usize, shared: &mut Sha
     } else {
         let want_plain = sv && !chart.sv.is_empty() && any_strain;
         crate::tick::lap("scroll::reading");
-        let g = demand::geometry(chart, rate, k);
+        let g = demand::geometry(chart, rate, rows, k);
         crate::tick::lap("geometry");
         let mut rs = Vec::new();
         let mut plains = Vec::new();
-        let base = demand::base(chart, &g, read.as_ref().map(|r| &r.0[..]), k);
+        let lay = shared.layout.clone();
+        let bits = atoms.then(|| lay.as_ref().map(|l| &l.info_bits[..])).flatten();
+        let base = demand::base(chart, &g, read.as_ref().map(|r| &r.0[..]), bits, k);
         crate::tick::lap("base");
-        let one = |cl: bool| demand::demand_with(chart, &g, &base, cl, read.as_ref().map(|r| &r.1[..]), want_plain, k);
-        // odd keymodes: the middle key with each hand, two independent passes on two threads (a fifth of a 7K chart's time)
-        // ponytail: both splits on this thread: the bulk paths (carry, gate) already fill every core, and a thread per chart cost 3 % CPU
-        let both = if keys % 2 == 1 { vec![one(true), one(false)] } else { vec![one(true)] };
+        let topo = |cl: bool| atoms.then(|| lay.as_ref().map(|l| l.hand_topo(cl))).flatten();
+        let one = |cl: bool| demand::demand_with(chart, &g, &base, cl, topo(cl), read.as_ref().map(|r| &r.1[..]), want_plain, k);
+        // odd keymodes: the middle key with each hand, two independent passes (a fifth of a 7K chart's time), on this thread: the
+        // bulk paths fill every core, and on the card a thread per split gained 2 % (2026-11-20)
+        let both: Vec<_> = demand::splits(keys).iter().map(|&cl| one(cl)).collect();
         for (run, plain) in both {
             rs.push(run);
             if let Some(p) = plain {

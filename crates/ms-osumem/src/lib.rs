@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn dates_decode_from_net_binary() {
         // 2026-11-01T12:00:00Z in .NET ticks, Kind flags in the top bits
-        let ticks: i64 = 639_000_000_000_000_000 + 0;
+        let ticks: i64 = 639_000_000_000_000_000;
         let iso = net_date(((ticks >> 32) as i32) | 1 << 30, ticks as i32).unwrap();
         let back = chrono::DateTime::parse_from_rfc3339(&iso).unwrap().timestamp_millis();
         assert_eq!(back * 10_000 + 621_355_968_000_000_000, ticks);

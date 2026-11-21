@@ -254,6 +254,10 @@ pub fn load(data: &[u8]) -> Result<P, String> {
 }
 
 fn put(m: &mut Machine<'_>, at: usize) -> Result<(), String> {
+    // every memo entry costs at least one opcode byte: a larger index is a corrupt file, not a reason to allocate it
+    if at > m.b.len() {
+        return Err(format!("memo index {at} past the end of the pickle"));
+    }
     if m.memo.len() <= at {
         m.memo.resize(at + 1, None);
     }
@@ -279,6 +283,12 @@ mod tests {
         assert_eq!(p.items()[2].0, P::F(0.5));
         assert_eq!(p.items()[2].1.get("k"), Some(&P::Int(-1)));
         assert_eq!(p.get("big"), Some(&P::Int(1 << 40)));
+    }
+
+    #[test]
+    fn a_huge_memo_index_is_refused() {
+        // calib fuzz pickle: LONG_BINPUT 0x716c6c61 resized the memo to 1.9 G entries (45 GB)
+        assert!(load(b"\x80\x03}rallq.").is_err());
     }
 
     #[test]

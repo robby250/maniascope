@@ -193,6 +193,7 @@ impl Mods {
             ch.window_shift = (ch.great_window() / own).ln();
         }
         ch.no_release = self.no_release;
+        ch.invert = self.invert;
         sort(ch);
     }
 }
@@ -280,6 +281,11 @@ fn ramp(ch: &mut Chart, from: f64, to: f64) -> f64 {
     ch.sv.iter_mut().for_each(|p| p.0 = map(p.0));
     mean
 }
+
+/// Random before its seed is drawn: the forecast is the mean over these three shuffles (plan 2026-11-20 D; user: one play's
+/// shuffle varies as much as the mean's error, so no range). On 4K–10K they are distinct, none the chart as written or its
+/// mirror, and no two mirrors of each other (`random_seeds_are_three_different_shuffles`).
+pub const RANDOM_SEEDS: [i32; 3] = [1, 2, 3];
 
 /// ManiaModRandom: `Enumerable.Range(0, keys).OrderBy(_ => rng.Next())` with .NET's seeded generator; a note in column c
 /// moves to column `[c]`. The replay tool rebuilt 2,345 own Random replays to their saved judgement counts with it.
@@ -455,5 +461,23 @@ mod tests {
         let (hard, easy) = (window_law(-(1.4f64.ln())), window_law(1.4f64.ln()));
         assert!((hard - 0.5345).abs() < 1e-3 && (easy + 0.3361).abs() < 1e-3 && window_law(0.) == 0. && window_law(5.) == window_law(0.738), "{hard} {easy}");
         assert_eq!(crate::chart::parse(&tagged(b"osu file format v14\n[General]\nMode: 3\n[HitObjects]\n", "IN")).err().map(|_| ()), Some(()), "no key count: still an error, not a panic");
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+
+    #[test]
+    fn random_seeds_are_three_different_shuffles() {
+        for k in 4..=10 {
+            let p: Vec<Vec<usize>> = RANDOM_SEEDS.iter().map(|&s| shuffled_columns(s, k)).collect();
+            for (i, a) in p.iter().enumerate() {
+                assert!(a.iter().enumerate().any(|(c, &x)| x != c) && a.iter().enumerate().any(|(c, &x)| x != k - 1 - c), "{k}K seed {}: written or mirrored", RANDOM_SEEDS[i]);
+                for b in &p[i + 1..] {
+                    assert!(a != b && a.iter().zip(b).any(|(x, y)| *x != k - 1 - y), "{k}K: {a:?} {b:?}");
+                }
+            }
+        }
     }
 }

@@ -143,7 +143,7 @@ fn a_row_that_moves_up_after_a_play_is_aimed_at_the_target() {
     let mut aimed = b.clone();
     l.w.aim(&mut aimed, "nps").unwrap();
     assert_ne!(aimed.rate, 1.37, "the fixture must aim somewhere else");
-    assert_eq!((shown[0].sha.clone(), shown[0].rate), (b.sha.clone(), aimed.rate), "1.10.0: kept at 1.37 because it was first in the queue");
+    assert_eq!((shown[0].sha.clone(), shown[0].rate), (b.sha, aimed.rate), "1.10.0: kept at 1.37 because it was first in the queue");
 }
 
 #[test]
@@ -207,8 +207,8 @@ fn a_retained_pick_and_its_candidate_read_from_newer_features() {
     old.family = Some("old family".into());
     old.why = "1.0 raw NPS · Old · expect ~95.0%".into();
     l.w.playlists.insert("nps", vec![old.clone()]);
-    let stale = Choice { sha: sha.clone(), md5: old.md5.clone().unwrap(), keys: 7, rate, value: 0., installed: true, convert: false, source_web: false, playcount: -1., family: "old family".into(), group: "rice".into(),
-        nps: 1., length: 1., profile: Vec::new(), description: "Old".into(), matched: Vec::new(), practice: String::new(), acc_mid: 0.95, pred: old.pred.clone(), generated_at: 0. };
+    let stale = Choice { sha: sha, md5: old.md5.clone().unwrap(), keys: 7, rate, value: 0., installed: true, convert: false, source_web: false, playcount: -1., family: "old family".into(), group: "rice".into(),
+        nps: 1., length: 1., profile: Vec::new(), description: "Old".into(), matched: Vec::new(), practice: String::new(), acc_mid: 0.95, pred: old.pred, generated_at: 0. };
     l.w.mode = "skills".into(); // nothing publishes this list: the test reads what accept left
     l.w.states.get_mut("nps").unwrap().restored = false;
     let mut p = published(&l, "nps");
@@ -680,4 +680,29 @@ fn a_menu_convert_is_taken_out_of_the_queue_with_its_own_map_and_the_rest_keep_t
     assert!(matches!(taken.as_slice(), [Task::ConvertSelected { path, keys: 7 }] if path.as_os_str() == "a.osu"));
     assert!(matches!(q.get(Duration::ZERO), Some(Task::Publish)));
     assert!(matches!(q.get(Duration::ZERO), Some(Task::Refit)));
+}
+
+#[test]
+fn inverse_mod_rates_your_maps_under_invert_while_picked_on_lazer() {
+    let mut l = live("invert", 240, busy(false));
+    l.w.practice_skills = vec![skills::INVERT_MOD.into()];
+    let (b, _) = built(&mut l, "skills", |_| {});
+    let inverted: Vec<&Arc<Inst>> = b.catalog.values().filter(|i| i.invert_of.is_some()).collect();
+    assert!(!inverted.is_empty());
+    let mut source = crate::evidence::FeatureSource { public: l.w.rec.as_ref().unwrap().public.clone(), calc: CALC_ID.to_string(), cache: Default::default() };
+    let local = crate::catalog::local_shas(&l.world.db).unwrap();
+    for i in inverted {
+        assert!(local.contains(&i.sha256), "in the library through its source: the list keeps it");
+        let src = i.invert_of.as_deref().unwrap();
+        assert_eq!(crate::modcharts::find(&l.world.db, src, "IN").unwrap().as_deref(), Some(i.sha256.as_str()));
+        assert!(b.catalog[src].invert_of.is_none() && i.md5 != b.catalog[src].md5);
+        // rated as played: the source under Invert, counting only as Inverse mod
+        let f = source.lookup(&l.world.db, &source.key(&i.sha256, 1.)).unwrap().expect("rated at 1×");
+        assert_eq!(f.fget("invert", 0.), 1.);
+        assert_eq!(skills::demanded(&f), vec![skills::INVERT_MOD]);
+    }
+    // osu!stable has no Invert: the entries leave.
+    l.w.shown.client = "stable".into();
+    let (b, _) = built(&mut l, "skills", |_| {});
+    assert!(b.catalog.values().all(|i| i.invert_of.is_none()));
 }

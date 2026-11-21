@@ -27,12 +27,12 @@ fn quadstream_recognition_has_no_new_physical_charge_and_no_wide_name() {
     let c = make(&[&[0], four, &[2], four], 4);
     let a = run(&c, 1.);
     assert!(score(&a, "quadstream") > 0.);
-    let b = run_with(&c, 1., &Params::new(standard_params().model.clone(), &json!({"off": ["quadstream"]})).unwrap());
+    let b = run_with(&c, 1., &Params::new(standard_params().model, &json!({"off": ["quadstream"]})).unwrap());
     assert!((a.f("raw_overall") - b.f("raw_overall")).abs() < 1e-9 && score(&b, "quadstream") == 0.);
     assert_eq!(score(&run(&make(&[&[0, 1], four, &[2, 3], four], 4), 1.), "quadstream"), 0.);
     let seven: &[u8] = &[0, 1, 2, 3, 4, 5, 6];
     let wide = make(&[&[0], seven, &[6], seven], 7);
-    assert!(quadstream(&wide, 1., 0.5).1 > 0.8 && !run(&wide, 1.).dict("scores").unwrap().has("quadstream"));
+    assert!(quadstream(&wide, 1., &ms_calc::demand::rows(&wide, 1.), 0.5).1 > 0.8 && !run(&wide, 1.).dict("scores").unwrap().has("quadstream"));
     let mut notes: Vec<(f64, u8)> = (0..1600).map(|i| (1000. + i as f64 * 90., (i % 4) as u8)).collect();
     notes.extend([0, 2, 3].map(|c| (46090., c)));
     assert!(!title(&run(&rice(notes, 4, 5.), 1.)).contains("Quadstream"));
@@ -122,7 +122,9 @@ fn scroll_weights_select_only_calibrated_keymode() {
         let vectors = geometry(&c, 1.).vectors;
         assert!(vectors.iter().any(|v| v.iter().any(|x| *x != 0.)));
         for (s, v) in reading(&c, 1., &prm).unwrap().0.iter().zip(&vectors) {
-            let want: f64 = v.iter().zip(&weights).map(|(a, b)| a * b).sum();
+            let k = &prm.k; // the weights × SV_READ, stutter × SV_STUTTER too
+            let scaled = [weights[0], weights[1], weights[2], weights[3] * k.SV_STUTTER].map(|w| w * k.SV_READ);
+            let want: f64 = v.iter().zip(&scaled).map(|(a, b)| a * b).sum();
             assert!((s - want).abs() <= 1e-12 * want.abs().max(1e-300));
         }
     }

@@ -192,7 +192,7 @@ pub fn perform(p: &mut Pick, action: &str, client: &str, auto: bool) -> Performe
     }
     let original = p.convert_of.is_some() && !p.installed; // a website convert, looked at first: its original opens
     if p.installed {
-        let path = p.sha.as_deref().and_then(|s| crate::pp::chart_path(Some(s)));
+        let path = p.invert_of.as_deref().or(p.sha.as_deref()).and_then(|s| crate::pp::chart_path(Some(s))); // Invert: its source is the file
         if path.is_none() {
             if p.mode == "nps" || p.mode == "skills" {
                 return Performed { msg: "Chart is no longer installed — refresh the library".to_string(), unavailable: true, ..Performed::default() };
@@ -216,11 +216,11 @@ pub fn perform(p: &mut Pick, action: &str, client: &str, auto: bool) -> Performe
         } else {
             "Search copied — press Ctrl+V in song select"
         };
-        return Performed { copy: Some(query), msg: msg.to_string(), ..Performed::default() };
+        return Performed { copy: Some(query), msg: with_invert(p, msg.to_string()), ..Performed::default() };
     }
     let url = format!("osu://b/{}", bid.unwrap());
     if !game_running(client) {
-        return Performed { copy: Some(url), msg: "osu! is not running — copied beatmap link".to_string(), ..Performed::default() };
+        return Performed { copy: Some(url), msg: with_invert(p, "osu! is not running — copied beatmap link".to_string()), ..Performed::default() };
     }
     if let Err(e) = open_url(&url, client) {
         return Performed { copy: Some(url), msg: format!("Could not open beatmap panel ({e}) — copied link"), ..Performed::default() };
@@ -232,7 +232,12 @@ pub fn perform(p: &mut Pick, action: &str, client: &str, auto: bool) -> Performe
     } else {
         format!("Sent beatmap link to osu! — choose Go to beatmap; mods unchanged{}", if query.is_some() { " · search copied, Ctrl+V in song select" } else { "" })
     };
-    Performed { copy: query, msg, sent: true, unavailable: false }
+    Performed { copy: query, msg: with_invert(p, msg), sent: true, unavailable: false }
+}
+
+/// An Inverse mod pick is its source map played with the Invert mod: every message says so.
+fn with_invert(p: &Pick, msg: String) -> String {
+    if p.invert_of.is_some() { format!("{msg} · turn on Invert") } else { msg }
 }
 
 #[cfg(test)]
@@ -277,6 +282,6 @@ mod tests {
         assert_eq!(song_search(&p, "stable"), "A B T V keys=7");
         assert_eq!(song_search(&p, "lazer"), "artist=\"A=B\"! title=\"T!\"! diff=\"V\"! cs=7");
         // submitted maps too (user 2026-11-15: no beatmap id search)
-        assert_eq!(song_search(&Pick { bid: Some(42), ..p.clone() }, "lazer"), "artist=\"A=B\"! title=\"T!\"! diff=\"V\"! cs=7");
+        assert_eq!(song_search(&Pick { bid: Some(42), ..p }, "lazer"), "artist=\"A=B\"! title=\"T!\"! diff=\"V\"! cs=7");
     }
 }

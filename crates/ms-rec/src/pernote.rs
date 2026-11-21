@@ -42,9 +42,9 @@ fn iso(days: f64) -> String {
     chrono::DateTime::from_timestamp_millis((days.max(0.) * 86_400_000.) as i64).map_or_else(String::new, |d| d.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
 }
 
-/// Now in days.
+/// Now in days, on the app's one clock (`store::now`: a benchmark pins it; the wall clock made two pinned runs differ).
 pub fn today() -> f64 {
-    chrono::Utc::now().timestamp_millis() as f64 / 86_400_000.
+    ms_data::store::now() / 86_400.
 }
 
 impl PerNote {
@@ -84,12 +84,15 @@ impl PerNote {
                                          AND NOT EXISTS (SELECT 1 FROM play_theta p WHERE p.key=s.key AND p.net=?)")?
             .query_map(rusqlite::params![iso(from - 1.), self.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?
             .collect::<Result<_>>()?;
+        // rows of other nets are never read again (a calculator update re-stamps the net)
+        db.execute("DELETE FROM play_theta WHERE net<>?", [&self.id])?;
         if todo.is_empty() {
             return Ok(0);
         }
         let past = self.history(db, from - 1., f64::INFINITY)?;
-        for (key, played, sha, rate, stats, mods, client, n) in &todo {
-            let solved = (|| {
+        // each play is solved on its own (its result and place), so on all cores the carry may use
+        let solved = ms_calc::background::background_map(&todo, ms_data::store::carry_threads(), |(_, played, sha, rate, stats, mods, client, n)| {
+            Ok((|| {
                 // a modded play is solved on the chart as played; an unseeded Random's columns are unknown
                 let m = evidence_mods(mods.as_deref()).filter(|m| m.random != Some(None))?;
                 let (t, rate, stats) = (days(played.as_deref()?)?, rate.or(m.rate)?, parse_stats(stats.as_deref()?)?);
@@ -104,9 +107,14 @@ impl PerNote {
                 // the net reads the chart's own windows: a play under moved ones (Hard Rock, Easy, Difficulty Adjust) counts as the
                 // loss the window law gives it there
                 Some((c.keys as i64, theta_of(&d, (1. - acc) * (-ms_calc::mods::window_law(c.window_shift)).exp())))
-            })();
-            db.execute("INSERT OR REPLACE INTO play_theta VALUES (?,?,?,?)", rusqlite::params![key, self.id, solved.map(|s| s.0), solved.map(|s| s.1)])?;
+            })())
+        });
+        let tx = db.unchecked_transaction()?;
+        for ((key, ..), solved) in todo.iter().zip(solved) {
+            let solved = solved.ok().flatten();
+            tx.execute("INSERT OR REPLACE INTO play_theta VALUES (?,?,?,?)", rusqlite::params![key, self.id, solved.map(|s| s.0), solved.map(|s| s.1)])?;
         }
+        tx.commit()?;
         Ok(todo.len())
     }
 

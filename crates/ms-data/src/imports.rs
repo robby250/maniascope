@@ -468,7 +468,7 @@ pub fn add_live_score(db: &Db, score: &Value, fresh: bool, play: Option<&Value>)
     let mods = score.get("mods_list").filter(|m| !m.is_null());
     let (rate, ranked) = mods.map_or_else(|| (score["rate"].as_f64(), false), |m| variant(m.as_array().map_or(&[], Vec::as_slice))); // [] is NoMod: ranked
     let mut score = score.clone();
-    if fresh && !score["played"].as_str().is_some_and(|p| !p.is_empty()) {
+    if fresh && score["played"].as_str().is_none_or(|p| p.is_empty()) {
         score["played"] = json!(chrono::Utc::now().to_rfc3339());
     }
     if !score_allowed(db, &score, play.filter(|_| fresh), true)? {

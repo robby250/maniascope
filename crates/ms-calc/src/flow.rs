@@ -144,45 +144,30 @@ pub fn arms(row: &[f64], l0: f64, s: f64) -> Vec<f64> {
 /// Which hand plays a column and where on it. The middle key of an odd keymode goes with the left hand or the right one,
 /// both read and averaged (user 2026-11-03: "a thumb is a finger … do 3"); it used to sit outside both hands' order.
 pub fn hand(col: usize, keys: usize, centre_left: bool) -> (usize, f64) {
-    (if col < keys / 2 || (centre_left && keys % 2 == 1 && col == keys / 2) { 0 } else { 1 }, col as f64)
+    ((crate::demand::hand_masks(keys, centre_left)[1] >> col & 1) as usize, col as f64)
 }
 
-/// Each hand's columns as a bit mask: a row's hands are `mask & m[h]` (once per chart, not a column loop per row).
-fn hand_masks(keys: usize, centre_left: bool) -> [u32; 2] {
-    (0..keys).fold([0u32; 2], |mut m, c| { m[hand(c, keys, centre_left).0] |= 1 << c; m })
-}
 
-/// The chart's rows: (seconds at `rate`, column mask).
-pub fn rows(chart: &Chart, rate: f64) -> Vec<(f64, u32)> {
-    let scale = 0.001 / rate;
-    let mut rows: Vec<(f64, u32)> = Vec::with_capacity(chart.len());
-    let mut i = 0;
-    while i < chart.len() {
-        let t = chart.t[i];
-        let mut mask = 0u32;
-        while i < chart.len() && chart.t[i] == t {
-            mask |= 1 << chart.col[i];
-            i += 1;
-        }
-        rows.push((t * scale, mask));
-    }
-    rows
-}
 
 /// Of the chart as written: read as played (`Chart::played`), flams on the written notes (a mashed roll's spread).
 pub fn flow(written: &Chart, rate: f64, k: &Knobs) -> Flow {
-    crate::tick::lap("f.before");
     let played = written.played(rate, k).map(|p| p.0);
     let chart = played.as_ref().unwrap_or(written);
+    flow_of(written, chart, rate, &crate::demand::rows(chart, rate), k)
+}
+
+/// `flow` with the chart as played already at hand (compute's).
+pub fn flow_of(written: &Chart, chart: &Chart, rate: f64, rs: &[crate::demand::Row], k: &Knobs) -> Flow {
+    crate::tick::lap("f.before");
     let scale = 0.001 / rate;
-    let rows = rows(chart, rate);
-    let splits: &[bool] = if chart.keys % 2 == 1 { &[true, false] } else { &[true] };
+    let rows: Vec<(f64, u32)> = rs.iter().map(|r| (r.t, r.mask)).collect();
+    let splits = crate::demand::splits(chart.keys);
     let (mut broken, mut skip, mut split, mut imbalance, mut ohj, mut ring, mut polyrate, mut variety, mut chaos) = (0., 0., 0., 0., 0., 0., 0., 0., 0.);
-    let holds = held(chart);
+    let holds = held(chart, &rs);
     let (mut gaps, mut hold_tap, mut shape_load) = ([0.; 4], [0.; 2], 0.);
     for &centre_left in splits {
         crate::tick::lap("f.head");
-        let (b, s) = order(chart, scale, centre_left, k);
+        let (b, s) = order(chart, &rs, centre_left, k);
         crate::tick::lap("f.order");
         let part = splits.len() as f64;
         let h = hand_pass(&rows, &holds, chart.keys, centre_left, k);
@@ -206,7 +191,7 @@ pub fn flow(written: &Chart, rate: f64, k: &Knobs) -> Flow {
     crate::tick::lap("f.evenness");
     let coupling = coupling(chart, scale, k);
     crate::tick::lap("f.coupling");
-    let roll = rolls(chart, scale, k);
+    let roll = rolls(chart, &rs, k);
     crate::tick::lap("f.rolls");
     let flam = flams(written, scale, k);
     crate::tick::lap("f.flams");
@@ -230,21 +215,18 @@ pub fn flow(written: &Chart, rate: f64, k: &Knobs) -> Flow {
     Flow { broken, skip, change: changed as f64 / rows.len().max(2).saturating_sub(1) as f64, fast_ln: rolled as f64 / heads.len().max(1) as f64, split, imbalance, even, coupling, roll, flam, ohj, ring, polyrate, isolated, vibro_run, variety, chaos, jack_comp, gaps, hold_tap, shape_load }
 }
 
-/// Each row's columns held by a long note pressed before it and released after it (aligned with `flow::rows`).
-pub fn held(chart: &Chart) -> Vec<u32> {
-    let (mut out, mut active, mut i): (Vec<u32>, Vec<(f64, u8)>, usize) = (Vec::new(), Vec::new(), 0);
-    while i < chart.len() {
-        let t = chart.t[i];
-        active.retain(|a| a.0 > t);
-        out.push(active.iter().fold(0, |m, a| m | 1 << a.1));
-        while i < chart.len() && chart.t[i] == t {
-            if chart.end[i] > t {
-                active.push((chart.end[i], chart.col[i]));
-            }
-            i += 1;
-        }
-    }
-    out
+/// Each row's columns held by a long note pressed before it and released after it (aligned with `rows`).
+pub fn held(chart: &Chart, rows: &[crate::demand::Row]) -> Vec<u32> {
+    let mut active: Vec<(f64, u8)> = Vec::new();
+    rows.iter()
+        .map(|r| {
+            let t = chart.t[r.start];
+            active.retain(|a| a.0 > t);
+            let m = active.iter().fold(0, |m, a| m | 1 << a.1);
+            active.extend((r.start..r.end).filter(|&i| chart.end[i] > chart.t[i]).map(|i| (chart.end[i], chart.col[i])));
+            m
+        })
+        .collect()
 }
 
 /// The per-hand descriptors of one hand split, in one pass over the rows (each was its own pass; values unchanged).
@@ -275,7 +257,7 @@ struct HandPass {
 /// - hold_tap: presses on a hand holding a long note (round 3 `calib motifs`: 7K taps under a same-hand hold play harder,
 ///   TRAIN t up to +11), shares of all hand presses [gap ≥ 180 ms, faster].
 fn hand_pass(rows: &[(f64, u32)], held: &[u32], keys: usize, centre_left: bool, k: &Knobs) -> HandPass {
-    let hm = hand_masks(keys, centre_left);
+    let hm = crate::demand::hand_masks(keys, centre_left);
     let rings: Option<[usize; 2]> = (keys >= 6).then(|| {
         let cols: [Vec<usize>; 2] = [0, 1].map(|h| (0..keys).filter(|&c| hand(c, keys, centre_left).0 == h).collect());
         [cols[0][1], cols[1][cols[1].len() - 2]]
@@ -393,7 +375,7 @@ fn variety(marks: &[(f64, i32)]) -> f64 {
 fn shape_loads(rows: &[(f64, u32)], keys: usize, centre_left: bool) -> f64 {
     let (mut total, mut n) = (0., 0.);
     for h in 0..2 {
-        let mine = hand_masks(keys, centre_left)[h];
+        let mine = crate::demand::hand_masks(keys, centre_left)[h];
         let hr: Vec<(f64, u32)> = rows.iter().filter(|r| r.1 & mine != 0).map(|r| (r.0, r.1 & mine)).collect();
         // shape counts over the last 2 s, dense by mask (≤ 2^keys): no hashing per press
         let (mut lo2, mut lo30, mut seen, mut distinct) = (0, 0, vec![0u32; 1 << keys], 0usize);
@@ -500,16 +482,8 @@ fn jack_compensation(chart: &Chart, scale: f64, k: &Knobs) -> f64 {
 
 /// MinaCalc's rolls: a single note one column on from the previous single, the same way as the step before, its gap within
 /// 20 % of that step's: a roll the hand sweeps, not a stream it reads.
-fn rolls(chart: &Chart, scale: f64, k: &Knobs) -> f64 {
-    let mut singles: Vec<(f64, i32)> = Vec::new();
-    let mut i = 0;
-    while i < chart.len() {
-        let j = (i..chart.len()).find(|&j| chart.t[j] != chart.t[i]).unwrap_or(chart.len());
-        if j - i == 1 {
-            singles.push((chart.t[i] * scale, chart.col[i] as i32));
-        }
-        i = j;
-    }
+fn rolls(chart: &Chart, rows: &[crate::demand::Row], k: &Knobs) -> f64 {
+    let singles: Vec<(f64, i32)> = rows.iter().filter(|r| r.end - r.start == 1).map(|r| (r.t, chart.col[r.start] as i32)).collect();
     let (mut total, mut roll) = (0., 0.);
     for w in singles.windows(3) {
         let (g1, g2) = (w[1].0 - w[0].0, w[2].0 - w[1].0);
@@ -565,21 +539,18 @@ fn vibro_runs(chart: &Chart, rate: f64, k: &Knobs) -> f64 {
 }
 
 /// (broken, skip) of both hands' finger order, the middle key of an odd keymode with the left hand or not.
-fn order(chart: &Chart, scale: f64, centre_left: bool, k: &Knobs) -> (f64, f64) {
+fn order(chart: &Chart, rows: &[crate::demand::Row], centre_left: bool, k: &Knobs) -> (f64, f64) {
     let mut hands: [Vec<(f64, f64)>; 2] = Default::default();
-    let mut i = 0;
-    while i < chart.len() {
-        let t = chart.t[i];
+    for r in rows {
         let (mut sum, mut count) = ([0.; 2], [0.; 2]);
-        while i < chart.len() && chart.t[i] == t {
+        for i in r.start..r.end {
             let (h, at) = hand(chart.col[i] as usize, chart.keys, centre_left);
             sum[h] += at;
             count[h] += 1.;
-            i += 1;
         }
         for h in 0..2 {
             if count[h] > 0. {
-                hands[h].push((t * scale, sum[h] / count[h]));
+                hands[h].push((r.t, sum[h] / count[h]));
             }
         }
     }
@@ -638,7 +609,7 @@ mod tests {
     #[test]
     fn taps_under_a_long_note_are_held() {
         let c = Chart { keys: 4, t: vec![0., 200., 400., 1200.], end: vec![1000., 200., 400., 1200.], col: vec![0, 1, 1, 1], ..Default::default() };
-        assert_eq!(held(&c), vec![0, 1, 1, 0]);
+        assert_eq!(held(&c, &crate::demand::rows(&c, 1.)), vec![0, 1, 1, 0]);
     }
 
     /// 7K: column 0 held 0–2000 ms while column 1 (same hand) taps every 250 ms: slow taps under a hold; column 5 taps

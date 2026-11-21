@@ -31,6 +31,8 @@ pub struct Chart {
     /// Judgements no press can get (a hold counts head and tail): notes on a note already at that column and time. One
     /// press takes one note, so even auto misses them (user 2026-11-16: Tentacle VIP [Inertia VIP], 195 stacked, auto ~80 %).
     pub stacked: f64,
+    /// Played with lazer's Invert (`Mods::apply`): the Skills tab's "Inverse mod" offers read it (`features::chart_features`).
+    pub invert: bool,
     pub title: String,
     pub artist: String,
     pub version: String,
@@ -131,7 +133,24 @@ fn strip(s: &str) -> &str {
     s.trim_matches(|c: char| c.is_whitespace() || ('\x1c'..='\x1f').contains(&c))
 }
 
+/// Longest chart span analysed (first note to last end): the longest ranked marathons are under an hour.
+pub const MAX_SPAN_MS: f64 = 3. * 3.6e6;
+
 pub fn parse(data: &[u8]) -> Result<Chart, ChartError> {
+    parse_inner(data, false).map(|x| x.0)
+}
+
+/// A hit object as the file lists it: (time, end, x, hold).
+pub type Object = (i64, i64, i64, bool);
+
+/// `parse` with the hit objects in file order, for lazer's star rating (`features::lazer_notes`); None when a value isn't a whole
+/// number (rosu reads fractions, `parse` truncates them), an object is a slider or spinner, or the file is ManiaScope's own
+/// modded chart.
+pub fn parse_with_objects(data: &[u8]) -> Result<(Chart, Option<Vec<Object>>), ChartError> {
+    parse_inner(data, true)
+}
+
+fn parse_inner(data: &[u8], keep: bool) -> Result<(Chart, Option<Vec<Object>>), ChartError> {
     // Valid UTF-8 without U+FFFD (nearly every chart) is read in place; the copy only drops bad bytes.
     let text: std::borrow::Cow<str> = match std::str::from_utf8(data) {
         Ok(t) if !t.contains('\u{FFFD}') => t.into(),
@@ -153,6 +172,8 @@ pub fn parse(data: &[u8]) -> Result<Chart, ChartError> {
     // string, compared up to four times per line)
     let mut section = 0u8;
     let mut raw: Vec<(i64, i64, i64)> = Vec::new();
+    let mut objects: Vec<Object> = Vec::new();
+    let mut whole = true; // every hit object a note or hold with whole-number x, time and end
     let mut tps: Vec<(f64, f64, bool)> = Vec::new();
     for line in &lines[1..] {
         let line = strip(line);
@@ -205,6 +226,10 @@ pub fn parse(data: &[u8]) -> Result<Chart, ChartError> {
             } else {
                 t
             };
+            if keep {
+                whole &= typ & (2 | 8) == 0 && !p[0].contains('.') && !p[2].contains('.') && (typ & 128 == 0 || !p[5].split(':').next().is_some_and(|e| e.contains('.')));
+                objects.push((t, end, x, typ & 128 != 0));
+            }
             raw.push((t, end.max(t), x));
         } else if section == 2 {
             let p: Vec<&str> = line.split(',').collect();
@@ -247,6 +272,7 @@ pub fn parse(data: &[u8]) -> Result<Chart, ChartError> {
         k => return Err(ChartError::Chart(format!("unsupported key count: {}", k.map_or("None".into(), |k| k.to_string())))),
     };
     // Normalise: column, stacked notes out, order-independent sort, no same-column overlap.
+    let objects = (keep && whole && mods.is_none()).then_some(objects);
     let mut notes: Vec<(i64, i64, i64)> = raw
         .into_iter()
         .map(|(t, e, x)| (t, e, (keys - 1).min(0i64.max(py::floordiv(x.saturating_mul(keys), 512)))))
@@ -270,6 +296,12 @@ pub fn parse(data: &[u8]) -> Result<Chart, ChartError> {
         ch.col.push(c as u8);
     }
     crate::tick::lap("p.normalise");
+    // the analysis keeps arrays over the chart's span: a note at a corrupt time (fuzz: t = −2^31 ms) asked for 25 days of bins
+    if let Some(first) = ch.t.first() {
+        if ch.last_end() - first > MAX_SPAN_MS {
+            return Err(ChartError::Chart(format!("chart spans {:.0} hours", (ch.last_end() - first) / 3.6e6)));
+        }
+    }
     ch.od = if od.is_finite() { od } else { 5.0 };
     let get = |k: &str| meta.iter().find(|(mk, _)| mk == k).map(|(_, v)| v.clone());
     let nonempty = |k: &str| get(k).filter(|v| !v.is_empty());
@@ -282,7 +314,7 @@ pub fn parse(data: &[u8]) -> Result<Chart, ChartError> {
         let beats: Vec<(f64, f64)> = tps.iter().filter(|p| p.2 && p.1 > 0.0).map(|p| (p.0, p.1)).collect();
         m.apply(&mut ch, &beats);
     }
-    Ok(ch)
+    Ok((ch, objects))
 }
 
 /// [(ms, scroll multiplier)] as osu!lazer's mania playfield scrolls (ppy/osu 577d29f,
@@ -375,5 +407,14 @@ mod tests {
                    192,192,1000,128,0,1500:0:0:0:0:\n";
         let c = super::parse(osu.as_bytes()).unwrap();
         assert_eq!((c.t.len(), c.stacked), (2, 4.));
+    }
+
+    #[test]
+    fn a_corrupt_note_time_is_refused() {
+        // calib fuzz calc: a note at −2^31 ms made the analysis allocate 25 days of bins (OOM)
+        let osu = |t: &str| format!("osu file format v14\n[General]\nMode: 3\n[Difficulty]\nCircleSize:4\nOverallDifficulty:8\n[HitObjects]\n\
+                   64,192,{t},1,0,0:0:0:0:\n192,192,1000,1,0,0:0:0:0:\n");
+        assert!(super::parse(osu("-2147483649").as_bytes()).is_err());
+        assert!(super::parse(osu("500").as_bytes()).is_ok());
     }
 }

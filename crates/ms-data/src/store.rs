@@ -473,6 +473,15 @@ pub fn played_keys(db: &Db, n: i64, share: f64) -> Result<Vec<i64>> {
     Ok(out)
 }
 
+/// Hand freed heap back to the OS: glibc keeps it after the fit and each build, as RSS nothing uses.
+pub fn release_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // Safety: no arguments beyond the padding, callable from any thread.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,7 +542,7 @@ mod tests {
             let mut cf = vec![0.; 12];
             (cf[1], cf[6]) = (cj, 0.3);
             f.set("keys", keys);
-            (f.set("overall", 5.), f.set("baseline_overall", 5.), f.set("raw_overall", 8.), f.set("od", 8.));
+            f.set("overall", 5.); f.set("baseline_overall", 5.); f.set("raw_overall", 8.); f.set("od", 8.);
             f.set("calibration_features", Val::floats(&cf));
             crate::codec::encode(&Val::Dict(f))
         };
@@ -546,7 +555,7 @@ mod tests {
         let at = |key: &str| db.query_row("SELECT data FROM feats WHERE key=?", [key], |r| r.get::<_, Vec<u8>>(0)).unwrap();
         for (key, keys) in [("a@1.000", 10), ("c@1.000", 7)] {
             let Val::Dict(moved) = crate::codec::decode(&at(&format!("{key}|new"))).unwrap() else { panic!() };
-            let mut cf = vec![0.; 12];
+            let mut cf = [0.; 12];
             (cf[1], cf[6]) = (0.95, 0.3);
             // Not the stored 5 times a ratio: what `after` rates these inputs, as a fresh analysis would (the ratio kept old
             // calibrations' shifts when "before" wasn't the old calibration, 2026-11-04).
@@ -557,15 +566,15 @@ mod tests {
         let c = ms_calc::chart::Chart { keys: 7, t: (0..400).map(|i| 1000. + 90. * f64::from(i)).collect(), end: (0..400).map(|i| 1000. + 90. * f64::from(i)).collect(),
             col: (0..400).map(|i| (i * 3 % 7) as u8).collect(), ..Default::default() };
         let mut old = Dict::new();
-        (old.set("keys", 7i64), old.set("overall", 5.), old.set("stars", 4.2));
+        old.set("keys", 7i64); old.set("overall", 5.); old.set("stars", 4.2);
         db.execute("INSERT INTO feats VALUES (?,?)", params!["b@1.000|old", crate::codec::encode(&Val::Dict(old))]).unwrap();
         carry_feats(&db, "old", "new", &after, &|_| Some(c.clone()), None).unwrap();
         let Val::Dict(moved) = crate::codec::decode(&at("b@1.000|new")).unwrap() else { panic!() };
         let fresh = ms_calc::features::features_of(&ms_calc::compute::compute(&c, 1., true, &after).unwrap(), &after);
         assert_eq!((moved.f("overall"), moved.f("stam"), moved.f("stars")), (fresh.f("overall"), fresh.f("stam"), 4.2));
         // A row analysed under today's rules isn't analysed again: only its calibration moves.
-        let mut current = fresh.clone();
-        (current.set("overall", 5.), current.set("stam", 0.123));
+        let mut current = fresh;
+        current.set("overall", 5.); current.set("stam", 0.123);
         db.execute("INSERT INTO feats VALUES (?,?)", params!["d@1.000|old", crate::codec::encode(&Val::Dict(current))]).unwrap();
         carry_feats(&db, "old", "new", &after, &|_| Some(c.clone()), None).unwrap();
         let Val::Dict(moved) = crate::codec::decode(&at("d@1.000|new")).unwrap() else { panic!() };
@@ -637,14 +646,5 @@ mod tests {
         upsert_score(&db, Score { online_id: 7, local_id: Some("u".into()), ..row }).unwrap();
         let (online, local): (i64, String) = db.query_row("SELECT online_id, local_id FROM scores", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert_eq!((online, local.as_str()), (7, "u"));
-    }
-}
-
-/// Hand freed heap back to the OS: glibc keeps it after the fit and each build, as RSS nothing uses.
-pub fn release_memory() {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    // Safety: no arguments beyond the padding, callable from any thread.
-    unsafe {
-        libc::malloc_trim(0);
     }
 }

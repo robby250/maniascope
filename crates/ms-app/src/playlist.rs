@@ -226,6 +226,9 @@ fn badges(c: &Pick) -> Vec<(String, Color32, &'static str)> {
     if c.convert_of.is_some() {
         out.push((format!("{}K→{}K", c.source_keys, c.keys), theme::CONVERT, "A keymode convert, written and imported when picked"));
     }
+    if c.invert_of.is_some() {
+        out.push(("INVERT".to_string(), theme::CONVERT, "Play it with the Invert mod on: rated that way"));
+    }
     out
 }
 
@@ -464,6 +467,10 @@ impl App {
             }
             let mut units: Vec<Option<&Skill>> = if at == 0 { vec![None] } else { Vec::new() };
             units.extend(skills::tree(mode).iter().map(Some));
+            // Last: the Invert mod on any map at your level (user 2026-11-20); osu!stable has no Invert.
+            if self.units.client != "stable" {
+                units.push(skills::node(skills::INVERT_MOD));
+            }
             self.chip_rows(ui, &units, |ui, u| u.map_or(chip_width(ui, "Any"), |p| chip_width(ui, p.name) + if p.children.is_empty() { 0. } else { chip_width(ui, "▾") }), |app, ui, u| {
                 let Some(parent) = u else { return app.any_chip(ui) };
                 // Together: a chip and its ▾ wrap as one.

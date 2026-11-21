@@ -85,7 +85,7 @@ impl<'a> Reader<'a> {
             }
             7 => {
                 let n = self.u32()?;
-                let mut d = Vec::with_capacity(n);
+                let mut d = Vec::with_capacity(n.min(self.b.len() - self.at)); // a count from the cell, at least 2 bytes each
                 for _ in 0..n {
                     let len = u16::from_le_bytes(self.take(2)?.try_into().unwrap()) as usize;
                     let key = std::str::from_utf8(self.take(len)?).map_err(|e| e.to_string())?.to_owned();

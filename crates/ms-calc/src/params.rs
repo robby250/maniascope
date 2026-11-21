@@ -128,7 +128,8 @@ knobs! {
     W_JACK_KEYS: f64 = 0.67, // flat 0.57–0.77 (thin-keymode retune 2026-11-19)
     JACK_P: f64 = 0.5,      // on 4K; wider keymodes as (keys/4)^JACK_P_KEYS (open loop p8/p12: wide keys want a steeper jack speed curve)
     JACK_P_KEYS: f64 = 1.44, // flat 1.3–1.55 (thin-keymode retune 2026-11-19: 8K–10K confirm −0.3 … −1 %, 4K/7K ±0.1 %)
-    STREAM_FAMILY: f64 = 0.933, // 5K+ card: the Stream row = this × the rating of the fast and slow halves together (0 = the stronger half). Searched 2026-11-19 so Stream leads as many 5K+ cards as the stronger half did (47.3 % of 6,119; user: within 0.3 points)
+    CHORDJACK_CARD: f64 = 1.2, // card only: the Chordjack row's rating × this (the model keeps the rating). User 2026-11-20: "bring back to the previous level and then a bit more": hardest 303 7K charts lead with Chordjack 24 → 33 (v1.15.0: 31; 1.16 matches it), on the card 42 → 73 (57)
+    STREAM_FAMILY: f64 = 0.888, // 5K+ card: the Stream row = this × the fast and slow halves rated together. One flat scale (user 2026-11-20: "just outright lowering the stream occurrence on all levels equally") fitted so the hardest 7K charts lead with Stream as often as the stronger half did (top 1 %: 20.3 vs 23.7 %, 95–99 %: 20.0 vs 23.0, 90–95 %: 20.4 vs 19.4); easy charts lower than before (54.0 → 45.5 %). Was 0.933 (all-chart count)
     // A re-hit is played by the cheapest of two techniques (user 2026-11-19: finger, wrist and arm jack with different speed,
     // stamina and precision). Neither cost falls with speed, so a rating never falls when the rate rises (the old knee made a
     // re-hit under 70 ms cheaper than one at 70 ms). Searched together 2026-11-19 (31 trials): the values below.
@@ -259,7 +260,11 @@ knobs! {
     PATTERN_INFO: f64 = 0.2, // demand: a bin's total × e^(PATTERN_INFO · max(0, chord-sequence surprise bits/keys in the bin − PATTERN_INFO_B))
     PATTERN_INFO_B: f64 = 10.0, // surprise (rows' −log2 ÷ keys) per 0.5 s bin before it counts (~20 novel rows/s)
     PATTERN_INFO_X: f64 = 3.0, // PATTERN_INFO × (keys/7)^this (plan 2026-11-18 H7: one curve over keymodes)
-    SV_READ: f64 = 1.5,     // scale on every fitted scroll-reading weight (scroll::reading)
+    SV_Q: f64 = 1.416,      // a note's reading strain to this power (scroll::reading; < 1: the cost saturates). Top replays of 10 SV charts
+                            // (plan 2026-11-20 C2) hinted concave; the joint search on every keymode chose convex (1.0 → 1.42)
+    SV_SPEED: f64 = 0.184,  // the SV reading cost grows as row speed to this power (demand::base; pivot 10 rows/s). Searched with SV_Q,
+                            // SV_READ (plan 2026-11-20 C2): 0.5 → 0.18, flat 0–0.25; reading is a cost per row more than per second
+    SV_READ: f64 = 1.079,   // scale on every fitted scroll-reading weight (scroll::reading)
     // flow descriptors (flow.rs)
     FLOW_LINK: f64 = 0.25,   // s: a hand's next note further than this starts a new phrase
     FLOW_FLOOR: f64 = 0.04,  // s: faster than this counts the same
@@ -280,6 +285,8 @@ pub struct Params {
     pub model: Value,
     overrides: String,
     id: std::sync::OnceLock<u64>,
+    /// `features::rules_stamp`, made once (it hashed the formatted knobs per chart-rate).
+    pub(crate) rules: std::sync::OnceLock<String>,
 }
 
 impl Params {
@@ -317,7 +324,7 @@ impl Params {
                 }
             }
         }
-        Ok(Params { k, off, model, overrides: overrides.to_string(), id: std::sync::OnceLock::new() })
+        Ok(Params { k, off, model, overrides: overrides.to_string(), id: std::sync::OnceLock::new(), rules: std::sync::OnceLock::new() })
     }
 
     pub fn off(&self, component: &str) -> bool {

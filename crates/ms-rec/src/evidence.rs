@@ -61,6 +61,8 @@ pub struct Evidence {
 pub struct Rows {
     pub rows: Vec<Evidence>,
     pub feats: Vec<Feats>,
+    /// Every local play of each chart, failed and short ones too (`personal::Reads`).
+    pub reads: ms_model::personal::Reads,
     pub skipped: std::collections::BTreeMap<&'static str, usize>,
 }
 
@@ -163,6 +165,16 @@ pub fn evidence_rows(db: &Db, source: &mut FeatureSource, c: &Consts) -> Result<
     let mut out = Rows::default();
     let mut dedupe: HashMap<*const Dict, usize> = HashMap::default();
     for r in &scores {
+        // a read of the chart: any local play but Constant Speed (it reads no SV), keyed as an unmodded play's chart
+        let constant = r.mods.as_deref().is_some_and(|m| serde_json::from_str::<Value>(m).ok().and_then(|v| v.as_array().map(|a| a.iter().any(|x| x["acronym"] == "CS"))).unwrap_or(false));
+        if r.src != "public" && !constant {
+            if let (Some(t), Some(ts)) = (r.played.as_deref().and_then(months), r.played.as_deref().and_then(timestamp)) {
+                // under both names a chart goes by (an unmodded play's chart is its md5, a modded chart's source its sha)
+                for key in [r.md5.as_ref().filter(|m| !m.is_empty()), r.sha.as_ref()].into_iter().flatten() {
+                    out.reads.entry(key.clone()).or_default().push((t, ts));
+                }
+            }
+        }
         let Some((rate, m)) = evidence_mods(r.mods.as_deref()).and_then(|m| Some((r.rate.or(m.rate)?, m))) else {
             *out.skipped.entry("mods").or_default() += 1;
             continue;
@@ -229,6 +241,14 @@ pub fn evidence_rows(db: &Db, source: &mut FeatureSource, c: &Consts) -> Result<
             overall: out.feats[at].overall,
             family,
         });
+    }
+    // a modded chart (a Random shuffle, Invert) reads as its source: same SV, same plays
+    let mut q = db.prepare("SELECT sha, source FROM mod_charts")?;
+    let aliases: Vec<(String, String)> = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_>>()?;
+    for (sha, source) in aliases {
+        if let Some(v) = out.reads.get(&source).cloned() {
+            out.reads.insert(sha, v);
+        }
     }
     Ok(out)
 }

@@ -144,7 +144,7 @@ fn fit_shape(z: &[f64], p: usize, target: &[f64], w: &[f64], groups: &[&str]) ->
         }
         beta
     };
-    let mut folds = fold_of.clone();
+    let mut folds = fold_of;
     folds.sort_unstable();
     folds.dedup();
     if order.len() < 8 || folds.len() < 2 {
@@ -397,42 +397,174 @@ fn retry(rows: &[Row], u: &[f64], session_gap: f64) -> f64 {
     if diffs.len() < 20 { 0. } else { (mean(&diffs) * diffs.len() as f64 / (diffs.len() as f64 + 50.)).clamp(0., 0.15) }
 }
 
-/// The chart's SV rating (its SV share × overall) squared: what an unread chart's first plays lose grows with how hard its SV
-/// is, little on light SV and much on the hardest (own first plays since 2026-09-01: Carry me away 4K/7K at SV 6.0/5.9 −7/−10 pp,
-/// SV under 1 about ±1 pp; squared fit the curve better than linear; SV share instead fitted 0).
-pub fn sv_load(f: &Feats, c: &Consts) -> f64 {
-    c.names.iter().position(|n| n == "sv").map_or(0., |j| (f.sk[j] * f.overall).powi(2))
+/// The chart's SV rating: its SV share × overall.
+pub fn sv_rating(f: &Feats, c: &Consts) -> f64 {
+    c.names.iter().position(|n| n == "sv").map_or(0., |j| f.sk[j] * f.overall)
 }
 
-/// Unread-chart deficit (user 2026-11-16: SV maps with no local scores play far under their forecast, accuracy rises with
-/// retries): extra error on a chart's (n+1)-th own play, (a + UNREAD_SV·sv_load)/(1 + n). `a` is ridge-fitted on the context
-/// residual `u`; both are taken out of it, so chart affinity keeps only what stays after the chart is learned.
-fn unread(rows: &[Row], feats: &[Feats], c: &Consts, u: &mut [f64]) -> (f64, f64) {
-    let mut seq: Vec<usize> = (0..rows.len()).filter(|&i| !rows[i].public && rows[i].ts > 0.).collect();
-    seq.sort_by(|&a, &b| rows[a].ts.total_cmp(&rows[b].ts));
-    let mut seen: HashMap<&str, f64> = HashMap::default();
-    let x: Vec<(usize, f64, f64)> = seq.iter().map(|&i| {
-        let n = seen.entry(rows[i].chart.as_str()).or_insert(0.);
-        let w = 1. / (1. + *n);
-        *n += 1.;
-        (i, w, w * feats.get(rows[i].f).map_or(0., |f| sv_load(f, c)))
+/// SV reading's population start (plan 2026-11-20 S1: public best scores against play counts, passes of the top 10,000 players,
+/// a lower bound on the loss): (p, L, s), a first read losing L·SV^p ln that falls as 1/(1 + s·reads). `calib sv_reading pop`.
+pub fn read_pop(keys: i64) -> (f64, f64, f64) {
+    match keys {
+        4 => (1.25, 0.0230, 0.10),
+        7 => (2.0, 0.0092, 0.02),
+        _ => (2.0, 0.0056, 0.10),
+    }
+}
+
+/// How a player reads SV (plan 2026-11-20 C1). The deficit of a play = (a + loss·L·SV^p) / (1 + learn·s·reads), with (p, L, s)
+/// the keymode's population start and reads = Σ over the chart's earlier local plays of e^(−forget·years since). The three
+/// personal values start at the population (1, 1, 0) and move by the player's own SV plays (`fit_reading`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Reading {
+    pub a: f64,      // ln on any unread chart, SV or not
+    pub loss: f64,   // × the population's first-read loss
+    pub learn: f64,  // × the population's learning speed
+    pub forget: f64, // per year away, how much of an earlier read is lost (0: never)
+}
+
+impl Default for Reading {
+    fn default() -> Self {
+        Reading { a: 0., loss: 1., learn: 1., forget: 0. }
+    }
+}
+
+impl Reading {
+    /// An earlier read's weight `months` later.
+    pub fn kept(&self, months: f64) -> f64 {
+        (-self.forget * months.max(0.) / 12.).exp()
+    }
+
+    /// The deficit (ln) of a play of a chart with SV rating `sv` after `reads` (`kept`-weighted earlier plays).
+    pub fn deficit(&self, keys: i64, sv: f64, reads: f64) -> f64 {
+        let (p, l, s) = read_pop(keys);
+        (self.a + self.loss * l * sv.max(0.).powf(p)) / (1. + self.learn * s * reads)
+    }
+}
+
+/// A play as `fit_reading` reads it: its residual `y` (ln, + = more misses), keymode, SV rating, the months since each earlier
+/// read of its chart, and whether no earlier read is known (`chart` groups a chart's plays).
+pub struct ReadObs {
+    pub y: f64,
+    pub keys: i64,
+    pub sv: f64,
+    pub before: Vec<f64>,
+    pub chart: usize,
+}
+
+/// Ridge strengths of `fit_reading`, each in plays' worth of evidence, and the evidence a first known play needs to count as
+/// already read (likelihood ratio). `calib sv_reading kappa` searches them (chart-grouped cross-validation on own plays).
+#[derive(Clone, Copy, Debug)]
+pub struct ReadPriors {
+    pub a: f64,
+    pub loss: f64,
+    pub learn: f64,
+    pub forget: f64,
+    pub read_before: f64,
+}
+
+/// `calib sv_reading own` 2026-11-20: CV SSE flat for ridge 0.3–3 (109.1–109.8; 10: 113.6, none: 148.7), read-before 20–1000.
+pub const READ_PRIORS: ReadPriors = ReadPriors { a: 0.3, loss: 0.3, learn: 0.3, forget: 0.3, read_before: 1000. };
+
+const LEARN_GRID: [f64; 17] = [0.25, 0.5, 1., 2., 3.5, 5., 7.5, 10., 15., 25., 35., 50., 75., 100., 150., 250., 400.];
+const FORGET_GRID: [f64; 6] = [0., 0.05, 0.1, 0.2, 0.5, 1.];
+
+/// The player's Reading and the charts read before their first known play. A chart whose first known play fits "already read"
+/// (deficit 0) better than "first read" by `read_before` (likelihood ratio, at the residuals' spread) counts as read: no deficit.
+/// Then (learn, forget) on a grid and (a, loss) by ridge least squares toward the population, the whole penalised error least.
+pub fn fit_reading(obs: &[ReadObs], pr: &ReadPriors) -> (Reading, Vec<usize>) {
+    if obs.is_empty() {
+        return (Reading::default(), Vec::new());
+    }
+    let reads = |r: &Reading, o: &ReadObs| o.before.iter().map(|&m| r.kept(m)).sum::<f64>();
+    let first = fit_unread(obs, &[], pr, obs.iter().map(|o| o.y * o.y).sum::<f64>() / obs.len() as f64);
+    // the residuals' spread under that fit: what a first play's distance from each forecast is measured in
+    let var = (obs.iter().map(|o| (o.y - first.deficit(o.keys, o.sv, reads(&first, o))).powi(2)).sum::<f64>() / obs.len() as f64).max(1e-4);
+    let mut known: Vec<usize> = obs.iter().filter(|o| o.before.is_empty()).filter(|o| {
+        let d = first.deficit(o.keys, o.sv, 0.);
+        ((o.y - d).powi(2) - o.y * o.y) / (2. * var) > pr.read_before.ln()
+    }).map(|o| o.chart).collect();
+    known.sort_unstable();
+    known.dedup();
+    (fit_unread(obs, &known, pr, var), known)
+}
+
+/// `fit_reading` on the plays of charts not in `known`, penalties scaled by the residual variance `var`.
+fn fit_unread(obs: &[ReadObs], known: &[usize], pr: &ReadPriors, var: f64) -> Reading {
+    let pop = Reading::default();
+    let unread: Vec<&ReadObs> = obs.iter().filter(|o| known.binary_search(&o.chart).is_err()).collect();
+    let mut best = (f64::INFINITY, pop);
+    for &learn in &LEARN_GRID {
+        for &forget in &FORGET_GRID {
+            let r = Reading { learn, forget, ..pop };
+            // y ≈ (a + loss·x)·w: two unknowns, ridge to (0, 1)
+            let (mut saa, mut sal, mut sll, mut say, mut sly, mut syy) = (0., 0., 0., 0., 0., 0.);
+            for o in &unread {
+                let reads: f64 = o.before.iter().map(|&m| r.kept(m)).sum();
+                let (p, l, s) = read_pop(o.keys);
+                let w = 1. / (1. + learn * s * reads);
+                let (ua, ul) = (w, w * l * o.sv.max(0.).powf(p));
+                saa += ua * ua;
+                sal += ua * ul;
+                sll += ul * ul;
+                say += ua * o.y;
+                sly += ul * o.y;
+                syy += o.y * o.y;
+            }
+            let m = unread.len().max(1) as f64;
+            let (ka, kl) = (pr.a * saa / m, pr.loss * sll / m);
+            // (saa + ka)·a + sal·loss = say; sal·a + (sll + kl)·loss = sly + kl·1
+            let (p11, p12, p22, q1, q2) = (saa + ka, sal, sll + kl, say, sly + kl);
+            let det = p11 * p22 - p12 * p12;
+            if det <= 0. {
+                continue;
+            }
+            let a = ((q1 * p22 - p12 * q2) / det).clamp(0., 0.3);
+            // both sources bound the loss from below (public passes after failed tries, an above-average reader who knew most
+            // charts; plan 2026-11-20): never under the population's
+            let loss = ((q2 - p12 * a) / p22).max(1.); // given the clamped a
+            let sse = syy - 2. * (a * say + loss * sly) + a * a * saa + 2. * a * loss * sal + loss * loss * sll;
+            let pen = ka * a * a + kl * (loss - 1.).powi(2) + var * (pr.learn * learn.ln().powi(2) + pr.forget * forget * forget);
+            if sse + pen < best.0 {
+                best = (sse + pen, Reading { a, loss, learn, forget });
+            }
+        }
+    }
+    best.1
+}
+
+/// A chart's local plays at the fit: their `kept` weight (∞: read before its first known play), count and the last one (months).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Read {
+    pub weight: f64,
+    pub count: usize,
+    pub last: f64,
+}
+
+/// The player's Reading from their own plays, the deficit taken out of the residual `u` (so an unread play doesn't pull the level
+/// down), and each chart's reads at `now`.
+fn reading_of(rows: &[Row], feats: &[Feats], c: &Consts, u: &mut [f64], reads: &Reads, now: f64) -> (Reading, HashMap<String, Read>) {
+    let (mut charts, mut at): (Vec<&str>, HashMap<&str, usize>) = (Vec::new(), HashMap::default());
+    let own: Vec<usize> = (0..rows.len()).filter(|&i| !rows[i].public && rows[i].ts > 0.).collect();
+    let obs: Vec<ReadObs> = own.iter().map(|&i| {
+        let r = &rows[i];
+        let chart = *at.entry(r.chart.as_str()).or_insert_with(|| { charts.push(r.chart.as_str()); charts.len() - 1 });
+        let before = reads.get(&r.chart).map_or_else(Vec::new, |v| v.iter().filter(|x| x.1 < r.ts).map(|x| r.t - x.0).collect());
+        ReadObs { y: u[i], keys: r.keys, sv: feats.get(r.f).map_or(0., |f| sv_rating(f, c)), before, chart }
     }).collect();
-    if x.len() < 50 {
-        return (0., 0.);
+    let (reading, known) = if obs.len() < 50 { (Reading::default(), Vec::new()) } else { fit_reading(&obs, &READ_PRIORS) };
+    let known: std::collections::HashSet<&str> = known.iter().map(|&k| charts[k]).collect();
+    for (o, &i) in obs.iter().zip(&own) {
+        if !known.contains(charts[o.chart]) {
+            u[i] -= reading.deficit(o.keys, o.sv, o.before.iter().map(|&m| reading.kept(m)).sum());
+        }
     }
-    let (pp, pu) = x.iter().fold((UNREAD_RIDGE, 0.), |(pp, pu), &(i, p, q)| (pp + p * p, pu + p * (u[i] - UNREAD_SV * q)));
-    let a = (pu / pp).clamp(0., 0.3);
-    for &(i, p, q) in &x {
-        u[i] -= a * p + UNREAD_SV * q;
-    }
-    (a, UNREAD_SV)
+    let plays = reads.iter().map(|(chart, v)| {
+        let weight = if known.contains(chart.as_str()) { f64::INFINITY } else { v.iter().map(|x| reading.kept(now - x.0)).sum() };
+        (chart.clone(), Read { weight, count: v.len(), last: v.iter().map(|x| x.0).fold(f64::NEG_INFINITY, f64::max) })
+    }).collect();
+    (reading, plays)
 }
-
-const UNREAD_RIDGE: f64 = 20.;
-/// Log error per SV rating² on a chart's first play. ponytail: speculative (user 2026-11-16: "make a speculative value, we'll
-/// change it later"); own history holds only two hard-SV first plays (Carry me away 4K/7K, SV ~6: −7/−10 pp, this gives ~−5/−11).
-/// Fit it once more SV first plays and retries exist.
-const UNREAD_SV: f64 = 0.03;
 
 /// Personal._rate_anchors
 fn rate_anchors(stats: &[(f64, f64, f64)], bandwidth: f64, shrinkage: f64) -> Vec<(f64, f64, f64)> {
@@ -1058,8 +1190,8 @@ pub struct Fit {
     pub kap_c: f64,
     pub sd_all: f64,
     pub retry: f64,
-    pub unread: (f64, f64),             // `unread`: (a, b) of the deficit on a chart's first own plays
-    pub plays: HashMap<String, f64>,    // own plays per chart
+    pub reading: Reading,               // how the player reads SV (`fit_reading`)
+    pub plays: HashMap<String, Read>,   // every chart with a local play: its reads at the fit
     pub n_rows: usize,
     pub warmup: WarmModels,
 }
@@ -1079,7 +1211,11 @@ fn steepness(lr: &[f64], u: &[f64], w: &[f64], ridge: f64) -> Option<(f64, f64)>
 }
 
 /// recommend.Personal.__init__ on the kept evidence rows.
-pub fn personal_fit(c: &Consts, mut rows: Vec<Row>, feats: &[Feats], now: f64, levels: &HashMap<i64, f64>, knobs: Knobs, warmup: &WarmupArgs) -> Fit {
+/// Local plays of each chart (months, unix seconds): every local score of any client, rate and outcome; Constant Speed left out
+/// (it reads no SV). Keyed like `Row::chart`.
+pub type Reads = HashMap<String, Vec<(f64, f64)>>;
+
+pub fn personal_fit(c: &Consts, mut rows: Vec<Row>, feats: &[Feats], now: f64, levels: &HashMap<i64, f64>, knobs: Knobs, warmup: &WarmupArgs, reads: &Reads) -> Fit {
     let Knobs { half_life, level_bw, history_zone, recent_months, att_sd, session_gap } = knobs;
     // A row whose chart has no population prediction (no features) would spread NaN through its keymode's level curve.
     rows.retain(|r| r.y.is_finite() && r.base.is_finite());
@@ -1230,10 +1366,7 @@ pub fn personal_fit(c: &Consts, mut rows: Vec<Row>, feats: &[Feats], now: f64, l
     // its own context, and retries in one session are one block of affinity evidence.
     let (context, session_ids, ctx) = session_context(c, &rows, feats, &u);
     u.iter_mut().zip(&context).for_each(|(x, a)| *x -= a);
-    out.unread = unread(&rows, feats, c, &mut u);
-    for r in rows.iter().filter(|r| !r.public) {
-        *out.plays.entry(r.chart.clone()).or_insert(0.) += 1.;
-    }
+    (out.reading, out.plays) = reading_of(&rows, feats, c, &mut u, reads, now);
     let blocks = chart_blocks(&rows, &chart, charts.len(), &u, &session_ids, now);
     let within = |ix: &Vec<usize>| -> Vec<f64> {
         let m = mean(&ix.iter().map(|&i| u[i]).collect::<Vec<_>>());
@@ -1420,19 +1553,63 @@ mod tests {
         assert!((retried(&[(false, 0.6), (true, 3.), (false, 0.2)]) - expected).abs() < 1e-12);
     }
 
+    /// Plays of `charts` 7K charts at SV `sv`, each played `n` times `gap` months apart, residuals from `truth`.
+    fn read_plays(truth: Reading, charts: usize, n: usize, gap: f64, sv: f64) -> Vec<ReadObs> {
+        (0..charts).flat_map(|c| (0..n).map(move |i| {
+            let sv = sv * (0.5 + (c % 5) as f64 / 4.); // SV 0.5–1.5× `sv`: the loss apart from `a`
+            let before: Vec<f64> = (0..i).map(|j| (i - j) as f64 * gap).collect();
+            let y = truth.deficit(7, sv, before.iter().map(|&m| truth.kept(m)).sum());
+            ReadObs { y, keys: 7, sv, before, chart: c }
+        })).collect()
+    }
+
     #[test]
-    fn an_unread_chart_loses_its_deficit_as_it_is_learned() {
-        // 100 charts, each played twice: first play 0.1 worse, second 0.05 — (1/(1 + n)) × 0.1
-        let rows: Vec<Row> = (0..200).map(|i| row(&format!("c{}", i % 100), 1., 1. + i as f64, false)).collect();
-        let mut u: Vec<f64> = (0..200).map(|i| if i < 100 { 0.1 } else { 0.05 }).collect();
-        let c = Consts::standard();
-        let (a, b) = unread(&rows, &[], &c, &mut u);
-        assert!((a - 12.5 / 145.).abs() < 1e-12 && b == UNREAD_SV, "{a} {b}");
-        assert!(u[0] < 0.1 && u[100] < 0.05);
-        // a chart rated 10 with half of it SV carries SV 5: load 25
-        let mut f = Feats::bare(4, 10., 8., &c);
-        f.sk[c.names.iter().position(|n| n == "sv").unwrap()] = 0.5;
-        assert!((sv_load(&f, &c) - 25.).abs() < 1e-12);
+    fn a_player_without_sv_plays_reads_as_the_population() {
+        let (r, known) = fit_reading(&[], &READ_PRIORS);
+        assert_eq!((r, known.len()), (Reading::default(), 0));
+        // plays without SV say nothing of the SV loss, learning or forgetting: those stay at the population's
+        let (r, _) = fit_reading(&read_plays(Reading { a: 0.05, ..Reading::default() }, 60, 3, 1., 0.), &READ_PRIORS);
+        assert_eq!((r.loss, r.learn, r.forget), (1., 1., 0.), "{r:?}");
+        let mut f = Feats::bare(7, 10., 8., &Consts::standard());
+        f.sk[Consts::standard().names.iter().position(|n| n == "sv").unwrap()] = 0.5;
+        assert!((sv_rating(&f, &Consts::standard()) - 5.).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_player_who_loses_more_on_first_reads_gets_a_larger_loss() {
+        let (r, _) = fit_reading(&read_plays(Reading { loss: 4., ..Reading::default() }, 60, 3, 0.1, 6.), &READ_PRIORS);
+        assert!(r.loss > 2.5, "{r:?}");
+    }
+
+    #[test]
+    fn a_player_who_learns_faster_gets_a_faster_learning_speed() {
+        let (r, _) = fit_reading(&read_plays(Reading { loss: 4., learn: 10., ..Reading::default() }, 60, 4, 0.1, 6.), &READ_PRIORS);
+        assert!(r.learn >= 5., "{r:?}");
+    }
+
+    #[test]
+    fn a_player_who_forgets_gets_a_forgetting_value() {
+        // three plays a few days apart, then one two years later: forgetting brings the loss back on the last
+        let plays = |truth: Reading| -> Vec<ReadObs> {
+            let at = [0., 0.1, 0.2, 24.2];
+            (0..60).flat_map(|c| (0..4).map(move |i| {
+                let sv = 6. * (0.5 + (c % 5) as f64 / 4.);
+                let before: Vec<f64> = (0..i).map(|j| at[i] - at[j]).collect();
+                ReadObs { y: truth.deficit(7, sv, before.iter().map(|&m| truth.kept(m)).sum()), keys: 7, sv, before, chart: c }
+            })).collect()
+        };
+        let (r, _) = fit_reading(&plays(Reading { a: 0., loss: 4., learn: 25., forget: 1. }), &READ_PRIORS);
+        assert!(r.forget >= 0.5, "{r:?}");
+        let (r, _) = fit_reading(&plays(Reading { a: 0., loss: 4., learn: 25., forget: 0. }), &READ_PRIORS);
+        assert_eq!(r.forget, 0., "{r:?}");
+    }
+
+    #[test]
+    fn a_first_play_that_reads_as_learned_counts_as_read_before() {
+        let mut obs = read_plays(Reading { loss: 4., ..Reading::default() }, 60, 3, 0.1, 6.);
+        obs.push(ReadObs { y: 0., keys: 7, sv: 8., before: Vec::new(), chart: 99 }); // SV 8, no loss at all
+        let (_, known) = fit_reading(&obs, &READ_PRIORS);
+        assert_eq!(known, vec![99]);
     }
 
     #[test]

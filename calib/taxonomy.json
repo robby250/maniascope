@@ -1,8 +1,11 @@
 {
-  "note": "Slice ramps (ms_calc::skills::ramp): [lo, hi, e, g] at 7K and chart level 5, both × (keys/7)^e × (level/5)^g. `calib ramps` refits them; card: TAG (`calib labels --fit`).",
+  "note": "Slice ramps (ms_calc::skills::ramp): [lo, hi, e, g] at 7K and chart level 5, both × (keys/7)^e × (level/5)^g. `calib ramps` refits them; card: TAG (`calib labels --fit`); card.name_scale: a type names its row from NAME × this (bracket 1.1: Bracket and Chordstream about equally often on the cards of the hardest 7K charts, 117/123 of 303, user 2026-11-20).",
   "card": {
     "tag": 0.76,
-    "name": 0.63
+    "name": 0.63,
+    "name_scale": {
+      "bracket": 1.1
+    }
   },
   "ramps": {
     "bracket": [
@@ -66,32 +69,32 @@
       2.8813
     ],
     "sv_fast": [
+      0.2496,
       1.0,
-      3.2716,
       0.0,
       0.0
     ],
     "sv_slow": [
       0.0,
-      0.2544,
+      0.3792,
       0.0,
       0.0
     ],
     "sv_accel": [
-      0.2714,
-      3.0764,
+      0.1827,
+      1.0,
       0.0,
       0.0
     ],
     "sv_stutter": [
-      0.007,
-      1.8407,
+      0.0268,
+      0.8328,
       0.0,
       0.0
     ],
     "sv_brake": [
-      0.3336,
-      6.9734,
+      0.2713,
+      1.0,
       0.0,
       0.0
     ],

@@ -109,28 +109,6 @@ fn cholesky(a: &[f64], n: usize) -> Option<Vec<f64>> {
     Some(l)
 }
 
-#[cfg(test)]
-mod spd_tests {
-    use super::*;
-
-    #[test]
-    fn the_blocked_cholesky_matches_elimination_on_a_positive_definite_system() {
-        let n = 150; // over two blocks, with a ragged last one
-        let mut seed = 7u64;
-        let mut r = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5 };
-        let m: Vec<f64> = (0..n * n).map(|_| r()).collect();
-        let a: Vec<f64> = (0..n * n).map(|ij| { let (i, j) = (ij / n, ij % n); (0..n).map(|k| m[i * n + k] * m[j * n + k]).sum::<f64>() + if i == j { 0.1 } else { 0. } }).collect();
-        let b: Vec<f64> = (0..n).map(|_| r()).collect();
-        assert!(cholesky(&a, n).is_some(), "the fast path, not the fallback");
-        let (x, y) = (solve_spd(&a, &b), solve(&a, &b));
-        for i in 0..n {
-            assert!((x[i] - y[i]).abs() < 1e-8 * (1. + y[i].abs()), "{i}: {} {}", x[i], y[i]);
-        }
-        let neg: Vec<f64> = a.iter().enumerate().map(|(ij, v)| if ij == 0 { -1. } else { *v }).collect();
-        assert_eq!(solve_spd(&neg, &b), solve(&neg, &b));
-    }
-}
-
 /// warmup._fit's alternation: box-constrained ridge coefficients (A·coeff = Xᵀ·w·(y − effects) + prior, by
 /// box_cd from the unconstrained solve), then each random effect group in turn as the ridge-shrunk weighted
 /// mean of what the rest leaves. X is n×p row-major f64 bytes, y and weights f64 bytes; groups are
@@ -221,4 +199,26 @@ pub fn warmup_timeline(end: &[f64], seconds: &[f64], keys: &[i64], family: &[usi
         last_end = Some(end[i]);
     }
     (sessions, minutes, ds)
+}
+
+#[cfg(test)]
+mod spd_tests {
+    use super::*;
+
+    #[test]
+    fn the_blocked_cholesky_matches_elimination_on_a_positive_definite_system() {
+        let n = 150; // over two blocks, with a ragged last one
+        let mut seed = 7u64;
+        let mut r = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5 };
+        let m: Vec<f64> = (0..n * n).map(|_| r()).collect();
+        let a: Vec<f64> = (0..n * n).map(|ij| { let (i, j) = (ij / n, ij % n); (0..n).map(|k| m[i * n + k] * m[j * n + k]).sum::<f64>() + if i == j { 0.1 } else { 0. } }).collect();
+        let b: Vec<f64> = (0..n).map(|_| r()).collect();
+        assert!(cholesky(&a, n).is_some(), "the fast path, not the fallback");
+        let (x, y) = (solve_spd(&a, &b), solve(&a, &b));
+        for i in 0..n {
+            assert!((x[i] - y[i]).abs() < 1e-8 * (1. + y[i].abs()), "{i}: {} {}", x[i], y[i]);
+        }
+        let neg: Vec<f64> = a.iter().enumerate().map(|(ij, v)| if ij == 0 { -1. } else { *v }).collect();
+        assert_eq!(solve_spd(&neg, &b), solve(&neg, &b));
+    }
 }

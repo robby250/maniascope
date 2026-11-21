@@ -87,6 +87,14 @@ pub fn pick_acc(c: &Pick, obs: &Obs, card: Option<&Card>) -> f64 {
     card.filter(|_| set_check(c, obs).1).map_or(c.pred.acc_mid, |k| k.acc_mid)
 }
 
+/// The pick's unread-SV note ("first read −5.2"), the card's once the pick is set.
+pub fn pick_note(c: &Pick, obs: &Obs, card: Option<&Card>) -> Option<String> {
+    match card.filter(|_| set_check(c, obs).1) {
+        Some(k) => k.unread.clone(),
+        None => c.pred.read_note(ms_rec::evidence::now_months()),
+    }
+}
+
 /// The picked map: [rate to set (green once osu! shows it) and expectation, title], so they never move.
 pub fn target_lines(c: &Pick, obs: &Obs, card: Option<&Card>, shown: &Shown) -> Vec<Line> {
     let wanted = wanted_mod(c.rate);
@@ -95,7 +103,11 @@ pub fn target_lines(c: &Pick, obs: &Obs, card: Option<&Card>, shown: &Shown) -> 
     let (known, correct, _) = set_check(c, obs);
     let colour = if correct { GREEN } else if known { RED } else { GREY };
     let expected = if same && c.sha.as_deref().is_some_and(|s| s != observed) { "Updated chart selected".to_string() } else { format!("~{:.1}%", 100. * shown.acc(pick_acc(c, obs, card))) };
-    vec![vec![Span { text: format!("{} SET {:.2}× · {wanted}", if correct { "✓" } else { "→" }, c.rate), bold: true, small: false, color: Some(colour) }, plain("  "), bold(expected)], pick_line(c)]
+    let mut first = vec![Span { text: format!("{} SET {:.2}× · {wanted}", if correct { "✓" } else { "→" }, c.rate), bold: true, small: false, color: Some(colour) }, plain("  "), bold(expected)];
+    if let Some(note) = pick_note(c, obs, card) {
+        first.extend([plain("  "), small(note)]);
+    }
+    vec![first, pick_line(c)]
 }
 
 /// 'warming up −1.2%': the form reason and what it does to this map's expected accuracy.
@@ -117,12 +129,18 @@ pub fn prediction_line(c: &Card, pp: bool, shown: &Shown) -> (Line, String) {
     let pct = |x: f64| 100. * shown.acc(x);
     let (mid, lo, hi) = (pct(c.acc_mid), pct(c.acc_lo), pct(c.acc_hi));
     let mut parts: Vec<Line> = vec![vec![bold(format!("Expected ~{mid:.1}%")), plain(" "), small(format!("({lo:.1}–{hi:.1}%)"))]];
+    if c.random {
+        parts.push(vec![small("≈ with Random")]);
+    }
     if !c.without.is_empty() {
         parts.push(vec![small(format!("without {}", c.without.join(", ")))]); // mods nothing models: the number is the chart's without them
     }
     let form = form_text(c.form, c.acc_mid, shown);
     if !form.is_empty() {
         parts.push(vec![Span { bold: true, ..small(form.clone()) }]);
+    }
+    if let Some(note) = &c.unread {
+        parts.push(vec![Span { bold: true, ..small(note.clone()) }]);
     }
     if let Some(v) = c.pp_expected {
         parts.push(vec![bold(format!("~{v:.0}pp"))]);
@@ -135,11 +153,17 @@ pub fn prediction_line(c: &Card, pp: bool, shown: &Shown) -> (Line, String) {
     if !c.mods.is_empty() {
         tip.push(format!("With {}: the chart as these mods make it", c.mods.join(", ")));
     }
+    if c.random {
+        tip.push("Random: the average over three shuffles; the one osu! deals can play easier or harder".to_string());
+    }
     if !c.without.is_empty() {
         tip.push(format!("{} can't be forecast: this is the chart without {}", c.without.join(", "), if c.without.len() == 1 { "it" } else { "them" }));
     }
     if !form.is_empty() {
         tip.push(format!("Form now: {form} against your rested level on this map"));
+    }
+    if let Some(note) = &c.unread {
+        tip.push(format!("{note}%: you haven't learned to read this map's SV yet. Accuracy rises as you replay it; the playlist offers it at the rate for the learned map"));
     }
     match c.pp.filter(|_| c.ranked) {
         None => tip.push(c.pp_expected.map_or_else(|| "No pp: no osu! star rating for this map".into(), |v| format!("~{v:.0}pp at the expected accuracy if this map and rate gave pp"))),
@@ -194,7 +218,7 @@ pub fn duration(s: f64) -> String {
 
 /// Context line of the main window: dan before the rate, so the rate note goes first when the line is cut.
 pub fn context(a: &Analysis, dan: Option<&str>, mode: &str) -> String {
-    format!("{}K{}  ·  {:.2}×{mode}{}", a.keys, dan.map_or(String::new(), |d| format!("  ·  {d}")), a.rate, ms_calc::mods::Mods::from_tag(&a.mods).labels().iter().map(|m| format!("  ·  {m}")).collect::<String>())
+    format!("{}K{}  ·  {:.2}×{mode}{}", a.keys, dan.map_or(String::new(), |d| format!("  ·  {d}")), a.rate, ms_calc::mods::Mods::from_tag(&a.mods).labels().iter().map(|m| format!("  ·  {m}")).chain(a.mods.ends_with(crate::viewer::RANDOM_ESTIMATE).then(|| "  ·  ≈ Random".to_string())).collect::<String>())
 }
 
 // osu!lazer star badge (osu.Game/Graphics/OsuColour.cs): the pill takes STAR, its text is 75 % black below 6.5 ★, Orange1 up

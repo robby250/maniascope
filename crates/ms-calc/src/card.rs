@@ -33,6 +33,13 @@ pub fn fitted_name() -> f64 {
     *C.get_or_init(|| fitted("name"))
 }
 
+/// A type's own factor on NAME (calib/taxonomy.json card.name_scale; 1 for a type not listed).
+fn name_scale(sk: Sk) -> f64 {
+    static C: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    let v = C.get_or_init(|| serde_json::from_str::<serde_json::Value>(include_str!("../../../calib/taxonomy.json")).expect("calib/taxonomy.json")["card"]["name_scale"].clone());
+    v[sk.name()].as_f64().unwrap_or(1.0)
+}
+
 /// Most entries a card holds: the main window's "Skills shown" goes to 6 (user 2026-11-02).
 pub const CARD_MAX: usize = 6;
 /// A row shows from this share of the top row (1.9.0, user 2026-11-12: "i kinda want the old way").
@@ -72,10 +79,16 @@ pub fn ranked(res: &Dict, name_at: f64) -> Vec<Cand> {
         let rows: Vec<&taxonomy::Row> = taxonomy::family(key).filter(on).collect();
         let Some(lead) = rows.iter().max_by(|a, b| sc.f(a.sk.name()).total_cmp(&sc.f(b.sk.name()))) else { continue };
         // the whole Stream family where compute rated it (5K+)
-        let r = if key == "stream" && sc.f(STREAM_FAMILY) > 0.0 { sc.f(STREAM_FAMILY) } else { sc.f(lead.sk.name()) };
+        let r = if key == "stream" && sc.f(STREAM_FAMILY) > 0.0 {
+            sc.f(STREAM_FAMILY)
+        } else if key == "chordjack" && sc.f(CHORDJACK_CARD) > 0.0 {
+            sc.f(CHORDJACK_CARD)
+        } else {
+            sc.f(lead.sk.name())
+        };
         let typed = rows.iter().filter(|x| x.child.is_some()).max_by(|a, b| sc.f(a.sk.name()).total_cmp(&sc.f(b.sk.name())));
         let plain = rows.iter().find(|x| x.child.is_none()).map_or(label, |x| x.name);
-        let name = typed.filter(|t| sc.f(t.sk.name()) >= name_at * r).map_or(plain, |t| t.name);
+        let name = typed.filter(|t| sc.f(t.sk.name()) >= name_at * name_scale(t.sk) * r).map_or(plain, |t| t.name);
         let name = if key == "sv" && memorized(res) { MEMORIZATION_SV } else { name };
         out.push((lead.sk, name, r));
     }
@@ -85,6 +98,10 @@ pub fn ranked(res: &Dict, name_at: f64) -> Vec<Cand> {
     out.sort_by(|a, b| py::round_digits(b.2, 6).total_cmp(&py::round_digits(a.2, 6)));
     out
 }
+
+/// The score key of the card's Chordjack row: the chordjack rating × CHORDJACK_CARD (compute.rs). User 2026-11-20: Chordjack
+/// led fewer cards after the jack-technique change (v1.16.0: hardest 7K 31 → 24 of 303); raised past v1.15.0's level.
+pub const CHORDJACK_CARD: &str = "chordjack_card";
 
 /// The score key of the whole Stream family on keymodes that split it (compute.rs).
 pub const STREAM_FAMILY: &str = "stream_family";
@@ -108,7 +125,8 @@ pub fn tags(series: &Series, sc: &Dict, judged: &Judged, keys: usize, k: &Knobs)
         }
         let whole = (sc.f(STREAM_FAMILY) > 0.0 && taxonomy::of(s).family == "stream").then(|| stream_family(series));
         let row = whole.as_deref().unwrap_or(series.get(s));
-        let own = if whole.is_some() { rating(row, judged, keys, k) } else { own };
+        // tag shares against the row's own rating: the whole Stream family's, the unscaled chordjack rating
+        let own = if whole.is_some() { rating(row, judged, keys, k) } else if s == Sk::chordjack && sc.f(CHORDJACK_CARD) > 0.0 { sc.f("chordjack") } else { own };
         let mut d = Dict::new();
         d.set("Tech", rating(&min_series(row, series.get(Sk::technical)), judged, keys, k) / own);
         d.set("Stamina", stamina_rating(row, judged, keys, k) / own);
@@ -206,15 +224,19 @@ pub fn describe(res: &Dict, k: &Knobs) -> (String, Vec<String>) {
         tags.push("short burst".to_string());
     }
     let shown: Vec<String> = entries.iter().flat_map(parts).collect();
-    tags.extend(also_line(&also(res), &shown));
+    tags.extend(also_line(&also_at(res, first.f("rating")), &shown));
     (dom, tags)
 }
 
 /// The families the "also" line may name, each with its member skills: the line drops a family whose member is on the
 /// rows the reader sees (`also_line`), so the app filters by its own row count (user 2026-11-15: "also LN" beside LN General).
 pub fn also(res: &Dict) -> Vec<(&'static str, Vec<&'static str>)> {
+    card(res).first().and_then(|e| if let Val::Dict(d) = e { Some(also_at(res, d.f("rating"))) } else { None }).unwrap_or_default()
+}
+
+/// `also` against the card's top row rating `top` (the caller has the card already).
+fn also_at(res: &Dict, top: f64) -> Vec<(&'static str, Vec<&'static str>)> {
     let sc = res.dict("scores").unwrap();
-    let Some(top) = card(res).first().and_then(|e| if let Val::Dict(d) = e { Some(d.f("rating")) } else { None }) else { return Vec::new() };
     let fam = |s: &str| Sk::from_name(s).map_or("", |s| if s == Sk::vibro { "vibro" } else { taxonomy::of(s).family });
     let keys = res.f("keys") as usize;
     ALSO.iter().filter_map(|(label, key, share)| {

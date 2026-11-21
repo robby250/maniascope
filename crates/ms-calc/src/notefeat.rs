@@ -242,7 +242,7 @@ pub fn features(keys: usize, notes: &[Input], at: &dyn Fn(f64) -> (f64, f64)) ->
             let col_next = times.get(col_at).map_or(9., |x| (x - t).min(9.));
             let (mine, other) = (row_hand[h], row_hand[1 - h]);
             let was = prev_hand[h];
-            let width = |m: u32| (m != 0).then(|| (31 - m.leading_zeros() - m.trailing_zeros() + 1) as f32).unwrap_or(0.);
+            let width = |m: u32| if m != 0 { (31 - m.leading_zeros() - m.trailing_zeros() + 1) as f32 } else { 0. };
             let nb = [n.col.wrapping_sub(1), n.col + 1].iter().filter(|&&c| c < keys && hand[c] == h && mine & was & bit(c) != 0).count();
             let finger = if h == 0 { n.col } else { keys - 1 - n.col };
             let centre = keys % 2 == 1 && n.col == keys / 2;

@@ -208,7 +208,7 @@ pub fn layouts(keys: usize) -> Vec<Layout> {
     }
 
     // Two stages: co-op, or solo with a stage per hand.
-    if keys > 10 && keys % 2 == 0 && keys <= 18 {
+    if keys > 10 && keys.is_multiple_of(2) && keys <= 18 {
         let stage = keys / 2;
         return vec![
             Layout { name: "Co-op", fingers: parse(&coop(stage)) },

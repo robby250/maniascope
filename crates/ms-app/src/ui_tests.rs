@@ -461,7 +461,7 @@ fn every_skill_chip_stays_inside_the_settings_page() {
         let mut h = Harness::builder().with_size(egui::vec2(width, 760.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.playlist_ui(ui), a);
         h.run(); // the second frame cuts rows from the drawn widths
         h.get_by_label("Any");
-        for chip in ["Stream", "Chordstream", "Trills", "Chordjack", "Jacks", "LN", "Technical", "Stamina", "SV", "Vibro", "Mash"] {
+        for chip in ["Stream", "Chordstream", "Trills", "Chordjack", "Jacks", "LN", "Technical", "Stamina", "SV", "Vibro", "Mash", "Inverse mod"] {
             let right = h.get_by_label(chip).rect().right() as f32;
             assert!(right <= width, "{chip} ends at {right} of {width}");
         }
@@ -470,6 +470,18 @@ fn every_skill_chip_stays_inside_the_settings_page() {
         }
         if let Ok(path) = std::env::var("MS_SHOT") { h.render().expect("render").save(format!("{path}-{width}.png")).expect("save"); }
     }
+}
+
+#[test]
+fn osu_stable_has_no_inverse_mod_chip() {
+    let ctx = egui::Context::default();
+    let mut a = app(json!({"recommendation_mode": "skills", "skills_keys": [7]}), &ctx);
+    a.views.get_mut("skills").unwrap().settings = true;
+    a.units.client = "stable".into();
+    let mut h = Harness::builder().with_size(egui::vec2(900., 760.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.playlist_ui(ui), a);
+    h.run();
+    h.get_by_label("Vibro");
+    assert!(h.query_by_label("Inverse mod").is_none());
 }
 
 #[test]
@@ -599,7 +611,7 @@ fn clicking_the_title_copies_its_search_text_and_says_so() {
     a.refresh();
     let result = viewer::analyse(&file, 1., "", &standard_params()).map(Arc::new);
     let generation = a.generation;
-    a.on_analysed(viewer::Done { request: viewer::Request { generation, path: file.clone(), rate: 1., mods: String::new() }, result });
+    a.on_analysed(viewer::Done { request: viewer::Request { generation, path: file, rate: 1., mods: String::new() }, result });
     let mut h = Harness::builder().with_size(egui::vec2(430., 300.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.main_ui(ui), a);
     h.step();
     assert!(h.query_by_label_contains("Copied").is_none());
@@ -668,7 +680,7 @@ fn stats_open_on_the_selected_maps_keymode_and_remember_the_last_one() {
     a.refresh();
     let result = viewer::analyse(&file, 1., "", &standard_params()).map(Arc::new);
     let generation = a.generation;
-    a.on_analysed(viewer::Done { request: viewer::Request { generation, path: file.clone(), rate: 1., mods: String::new() }, result });
+    a.on_analysed(viewer::Done { request: viewer::Request { generation, path: file, rate: 1., mods: String::new() }, result });
     a.set_stats(true);
     assert_eq!(a.s.stats_keys, Some(7));
     let back = Settings::from_json(&a.s.to_json());

@@ -185,7 +185,7 @@ impl App {
         let tracking = tracking_switch(&db, debug);
         let list_open = Arc::new(AtomicBool::new(s.recs_open));
         let mut app = App {
-            s, rx, list_open, mail: mail.clone(), q: q.clone(), halt: halt.clone(), play: play.clone(), busy: busy.clone(), game: game.clone(), client_name: Arc::new(Mutex::new(client.clone())), viewer: Arc::default(), db,
+            s, rx, list_open, mail, q, halt, play, busy, game, client_name: Arc::new(Mutex::new(client.clone())), viewer: Arc::default(), db,
             obs: Obs { note: "starting…".into(), ..Obs::default() }, shown: None, pending: None, generation: 0, requested: None, live: None, card: None, card_note: None,
             views: MODES.into_iter().map(|m| (m, view())).collect(), stats: None, stats_open: false, stats_wait: None, chips_open: HashSet::new(), revision: 0, selection_id: 0,
             units: Shown { client, miss_ratio }, result: None, status_text: String::new(), delivery: None, bg_progress: None, bg_main: false, blocker: None, foot: String::new(), recs_opened: None, open: Open::default(), save_at: None, page: None, tracking, debug,
@@ -207,7 +207,7 @@ impl App {
         // The worker: the UI thread never waits on it.
         let (mail, q, halt, play, busy, game, open) = (app.mail.clone(), app.q.clone(), app.halt.clone(), app.play.clone(), app.busy.clone(), app.game.clone(), app.list_open.clone());
         let m = mail.clone();
-        let hooks = Hooks { emit: Arc::new(move |o| m.send(Msg::Rec(o))), busy: { let b = busy.clone(); Arc::new(move || b.load(Ordering::Relaxed)) }, game: { let g = game.clone(); Arc::new(move || g.load(Ordering::Relaxed)) }, list_open: Arc::new(move || open.load(Ordering::Relaxed)) };
+        let hooks = Hooks { emit: Arc::new(move |o| m.send(Msg::Rec(o))), busy: { let b = busy; Arc::new(move || b.load(Ordering::Relaxed)) }, game: { let g = game; Arc::new(move || g.load(Ordering::Relaxed)) }, list_open: Arc::new(move || open.load(Ordering::Relaxed)) };
         let _ = spawn(crate::public::load, q.clone(), hooks, halt.clone(), db_path);
         let (v, m) = (app.viewer.clone(), mail.clone());
         std::thread::Builder::new().name("selected".into()).spawn(move || { let prm = standard_params(); v.run(&prm, |d| m.send(Msg::Analysed(d))); }).map_err(|e| e.to_string())?;
@@ -355,10 +355,10 @@ impl App {
             Some(skip) => Task::Next { skip, mode: Some(mode.into()), revision: Some(rev), candidate: Some(Box::new(c.clone())), result, selected_at: Some(selected_at), selection_id: sel },
         });
         if done.unavailable {
-            self.status_text = done.msg.clone();
+            self.status_text = done.msg;
         } else {
             let msg = format!("{} · set {} manually", done.msg, c.var);
-            self.on_rec(Out::Target { mode: mode.to_string(), revision: rev, selection_id: sel, c: Some(Box::new(c.clone())), msg, copy: done.copy.clone() });
+            self.on_rec(Out::Target { mode: mode.to_string(), revision: rev, selection_id: sel, c: Some(Box::new(c.clone())), msg, copy: done.copy });
         }
         let id = c.identity();
         for v in self.views.values_mut() {
@@ -451,7 +451,7 @@ impl App {
                 for m in MODES.into_iter().filter(|m| v.targets.iter().any(|t| t == m)) {
                     self.views.get_mut(m).expect("a tab").played = true;
                 }
-                if self.s.auto_next && v.targets.iter().any(|m| *m == self.s.mode) && self.next_enabled() {
+                if self.s.auto_next && v.targets.contains(&self.s.mode) && self.next_enabled() {
                     self.next();
                 }
             }
@@ -537,7 +537,14 @@ impl App {
 
     /// The selection's mods as the analysis takes them (`ms_calc::mods` tag): "" for the chart as written.
     fn mods(&self) -> String {
-        self.obs.mods.as_ref().map_or_else(String::new, |m| ms_calc::mods::plan(m).tag())
+        self.obs.mods.as_ref().map_or_else(String::new, |m| {
+            let p = ms_calc::mods::plan(m);
+            match (p.tag(), p.random == Some(None)) {
+                (t, true) if t.is_empty() => viewer::RANDOM_ESTIMATE.to_string(),
+                (t, true) => format!("{t}+{}", viewer::RANDOM_ESTIMATE),
+                (t, false) => t,
+            }
+        })
     }
 
     /// Reconcile the display with the effective state and ask for an analysis if needed.
@@ -637,7 +644,8 @@ impl App {
         }
         if let Some(c) = &self.card {
             state["expected"] = json!(format!("~{:.1}%", 100. * self.units.acc(c.acc_mid)));
-            state["form"] = json!(fmt::form_text(c.form, c.acc_mid, &self.units));
+            let notes: Vec<String> = [Some(fmt::form_text(c.form, c.acc_mid, &self.units)), c.unread.clone(), c.random.then(|| "≈ with Random".to_string())].into_iter().flatten().filter(|t| !t.is_empty()).collect();
+            state["form"] = json!(notes.join(" · "));
         }
         if let Some(p) = &self.views[self.mode()].target {
             state["pick"] = json!({"title": p.title, "expected": format!("~{:.1}%", 100. * self.units.acc(fmt::pick_acc(p, &self.obs, self.card.as_deref()))), "set": format!("{:.2}× {}", p.rate, fmt::wanted_mod(p.rate))});

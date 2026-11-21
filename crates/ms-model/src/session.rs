@@ -417,6 +417,7 @@ impl Session {
         for (map, attempts) in &self.attempts_by_map {
             let Some(chart) = bare(map) else { continue };
             let entry = charts.entry(chart).or_default();
+            entry.reads = attempts.iter().filter(|a| a.start_id.is_some_and(|s| active.contains(&s))).count() as f64;
             let mut finished: Vec<&Arc<Attempt>> = attempts.iter().filter(|a| a.finished).collect();
             finished.sort_by(|a, b| a.end.total_cmp(&b.end));
             for a in finished {
@@ -486,20 +487,14 @@ impl Session {
         let at = |minutes: f64| m.penalty(&self.consts, keys, None, minutes, 0., Some(1.), clock) * unit;
         let cold = at(self.activation(keys, None)) - fatigue - (at(WARM_MINUTES) - at(f64::INFINITY));
         let form = self.correction(keys, None);
-        let reason = if cold > FORM_NOTICE {
-            Some("warming up")
-        } else if rusty.is_some() {
-            rusty
-        } else if fatigue > FORM_NOTICE / 2. {
-            Some("fading")
-        } else if form < -FORM_NOTICE {
-            Some("on form")
-        } else if form > FORM_NOTICE {
-            Some("off form")
-        } else {
-            None
-        };
-        (reason, cold + fatigue + form + rust)
+        // the readout names the biggest term on the side the total falls (user 2026-11-21: "warming up +0.0%" two hours in,
+        // an on-form session outweighing a cold keymode); nothing when the total is under notice
+        let total = cold + fatigue + form + rust;
+        let terms = [("warming up", cold), ("rusty", rust), ("fading", fatigue), (if form < 0. { "on form" } else { "off form" }, form)];
+        let reason = (total.abs() > FORM_NOTICE)
+            .then(|| terms.iter().filter(|t| t.1 * total > 0.).max_by(|a, b| a.1.abs().total_cmp(&b.1.abs())).map(|t| t.0))
+            .flatten();
+        (reason, total)
     }
 
     fn zs(&self) -> Vec<(&Arc<Attempt>, f64)> {

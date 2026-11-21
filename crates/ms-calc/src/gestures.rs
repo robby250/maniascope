@@ -85,7 +85,7 @@ fn packets(notes: &Notes, rows: &Rows, hand_of: &[u8], window: f64) -> (Vec<Pack
             let tl = notes.t[*group.last().unwrap()];
             let cols = group.iter().fold(0u32, |m, &i| m | 1 << notes.c[i]);
             if t0 == tl {
-                let mean = py::sum(std::iter::repeat(t0).take(group.len())) / group.len() as f64;
+                let mean = py::sum(std::iter::repeat_n(t0, group.len())) / group.len() as f64;
                 out.push(Packet { center: mean, hand: h, ids: *start..ids.len(), cols, span: 0.0, direction: 0.0, gap: 0.0, held: *group_hold });
             } else {
                 let dirs: i64 = group.windows(2).map(|w| if notes.c[w[1]] > notes.c[w[0]] { 1 } else { -1 }).sum();
@@ -426,7 +426,7 @@ pub struct Analysis {
     pub rows: Rows,
 }
 
-pub fn analyse(chart: &Chart, rate: f64, k: &crate::params::Knobs) -> Analysis {
+pub fn analyse(chart: &Chart, rate: f64, rows: &[crate::demand::Row], k: &crate::params::Knobs) -> Analysis {
     let bin_seconds = k.BIN;
     let origin = chart.t.first().copied().unwrap_or(0.0);
     let conv = |x: f64| (x - origin) * 0.001 / rate;
@@ -438,27 +438,13 @@ pub fn analyse(chart: &Chart, rate: f64, k: &crate::params::Knobs) -> Analysis {
     let first = notes.t[0];
     let max_e = notes.e.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let bins = ((max_e - first) / bin_seconds + 1e-9) as usize + 1;
-    let mut rows: Rows = Vec::with_capacity(nn);
-    let mut at = 0.0f64;
-    let mut start = 0usize;
-    for i in 0..nn {
-        let t = notes.t[i];
-        if i > start && t - at > 0.003 {
-            rows.push((at, start, i));
-            start = i;
-        }
-        if i == start {
-            at = t;
-        }
-    }
-    rows.push((at, start, nn));
+    let rows: Rows = rows.iter().map(|r| (notes.t[r.start], r.start, r.end)).collect();
     crate::tick::lap("g.head");
-    let half = chart.keys / 2;
-    let assignments: &[bool] = if chart.keys % 2 == 1 { &[false, true] } else { &[false] };
+    let assignments = crate::demand::splits(chart.keys);
     let mut js: Vec<[Vec<f64>; 5]> = Vec::new();
     let window = chart.great_window();
     for &cl in assignments {
-        let hand_of: Vec<u8> = (0..chart.keys).map(|c| if c < half || (cl && c == half) { 0 } else { 1 }).collect();
+        let hand_of = crate::demand::hand_of(chart.keys, cl);
         js.push(jumptrills(&notes, &rows, &hand_of, window));
     }
     crate::tick::lap("g.jumptrills");

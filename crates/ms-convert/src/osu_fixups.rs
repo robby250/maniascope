@@ -27,7 +27,6 @@ fn strip_orphan_inherited_timing_points(osu: String) -> String {
     let mut out = String::with_capacity(osu.len());
     let mut in_section = false;
     let mut seen_uninherited = false;
-    let mut dropped = 0;
 
     for line in osu.split_inclusive('\n') {
         let trimmed = line.trim();
@@ -42,22 +41,13 @@ fn strip_orphan_inherited_timing_points(osu: String) -> String {
             // time,beatLength,meter,sampleSet,sampleIndex,volume,uninherited,effects
             match trimmed.split(',').nth(6).map(str::trim) {
                 Some("1") => seen_uninherited = true,
-                Some(_) => {
-                    
-                    dropped += 1;
-                    continue;
-                }
+                Some(_) => continue,
                 None => {}
             }
         }
 
         out.push_str(line);
     }
-
-    if dropped > 0 {
-        
-    }
-
     out
 }
 
@@ -110,7 +100,7 @@ fn replace_lines(osu: String, prefix: &str, f: impl Fn(&str) -> Option<String>) 
     for line in osu.split_inclusive('\n') {
         let trimmed = line.trim_end_matches(['\n', '\r']);
 
-        match trimmed.strip_prefix(prefix).and_then(|v| f(v)) {
+        match trimmed.strip_prefix(prefix).and_then(&f) {
             Some(replacement) => {
                 out.push_str(&replacement);
                 out.push('\n');

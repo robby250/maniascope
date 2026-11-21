@@ -1286,7 +1286,7 @@ mod tests {
                     continue;
                 }
                 let x = mania::column_x(col, keys) as i32;
-                if (seed >> 40) % 5 == 0 {
+                if (seed >> 40).is_multiple_of(5) {
                     let end = time + 375;
                     busy[col] = end;
                     osu.push_str(&format!("{},192,{},128,0,{}:0:0:0:0:\n", x, time, end));

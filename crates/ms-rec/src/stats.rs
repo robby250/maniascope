@@ -451,10 +451,10 @@ pub fn build(rec: &Engine, db: &Db) -> Result<Profile> {
     source.prefetch(db, usable.iter().filter_map(|r| Some(source_key(r.sha.as_deref()?, r.rate))))?;
     for r in &usable {
         let id = (r.chart.clone(), r.rate.to_bits());
-        if !dicts.contains_key(&id) {
+        if let std::collections::hash_map::Entry::Vacant(e) = dicts.entry(id) {
             let md5 = (r.chart.len() == 32).then_some(r.chart.as_str());
             if let (Some(d), _) = source.of(db, r.sha.as_deref(), md5, r.b, Some(r.rate))? {
-                dicts.insert(id, d);
+                e.insert(d);
             }
         }
     }
@@ -479,7 +479,7 @@ pub fn build(rec: &Engine, db: &Db) -> Result<Profile> {
             charts.iter().filter_map(|(k, r)| Some((*k, (ctx.feats(r).overall.ln(), ctx.miss(ctx.feats(r), &format!("stats:{}", r.chart), ms_calc::py::round_digits(r.rate, 2))?)))).collect()
         } else { HashMap::default() };
         let mut names = vec!["overall".to_string()];
-        names.extend(skills::dimensions(keys).iter().map(|n| n.key.clone()));
+        names.extend(skills::dimensions(keys).iter().filter(|n| n.key != skills::INVERT_MOD).map(|n| n.key.clone())); // a mod, not a skill of the player's
         let mut groups: BTreeMap<String, Group> = BTreeMap::new();
         let shown = |r: &Evidence| ctx.dict(r).map_or(0., |d| d.f("overall"));
         for group in &names {

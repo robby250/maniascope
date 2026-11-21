@@ -22,7 +22,7 @@ fn args(c: &Consts) -> WarmupArgs {
 }
 
 fn fit(c: &Consts, rows: Vec<Row>, f: &[Feats], now: f64) -> Fit {
-    personal_fit(c, rows, f, now, &HashMap::default(), KNOBS, &args(c))
+    personal_fit(c, rows, f, now, &HashMap::default(), KNOBS, &args(c), &HashMap::default())
 }
 
 /// Forty three-hour sessions of two-minute maps with a known warm-up and fatigue; the same maps recur.

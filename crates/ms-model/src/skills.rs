@@ -64,17 +64,28 @@ fn trees() -> &'static Trees {
     })
 }
 
+/// The Skills tab's "Inverse mod" (user 2026-11-20, R10): any chart played with lazer's Invert at the player's level, offered
+/// with the mod on. A dimension of every keymode after the pattern tree; a chart counts as it only when rated under Invert
+/// (its features' "invert"). Separate from LN Inverse (charts written as inverse).
+pub const INVERT_MOD: &str = "invert_mod";
+
+fn invert_node() -> &'static Skill {
+    static N: OnceLock<Skill> = OnceLock::new();
+    N.get_or_init(|| Skill { key: INVERT_MOD.to_string(), name: "Inverse mod", members: vec![INVERT_MOD], children: Vec::new(),
+                             tip: "Any map at your level, played with osu!lazer's Invert mod (every note a hold, the gaps between them the holds). Not LN Inverse: those maps are written that way." })
+}
+
 pub fn tree(keys: i64) -> &'static [Skill] {
     if keys == 4 { &trees().four } else { &trees().wide }
 }
 
 /// The tree's nodes, parents before their children.
 pub fn dimensions(keys: i64) -> Vec<&'static Skill> {
-    tree(keys).iter().flat_map(|p| std::iter::once(p).chain(&p.children)).collect()
+    tree(keys).iter().flat_map(|p| std::iter::once(p).chain(&p.children)).chain(std::iter::once(invert_node())).collect()
 }
 
 pub fn node(key: &str) -> Option<&'static Skill> {
-    trees().all.iter().find(|n| n.key == key)
+    trees().all.iter().find(|n| n.key == key).or_else(|| (key == INVERT_MOD).then(invert_node))
 }
 
 pub fn name(key: &str) -> &'static str {
@@ -84,7 +95,7 @@ pub fn name(key: &str) -> &'static str {
 /// The strongest of a dimension's members.
 pub fn member_value<S: AsRef<str>>(f: &ms_calc::val::Dict, members: &[S]) -> f64 {
     let sk = f.dict("sk");
-    members.iter().filter_map(|m| Some(sk?.get(m.as_ref())?.f().max(0.))).fold(0f64, f64::max)
+    members.iter().filter_map(|m| if m.as_ref() == INVERT_MOD { Some(f.fget("invert", 0.)) } else { Some(sk?.get(m.as_ref())?.f().max(0.)) }).fold(0f64, f64::max)
 }
 
 /// skill_practice.strengths and practice_strengths of one chart-rate: (key, raw, practice) per dimension.
@@ -92,7 +103,8 @@ fn strengths(f: &ms_calc::val::Dict) -> Vec<(&'static str, f64, f64)> {
     let keys = f.get("keys").map_or(7, |k| k.f() as i64);
     let profile = f.dict("tech_profile");
     dimensions(keys).into_iter().map(|node| {
-        let raw = member_value(f, &node.members);
+        // A chart rated under Invert counts only as Inverse mod: its holds are the mod's, not the map's LN.
+        let raw = if (node.key == INVERT_MOD) == (f.fget("invert", 0.) > 0.) { member_value(f, &node.members) } else { 0. };
         // Technical practice needs actual technical character, not just an awkward local peak in a smooth chart.
         let leaf = node.key.rsplit('/').next().unwrap_or("");
         let technical = node.key.split('/').next() == Some("technical");
@@ -113,7 +125,9 @@ pub fn relative(f: &ms_calc::val::Dict, value: f64) -> f64 {
 /// a technical dimension read at its practice value (actual technical character, not an awkward local peak); avoidance reads
 /// the raw one (a material forbidden passage stays forbidden).
 pub fn standing(f: &ms_calc::val::Dict) -> Vec<(&'static str, f64, f64, f64)> {
-    strengths(f).into_iter().map(|(key, raw, practice)| (key, raw, relative(f, practice.min(raw)), relative(f, raw))).collect()
+    // Inverse mod's value is the chart's Invert flag, not a rating beside the others: a chart under Invert stands wholly as
+    // it (read against its strongest skill it stood at 1/8 and never counted: no Invert map reached the list, user 2026-11-21)
+    strengths(f).into_iter().map(|(key, raw, practice)| if key == INVERT_MOD { (key, raw, raw.min(1.), raw.min(1.)) } else { (key, raw, relative(f, practice.min(raw)), relative(f, raw)) }).collect()
 }
 
 /// The standing a skill needs to count on a chart: the card's SHOW.
@@ -260,7 +274,7 @@ fn normalize_plain(selected: &[String]) -> Vec<String> {
             }
         }
     }
-    trees().all.iter().filter(|n| {
+    trees().all.iter().chain(std::iter::once(invert_node())).filter(|n| {
         states.get(&n.key).is_some_and(|s| !n.key.contains('/') || states.get(n.key.split('/').next().unwrap()) != Some(s))
     }).map(|n| format!("{}{}", if states[&n.key] < 0 { "!" } else { "" }, n.key)).collect()
 }
@@ -422,6 +436,20 @@ mod tests {
         let d = demanded(&f);
         assert!(d.contains(&"stream") && d.contains(&"trills") && !d.contains(&"ln"), "{d:?}");
         assert_eq!(relative(&f, 3.), 1.);
+    }
+
+    #[test]
+    fn a_chart_under_invert_counts_only_as_inverse_mod() {
+        let mut sk = ms_calc::val::Dict::new();
+        sk.set("stream", 8.); // ratings on the skill scale: the flag must not be read against them
+        sk.set("ln", 6.4);
+        let mut f = ms_calc::val::Dict::new();
+        f.set("keys", 7i64);
+        f.set("sk", ms_calc::val::Val::Dict(sk));
+        assert!(!demanded(&f).contains(&INVERT_MOD) && demanded(&f).contains(&"stream"));
+        f.set("invert", 1.);
+        assert_eq!(demanded(&f), vec![INVERT_MOD]);
+        assert_eq!(normalize(&[INVERT_MOD.to_string(), "stream".to_string()]), vec!["stream".to_string(), INVERT_MOD.to_string()], "a pick that stays picked");
     }
 
     /// consts.json's fit families are the skill table's `fit` column (P3 generates them from it).

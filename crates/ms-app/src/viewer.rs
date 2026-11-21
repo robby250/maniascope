@@ -113,13 +113,32 @@ fn bars(names: &[(String, String)], sc: &Dict) -> Vec<(String, String, f64)> {
     out
 }
 
+/// The viewer's mods suffix for Random before its seed is drawn (`App::mods`).
+pub const RANDOM_ESTIMATE: &str = "RD?";
+
 pub fn analyse(path: &Path, rate: f64, mods: &str, prm: &Params) -> Result<Analysis, String> {
-    let mut data = std::fs::read(path).map_err(|e| e.to_string())?;
-    if !mods.is_empty() {
-        data = ms_calc::mods::tagged(&data, mods); // the chart as played with the mods: its own file
+    let plain = std::fs::read(path).map_err(|e| e.to_string())?;
+    // `RANDOM_ESTIMATE` (Random before its seed): the mean over the three fixed shuffles (plan 2026-11-20 D)
+    let tags: Vec<String> = match mods.strip_suffix(RANDOM_ESTIMATE) {
+        Some(rest) => ms_calc::mods::RANDOM_SEEDS.iter().map(|&s| ms_calc::mods::Mods { random: Some(Some(s)), ..ms_calc::mods::Mods::from_tag(rest.trim_end_matches('+')) }.tag()).collect(),
+        None => vec![mods.to_string()],
+    };
+    let mut all = Vec::new();
+    for tag in &tags {
+        // the chart as played with the mods: its own file
+        let data = if tag.is_empty() { plain.clone() } else { ms_calc::mods::tagged(&plain, tag) };
+        let chart = parse(&data).map_err(|e| format!("{e:?}"))?;
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compute_selected(&data, &chart, rate, true, prm))).map_err(|_| "internal error (see crash.log)".to_string())??;
+        all.push((data, chart, res));
     }
-    let chart = parse(&data).map_err(|e| format!("{e:?}"))?;
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compute_selected(&data, &chart, rate, true, prm))).map_err(|_| "internal error (see crash.log)".to_string())??;
+    let res = if all.len() == 1 { all[0].2.clone() } else {
+        let vals: Vec<Val> = all.iter().map(|x| Val::Dict((*x.2).clone())).collect();
+        match ms_calc::val::mean(&vals.iter().collect::<Vec<_>>()) {
+            Val::Dict(d) => std::sync::Arc::new(d),
+            _ => unreachable!("a mean of dicts is a dict"),
+        }
+    };
+    let (data, chart) = (&all[0].0, &all[0].1);
     let sc = res.dict("scores").ok_or("no scores")?;
     let keys = chart.keys as i64;
     let names: Vec<(String, String)> = ms_calc::taxonomy::rated(chart.keys).iter().filter(|s| ms_calc::taxonomy::shown(**s)).map(|s| (s.name().to_string(), display_name(*s).to_string())).collect();
@@ -133,7 +152,7 @@ pub fn analyse(path: &Path, rate: f64, mods: &str, prm: &Params) -> Result<Analy
         span: (chart.len() >= 2).then(|| (chart.t[0], chart.last_end())), timeline: res.get("timeline").map_or_else(Vec::new, Val::list_f), entries, tags: describe(&res, &prm.k).1.into_iter().filter(|t| !t.starts_with("also ")).collect(), also: ms_calc::card::also(&res),
         bars: bars(&names, sc), names, tech,
         dan_vibro: ms_rec::dans::vibro_runs(&chart, rate, &prm.k), title: chart.title.clone(), artist: chart.artist.clone(), version: chart.version.clone(), creator: chart.creator.clone(),
-        o2jam: ms_rec::o2jam::level(keys, |k| sc.fget(k, 0.), res.fget("ln_notes", 0.) / res.fget("notes", 1.).max(1.), (chart.len() >= 2).then(|| (chart.last_end() - chart.t[0]) / 1000. / rate).unwrap_or(0.), res.fget("notes", 0.)),
+        o2jam: ms_rec::o2jam::level(keys, |k| sc.fget(k, 0.), res.fget("ln_notes", 0.) / res.fget("notes", 1.).max(1.), if chart.len() >= 2 { (chart.last_end() - chart.t[0]) / 1000. / rate } else { 0. }, res.fget("notes", 0.)),
     })
 }
 
@@ -222,6 +241,26 @@ mod tests {
     use super::*;
     use ms_calc::features::standard_params;
     use std::sync::mpsc::channel;
+
+    /// Plan 2026-11-20 D: a one-hand trill (columns 1–2 of 4K) under Random is one hand's trill only for the shuffles that keep
+    /// both columns on a hand: the three-shuffle mean rates it apart from the chart as written, the same every time.
+    #[test]
+    fn random_before_its_seed_is_the_mean_of_three_shuffles() {
+        let dir = std::env::temp_dir().join(format!("ms-random-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("trill.osu");
+        let mut text = "osu file format v14\n\n[General]\nMode: 3\n\n[Difficulty]\nCircleSize:4\nOverallDifficulty:8\n\n[HitObjects]\n".to_string();
+        for i in 0..600 {
+            text.push_str(&format!("{},192,{},1,0,0:0:0:0:\n", [64, 192][i % 2], 1000 + i * 70));
+        }
+        std::fs::write(&path, text).unwrap();
+        let prm = standard_params();
+        let plain = analyse(&path, 1., "", &prm).unwrap();
+        let (a, b) = (analyse(&path, 1., RANDOM_ESTIMATE, &prm).unwrap(), analyse(&path, 1., RANDOM_ESTIMATE, &prm).unwrap());
+        assert_eq!((a.overall, &a.bars), (b.overall, &b.bars));
+        assert!((a.overall / plain.overall - 1.).abs() > 0.01, "{} {}", a.overall, plain.overall);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn write(path: &Path, gap: i64) {
         let mut text = "osu file format v14\n\n[General]\nMode: 3\n\n[Difficulty]\nCircleSize:4\nOverallDifficulty:8\n\n[TimingPoints]\n0,500,4,1,0,100,1,0\n\n[HitObjects]\n".to_string();

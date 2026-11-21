@@ -12,7 +12,7 @@ fn days(s: &str) -> f64 {
     (era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy) as f64 + p(11, 13) as f64 / 24. + p(14, 16) as f64 / 1440. + p(17, 19) as f64 / 86400.
 }
 
-fn solve(a: &mut Vec<Vec<f64>>, b: &mut Vec<f64>) -> Vec<f64> {
+fn solve(a: &mut [Vec<f64>], b: &mut [f64]) -> Vec<f64> {
     let n = b.len();
     for i in 0..n {
         a[i][i] += 1e-6;

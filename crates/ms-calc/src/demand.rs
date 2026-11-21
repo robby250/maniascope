@@ -50,9 +50,9 @@ pub fn part_keys(wide: bool) -> Vec<P> {
 }
 
 /// A closed burst of same-column re-hits: short ones are minijacks at each re-hit's speed weight, longer ones sustained jacks.
-fn add_burst(comp: &mut [f64], burst: &[(usize, f64)], max: usize) {
+fn add_burst(comp: &mut [f64], nbins: usize, burst: &[(usize, f64)], max: usize) {
     for &(b, w) in burst {
-        if burst.len() <= max { comp[b * NP + P::mj as usize] += w } else { comp[b * NP + P::sus as usize] += 1.0 }
+        if burst.len() <= max { comp[(P::mj as usize) * nbins + b] += w } else { comp[(P::sus as usize) * nbins + b] += 1.0 }
     }
 }
 
@@ -118,7 +118,25 @@ pub struct Geometry {
     pub roll: Vec<bool>,
 }
 
-pub fn geometry(chart: &Chart, rate: f64, k: &Knobs) -> Geometry {
+/// The chart's rows at `rate`: notes within 3 ms of real time of the row's first note. The one row rule of every analysis.
+pub fn rows(chart: &Chart, rate: f64) -> Vec<Row> {
+    let (n, limit, inv) = (chart.len(), 3.0 * rate, 0.001 / rate);
+    let mut rows = Vec::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        let mut m = i + 1;
+        while m < n && chart.t[m] - chart.t[i] <= limit {
+            m += 1;
+        }
+        let mask = chart.col[i..m].iter().fold(0u32, |a, &c| a | 1 << c);
+        rows.push(Row { t: chart.t[i] * inv, mask, start: i, end: m });
+        i = m;
+    }
+    rows
+}
+
+/// `rows` = `rows(chart, rate)`, built once per pass by the caller.
+pub fn geometry(chart: &Chart, rate: f64, rows: &[Row], k: &Knobs) -> Geometry {
     let inv = 0.001 / rate;
     let n = chart.len();
     let times: Vec<f64> = chart.t.iter().map(|&t| t * inv).collect();
@@ -129,17 +147,7 @@ pub fn geometry(chart: &Chart, rate: f64, k: &Knobs) -> Geometry {
     for r in crate::structure::column_runs(chart, rate, k) {
         r.notes.iter().for_each(|&i| if r.vibro { vib[i] = true } else { lj[i] = true });
     }
-    let mut rows = Vec::with_capacity(n);
-    let mut i = 0;
-    while i < n {
-        let mut m = i + 1;
-        while m < n && times[m] - times[i] <= 0.003 {
-            m += 1;
-        }
-        let mask = columns[i..m].iter().fold(0u32, |a, &c| a | 1 << c);
-        rows.push(Row { t: times[i], mask, start: i, end: m });
-        i = m;
-    }
+    let rows = rows.to_vec();
     let nr = rows.len();
     let mut roll = vec![false; nr];
     let mut run: Vec<usize> = Vec::new();
@@ -183,6 +191,35 @@ pub enum Trill {
 }
 
 /// Pattern Tech evidence per row (inserted repeats, chained switches).
+/// Each row's trill family under a hand split: four rows of chords (≥ 2 notes) within 3 × TRILL_GAP whose hands alternate one
+/// against the other (Jumptrill), or, under 5K, two disjoint chords of both hands alternating (Split Trill). Demand and the
+/// tech profile read the same.
+pub fn trills(rows: &[Row], keys: usize, centre_left: bool, k: &Knobs) -> Vec<Trill> {
+    let [lo, hi] = hand_masks(keys, centre_left);
+    let hands = |m: u32| ((m & lo != 0) as u8) | ((m & hi != 0) as u8) << 1;
+    let nr = rows.len();
+    let mut trill = vec![Trill::None; nr];
+    for r in 3..nr {
+        let (a, bb, cc, dd) = (rows[r - 3].mask, rows[r - 2].mask, rows[r - 1].mask, rows[r].mask);
+        if a.count_ones().min(bb.count_ones()).min(cc.count_ones()).min(dd.count_ones()) >= 2 && rows[r].t - rows[r - 3].t < 3.0 * k.TRILL_GAP {
+            let (ha, hb, hc, hd) = (hands(a), hands(bb), hands(cc), hands(dd));
+            let kind = if ha.count_ones() == 1 && hb.count_ones() == 1 && ha != hb && ha == hc && hb == hd {
+                Trill::Jumptrill
+            } else if keys < 5 && cc == a && dd == bb && a & bb == 0 && ha.count_ones() == 2 && hb.count_ones() == 2 {
+                Trill::Splittrill
+            } else {
+                Trill::None
+            };
+            if kind != Trill::None {
+                for x in &mut trill[r - 3..=r] {
+                    *x = kind;
+                }
+            }
+        }
+    }
+    trill
+}
+
 pub fn pattern_evidence(rows: &[Row], trill: &[Trill], k: &Knobs) -> (Vec<f64>, Vec<f64>) {
     let n = rows.len();
     let rep: Vec<bool> =
@@ -222,38 +259,19 @@ pub fn pattern_evidence(rows: &[Row], trill: &[Trill], k: &Knobs) -> (Vec<f64>, 
 /// gap ≤ 0.2 s, and the other hand plays on at most 3 of the run's rows (its own or between) and chords at most one trill row (more is a chord pattern or bracket) and never alternates two columns itself (that is
 /// a split trill or bracket). hand_patterns only finds trills where the other hand is silent: the user's 2,201 7K charts
 /// never rated 1H Trill above .28 (2026-11-10, "0 1h trill plays").
-fn mixed_trills(rows: &[Row], hand_mask: [u32; 2], oht: &mut [bool]) {
-    for (h, &hm) in hand_mask.iter().enumerate() {
-        let other = hand_mask[1 - h];
-        let mine: Vec<usize> = (0..rows.len()).filter(|&r| rows[r].mask & hm != 0).collect();
-        let mut between: Vec<u32> = Vec::new();
-        for w in mine.windows(4) {
-            let m = [0, 1, 2, 3].map(|x| rows[w[x]].mask & hm);
-            if m.iter().any(|x| x & (x - 1) != 0) || m[0] == m[1] || m[0] != m[2] || m[1] != m[3] {
-                continue;
-            }
-            let gaps = [0, 1, 2].map(|x| rows[w[x + 1]].t - rows[w[x]].t);
-            let (mx, mn) = gaps.iter().fold((f64::MIN, f64::MAX), |a, &g| (a.0.max(g), a.1.min(g)));
-            if mx > 0.2 || mx > 1.6 * mn {
-                continue;
-            }
-            between.clear();
-            between.extend((w[0]..=w[3]).map(|r| rows[r].mask & other).filter(|&x| x != 0));
-            let alternating = between.len() >= 3 && between.windows(3).all(|t| t[0] == t[2] && t[0] != t[1] && t[0] & (t[0] - 1) == 0);
-            // Chords on two of the four trill rows are a chord pattern (4K "[13]2[14]2" chordjack), not one hand trilling.
-            let chords = w.iter().filter(|&&r| rows[r].mask & other != 0).count();
-            if between.len() <= 3 && !alternating && chords <= 1 {
-                w.iter().for_each(|&r| oht[r] = true);
-            }
-        }
-    }
+/// What 1H Trill and Anchor read of a hand split that no rate changes: the candidate rows by their masks alone.
+pub struct HandTopo {
+    /// last row of each four-row single-note trill window of one hand (the rest of the row nearly that hand only)
+    trill: Vec<usize>,
+    /// four rows of one hand trilling single notes while the other hand stays out of a pattern (`mixed_trills`)
+    mixed: Vec<[usize; 4]>,
+    /// each column's rows
+    occs: Vec<Vec<usize>>,
 }
 
-/// Row membership of 1H Trill and Anchor.
-fn hand_patterns(rows: &[Row], hand_mask: [u32; 2], keys: usize) -> (Vec<bool>, Vec<bool>) {
+pub fn hand_topo(rows: &[Row], hand_mask: [u32; 2], keys: usize) -> HandTopo {
     let n = rows.len();
-    let mut oht = vec![false; n];
-    let mut anc = vec![false; n];
+    let mut trill = Vec::new();
     for hm in hand_mask {
         for r in 3..n {
             let (a, b) = (rows[r - 3].mask & hm, rows[r - 2].mask & hm);
@@ -270,20 +288,30 @@ fn hand_patterns(rows: &[Row], hand_mask: [u32; 2], keys: usize) -> (Vec<bool>, 
                     + (rows[r].mask != b) as u32)
                     <= 1
             {
-                let g = [rows[r - 1].t - rows[r - 2].t, rows[r].t - rows[r - 1].t, 0.0];
-                let g0 = rows[r - 2].t - rows[r - 3].t;
-                let gaps = [g0, g[0], g[1]];
-                let mx = gaps.iter().cloned().fold(f64::MIN, f64::max);
-                let mn = gaps.iter().cloned().fold(f64::MAX, f64::min);
-                if mx <= 0.2 && mx <= 1.6 * mn {
-                    for x in &mut oht[r - 3..=r] {
-                        *x = true;
-                    }
-                }
+                trill.push(r);
             }
         }
     }
-    let mut others = vec![0usize; keys];
+    let mut mixed = Vec::new();
+    let mut between: Vec<u32> = Vec::new();
+    for (h, &hm) in hand_mask.iter().enumerate() {
+        let other = hand_mask[1 - h];
+        let mine: Vec<usize> = (0..n).filter(|&r| rows[r].mask & hm != 0).collect();
+        for w in mine.windows(4) {
+            let m = [0, 1, 2, 3].map(|x| rows[w[x]].mask & hm);
+            if m.iter().any(|x| x & (x - 1) != 0) || m[0] == m[1] || m[0] != m[2] || m[1] != m[3] {
+                continue;
+            }
+            between.clear();
+            between.extend((w[0]..=w[3]).map(|r| rows[r].mask & other).filter(|&x| x != 0));
+            let alternating = between.len() >= 3 && between.windows(3).all(|t| t[0] == t[2] && t[0] != t[1] && t[0] & (t[0] - 1) == 0);
+            // Chords on two of the four trill rows are a chord pattern (4K "[13]2[14]2" chordjack), not one hand trilling.
+            let chords = w.iter().filter(|&&r| rows[r].mask & other != 0).count();
+            if between.len() <= 3 && !alternating && chords <= 1 {
+                mixed.push([w[0], w[1], w[2], w[3]]);
+            }
+        }
+    }
     // every column's rows in one walk over the rows (it walked them once per column)
     let mut occs: Vec<Vec<usize>> = vec![Vec::new(); keys];
     for (r, row) in rows.iter().enumerate() {
@@ -295,9 +323,39 @@ fn hand_patterns(rows: &[Row], hand_mask: [u32; 2], keys: usize) -> (Vec<bool>, 
             m &= m - 1;
         }
     }
+    HandTopo { trill, mixed, occs }
+}
+
+/// Row membership of 1H Trill and Anchor at the rows' rate; `mixed`: one hand's trill beside the other's notes counts.
+fn hand_patterns(rows: &[Row], topo: &HandTopo, keys: usize, mixed: bool) -> (Vec<bool>, Vec<bool>) {
+    let n = rows.len();
+    let mut oht = vec![false; n];
+    let mut anc = vec![false; n];
+    for &r in &topo.trill {
+        let g = [rows[r - 1].t - rows[r - 2].t, rows[r].t - rows[r - 1].t, 0.0];
+        let g0 = rows[r - 2].t - rows[r - 3].t;
+        let gaps = [g0, g[0], g[1]];
+        let mx = gaps.iter().cloned().fold(f64::MIN, f64::max);
+        let mn = gaps.iter().cloned().fold(f64::MAX, f64::min);
+        if mx <= 0.2 && mx <= 1.6 * mn {
+            for x in &mut oht[r - 3..=r] {
+                *x = true;
+            }
+        }
+    }
+    if mixed {
+        for w in &topo.mixed {
+            let gaps = [0, 1, 2].map(|x| rows[w[x + 1]].t - rows[w[x]].t);
+            let (mx, mn) = gaps.iter().fold((f64::MIN, f64::MAX), |a, &g| (a.0.max(g), a.1.min(g)));
+            if !(mx > 0.2 || mx > 1.6 * mn) {
+                w.iter().for_each(|&r| oht[r] = true);
+            }
+        }
+    }
+    let mut others = vec![0usize; keys];
     for c in 0..keys {
         let bit = 1u32 << c;
-        let occ = &occs[c];
+        let occ = &topo.occs[c];
         let mut run: Vec<usize> = occ.first().copied().into_iter().collect();
         for (x, &a) in occ.iter().enumerate() {
             let z = occ.get(x + 1).copied();
@@ -307,7 +365,7 @@ fn hand_patterns(rows: &[Row], hand_mask: [u32; 2], keys: usize) -> (Vec<bool>, 
                     continue;
                 }
             }
-            if run.len() >= 5 && run.len() * 3 >= run[run.len() - 1] - run[0] + 1 {
+            if run.len() >= 5 && run.len() * 3 > run[run.len() - 1] - run[0] {
                 others.iter_mut().for_each(|o| *o = 0);
                 for r in run[0]..=run[run.len() - 1] {
                     let m = rows[r].mask & !bit;
@@ -332,9 +390,23 @@ fn hand_patterns(rows: &[Row], hand_mask: [u32; 2], keys: usize) -> (Vec<bool>, 
     (oht, anc)
 }
 
+/// The one hand split: each hand's columns as a mask. An odd keymode's middle key goes with the left hand or with the right
+/// one, both read and averaged (`splits`; user 2026-11-03: "a thumb is a finger … do 3").
+pub fn hand_masks(keys: usize, centre_left: bool) -> [u32; 2] {
+    let left = keys / 2 + (centre_left && keys % 2 == 1) as usize;
+    let lo = ((1u64 << left) - 1) as u32;
+    [lo, ((1u64 << keys) - 1) as u32 & !lo]
+}
+
+/// The splits a keymode reads: the middle key with the left hand, then with the right; one split on an even keymode.
+pub fn splits(keys: usize) -> &'static [bool] {
+    if keys % 2 == 1 { &[true, false] } else { &[true] }
+}
+
+/// Each column's hand (0 left, 1 right) under a split.
 pub fn hand_of(keys: usize, centre_left: bool) -> Vec<u8> {
-    let half = keys / 2;
-    (0..keys).map(|c| if c < half || (keys % 2 == 1 && c == half && centre_left) { 0 } else { 1 }).collect()
+    let m = hand_masks(keys, centre_left);
+    (0..keys).map(|c| (m[1] >> c & 1) as u8).collect()
 }
 
 /// Extra outputs of a run on an SV chart: the same physical work without the reading part.
@@ -364,11 +436,12 @@ pub struct Base {
     info: Vec<f64>,
 }
 
-pub fn base(chart: &Chart, g: &Geometry, strain: Option<&[f64]>, k: &Knobs) -> Base {
+/// `bits`: the rows' pattern-information bits when the layout holds them (`Layout::info_bits`, rows = the chart's atoms).
+pub fn base(chart: &Chart, g: &Geometry, strain: Option<&[f64]>, bits: Option<&[f64]>, k: &Knobs) -> Base {
     let keys = chart.keys;
     let row_share: Vec<f64> = (0..=keys).map(|c| (c as f64).powf(-k.ROW_SHARE)).collect();
     let n = g.times.len();
-    let (times, columns, roll) = (&g.times, &g.columns, &g.roll);
+    let (times, roll) = (&g.times, &g.roll);
     let t0 = times[0];
     let max_end = g.ends.iter().cloned().fold(f64::MIN, f64::max);
     let (bin, phases) = (k.BIN, k.PHASES);
@@ -432,7 +505,9 @@ pub fn base(chart: &Chart, g: &Geometry, strain: Option<&[f64]>, k: &Knobs) -> B
             }
         }
         if gap != 0.0 {
-            read = k.W_SV * reading[top] * (6.0 * v(gap, flam, 2.0)).sqrt();
+            let speed = 6.0 * v(gap, flam, 2.0);
+            // reading cost × speed^SV_SPEED, pivot 10 rows/s (rate pairs, plan 2026-11-20 C2: slowjam 2897720 −.60 at 0.75×, +1.04 at 1.5×)
+            read = k.W_SV * reading[top] * if k.SV_SPEED == 0.5 { speed.sqrt() } else { speed.sqrt() * (speed / 60.0).powf(k.SV_SPEED - 0.5) };
         }
         let mut odd_v = 0.0;
         if gap != 0.0 && gap < 0.04 {
@@ -484,20 +559,18 @@ pub fn base(chart: &Chart, g: &Geometry, strain: Option<&[f64]>, k: &Knobs) -> B
     // chord sequence at high density): each row's −log2 under an order-1 chain over the last 128 rows (notefeat's), per keymode bit
     // (÷ keys), summed per bin; the bin's total × e^(PATTERN_INFO · max(0, that − PATTERN_INFO_B)).
     let info: Vec<f64> = if k.PATTERN_INFO == 0.0 { Vec::new() } else {
-        let mut chain = crate::notefeat::Markov::new(2f64.powi(keys as i32) - 1., 128);
         let mut out = vec![0.0f64; nbins];
-        let (mut i, mut prev) = (0usize, 0u32);
-        while i < n {
-            let mut j = i;
-            let mut mask = 0u32;
-            while j < n && times[j] - times[i] <= 0.003 {
-                mask |= 1 << columns[j];
-                j += 1;
+        let mut add = |r: &Row, x: f64| out[(nbins - 1).min(((r.t - t0) / bin) as usize)] += x;
+        match bits {
+            Some(bits) => g.rows.iter().zip(bits).for_each(|(r, &x)| add(r, x)),
+            None => {
+                let mut chain = crate::notefeat::Markov::new(2f64.powi(keys as i32) - 1., 128);
+                let mut prev = 0u32;
+                for r in &g.rows {
+                    add(r, chain.step(prev, r.mask) / keys as f64);
+                    prev = r.mask;
+                }
             }
-            let b = (nbins - 1).min(((times[i] - t0) / bin) as usize);
-            out[b] += chain.step(prev, mask) / keys as f64;
-            prev = mask;
-            i = j;
         }
         out
     };
@@ -506,11 +579,12 @@ pub fn base(chart: &Chart, g: &Geometry, strain: Option<&[f64]>, k: &Knobs) -> B
 
 /// One `_demand` run (see skill_calc._demand).
 pub fn demand(chart: &Chart, g: &Geometry, centre_left: bool, strain: Option<&[f64]>, kinds: Option<&[[f64; 5]]>, want_plain: bool, k: &Knobs) -> (Run, Option<Run>) {
-    demand_with(chart, g, &base(chart, g, strain, k), centre_left, kinds, want_plain, k)
+    demand_with(chart, g, &base(chart, g, strain, None, k), centre_left, None, kinds, want_plain, k)
 }
 
 /// `demand` on a `base` made once for the chart's hand splits.
-pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, kinds: Option<&[[f64; 5]]>, want_plain: bool, k: &Knobs) -> (Run, Option<Run>) {
+/// `topo`: the split's `hand_topo` of these rows when the layout holds it.
+pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, topo: Option<&HandTopo>, kinds: Option<&[[f64; 5]]>, want_plain: bool, k: &Knobs) -> (Run, Option<Run>) {
     crate::tick::lap("d.before");
     let keys = chart.keys;
     let wide = keys >= 5;
@@ -556,56 +630,27 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
     let mut nseen = 0usize;
     let mut previous_hand = [0.0f64; 2];
     let mut previous_mask = [0u32; 2];
-    let mut hand_mask = [0u32; 2];
-    for c in 0..keys {
-        hand_mask[hand_of[c] as usize] |= 1 << c;
-    }
+    let hand_mask = hand_masks(keys, centre_left);
     let mut held_until = f64::MIN; // the latest release so far: past it no column is held and the hold scan finds nothing
     let mut jrun = [0usize; 32];
     let mut lj_row = [0u32; 32]; // the row of each column's last hit
     let mut burst: Vec<(usize, f64)> = Vec::new(); // bin, the re-hit's minijack weight
     crate::tick::lap("d.setup");
     let rows = &g.rows;
-    let nr = rows.len();
-    let mut trill = vec![Trill::None; nr];
-    for r in 3..nr {
-        let (a, bb, cc, dd) = (rows[r - 3].mask, rows[r - 2].mask, rows[r - 1].mask, rows[r].mask);
-        if a.count_ones().min(bb.count_ones()).min(cc.count_ones()).min(dd.count_ones()) >= 2
-            && rows[r].t - rows[r - 3].t < 3.0 * k.TRILL_GAP
-        {
-            let hands = |m: u32| -> u8 {
-                let mut s = 0u8;
-                for c in 0..keys {
-                    if m >> c & 1 == 1 {
-                        s |= 1 << hand_of[c];
-                    }
-                }
-                s
-            };
-            let (ha, hb, hc, hd) = (hands(a), hands(bb), hands(cc), hands(dd));
-            let kind = if ha.count_ones() == 1 && hb.count_ones() == 1 && ha != hb && ha == hc && hb == hd {
-                Trill::Jumptrill
-            } else if !wide && cc == a && dd == bb && a & bb == 0 && ha.count_ones() == 2 && hb.count_ones() == 2 {
-                Trill::Splittrill
-            } else {
-                Trill::None
-            };
-            if kind != Trill::None {
-                for x in &mut trill[r - 3..=r] {
-                    *x = kind;
-                }
-            }
-        }
-    }
+    let trill = trills(rows, keys, centre_left, k);
     crate::tick::lap("d.trill");
     let (p_ins, p_sw) = pattern_evidence(rows, &trill, k);
     crate::tick::lap("d.evidence");
-    let (mut oht, anc) = hand_patterns(rows, hand_mask, keys);
+    let own;
+    let topo = match topo {
+        Some(t) => t,
+        None => {
+            own = hand_topo(rows, hand_mask, keys);
+            &own
+        }
+    };
+    let (oht, anc) = hand_patterns(rows, topo, keys, k.OHT_MIX > 0.0);
     crate::tick::lap("d.hand_patterns");
-    if k.OHT_MIX > 0.0 {
-        mixed_trills(rows, hand_mask, &mut oht);
-    }
-    crate::tick::lap("d.mixed_trills");
     let keys_out = part_keys(wide);
     let mut comp = vec![0.0f64; NP * nbins];
     let mut hands = vec![0.0f64; 3 * nbins];
@@ -613,7 +658,7 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
     let mut plain_x = if want_plain { vec![0.0f64; nbins] } else { Vec::new() };
     let mut plain_fine_x = if want_plain { vec![0.0f64; nfine] } else { Vec::new() };
     let mut rows_by_size = [vec![0usize; nbins], vec![0usize; nbins], vec![0usize; nbins]];
-    let o = |p: P| p as usize; // comp is bin-major: a row's parts sit side by side (they were NP series nbins apart)
+    let o = |p: P| p as usize; // comp is part-major, as `Parts` holds it (no transpose at the end)
     let mut prev_row_t = 0.0f64;
     let mut prev_row_mask = 0u32;
     let mut pending: Vec<(f64, usize)> = Vec::with_capacity(48);
@@ -634,13 +679,13 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
             Trill::Splittrill => Some(o(P::splittrill)),
         };
         rows_by_size[size.min(3) - 1][b] += 1;
-        comp[b * NP + o(P::technical)] += tech;
-        comp[b * NP + o(P::sv)] += read;
-        comp[b * NP + o(P::sv_raw)] += read;
+        comp[(o(P::technical)) * nbins + b] += tech;
+        comp[(o(P::sv)) * nbins + b] += read;
+        comp[(o(P::sv_raw)) * nbins + b] += read;
         if read != 0.0 {
             if let Some(kinds) = kinds.filter(|x| !x.is_empty()) {
                 for (q, &f) in SV_KINDS.iter().zip(kinds[top].iter()) {
-                    comp[b * NP + o(*q)] += read * f;
+                    comp[(o(*q)) * nbins + b] += read * f;
                 }
             }
         }
@@ -650,15 +695,15 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
             plain_x[b] += cross + tech + 0.0;
             plain_fine_x[fb] += cross + tech + 0.0;
         }
-        comp[b * NP + o(P::rodd)] += rodd; // 0 where the row adds none
-        comp[b * NP + o(P::rows)] += 1.0;
-        comp[b * NP + o(P::pins)] += p_ins[ri];
-        comp[b * NP + o(P::psw)] += p_sw[ri];
-        comp[b * NP + o(P::oht)] += oht[ri] as u8 as f64;
-        comp[b * NP + o(P::anc)] += anc[ri] as u8 as f64;
+        comp[(o(P::rodd)) * nbins + b] += rodd; // 0 where the row adds none
+        comp[(o(P::rows)) * nbins + b] += 1.0;
+        comp[(o(P::pins)) * nbins + b] += p_ins[ri];
+        comp[(o(P::psw)) * nbins + b] += p_sw[ri];
+        comp[(o(P::oht)) * nbins + b] += oht[ri] as u8 as f64;
+        comp[(o(P::anc)) * nbins + b] += anc[ri] as u8 as f64;
         let row_mask = row.mask;
         let any_vib = g.vib[i..j].iter().any(|&x| x);
-        comp[b * NP + o(P::vib)] += any_vib as u8 as f64;
+        comp[(o(P::vib)) * nbins + b] += any_vib as u8 as f64;
         if gap != 0.0 && gap < 0.25 && row_mask & prev_row_mask != 0 {
             // a minijack in full up to MJ_FULL, none from MJ_NONE: slow re-hits read Minijacks first though the user saw none
             // and only while few columns re-hit: a re-hit of most of the keys is a chordjack/mash (user 2026-11-17: 10K
@@ -666,7 +711,7 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
             let wide_rehit = smooth((row_mask & prev_row_mask).count_ones() as f64 / keys as f64, k.MJ_WIDE_LO, k.MJ_WIDE_HI);
             burst.push((b, ((k.MJ_NONE - gap) / (k.MJ_NONE - k.MJ_FULL)).clamp(0.0, 1.0) * (1.0 - wide_rehit)));
         } else {
-            add_burst(&mut comp, &burst, k.MJ_BURST);
+            add_burst(&mut comp, nbins, &burst, k.MJ_BURST);
             burst.clear();
         }
         let mut n_hand = [0usize; 2];
@@ -824,10 +869,10 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
             let mut e_ln = (rice + k.LN_BASE * share)
                 * (k.W_HOLD_SAME * if held_same > 0.0 { held_same.powf(0.7) } else { 0.0 } + k.W_HOLD_OTHER * held_other.min(1.0));
             if e - t <= 0.003 && held_same + held_other >= 0.5 && gap != 0.0 && gap < 0.15 {
-                comp[b * NP + o(P::hyb)] += 1.0;
+                comp[(o(P::hyb)) * nbins + b] += 1.0;
             }
             if was && last_end[c] - last_head[c] <= 0.003 && e - t > 0.003 && t - last_head[c] < 0.12 {
-                comp[b * NP + o(P::shield)] += 1.0;
+                comp[(o(P::shield)) * nbins + b] += 1.0;
             }
             if was && last_end[c] - last_head[c] > 0.003 {
                 let gg = t - last_end[c];
@@ -839,35 +884,35 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
                         * share;
                     e_ln += rep;
                     if gg < 0.12 && last_end[c] - last_head[c] >= 0.1 {
-                        comp[b * NP + o(P::inv)] += 1.0;
+                        comp[(o(P::inv)) * nbins + b] += 1.0;
                     }
                 }
             }
             hands[b * 3 + h] += rice + e_ln;
             fine[fb * 3 + h] += rice + e_ln;
-            comp[b * NP + o(P::ln)] += e_ln;
+            comp[(o(P::ln)) * nbins + b] += e_ln;
             jrun[c] = if jacked { jrun[c] + 1 } else { 0 };
             // a Longjacks note: a tap in a column run whose row shares only this column with the run's previous row (more
             // shared columns are a chordjack)
             if g.lj[ni] && e - t <= 0.003 && last_end[c] - last_head[c] <= 0.003 && (row_mask & lj_row[c]).count_ones() == 1 {
-                comp[b * NP + o(P::lj)] += 1.0;
+                comp[(o(P::lj)) * nbins + b] += 1.0;
             }
             lj_row[c] = row_mask;
             if wide && e_jack != 0.0 && (jrun[c] >= 2 || n_hand[h] >= 2) {
                 jack_w += 1.0;
                 let part = if n_jack[h] >= 2 || n_hand[h] >= 2 { P::chordjack } else { P::jack };
-                comp[b * NP + tr.unwrap_or(o(part))] += rice;
+                comp[(tr.unwrap_or(o(part))) * nbins + b] += rice;
             } else if wide && e_jack != 0.0 {
                 pending.push((rice, h));
             } else if !wide && e_jack != 0.0 && prev_row_mask >> c & 1 == 1 {
                 jack_w += 1.0;
                 let part = if size >= 2 && was && last_size[c] >= 2 { P::chordjack } else { P::jackspeed };
-                comp[b * NP + tr.unwrap_or(o(part))] += rice;
+                comp[(tr.unwrap_or(o(part))) * nbins + b] += rice;
             } else {
                 pending.push((rice, h));
             }
         }
-        comp[b * NP + o(P::odd)] += odd_v;
+        comp[(o(P::odd)) * nbins + b] += odd_v;
         let split = k.W_SPLIT * eh[0].min(eh[1]);
         hands[b * 3 + 2] += split;
         fine[fb * 3 + 2] += split;
@@ -911,15 +956,18 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
             }
             cs_sum += if size >= 3 { cross + split } else { 0.0 };
             ds_sum += if size < 3 { cross + split } else { 0.0 };
-            comp[b * NP + tr.unwrap_or(o(P::chordstream))] += cs_sum * (1.0 - jf);
-            comp[b * NP + tr.unwrap_or(o(P::delay))] += ds_sum * (1.0 - jf) * fast;
-            comp[b * NP + tr.unwrap_or(o(P::stream))] += ds_sum * (1.0 - jf) * (1.0 - fast);
+            comp[(tr.unwrap_or(o(P::chordstream))) * nbins + b] += cs_sum * (1.0 - jf);
+            comp[(tr.unwrap_or(o(P::delay))) * nbins + b] += ds_sum * (1.0 - jf) * fast;
+            comp[(tr.unwrap_or(o(P::stream))) * nbins + b] += ds_sum * (1.0 - jf) * (1.0 - fast);
             let part = if size >= 2 { P::chordjack } else { P::jack };
-            comp[b * NP + tr.unwrap_or(o(part))] += (cs_sum + ds_sum) * jf;
+            comp[(tr.unwrap_or(o(part))) * nbins + b] += (cs_sum + ds_sum) * jf;
             for h in 0..2 {
                 let old_width = previous_mask[h].count_ones() as usize;
+                // not while the other hand jacks: a hand alternating beside a jacking hand is chordjack (user 2026-11-20; 27 % of
+                // a chordjack map's bracket credit came from such rows, 9–15 % on charts named Bracket)
                 if n_hand[h] != 0
                     && n_jack[h] == 0
+                    && n_jack[1 - h] == 0
                     && previous_mask[h] != 0
                     && previous_hand[h] == prev_row_t
                     && n_hand[h].max(old_width) >= 2
@@ -930,7 +978,7 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
                             other += amount;
                         }
                     }
-                    comp[b * NP + o(P::bracket)] += other * (1.0 - jf);
+                    comp[(o(P::bracket)) * nbins + b] += other * (1.0 - jf);
                 }
             }
         } else {
@@ -940,9 +988,9 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
                 other += amount;
             }
             other = other + cross + split;
-            comp[b * NP + tr.unwrap_or(o(P::stream))] += other * (1.0 - jf);
+            comp[(tr.unwrap_or(o(P::stream))) * nbins + b] += other * (1.0 - jf);
             let part = if size >= 2 { P::chordjack } else { P::jackspeed };
-            comp[b * NP + tr.unwrap_or(o(part))] += other * jf;
+            comp[(tr.unwrap_or(o(part))) * nbins + b] += other * jf;
             if tr.is_none() {
                 let mut ds_sum = 0.0;
                 for &(amount, h) in &pending {
@@ -957,7 +1005,7 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
                 if dump != 0.0 {
                     // the log only where there is fast rice to call a dump (elsewhere the product is 0 whatever it says)
                     let uneven = if gap != 0.0 && prev_gap != 0.0 { smooth((gap / prev_gap).ln().abs(), 0.1, 0.3) } else { 0.0 };
-                    comp[b * NP + o(P::dump)] += dump * uneven;
+                    comp[(o(P::dump)) * nbins + b] += dump * uneven;
                 }
             }
         }
@@ -1035,7 +1083,7 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
         }
     }
     for (b, m) in used.iter().enumerate() {
-        comp[b * NP + o(P::used)] = f64::from(m.count_ones()) * bin;
+        comp[(o(P::used)) * nbins + b] = f64::from(m.count_ones()) * bin;
     }
     crate::tick::lap("d.rel.used");
     for ni in 0..n {
@@ -1074,26 +1122,26 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
         let fb = (nfine - 1).min(((e - t0) * phases as f64 / bin) as usize);
         hands[b * 3 + h] += eff;
         fine[fb * 3 + h] += eff;
-        comp[b * NP + o(P::ln)] += eff;
-        comp[b * NP + o(P::ln_rel)] += eff;
+        comp[(o(P::ln)) * nbins + b] += eff;
+        comp[(o(P::ln_rel)) * nbins + b] += eff;
         // skills::attribute's LN shares: releases, the staggered ones (another finger of the hand holds on), held time
-        comp[b * NP + o(P::lnend)] += 1.0;
+        comp[(o(P::lnend)) * nbins + b] += 1.0;
         let staggered = (0..keys).filter(|&oc| oc != c as usize && hand_of[oc] as usize == h).any(|oc| {
             let v = &holds[oc];
             let i = v.partition_point(|x| x.0 < e - 0.02);
             i > 0 && v[i - 1].1 > e + 0.02
         });
         if staggered {
-            comp[b * NP + o(P::stag)] += 1.0;
+            comp[(o(P::stag)) * nbins + b] += 1.0;
         }
         let first = (nbins - 1).min(((t - t0) / bin).max(0.0) as usize);
         for hb in first..=b {
             let (lo, hi) = (t0 + hb as f64 * bin, if hb == nbins - 1 { f64::INFINITY } else { t0 + (hb + 1) as f64 * bin });
-            comp[hb * NP + o(P::cover)] += 0f64.max(e.min(hi) - t.max(lo));
+            comp[(o(P::cover)) * nbins + hb] += 0f64.max(e.min(hi) - t.max(lo));
         }
     }
     crate::tick::lap("d.releases");
-    add_burst(&mut comp, &burst, k.MJ_BURST);
+    add_burst(&mut comp, nbins, &burst, k.MJ_BURST);
     if !wide {
         for b in 0..nbins {
             let low = b.saturating_sub(2);
@@ -1102,13 +1150,13 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
             let jumps: usize = rows_by_size[1][low..high].iter().sum();
             let chords: usize = rows_by_size[2][low..high].iter().sum();
             let count = singles + jumps + chords;
-            if count != 0 && comp[b * NP + o(P::stream)] != 0.0 {
+            if count != 0 && comp[(o(P::stream)) * nbins + b] != 0.0 {
                 let hs = 1f64.min(k.HS_SAT * chords as f64 / count as f64);
                 let js = (1.0 - hs) * 1f64.min(3.0 * jumps as f64 / count as f64);
-                let work = comp[b * NP + o(P::stream)];
-                comp[b * NP + o(P::handstream)] = work * hs;
-                comp[b * NP + o(P::jumpstream)] = work * js;
-                comp[b * NP + o(P::stream)] = work * (1.0 - hs - js);
+                let work = comp[(o(P::stream)) * nbins + b];
+                comp[(o(P::handstream)) * nbins + b] = work * hs;
+                comp[(o(P::jumpstream)) * nbins + b] = work * js;
+                comp[(o(P::stream)) * nbins + b] = work * (1.0 - hs - js);
             }
         }
     }
@@ -1120,7 +1168,7 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
         let mut pc = comp.clone();
         for b in 0..nbins {
             for p in [P::sv, P::sv_raw].iter().chain(SV_KINDS.iter()) {
-                pc[b * NP + o(*p)] = 0.0;
+                pc[(o(*p)) * nbins + b] = 0.0;
             }
         }
         let mut pt = vec![0.0f64; nbins];
@@ -1131,12 +1179,12 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
                 pt[b] = ((left * left + right * right).sqrt() + cv) / bin * info_x(b);
                 let factor = pt[b] / raw;
                 for &off in &offsets {
-                    pc[b * NP + off] *= factor;
+                    pc[(off) * nbins + b] *= factor;
                 }
             }
         }
         Some(Run {
-            parts: Parts { nbins, data: by_part(&pc, nbins), keys: keys_out.clone() },
+            parts: Parts { nbins, data: pc, keys: keys_out.clone() },
             totals: pt,
             fine: [side(&fine, 0), side(&fine, 1), plain_fine_x],
         })
@@ -1151,24 +1199,13 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
             totals[b] = ((left * left + right * right).sqrt() + cv) / bin * info_x(b);
             let factor = totals[b] / raw;
             for &off in &offsets {
-                comp[b * NP + off] *= factor;
+                comp[(off) * nbins + b] *= factor;
             }
         }
     }
     let fine = [side(&fine, 0), side(&fine, 1), side(&fine, 2)];
     crate::tick::lap("d.tail");
-    (Run { parts: Parts { nbins, data: by_part(&comp, nbins), keys: keys_out }, totals, fine }, plain)
-}
-
-/// The bin-major work matrix as `Parts` holds it: one series per part.
-fn by_part(comp: &[f64], nbins: usize) -> Vec<f64> {
-    let mut out = vec![0.0f64; NP * nbins];
-    for (b, row) in comp.chunks_exact(NP).enumerate() {
-        for (p, v) in row.iter().enumerate() {
-            out[p * nbins + b] = *v;
-        }
-    }
-    out
+    (Run { parts: Parts { nbins, data: comp, keys: keys_out }, totals, fine }, plain)
 }
 
 /// One side (left, right, cross) of the interleaved fine bins.

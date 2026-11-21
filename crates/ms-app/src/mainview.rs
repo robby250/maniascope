@@ -300,6 +300,9 @@ impl App {
         for m in ms_calc::mods::Mods::from_tag(&a.mods).labels() {
             parts.push((m, "A mod that is on in osu!: the difficulty, the skills and the dan are those of the chart as it is played with it.".into()));
         }
+        if a.mods.ends_with(crate::viewer::RANDOM_ESTIMATE) {
+            parts.push(("≈ Random".into(), "Random is on and osu! hasn't dealt its shuffle yet: the difficulty and skills are the average over three shuffles.".into()));
+        }
         // Chart length, or time left (real seconds at this rate) in play.
         if let Some((t0, t1)) = a.span {
             let playing = self.live;

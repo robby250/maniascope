@@ -62,8 +62,9 @@ pub fn fit_shown(db: &Db, until: f64) -> Result<(f64, f64)> {
 /// Vibro plays needed for their own fit: fewer leave vibro charts on the population's prediction.
 const VIBRO_ROWS: usize = 10;
 
+#[allow(clippy::too_many_arguments)]
 pub fn fit_target(c: &Arc<Consts>, public: &Public, pop: &ms_data::public::Population, rows: &[&Evidence], feats: &[ms_model::predict::Feats],
-              levels: &HashMap<i64, f64>, display: bool, month: f64, shown: (f64, f64), judged_ln: f64) -> Target {
+              levels: &HashMap<i64, f64>, display: bool, month: f64, shown: (f64, f64), judged_ln: f64, reads: &ms_model::personal::Reads) -> Target {
     let native = Arc::new(population(pop, c));
     let base_model = PredModel::population(c.clone(), native.clone());
     let personal = |rows: &[&&Evidence]| -> Vec<_> { rows.iter().map(|r| {
@@ -73,9 +74,9 @@ pub fn fit_target(c: &Arc<Consts>, public: &Public, pop: &ms_data::public::Popul
     // Vibro charts are mashed: kept out of the ability fit, read by a fit of their own (PredModel::vibro).
     let (vibro, ability): (Vec<&&Evidence>, Vec<&&Evidence>) = rows.iter().partition(|r| c.vibro_chart(&feats[r.f]));
     let args = WarmupArgs { transfer: family_transfer(c), slopes: slopes(pop, &public.meta, c) };
-    let fit = personal_fit(c, personal(&ability), feats, month, levels, KNOBS, &args);
+    let fit = personal_fit(c, personal(&ability), feats, month, levels, KNOBS, &args, reads);
     let own = (vibro.len() >= VIBRO_ROWS).then(|| {
-        let mut own = personal_fit(c, personal(&vibro), feats, month, levels, KNOBS, &args);
+        let mut own = personal_fit(c, personal(&vibro), feats, month, levels, KNOBS, &args, reads);
         borrow_levels(&mut own, &fit);
         own
     });
@@ -109,8 +110,8 @@ fn borrow_levels(own: &mut Fit, ability: &Fit) {
     let mass: f64 = shared.iter().map(weight).sum();
     let gap = if mass > 0. { shared.iter().map(|k| weight(k) * (own.level[k] - ability.level[k])).sum::<f64>() / mass } else { 0. };
     for (&k, &l) in &ability.level {
-        if !own.level.contains_key(&k) {
-            own.level.insert(k, l + gap);
+        if let std::collections::hash_map::Entry::Vacant(e) = own.level.entry(k) {
+            e.insert(l + gap);
             own.level_var.insert(k, ability.level_var[&k] + if mass > 0. { 1. / mass } else { 0.25 });
             if let Some(&sd) = ability.sd_att.get(&k) {
                 own.sd_att.insert(k, sd);
@@ -130,11 +131,13 @@ pub fn fit(db: &Db, public: &Arc<Public>, calc: &str, c: &Arc<Consts>) -> Result
     let historical: Vec<&Evidence> = rows.rows.iter().filter(|r| r.ts.is_none_or(|t| t == 0. || t < begin)).collect();
     let levels = play_levels(&historical.iter().filter(|r| !c.vibro_chart(&rows.feats[r.f])).copied().collect::<Vec<_>>(), month);
     let shown = fit_shown(db, begin)?;
+    // reads before this session: the session's own attempts are read live (`ChartSession::reads`)
+    let reads: ms_model::personal::Reads = rows.reads.iter().map(|(k, v)| (k.clone(), v.iter().copied().filter(|x| x.1 < begin).collect())).collect();
     // Evidence is in lazer units; a stable player's forecasts are what stable judges (more lost per hold).
     let stable = kv_get(db, "client").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| crate::history::default_client().to_string()) == "stable";
     let judged = if stable { crate::evidence::STABLE_LN_Y } else { 0. };
-    let pp = fit_target(c, public, &public.meta.pop, &historical, &rows.feats, &levels, false, month, shown, judged);
-    let display = public.meta.pop_lazer.as_ref().map(|pop| fit_target(c, public, pop, &historical, &rows.feats, &levels, true, month, (0., 1.), judged));
+    let pp = fit_target(c, public, &public.meta.pop, &historical, &rows.feats, &levels, false, month, shown, judged, &reads);
+    let display = public.meta.pop_lazer.as_ref().map(|pop| fit_target(c, public, pop, &historical, &rows.feats, &levels, true, month, (0., 1.), judged, &reads));
     Ok(Fitted { rows, levels, pp, display, shown })
 }
 

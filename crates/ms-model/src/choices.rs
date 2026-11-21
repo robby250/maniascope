@@ -873,15 +873,15 @@ mod deal_tests {
         let first = deal(&pool, &shares, &ledger, &vec![None; 20]);
         assert_eq!(first.iter().map(|&i| pool[i].clone()).collect::<Vec<_>>(), long[..20]);
         // Next took the first row: the rest stay, and the new last row is the one a longer deal had there
-        let mut taken = first.clone();
+        let mut taken = first;
         taken.sort_unstable();
         taken.iter().rev().for_each(|&i| { pool.remove(i); }); // rows on the list are no longer in the pool
-        let offered = [ledger.clone(), vec![long[0].clone()]].concat();
+        let offered = [ledger, vec![long[0].clone()]].concat();
         let queue: Vec<Option<Tags>> = long[1..20].iter().cloned().map(Some).chain([None]).collect();
         let new = deal(&pool, &shares, &offered, &queue);
         assert_eq!(new.iter().map(|&i| pool[i].clone()).collect::<Vec<_>>(), long[20..]);
         // a row that left the middle is replaced there by a row of the slot owed most at that place: the same kind
-        let mut holed = queue.clone();
+        let mut holed = queue;
         (holed[5], holed[19]) = (None, Some(long[20].clone()));
         let fill = deal(&pool, &shares, &offered, &holed);
         assert_eq!(fill.iter().map(|&i| pool[i].clone()).collect::<Vec<_>>(), [long[6].clone()]);

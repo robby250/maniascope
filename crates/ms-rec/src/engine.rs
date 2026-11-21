@@ -24,14 +24,14 @@ use std::sync::{Arc, Mutex};
 /// recommend.predictor_id of the model the Rust port reproduces: forecasts stay comparable across the port. A change to
 /// the prediction model takes a new id, so old forecasts are not read as this model's.
 pub const PREDICTOR_ID: &str = "532ce129f6fa"; // predictor families from the skill table (2026-11-11); was a6d61e058f5d
-pub const CALC_ID: &str = "14be0f41537b";
+pub const CALC_ID: &str = "cc36b2f14526";
 /// Differ from CALC_ID in calibration only (calib/carry.json), newest first: a crawl still running holds the website rows back a whole
 /// calculator, so those can start older than the library's. Each carry keeps its source row.
 // Every shipped calculator, newest last: a ship that leaves its predecessor out drops the scores whose chart file is gone
 // (1.10.0: 7K evidence 8718 → 3959 plays on a copy without the files).
-pub const CARRIED_CALCS: [&str; 33] = ["2f01eca5e738", "7cee1dfdba7f", "a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f",
+pub const CARRIED_CALCS: [&str; 34] = ["2f01eca5e738", "7cee1dfdba7f", "a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f",
                                        "4ccede2d49cf", "09639faa6673", "d3a86f7b014f", "f92680b7b136", "0f9f7da275f1", "a386c60fbb06", "a990d0ea0ada", "2789b337ae54", "bc901ee5b05a", "4c42635f416e", "5f0c6b2fdd16",
-                                       "29a02d72f4a7", "eea12425de4c", "6f3c526261aa", "83c4b154d906", "8b4eb56bb201", "c4681b3a3229", "da01b4c516f3", "0c5d5c8a61e7", "fc49ee7e2b64", "635154fd6f71", "009e2b28af08", "ea60729870d6"];
+                                       "29a02d72f4a7", "eea12425de4c", "6f3c526261aa", "83c4b154d906", "8b4eb56bb201", "c4681b3a3229", "da01b4c516f3", "0c5d5c8a61e7", "fc49ee7e2b64", "635154fd6f71", "009e2b28af08", "ea60729870d6", "14be0f41537b"];
 const SURE_PLAYS: usize = 50; // of the player's own, on a keymode: fewer and the model is mostly the population's guess
 pub const ACTIVE_KEYS: std::ops::RangeInclusive<i64> = 4..=10;
 
@@ -122,7 +122,7 @@ pub fn forecast_chart(state: Option<Value>, sha: Option<&str>, md5: Option<&str>
     Some(state)
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Card {
     pub bid: Option<i64>,
     pub md5: String,
@@ -148,6 +148,8 @@ pub struct Card {
     pub pp: Option<(f64, f64, Option<f64>, f64, f64)>, // pp_lo, pp_hi, best, gain, p_up
     pub pp_expected: Option<f64>, // shown on every map with stars, unranked too
     pub plays_like: Option<(f64, i64)>,
+    pub unread: Option<String>, // `Prediction::read_note`: acc_mid/lo/hi carry the deficit
+    pub random: bool, // Random before its seed: the mean over three shuffles (worker::mean_card)
 }
 
 /// recommend.top_skill
@@ -263,7 +265,7 @@ impl Engine {
         }
         let mods: Value = mods.as_deref().and_then(|m| serde_json::from_str(m).ok()).unwrap_or(json!([]));
         let lazer = !client.as_deref().unwrap_or("").starts_with("stable");
-        let pp = stored.or_else(|| Some(pp::score_pp(&pp::scored_chart(sha.as_deref(), Some(bid), md5.as_deref())?, &ms_data::store::parse_stats(stats.as_deref()?)?, &mods, lazer)?));
+        let pp = stored.or_else(|| pp::score_pp(&pp::scored_chart(sha.as_deref(), Some(bid), md5.as_deref())?, &ms_data::store::parse_stats(stats.as_deref()?)?, &mods, lazer));
         let Some(pp) = pp else { return Ok(()) };
         db.execute("UPDATE scores SET pp=? WHERE key=?", rusqlite::params![pp, key])?;
         if pp > self.r.ledger.best_of(bid) {
@@ -359,7 +361,9 @@ impl Engine {
     pub fn card(&mut self, db: &Db, path: &Path, rate: f64, n: &Now) -> Result<Option<Card>> {
         let Ok(data) = std::fs::read(path) else { return Ok(None) };
         let (sha, md5) = hashes(&data);
-        let Some((e, f, feats, b)) = self.expectation(db, &sha, &md5, rate, n)? else { return Ok(None) };
+        // a modded chart goes by its sha, as its plays do (evidence_rows): its affinity and reads are found under it
+        let chart = if crate::modcharts::source_of(db, &sha).is_some() { sha.clone() } else { md5.clone() };
+        let Some((e, f, feats, b)) = self.expectation(db, &sha, &chart, rate, n)? else { return Ok(None) };
         let inst = self.r.installed.get(&md5).cloned();
         let bid = b.or(inst.as_ref().and_then(|i| i.beatmap_id).filter(|&b| b != 0));
         let approved = b.and_then(|b| self.public.map_info(b)).is_some_and(|m| RANKED_STATUS.contains(&m.approved));
@@ -381,7 +385,7 @@ impl Engine {
         let pp = ranked.then(|| estimates(&e.pp, stars.unwrap(), hits, bid, &self.r.ledger));
         let plays_like = self.plays_like(&f, b, rate);
         let nps = f.dict("nps").and_then(|d| d.get("nps")).filter(|v| !v.is_none()).map(Val::f); // None under two notes (structure.rs)
-        Ok(Some(Card { mods: Vec::new(), without: Vec::new(), bid, md5, keys: feats.keys, title, var: rate_label_pp(rate), rate, ranked, artist, song, version, acc_mid: e.shown.acc_mid, acc_lo: e.shown.acc_lo, acc_hi: e.shown.acc_hi, sure: self.own_plays(feats.keys) >= SURE_PLAYS,
+        Ok(Some(Card { mods: Vec::new(), without: Vec::new(), bid, md5, keys: feats.keys, title, var: rate_label_pp(rate), rate, ranked, artist, song, version, acc_mid: e.shown.acc_mid, acc_lo: e.shown.acc_lo, acc_hi: e.shown.acc_hi, unread: e.shown.read_note(crate::evidence::now_months()), random: false, sure: self.own_plays(feats.keys) >= SURE_PLAYS,
                        form: n.session.form_state(feats.keys), length: f.f("length") / 1000. / rate, skill: top_skill(&f), nps, pp, pp_expected: stars.map(|s| crate::pp::expected(&e.pp, s, hits)), plays_like }))
     }
 
@@ -406,7 +410,7 @@ pub fn commas(n: usize) -> String {
     let text = n.to_string();
     let bytes = text.as_bytes();
     bytes.iter().enumerate().flat_map(|(i, b)| {
-        let sep = i > 0 && (bytes.len() - i) % 3 == 0;
+        let sep = i > 0 && (bytes.len() - i).is_multiple_of(3);
         sep.then_some(',').into_iter().chain(std::iter::once(*b as char))
     }).collect()
 }
@@ -436,46 +440,6 @@ pub fn plays_like_ratio(pop: &ms_model::predict::Pop, k: i64, overall: f64, b: i
     let x = if target <= g(knee) || c <= 0. { target / s } else { knee + (-s + (s * s + 4. * c * (target - s * knee)).sqrt()) / (2. * c) };
     let ratio = (x - lr).exp();
     ((ratio - 1.).abs() >= MIN_SHIFT).then_some((ratio, n as i64))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ms_model::predict::{ByKeys, Pop};
-
-    fn pop() -> Pop {
-        let mut p = Pop { slope: ByKeys { map: [(0, 2.), (4, 2.)].into_iter().collect() }, knee: 4., ..Pop::default() };
-        p.mb = [(1, (-0.5, 300.)), (2, (0.02, 300.)), (3, (-0.5, 5.))].into_iter().collect();
-        p.mbr = [(1, vec![(1.5f64.ln(), 0.4, 80.)])].into_iter().collect();
-        p
-    }
-
-    #[test]
-    fn a_calculator_change_carries_played_rows_and_each_charts_row_nearest_1x() {
-        let db = rusqlite::Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE feats(key TEXT PRIMARY KEY, data TEXT); CREATE TABLE scores(sha256 TEXT, rate REAL);
-            INSERT INTO feats VALUES ('a@1.000|old',''),('a@0.970|old',''),('a@1.200|old',''),('b@0.900|old',''),('b@1.300|older','');
-            INSERT INTO scores VALUES ('a', 1.2), ('c', NULL);").unwrap();
-        let mut names: Vec<String> = app_names(&db).unwrap().into_iter().collect();
-        names.sort();
-        assert_eq!(names, ["a@1.000", "a@1.200", "b@0.900", "c@1.000"], "a@0.970 was a refinement of a past list");
-    }
-
-    #[test]
-    fn plays_like_moves_stars_by_the_public_map_effect() {
-        let p = pop();
-        let (ratio, n) = plays_like_ratio(&p, 4, 10., 1, 1.).unwrap();
-        assert!(n == 300 && (ratio - (-0.25f64).exp()).abs() < 1e-9, "fewer misses than its stars: easier");
-        assert!(plays_like_ratio(&p, 4, 10., 1, 1.5).unwrap().0 > 1., "its own 1.5× evidence wins");
-        assert!(plays_like_ratio(&p, 4, 10., 2, 1.).is_none() && plays_like_ratio(&p, 4, 10., 3, 1.).is_none());
-        // Above the knee the link bends: the shift inverts slope and curve together (Chinmoku 1.5×: slope-only said
-        // 7.4★ for a 9.2★ chart the full link puts at 8.9★).
-        let mut curved = pop();
-        curved.curve = ByKeys { map: [(0, 1.6), (4, 1.6)].into_iter().collect() };
-        let (ratio, _) = plays_like_ratio(&curved, 4, 10., 1, 1.).unwrap();
-        let g = |x: f64| 2. * x + 1.6 * (x - 4f64.ln()).max(0.).powi(2);
-        assert!((g((10. * ratio).ln()) - (g(10f64.ln()) - 0.5)).abs() < 1e-9 && ratio > (-0.25f64).exp());
-    }
 }
 
 /// Stored ratings of the past calculators moved to this one, without their charts. Rows already there stay.
@@ -549,6 +513,7 @@ impl Charts {
         // Stable's store too: a stable player's charts all read as missing and kept the old calculator's analysis (a player
         // 2026-11-05: every LN skill at 0 charts, v1.4.0).
         crate::pp::chart_path(Some(sha)).and_then(|p| std::fs::read(p).ok()).or_else(|| std::fs::read(web).ok()).or_else(|| crate::converts::bytes(self.converts.get(sha)?, &self.root))
+            .or_else(|| std::fs::read(crate::modcharts::file(sha)).ok())
     }
 
     /// `chart`, counting the ones missing.
@@ -564,5 +529,45 @@ impl Charts {
             *last = Some((sha.to_string(), self.counted(sha)));
         }
         last.as_ref()?.1.as_ref().map(|c| ms_calc::flow::flow(c, rate, k))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ms_model::predict::{ByKeys, Pop};
+
+    fn pop() -> Pop {
+        let mut p = Pop { slope: ByKeys { map: [(0, 2.), (4, 2.)].into_iter().collect() }, knee: 4., ..Pop::default() };
+        p.mb = [(1, (-0.5, 300.)), (2, (0.02, 300.)), (3, (-0.5, 5.))].into_iter().collect();
+        p.mbr = [(1, vec![(1.5f64.ln(), 0.4, 80.)])].into_iter().collect();
+        p
+    }
+
+    #[test]
+    fn a_calculator_change_carries_played_rows_and_each_charts_row_nearest_1x() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE feats(key TEXT PRIMARY KEY, data TEXT); CREATE TABLE scores(sha256 TEXT, rate REAL);
+            INSERT INTO feats VALUES ('a@1.000|old',''),('a@0.970|old',''),('a@1.200|old',''),('b@0.900|old',''),('b@1.300|older','');
+            INSERT INTO scores VALUES ('a', 1.2), ('c', NULL);").unwrap();
+        let mut names: Vec<String> = app_names(&db).unwrap().into_iter().collect();
+        names.sort();
+        assert_eq!(names, ["a@1.000", "a@1.200", "b@0.900", "c@1.000"], "a@0.970 was a refinement of a past list");
+    }
+
+    #[test]
+    fn plays_like_moves_stars_by_the_public_map_effect() {
+        let p = pop();
+        let (ratio, n) = plays_like_ratio(&p, 4, 10., 1, 1.).unwrap();
+        assert!(n == 300 && (ratio - (-0.25f64).exp()).abs() < 1e-9, "fewer misses than its stars: easier");
+        assert!(plays_like_ratio(&p, 4, 10., 1, 1.5).unwrap().0 > 1., "its own 1.5× evidence wins");
+        assert!(plays_like_ratio(&p, 4, 10., 2, 1.).is_none() && plays_like_ratio(&p, 4, 10., 3, 1.).is_none());
+        // Above the knee the link bends: the shift inverts slope and curve together (Chinmoku 1.5×: slope-only said
+        // 7.4★ for a 9.2★ chart the full link puts at 8.9★).
+        let mut curved = pop();
+        curved.curve = ByKeys { map: [(0, 1.6), (4, 1.6)].into_iter().collect() };
+        let (ratio, _) = plays_like_ratio(&curved, 4, 10., 1, 1.).unwrap();
+        let g = |x: f64| 2. * x + 1.6 * (x - 4f64.ln()).max(0.).powi(2);
+        assert!((g((10. * ratio).ln()) - (g(10f64.ln()) - 0.5)).abs() < 1e-9 && ratio > (-0.25f64).exp());
     }
 }

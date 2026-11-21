@@ -118,7 +118,8 @@ pub fn get(url: &str) -> Result<Vec<u8>, String> {
         match ureq::get(url).set("User-Agent", UA).timeout(Duration::from_secs(30)).call() {
             Ok(r) => {
                 let mut out = Vec::new();
-                match std::io::Read::read_to_end(&mut r.into_reader(), &mut out) {
+                // a page or chart, never more than 64 MB
+                match std::io::Read::read_to_end(&mut std::io::Read::take(r.into_reader(), 64 << 20), &mut out) {
                     Ok(_) => return Ok(out),
                     Err(e) => last = e.to_string(),
                 }

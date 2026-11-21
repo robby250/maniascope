@@ -298,8 +298,8 @@ pub struct PredModel {
     pub shown: (f64, f64),
     pub judged_ln: f64, // added to log(1 − shown accuracy) per LN share: the client judges holds as stable does, 0 on lazer
     pub retry: f64,
-    pub unread: (f64, f64),
-    pub plays: HashMap<String, f64>,
+    pub reading: crate::personal::Reading,
+    pub plays: HashMap<String, crate::personal::Read>,
     pub sd_att: HashMap<i64, f64>,
     // warmup.Model
     pub slopes: Arc<Slopes>,
@@ -345,7 +345,7 @@ impl PredModel {
     pub fn population(c: Arc<Consts>, pop: Arc<Pop>) -> PredModel {
         PredModel { c, pop, levels: HashMap::default(), level: HashMap::default(), glob: 0., sd_all: 0., shape: HashMap::default(), steep: HashMap::default(),
                     recent: HashMap::default(), aff: HashMap::default(), rate_aff: HashMap::default(), rate_support: HashMap::default(),
-                    rate_bandwidth: [(0, 1.)].into_iter().collect(), tau2_c: 0., kap_c: 1., shown: (0., 1.), judged_ln: 0., retry: 0., unread: (0., 0.), plays: HashMap::default(),
+                    rate_bandwidth: [(0, 1.)].into_iter().collect(), tau2_c: 0., kap_c: 1., shown: (0., 1.), judged_ln: 0., retry: 0., reading: Default::default(), plays: HashMap::default(),
                     sd_att: HashMap::default(), slopes: Arc::new(Slopes::default()), modes: ByKeys::default(),
                     fallback: Mode { tau: 8., log_rate: false, amplitudes: Vec::new(), session: 0., fatigue: 0. }, vibro: None, vibro_pace: None }
     }
@@ -359,7 +359,7 @@ impl PredModel {
         }).collect();
         PredModel { c, pop, levels, level, glob: fit.glob, sd_all: fit.sd_all, shape, steep: fit.steep.clone(), recent: fit.recent.clone(), aff: fit.aff.clone(), rate_aff,
                     rate_support: fit.rate_support.clone(), rate_bandwidth: fit.rate_bandwidth.iter().map(|(&k, &v)| (k, v)).collect(), tau2_c: fit.tau2_c,
-                    kap_c: fit.kap_c, shown, judged_ln, retry: fit.retry, unread: fit.unread, plays: fit.plays.clone(), sd_att: fit.sd_att.clone(), slopes: Arc::new(warmup.slopes.clone()),
+                    kap_c: fit.kap_c, shown, judged_ln, retry: fit.retry, reading: fit.reading, plays: fit.plays.clone(), sd_att: fit.sd_att.clone(), slopes: Arc::new(warmup.slopes.clone()),
                     modes: warmup.modes.iter().map(|(&k, v)| (k, v.clone())).collect(), fallback: warmup.fallback.clone(), vibro: None, vibro_pace: None }
     }
 
@@ -953,13 +953,14 @@ pub struct ChartSession {
     pub retried: bool,
     pub downrates: Vec<(f64, f64)>,                  // (played rate, age factor)
     pub attempts: Vec<(f64, f64, f64, Vec<f64>)>,    // (rate, age factor, error, family loading)
+    pub reads: f64,                                  // this session's attempts of the chart: reads the fit hasn't seen
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Prediction {
     pub mu: f64,
     pub base_mu: f64,
-    pub shift: f64, // session correction + cold penalty (mu − base_mu)
+    pub shift: f64, // session correction + cold penalty (mu − base_mu − unread)
     pub cold: f64,
     pub sdm: f64,
     pub sda: f64,
@@ -973,6 +974,22 @@ pub struct Prediction {
     pub slope: f64,
     pub tau: f64,
     pub ln: f64, // the chart's LN share: a stable result on it converts to lazer units by it (ms_rec::evidence)
+    /// The unread deficit (ln, `PredModel::unread_deficit`), inside `mu` and every accuracy: an offer's rate lands on the target
+    /// with the first read counted (user 2026-11-20: "first read −0.2 … give me the end result 96% not 95.8%").
+    pub unread: f64,
+    pub learned_acc: f64, // acc_mid once the chart is learned (no deficit): the note's gap
+    pub reads: crate::personal::Read,
+}
+
+impl Prediction {
+    /// The card's note on what reading the chart costs (no deficit: None): "first read −5.2", "read 2× −1.7", "last read 2018
+    /// −3.1" (a last read over a year before `now`, months).
+    pub fn read_note(&self, now: f64) -> Option<String> {
+        let cost = 100. * (self.learned_acc - self.acc_mid);
+        let r = self.reads;
+        let what = if r.count == 0 { "first read".to_string() } else if now - r.last > 12. { format!("last read {}", 2000 + (r.last / 12.).floor() as i64) } else { format!("read {}×", r.count) };
+        (cost >= 0.05).then(|| format!("{what} −{cost:.1}"))
+    }
 }
 
 pub const BAND_Z: f64 = 1.2816 * 0.75; // recommend.BAND_Z
@@ -1201,9 +1218,11 @@ impl PredModel {
         (s * lr + curve * bend + c * (64. - 3. * f.od).max(10.).ln() + ms_calc::mods::window_law(f.window) + mb + self.gap_term(f, level), n_mb)
     }
 
-    /// personal::unread: the deficit of the next own play of a chart not yet learned, (a + UNREAD_SV·SV rating²)/(1 + plays).
-    pub fn unread_deficit(&self, f: &Feats, chart: &str) -> f64 {
-        (self.unread.0 + self.unread.1 * crate::personal::sv_load(f, &self.c)) / (1. + self.plays.get(chart).copied().unwrap_or(0.))
+    /// The deficit (ln) of the next play of a chart not yet learned (`personal::Reading`): 0 on a chart read before its first
+    /// known play.
+    pub fn unread_deficit(&self, f: &Feats, chart: &str, s: &PredSession) -> f64 {
+        let reads = self.plays.get(chart).map_or(0., |r| r.weight) + s.charts.get(chart).map_or(0., |c| c.reads);
+        if reads.is_infinite() { 0. } else { self.reading.deficit(f.keys, crate::personal::sv_rating(f, &self.c), reads) }
     }
 
     pub fn chart_affinity(&self, chart: &str, rate: f64, k: i64) -> (f64, f64) {
@@ -1274,7 +1293,7 @@ impl PredModel {
             mu += dot;
         }
         let (a, n_c) = self.chart_affinity(chart, rate, k);
-        mu += a + self.unread_deficit(f, chart);
+        mu += a;
         let var = lv + self.pop.tau2 * self.pop.kappa / (n_mb + self.pop.kappa) + self.tau2_c * self.kap_c / (n_c + self.kap_c);
         (mu, var.sqrt(), sd)
     }
@@ -1345,6 +1364,7 @@ impl PredModel {
         let weights = self.family_weights(f);
         let slope = self.rate_response(f, chart, b, rate, &weights);
         let (mut mu, sdm, sda) = self.personal(f, chart, b, rate);
+        let unread = self.unread_deficit(f, chart, s);
         let base_mu = mu;
         let mode = self.mode(k);
         let st = s.by_keys.get(&k).ok_or_else(|| err(&format!("predictor session lacks {k}K")))?;
@@ -1378,7 +1398,7 @@ impl PredModel {
             correction += if total > 0. { w / total } else { 1. / weights.len() as f64 } * st.form[i + 1];
         }
         let shift = correction + cold + self.played(f, chart, rate, st, s, sdm * sdm);
-        mu += shift;
+        mu += shift + unread;
         let (a, bb, judged) = (self.shown.0, self.shown.1, self.judged_ln * f.z_tail[0]);
         let shown = |y: f64| (1. - f.unhittable) * mash_floor(0f64.max(1f64.min(1. - (20f64.min(a + bb * y + judged)).exp())));
         let spread = sda.hypot(sdm);
@@ -1407,6 +1427,17 @@ impl PredModel {
             slope,
             tau: mode.tau,
             ln: f.z_tail[0],
+            unread,
+            learned_acc: shown(mu - unread),
+            reads: {
+                let mut r = self.plays.get(chart).copied().unwrap_or_default();
+                let now = s.charts.get(chart).map_or(0., |c| c.reads);
+                r.count += now as usize;
+                if now > 0. {
+                    r.last = f64::INFINITY; // this session
+                }
+                r
+            },
         })
     }
 }
@@ -1455,7 +1486,7 @@ mod model_tests {
         PredModel { c, pop: Arc::new(Pop { tau2: 0.1, kappa: 3., knee: 4., ..pop }), levels: HashMap::default(), level: [(7, (-3., 0.01, 0.2))].into_iter().collect(), glob: -3., sd_all: 0.2,
                     shape: HashMap::default(), steep: HashMap::default(), recent: HashMap::default(), aff: [("known".to_string(), (-0.6, 10.))].into_iter().collect(), rate_aff: HashMap::default(),
                     rate_support: [("known".to_string(), (1., 1.))].into_iter().collect(), rate_bandwidth: ByKeys { map: [(0, 0.18), (7, 0.12)].into_iter().collect() }, tau2_c: 0.12, kap_c: 2.,
-                    shown: (0.75f64.ln(), 1.), judged_ln: 0., retry: 0., unread: (0., 0.), plays: HashMap::default(), sd_att: [(7, 0.2)].into_iter().collect(), slopes: Arc::new(Slopes::default()), modes: ByKeys::default(), fallback: Mode::default(), vibro: None, vibro_pace: None }
+                    shown: (0.75f64.ln(), 1.), judged_ln: 0., retry: 0., reading: Default::default(), plays: HashMap::default(), sd_att: [(7, 0.2)].into_iter().collect(), slopes: Arc::new(Slopes::default()), modes: ByKeys::default(), fallback: Mode::default(), vibro: None, vibro_pace: None }
     }
 
     fn plain(m: &PredModel) -> Feats {
@@ -1541,6 +1572,32 @@ mod model_tests {
         let below = m.chart_affinity("known", 0.7, 7).0;
         assert!(0. < below && below < 0.6);
         assert_eq!(m.chart_affinity("unplayed", 0.9, 7), (0., 0.));
+    }
+
+    /// An unread SV chart's forecast and offer carry its reading deficit (user 2026-11-20: "first read −0.2 … give me the end
+    /// result 96% not 95.8%"): the offer's rate is solved on `mu`, which holds it; it recovers with reads (the session's own
+    /// attempts count at once).
+    #[test]
+    fn the_unread_deficit_is_in_the_forecast_the_offer_aims_with() {
+        let mut m = model(Pop::default());
+        m.reading = crate::personal::Reading { loss: 4., ..Default::default() };
+        m.plays.insert("learned".into(), crate::personal::Read { weight: f64::INFINITY, count: 1, last: 0. });
+        m.plays.insert("twice".into(), crate::personal::Read { weight: 2., count: 2, last: 300. });
+        let mut f = plain(&m);
+        f.sk[m.c.names.iter().position(|n| n == "sv").unwrap()] = 6. / f.overall; // SV rating 6
+        let s = played_session(0., false);
+        let (new, learned, twice) = (m.predict(&f, "new", None, 1., &s).unwrap(), m.predict(&f, "learned", None, 1., &s).unwrap(), m.predict(&f, "twice", None, 1., &s).unwrap());
+        assert!(learned.unread == 0. && new.unread > twice.unread && twice.unread > 0.);
+        assert!((new.mu - learned.mu - new.unread).abs() < 1e-12); // what the offer's rate is solved on
+        assert!(new.acc_mid < twice.acc_mid && twice.acc_mid < learned.acc_mid);
+        assert!((new.learned_acc - learned.acc_mid).abs() < 1e-12); // the note's "−x" is the learned chart's gap
+        assert_eq!(new.read_note(301.).unwrap().split(" −").next(), Some("first read"));
+        assert_eq!(twice.read_note(301.).unwrap().split(" −").next(), Some("read 2×"));
+        assert_eq!(twice.read_note(330.).unwrap().split(" −").next(), Some("last read 2025"));
+        // the session's attempt of chart "a" is a read the fit hasn't seen
+        let mut before = played_session(0., false);
+        before.charts.clear();
+        assert!(m.predict(&f, "a", None, 1., &s).unwrap().unread < m.predict(&f, "a", None, 1., &before).unwrap().unread);
     }
 
     /// Session tables: warm, one chart played with `error` against its forecast.
@@ -1635,7 +1692,7 @@ mod model_tests {
         let count = |x: f64| z.iter().filter(|v| (*v - x).abs() < 1e-12).count();
         assert_eq!((count(2.3 / 7.), count(0.37)), (1, 1));
         assert_eq!(z.len(), m.c.names.len() + 5 + 1 + g + 1);
-        let bare = Feats { geometry: None, ..f.clone() };
+        let bare = Feats { geometry: None, ..f };
         assert_eq!(z[z.len() - 1], m.c.zvec(&bare, -3.)[m.c.zvec(&bare, -3.).len() - 1]);
     }
 
@@ -1679,7 +1736,7 @@ mod model_tests {
         assert!(shift(&m, &ln, at) < 0. && 0. < shift(&m, &ln, at + 0.3), "LN at their level: cheaper; far below: still costs");
         let six = feats(6, 5., serde_json::json!({"jackspeed": 1.}), &m.c);
         assert_eq!(shift(&m, &six, at - 0.15), 0., "6K borrows 7K's curves: none here");
-        let borrowed = with(vec![(4, curves.clone()), (7, curves.clone())], Vec::new());
+        let borrowed = with(vec![(4, curves.clone()), (7, curves)], Vec::new());
         assert!(shift(&borrowed, &six, at - 0.15) > 0.);
         let nine = feats(9, 5., serde_json::json!({"jackspeed": 1.}), &m.c);
         assert_eq!(shift(&borrowed, &nine, at - 0.15), 0., "8K–10K keep none (DEV worse with 7K's)");

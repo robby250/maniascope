@@ -93,12 +93,11 @@ pub fn analyse(chart: &Chart, g: &Geometry, bin_seconds: f64) -> Info {
     let mut switch_cal = vec![0.0f64; bins];
     let mut count = vec![0.0f64; bins];
     let rows = &g.rows;
-    let half = chart.keys / 2;
     let roll = pattern::smooth_rolls(rows, chart.keys);
     crate::tick::lap("x.smooth_rolls");
     // Odd keymodes: the middle key with each hand in turn, averaged, as demand and smooth_rolls do (user 2026-11-03: "a
     // thumb is a finger … do 3"); it went to the right hand only.
-    let splits: Vec<u32> = if chart.keys % 2 == 1 { vec![((1u64 << (half + 1)) - 1) as u32, ((1u64 << half) - 1) as u32] } else { vec![((1u64 << half) - 1) as u32] };
+    let splits: Vec<u32> = crate::demand::splits(chart.keys).iter().map(|&cl| crate::demand::hand_masks(chart.keys, cl)[0]).collect();
     let mut pulses = vec![(0.0f64, 0.0f64); rows.len()];
     for &lo_mask in &splits {
         for (ri, p) in hand_pulses(rows, lo_mask, &roll).into_iter().enumerate() {

@@ -6,7 +6,7 @@ use ms_data::store::{Db, Result};
 use rusqlite::OptionalExtension;
 use std::path::PathBuf;
 
-fn file(sha: &str) -> PathBuf {
+pub(crate) fn file(sha: &str) -> PathBuf {
     ms_data::paths::rec_dir().join("mods").join(format!("{sha}.osu"))
 }
 
@@ -26,6 +26,11 @@ pub fn ensure(db: &Db, source: &str, data: &[u8], tag: &str) -> Result<(String, 
 /// The sha of `source` played with `tag`, once `ensure` has built it.
 pub fn find(db: &Db, source: &str, tag: &str) -> Result<Option<String>> {
     db.query_row("SELECT sha FROM mod_charts WHERE source=? AND tag=?", [source, tag], |r| r.get(0)).optional()
+}
+
+/// The source chart's sha of a modded chart; None for a chart as written.
+pub fn source_of(db: &Db, sha: &str) -> Option<String> {
+    db.query_row("SELECT source FROM mod_charts WHERE sha=?", [sha], |r| r.get(0)).optional().ok()?
 }
 
 /// A chart file by sha: an installed chart, else a modded one (rebuilt from its source when its file is gone).

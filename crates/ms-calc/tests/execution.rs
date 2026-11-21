@@ -99,7 +99,7 @@ fn card_of(values: &[(&str, f64)], shares: &[(&str, f64, f64)]) -> Vec<(String, 
         let mut d = Dict::new();
         d.set("Tech", *tech);
         d.set("Stamina", *stamina);
-        tags.set(*s, d);
+        tags.set(s, d);
     }
     result.set("tags", tags);
     let strs = |v: Option<&Val>| match v { Some(Val::List(l) | Val::Tuple(l)) => l.iter().filter_map(|x| if let Val::Str(s) = x { Some(s.clone()) } else { None }).collect(), _ => Vec::new() };

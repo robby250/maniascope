@@ -76,7 +76,7 @@ fn known(db: &Db, target: i64) -> Result<HashSet<String>> {
 const RATE_REACH: (f64, f64) = (0.55, 2.);
 
 /// A chart rated `overall` at 1× can fit `window` at some rate. Skipped charts stay unconverted, so they come in when reach moves.
-fn in_window(overall: f64, window: (f64, f64)) -> bool {
+pub(crate) fn in_window(overall: f64, window: (f64, f64)) -> bool {
     overall * RATE_REACH.1 >= window.0 && overall * RATE_REACH.0 <= window.1
 }
 
@@ -326,15 +326,21 @@ fn fetch(url: &str, to: &Path, report: Report) -> std::result::Result<(), String
     std::fs::rename(&part, to).map_err(|e| e.to_string())
 }
 
+const ENTRY_MAX: usize = 256 << 20;
+
 /// A website set's files from its .osz, its charts only when asked.
-fn archive_files(path: &Path, charts: bool) -> std::result::Result<Vec<(String, Vec<u8>)>, String> {
+pub fn archive_files(path: &Path, charts: bool) -> std::result::Result<Vec<(String, Vec<u8>)>, String> {
     let mut zip = zip::ZipArchive::new(std::fs::File::open(path).map_err(|e| e.to_string())?).map_err(|e| format!("not a beatmap archive: {e}"))?;
     let mut out = Vec::new();
     for i in 0..zip.len() {
         let mut f = zip.by_index(i).map_err(|e| e.to_string())?;
         if f.is_file() && (charts || !is_chart(f.name())) {
-            let mut data = Vec::with_capacity(f.size() as usize);
-            std::io::Read::read_to_end(&mut f, &mut data).map_err(|e| e.to_string())?;
+            // the size is the archive's claim: capacity and read stay under a set's largest sane file
+            let mut data = Vec::with_capacity((f.size() as usize).min(ENTRY_MAX));
+            std::io::Read::read_to_end(&mut std::io::Read::take(&mut f, ENTRY_MAX as u64 + 1), &mut data).map_err(|e| e.to_string())?;
+            if data.len() > ENTRY_MAX {
+                return Err(format!("{} is over {} MB", f.name(), ENTRY_MAX >> 20));
+            }
             out.push((f.name().to_string(), data));
         }
     }
@@ -399,7 +405,7 @@ pub fn deliver(p: &Pick, db: &Db, client: &str, root: &Path, picked: Instant, re
     let mut owned: Vec<(String, Vec<u8>)> = Vec::new();
     let mut local = Vec::new();
     if needs_original(p, db, stable) {
-        let holder = if stable { paths::cache() } else { dir.clone() }; // stable would take the original from Songs by itself
+        let holder = if stable { paths::cache() } else { dir }; // stable would take the original from Songs by itself
         std::fs::create_dir_all(&holder).map_err(|e| e.to_string())?;
         let original = holder.join(format!("{set}.osz"));
         download(set, &original, report)?;
@@ -604,7 +610,7 @@ mod tests {
         let mut source = crate::evidence::FeatureSource { public: public.clone(), calc: "calc".into(), cache: HashMap::default() };
         let c = ms_model::predict::Consts::standard();
         let rows = crate::evidence::evidence_rows(&db, &mut source, &c).unwrap();
-        assert_eq!(rows.rows.iter().map(|r| (r.key.as_str(), r.keys as i64)).collect::<Vec<_>>(), [("s", 10)]);
+        assert_eq!(rows.rows.iter().map(|r| (r.key.as_str(), r.keys)).collect::<Vec<_>>(), [("s", 10)]);
         let (ledger, _) = crate::pp::build_ledger(&db, &public, &HashMap::default()).unwrap();
         assert!(ledger.best.is_empty());
         let _ = std::fs::remove_dir_all(dir);

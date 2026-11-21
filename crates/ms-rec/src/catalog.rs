@@ -32,6 +32,7 @@ pub struct Inst {
     pub convert_of: Option<String>, // the source chart's sha of a keymode convert
     pub source_keys: i64,
     pub source_web: bool,
+    pub invert_of: Option<String>, // the source chart's sha of a chart rated under the Invert mod (Inverse mod skill)
 }
 
 impl Inst {
@@ -74,8 +75,10 @@ pub fn one_by_sha(db: &Db, sha: &str) -> Result<Option<Inst>> {
     Ok(select(db, " WHERE i.sha256=?", &[&sha])?.into_iter().next())
 }
 
+/// The charts in the client's library: installed ones, and each installed chart rated under Invert (played as its source with the
+/// mod on; its own file is ManiaScope's, so without it every Invert row left the list: user 2026-11-21 "dont see any").
 pub fn local_shas(db: &Db) -> Result<std::collections::HashSet<String>> {
-    let mut q = db.prepare("SELECT sha256 FROM installed")?;
+    let mut q = db.prepare("SELECT sha256 FROM installed UNION SELECT m.sha FROM mod_charts m JOIN installed i ON i.sha256 = m.source WHERE m.tag = 'IN'")?;
     let rows = q.query_map([], |r| r.get(0))?;
     rows.collect()
 }
@@ -159,6 +162,7 @@ pub struct Pick {
     pub source_keys: i64,
     pub source_web: bool, // from the website: a convert's source, or the map itself once its download is installed (it keeps its WEB badge)
     pub set_id: Option<i64>,
+    pub invert_of: Option<String>, // played as its source with the Invert mod on
 }
 
 impl Pick {

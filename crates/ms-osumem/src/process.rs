@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn this_process_reads_back_and_scans() {
         let me = Process::open(std::process::id(), cfg!(target_pointer_width = "64")).unwrap();
-        let data: Vec<u8> = [0x4d, 0x53, 0x13, 0x37, 0x42, 0x99, 0x11].repeat(1);
+        let data: Vec<u8> = [0x4d, 0x53, 0x13, 0x37, 0x42, 0x99, 0x11].to_vec();
         let at = data.as_ptr() as u64;
         assert_eq!(me.i16(at), Some(0x534d));
         assert!(me.scan_all(&Pattern::new("4D 53 13 37 42 ?? 11")).contains(&at));

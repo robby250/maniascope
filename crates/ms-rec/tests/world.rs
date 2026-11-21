@@ -165,9 +165,9 @@ fn the_card_names_a_pending_rate_a_failure_and_the_mods_it_leaves_out() {
     std::fs::write(&valid, chart_bytes(40)).unwrap();
     r.q.put(Task::Selected { path: Some(valid.clone()), rate: Some(1.25), mods: Some(dt.clone()) });
     r.card("pending", |_, n| n.as_deref() == Some("Calculating prediction at 1.25×…"));
-    r.q.put(Task::Selected { path: Some(file.clone()), rate: Some(1.25), mods: Some(dt.clone()) });
+    r.q.put(Task::Selected { path: Some(file.clone()), rate: Some(1.25), mods: Some(dt) });
     r.card("failed", |_, n| n.as_deref().is_some_and(|n| n.starts_with("Prediction unavailable at 1.25×: ")));
-    r.q.put(Task::Selected { path: Some(file.clone()), rate: None, mods: None });
+    r.q.put(Task::Selected { path: Some(file), rate: None, mods: None });
     r.card("unknown", |_, n| n.as_deref().is_some_and(|n| n.contains("Waiting for osu!")));
     // user 2026-11-19: "when auto is on it should still say the expected acc without auto"
     r.q.put(Task::Selected { path: Some(valid), rate: Some(1.), mods: Some(vec![json!({"acronym": "AT"}), json!({"acronym": "HO"})]) });

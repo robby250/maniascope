@@ -374,7 +374,7 @@ mod tests {
         ui.open_playlist(1);
         assert_eq!((ui.practice.clone(), ui.keys["skills"].clone(), ui.skills_focus), (vec!["ln".to_string()], vec![7], FOCUS_OFF));
         let back = Ui::from_json(&ui.to_json());
-        assert_eq!((back.playlist, back.playlists.len(), back.practice.clone()), (1, 2, vec!["ln".to_string()]));
+        assert_eq!((back.playlist, back.playlists.len(), back.practice), (1, 2, vec!["ln".to_string()]));
         ui.add_playlist("Copy".into());
         assert_eq!((ui.playlist, ui.playlists[2].0.as_str(), ui.practice.clone()), (2, "Copy", vec!["ln".to_string()]));
         ui.move_tab(4, 2);

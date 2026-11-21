@@ -59,7 +59,7 @@ fn fast_variable_and_interleaved_rolls_are_jumptrill_execution() {
 fn hand_grouping_generalizes_and_respects_center_assignment() {
     for keys in 4..=10usize {
         // Free outer fingers still roll while a spare center finger is held.
-        let cols: Vec<u8> = (0..keys / 2).chain((keys + 1) / 2..keys).map(|c| c as u8).collect();
+        let cols: Vec<u8> = (0..keys / 2).chain(keys.div_ceil(2)..keys).map(|c| c as u8).collect();
         let c = rolls(&cols, 12., 1200, keys, 8.);
         let mirror = chart(notes(&c).into_iter().map(|(t, e, k)| (t, e, keys as u8 - 1 - k)).collect(), keys, c.od);
         let (a, b) = (g(&c), g(&mirror));
@@ -184,12 +184,14 @@ fn degenerate_input_is_explicit() {
 
 #[test]
 fn sv_and_constant_scroll_share_the_final_difficulty() {
-    let mut c = rolls(&[0, 1, 3, 2], 27., 1600, 4, 8.);
-    c.sv = vec![(0., 1.), (4000., 0.4), (5000., 1.8), (6000., 1.)];
-    let prm = standard_params();
-    let (full, constant) = (compute(&c, 1., true, &prm).unwrap(), compute(&c, 1., false, &prm).unwrap());
-    assert!((full.f("no_sv_overall") - score(&constant, "overall")).abs() < 1e-9);
-    assert!(score(&full, "overall") >= score(&constant, "overall") - 1e-9);
-    let rating = final_rating(&prm, 4, full.f("raw_overall"), full.dict("execution"));
-    assert!((rating / score(&full, "overall") - 1.).abs() < 1e-12);
+    for gap in [27., 8.] { // 8 ms rolls are mashed: the no-SV pass mashes them too
+        let mut c = rolls(&[0, 1, 3, 2], gap, 1600, 4, 8.);
+        c.sv = vec![(0., 1.), (4000., 0.4), (5000., 1.8), (6000., 1.)];
+        let prm = standard_params();
+        let (full, constant) = (compute(&c, 1., true, &prm).unwrap(), compute(&c, 1., false, &prm).unwrap());
+        assert!((full.f("no_sv_overall") - score(&constant, "overall")).abs() < 1e-9);
+        assert!(score(&full, "overall") >= score(&constant, "overall") - 1e-9);
+        let rating = final_rating(&prm, 4, full.f("raw_overall"), full.dict("execution"));
+        assert!((rating / score(&full, "overall") - 1.).abs() < 1e-12);
+    }
 }
