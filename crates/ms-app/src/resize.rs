@@ -13,7 +13,7 @@ pub fn inner(ctx: &Context, title: &str, to: Vec2) {
     if !kde_wayland() || now.x < 1. {
         return ctx.send_viewport_cmd(ViewportCommand::InnerSize(to));
     }
-    let (d, title, ctx) = (to - now, title.to_string(), ctx.clone());
+    let (d, title, ctx) = ((to - now) * crate::theme::ZOOM, title.to_string(), ctx.clone()); // KWin's units are unzoomed
     std::thread::spawn(move || {
         if kwin(&title, d).is_err() {
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(to));

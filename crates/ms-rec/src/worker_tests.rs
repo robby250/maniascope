@@ -208,7 +208,7 @@ fn a_retained_pick_and_its_candidate_read_from_newer_features() {
     old.why = "1.0 raw NPS · Old · expect ~95.0%".into();
     l.w.playlists.insert("nps", vec![old.clone()]);
     let stale = Choice { sha: sha, md5: old.md5.clone().unwrap(), keys: 7, rate, value: 0., installed: true, convert: false, source_web: false, playcount: -1., family: "old family".into(), group: "rice".into(),
-        nps: 1., length: 1., profile: Vec::new(), description: "Old".into(), matched: Vec::new(), practice: String::new(), acc_mid: 0.95, pred: old.pred, generated_at: 0. };
+        nps: 1., length: 1., profile: Vec::new(), description: "Old".into(), matched: Vec::new(), practice: String::new(), acc_mid: 0.95, pred: old.pred, generated_at: 0., learning: false };
     l.w.mode = "skills".into(); // nothing publishes this list: the test reads what accept left
     l.w.states.get_mut("nps").unwrap().restored = false;
     let mut p = published(&l, "nps");

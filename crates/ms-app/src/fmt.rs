@@ -34,8 +34,8 @@ pub fn small(t: impl Into<String>) -> Span {
 
 pub type Line = Vec<Span>;
 
-/// One line: bold title, then small difficulty name and keymode.
-pub fn map_line(title: &str, artist: Option<&str>, song: Option<&str>, version: Option<&str>, keys: i64) -> Line {
+/// One line: bold title, then small difficulty name and, where asked, keymode.
+pub fn map_line(title: &str, artist: Option<&str>, song: Option<&str>, version: Option<&str>, keys: Option<i64>) -> Line {
     let (mut name, mut diff) = (title.to_string(), version.map(str::to_string));
     if let Some(song) = song.filter(|s| !s.is_empty()) {
         name = [artist.filter(|a| !a.is_empty()), Some(song)].into_iter().flatten().collect::<Vec<_>>().join(" - ");
@@ -45,11 +45,12 @@ pub fn map_line(title: &str, artist: Option<&str>, song: Option<&str>, version: 
         name.truncate(i);
     }
     let name = name.strip_suffix(".osu").unwrap_or(&name).to_string();
-    vec![bold(name), plain(" "), small(format!("{}{keys}K", diff.map_or(String::new(), |v| format!("[{v}] "))))]
+    let tail = [diff.map(|v| format!("[{v}]")), keys.map(|k| format!("{k}K"))].into_iter().flatten().collect::<Vec<_>>().join(" ");
+    vec![bold(name), plain(" "), small(tail)]
 }
 
 pub fn pick_line(c: &Pick) -> Line {
-    map_line(&c.title, c.artist.as_deref(), c.song.as_deref(), c.version.as_deref(), c.keys)
+    map_line(&c.title, c.artist.as_deref(), c.song.as_deref(), c.version.as_deref(), Some(c.keys))
 }
 
 pub fn wanted_mod(rate: f64) -> &'static str {
@@ -100,6 +101,12 @@ pub fn pick_note(c: &Pick, obs: &Obs, card: Option<&Card>) -> Option<String> {
     }
 }
 
+/// Why a pick forecast under the target is offered (`Pick::learning`); tooltip only (user 2026-11-22).
+pub fn learning_note(c: &Pick) -> Option<String> {
+    let skill = c.matched_skills.first().map(|s| ms_model::skills::name(s)).filter(|n| !n.is_empty()).unwrap_or("this skill");
+    c.learning.then(|| format!("Few charts reach your target for {skill} in {}K yet: this is one of the closest", c.keys))
+}
+
 /// The picked map: [rate to set (green once osu! shows it) and expectation, title], so they never move.
 pub fn target_lines(c: &Pick, obs: &Obs, card: Option<&Card>, shown: &Shown) -> Vec<Line> {
     let wanted = wanted_mod(c.rate);
@@ -130,7 +137,8 @@ pub fn clock(seconds: f64) -> String {
 pub fn prediction_line(c: &Card, pp: bool, shown: &Shown) -> (Line, String) {
     let pct = |x: f64| 100. * shown.acc(x);
     let (mid, lo, hi) = (pct(c.acc_mid), pct(c.acc_lo), pct(c.acc_hi));
-    let mut parts: Vec<Line> = vec![vec![bold(format!("Expected ~{mid:.1}%")), plain(" "), small(format!("({lo:.1}–{hi:.1}%)"))]];
+    // the usual range: tooltip only (user 2026-11-22)
+    let mut parts: Vec<Line> = vec![vec![bold(format!("Expected ~{mid:.1}%"))]];
     if c.random {
         parts.push(vec![small("≈ with Random")]);
     }
@@ -140,8 +148,14 @@ pub fn prediction_line(c: &Card, pp: bool, shown: &Shown) -> (Line, String) {
     if let Some(v) = c.pp_expected {
         parts.push(vec![bold(format!("~{v:.0}pp"))]);
     }
-    if let (true, true, Some((_, _, best, gain, up))) = (pp, c.ranked, c.pp) {
-        parts.push(vec![Span { bold: true, ..small(format!("+{gain:.1}pp")) }, small(format!(" {:.0}% to {}", 100. * up, if best.is_some() { "beat" } else { "count" }))]);
+    // the chance to beat your best, on every map; what it is measured against: tooltip (user 2026-11-22). The pp it
+    // would add only where the list is about pp.
+    let ranked = c.pp.filter(|_| c.ranked);
+    if let Some((_, _, best, gain, up)) = ranked {
+        let gain = if pp { vec![Span { bold: true, ..small(format!("+{gain:.1}pp")) }, small(" ")] } else { Vec::new() };
+        parts.push(gain.into_iter().chain([small(format!("{:.0}% to {}", 100. * up, if best.is_some() { "beat" } else { "count" }))]).collect());
+    } else if let Some(b) = &c.beat {
+        parts.push(vec![small(format!("{:.0}% to beat", 100. * b.chance))]);
     }
     let line = parts.join(&small(" · "));
     let mut tip = vec![format!("Your expected accuracy on this map at this rate, from your own plays: ~{mid:.1}%, usually {lo:.1}–{hi:.1}%")];
@@ -162,6 +176,13 @@ pub fn prediction_line(c: &Card, pp: bool, shown: &Shown) -> (Line, String) {
     if let Some(note) = &c.unread {
         tip.push(format!("{note}%: you haven't learned to read this map's SV yet. Accuracy rises as you replay it; the playlist offers it at the rate for the learned map"));
     }
+    if let Some(b) = c.beat.as_ref().filter(|_| ranked.is_none()) {
+        let score = b.score.map_or(String::new(), |t| format!("{} · ", ms_rec::engine::commas(t.max(0) as usize)));
+        // osu!mania pays a play by its mods (Half Time, No Fail, Easy…): against a top paid more, this one has to do that much better
+        let (now, then) = b.multipliers;
+        let paid = if (now - then).abs() > 1e-9 { format!(" osu!mania scores these mods ×{now:.2} and that play's ×{then:.2}.") } else { String::new() };
+        tip.push(format!("To beat: your top score on this map, {score}{:.2}% at {:.2}×. The chance is that this play's score passes it.{paid}", 100. * shown.play(&b.stats, ms_data::store::acc_lazer(&b.stats)), b.rate));
+    }
     match c.pp.filter(|_| c.ranked) {
         None => tip.push(c.pp_expected.map_or_else(|| "No pp: no osu! star rating for this map".into(), |v| format!("~{v:.0}pp at the expected accuracy if this map and rate gave pp"))),
         Some((low, high, best, gain, up)) => tip.push(format!("{low:.0}–{high:.0}pp · {}+{gain:.1}pp expected · {:.0}% to {}", best.map_or(String::new(), |b| format!("best {b:.0} · ")), 100. * up, if best.is_some() { "beat" } else { "count" })),
@@ -177,11 +198,11 @@ pub fn verdict_words(z: f64) -> &'static str {
     if z > 1.5 { "way above expected" } else if z > 0.5 { "better than expected" } else if z < -1.5 { "way below expected" } else if z < -0.5 { "below expected" } else { "about as expected" }
 }
 
-/// The last play: [rate · news, big accuracy vs expected, title]. No clock time: "00:44" read as the song's length (user
-/// 2026-10-31).
+/// The last play: [LAST PLAY and its title, accuracy vs expected · rate · news] (user 2026-11-22: the title beside
+/// LAST PLAY, no "1.00×"). No clock time: "00:44" read as the song's length (user 2026-10-31).
 pub fn result_lines(v: &Verdict) -> Vec<Line> {
-    let mut head = vec![v.rate.map_or("unknown rate".to_string(), |r| format!("{r:.2}×"))];
-    head.extend(v.news.iter().cloned());
+    let mut tail: Vec<String> = v.rate.map_or(Some("unknown rate".to_string()), |r| ((r - 1.).abs() > 0.004).then(|| format!("{r:.2}×"))).into_iter().collect();
+    tail.extend(v.news.iter().cloned());
     let mut acc = vec![bold(format!("{:.2}%", 100. * v.acc))];
     if let Some(e) = v.expected {
         acc.push(plain(format!(" · expected ~{:.2}%", 100. * e)));
@@ -191,7 +212,8 @@ pub fn result_lines(v: &Verdict) -> Vec<Line> {
         let colour = if z > 0.5 { GREEN } else if z < -0.5 { RED } else { GREY };
         acc.extend([plain(" · "), Span { text: verdict_words(z).into(), bold: true, small: false, color: Some(colour) }]);
     }
-    vec![vec![small("LAST PLAY"), plain("  "), plain(head.join(" · "))], acc, vec![bold(v.title.clone())]]
+    acc.extend(tail.into_iter().map(|t| plain(format!(" · {t}"))));
+    vec![vec![Span { color: Some(crate::theme::DIM), ..plain("LAST PLAY") }, plain("  "), bold(v.title.clone())], acc]
 }
 
 pub fn keys_label(keys: &[i64]) -> String {
@@ -280,9 +302,10 @@ mod tests {
 
     #[test]
     fn a_title_keeps_its_difficulty_apart() {
-        assert_eq!(line_text(&map_line("A - B [Hard]", None, None, None, 7)), "A - B [Hard] 7K");
-        assert_eq!(map_line("A - B [Hard]", None, None, None, 7)[0].text, "A - B");
-        assert_eq!(line_text(&map_line("x.osu", Some("Art"), Some("Song"), Some("V"), 4)), "Art - Song [V] 4K");
+        assert_eq!(line_text(&map_line("A - B [Hard]", None, None, None, Some(7))), "A - B [Hard] 7K");
+        assert_eq!(map_line("A - B [Hard]", None, None, None, Some(7))[0].text, "A - B");
+        assert_eq!(line_text(&map_line("x.osu", Some("Art"), Some("Song"), Some("V"), Some(4))), "Art - Song [V] 4K");
+        assert_eq!(line_text(&map_line("x.osu", Some("Art"), Some("Song"), Some("V"), None)), "Art - Song [V]");
     }
 
     #[test]

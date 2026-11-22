@@ -44,7 +44,9 @@ pub fn bytes(db: &Db, sha: &str) -> Option<Vec<u8>> {
         return std::fs::read(p).ok();
     }
     let (source, tag): (String, String) = db.query_row("SELECT source, tag FROM mod_charts WHERE sha=?", [sha], |r| Ok((r.get(0)?, r.get(1)?))).optional().ok()??;
-    build(&std::fs::read(crate::pp::chart_path(Some(&source))?).ok()?, &tag)
+    // its source: a file, or a convert not delivered yet
+    let data = crate::pp::chart_path(Some(&source)).and_then(|p| std::fs::read(p).ok()).or_else(|| crate::converts::bytes_by_sha(db, &source))?;
+    build(&data, &tag)
 }
 
 /// Invert charts' stored ratings without their "invert" flag get it back, once: the carry to calc cc36 rebuilt them without

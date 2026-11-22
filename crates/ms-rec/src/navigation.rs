@@ -237,7 +237,7 @@ pub fn perform(p: &mut Pick, action: &str, client: &str, auto: bool) -> Performe
 }
 
 /// An Inverse mod pick is its source map played with the Invert mod: every message says so.
-fn with_invert(p: &Pick, msg: String) -> String {
+pub(crate) fn with_invert(p: &Pick, msg: String) -> String {
     if p.invert_of.is_some() { format!("{msg} · turn on Invert") } else { msg }
 }
 

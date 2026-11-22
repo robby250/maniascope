@@ -4,6 +4,7 @@
 use chrono::{TimeZone, Utc};
 use memmap2::Mmap;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::Path;
 
 type R<T> = Result<T, String>;
@@ -376,6 +377,19 @@ pub fn set_files(path: &Path, sha: &str) -> R<Vec<(String, String)>> {
     let (lists, names, file_links, file_hash) = (sets.lists("Files")?, usage.strings("Filename")?, usage.links("File")?, files.strings("Hash")?);
     Ok(lists[set].iter().filter_map(|&k| usage.row(k)).filter_map(|u| {
         Some((names[u].clone()?, file_links[u].and_then(|k| files.row(k)).and_then(|r| file_hash[r].clone())?))
+    }).collect())
+}
+
+/// Every chart's background image: chart hash → the image file's content hash.
+pub fn backgrounds(path: &Path) -> R<HashMap<String, String>> {
+    let realm = Realm::open(path)?;
+    let (beatmap, sets, meta, usage, files) = (realm.table("Beatmap")?, realm.table("BeatmapSet")?, realm.table("BeatmapMetadata")?, realm.table("RealmNamedFileUsage")?, realm.table("File")?);
+    let (hashes, b_set, b_meta, wanted) = (beatmap.strings("Hash")?, beatmap.links("BeatmapSet")?, beatmap.links("Metadata")?, meta.strings("BackgroundFile")?);
+    let (lists, names, file_links, file_hash) = (sets.lists("Files")?, usage.strings("Filename")?, usage.links("File")?, files.strings("Hash")?);
+    Ok((0..beatmap.len()).filter_map(|i| {
+        let name = wanted[b_meta[i].and_then(|k| meta.row(k))?].as_deref()?.to_lowercase();
+        let u = lists[b_set[i].and_then(|k| sets.row(k))?].iter().filter_map(|&k| usage.row(k)).find(|&u| names[u].as_deref().is_some_and(|n| n.to_lowercase() == name))?;
+        Some((hashes[i].clone()?, file_hash[file_links[u].and_then(|k| files.row(k))?].clone()?))
     }).collect())
 }
 

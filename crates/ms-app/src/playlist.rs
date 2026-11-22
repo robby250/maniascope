@@ -2,7 +2,7 @@
 use crate::app::App;
 use crate::fmt::{self, keys_label};
 use crate::settings::{mode_name, Tab};
-use crate::theme::{self, ACCENT, BORDER, CHIP_OFF, CHIP_ON, DIM};
+use crate::theme::{self, BORDER, CHIP_OFF, CHIP_ON, DIM};
 use eframe::egui::{self, containers::menu::{MenuButton, MenuConfig}, Color32, PopupCloseBehavior, RichText, ScrollArea, Sense, Stroke, Ui, UiBuilder};
 use ms_data::webmaps::web_dir;
 use ms_model::skills::{self, Skill, AVOID};
@@ -28,8 +28,8 @@ const CHIP_GAP: f32 = 4.;
 
 fn row(ui: &mut Ui, name: &str, tip: Option<&str>, add: impl FnOnce(&mut Ui) -> bool) -> bool {
     let r = ui.horizontal(|ui| {
-        ui.allocate_ui_with_layout(egui::vec2(NAME, 16.), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.set_min_width(NAME);
+        ui.allocate_ui_with_layout(egui::vec2(theme::px(NAME), theme::px(16.)), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_min_width(theme::px(NAME));
             ui.add(egui::Label::new(name).truncate());
         });
         add(ui)
@@ -54,7 +54,7 @@ fn nudge(r: &egui::Response, value: &mut f64, default: f64) -> bool {
 /// VALUE let "80% NPS · 7899 maps" run past the window's right edge (user 2026-11-13).
 fn track(ui: &Ui, texts: &[String]) -> f32 {
     let gap = ui.spacing().item_spacing.x;
-    let widest = texts.iter().map(|t| ui.painter().layout_no_wrap(t.clone(), egui::FontId::proportional(theme::BODY), theme::TEXT).size().x + gap).fold(VALUE, f32::max);
+    let widest = texts.iter().map(|t| ui.painter().layout_no_wrap(t.clone(), egui::FontId::proportional(theme::body()), theme::TEXT).size().x + gap).fold(theme::px(VALUE), f32::max);
     (ui.available_width() - widest).max(60.)
 }
 
@@ -131,8 +131,8 @@ fn stepped(ui: &mut Ui, name: &str, value: &mut f64, values: &[f64], default: f6
 /// A chip's width, before it exists: rows are cut from this. A `ui.horizontal` inside `horizontal_wrapped` has no size when
 /// the wrap is decided, so the row ran off the window (user 2026-11-01: "the buttons go offscreen").
 fn chip_width(ui: &Ui, text: &str) -> f32 {
-    let mark = ui.painter().layout_no_wrap("✓ ".to_string(), egui::FontId::proportional(theme::BODY), theme::TEXT).size().x;
-    let text = ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(theme::BODY), theme::TEXT).size().x;
+    let mark = ui.painter().layout_no_wrap("✓ ".to_string(), egui::FontId::proportional(theme::body()), theme::TEXT).size().x;
+    let text = ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(theme::body()), theme::TEXT).size().x;
     text + mark + 2. * ui.spacing().button_padding.x + 2.
 }
 
@@ -156,7 +156,7 @@ pub fn wrap_rows(widths: &[f32], available: f32, gap: f32) -> Vec<Vec<usize>> {
 }
 
 fn switch(ui: &mut Ui, name: &str, value: &mut bool, tip: Option<&str>) -> bool {
-    let r = ui.checkbox(value, name);
+    let r = theme::checkbox(ui, value, name);
     let changed = r.changed();
     if let Some(t) = tip {
         r.on_hover_text(t);
@@ -206,6 +206,7 @@ fn row_tip(c: &Pick, shown: &ms_rec::history::Shown) -> String {
     let why = if c.why.is_empty() { String::new() } else { format!("{}\n", c.why) };
     let from: Vec<&str> = badges(c).iter().map(|b| b.2).collect();
     let why = if from.is_empty() { why } else { format!("{why}{}\n", from.join(" · ")) };
+    let why = fmt::learning_note(c).map_or(why.clone(), |l| format!("{why}{l}\n"));
     format!("{why}{}\n\nCtrl+click: copy its search. Right-click: skip for 12 h, copy, website.", facts.join(" · "))
 }
 
@@ -239,11 +240,9 @@ fn badges(c: &Pick) -> Vec<(String, Color32, &'static str)> {
 /// Small badges right-aligned in a right-to-left layout, so the title never moves (user 2026-11-03: "somewhere in the right
 /// where they don't shift the text and make them smaller").
 fn draw_badges(ui: &mut Ui, c: &Pick) {
-    ui.spacing_mut().item_spacing.x = 3.;
+    ui.spacing_mut().item_spacing.x = theme::px(4.);
     for (text, fill, _) in badges(c).into_iter().rev() {
-        egui::Frame::new().fill(fill).corner_radius(2).inner_margin(egui::Margin::symmetric(3, 0)).show(ui, |ui| {
-            ui.label(RichText::new(text).size(9.5).color(theme::VIEW));
-        });
+        theme::badge(ui, &text, fill);
     }
 }
 
@@ -260,7 +259,8 @@ fn row_text(c: &Pick, mode: &str, shown: &ms_rec::history::Shown) -> (String, Ve
         sub.extend([length, if c.description.is_empty() { c.skill.clone().unwrap_or_default() } else { c.description.clone() }]);
         (format!("~{acc:.1}%"), sub)
     };
-    (number, sub.into_iter().filter(|s| !s.is_empty()).collect())
+    // the keymode leads the second row, before the length (user 2026-11-22)
+    (number, std::iter::once(format!("{}K", c.keys)).chain(sub).filter(|s| !s.is_empty()).collect())
 }
 
 impl App {
@@ -268,18 +268,18 @@ impl App {
         let keys = self.s.keys[mode].clone();
         let mut next = None;
         ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(egui::vec2(NAME, 16.), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.set_min_width(NAME);
+            ui.allocate_ui_with_layout(egui::vec2(theme::px(NAME), theme::px(16.)), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.set_min_width(theme::px(NAME));
                 ui.label("Keymodes");
             });
             let config = MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside);
             MenuButton::new(keys_label(&keys)).config(config).ui(ui, |ui| {
-                if ui.button("All supported modes (4K–10K)").clicked() {
+                if theme::button(ui, "All supported modes (4K–10K)").clicked() {
                     next = Some(SUPPORTED_KEYS.collect::<Vec<_>>());
                 }
                 for k in SUPPORTED_KEYS {
                     let mut on = keys.contains(&k);
-                    if ui.checkbox(&mut on, format!("{k}K")).changed() {
+                    if theme::checkbox(ui, &mut on, format!("{k}K")).changed() {
                         let mut v: Vec<i64> = SUPPORTED_KEYS.filter(|x| if *x == k { on } else { keys.contains(x) }).collect();
                         v.sort_unstable();
                         next = Some(v);
@@ -360,8 +360,8 @@ impl App {
     fn web_button(&mut self, ui: &mut Ui) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
             let label = self.web_label();
-            if ui.button(label).on_hover_text("Add maps you don't have to the playlists (chart text only, no audio).").clicked() {
-                self.open.web = true;
+            if theme::button(ui, label).on_hover_text("Add maps you don't have to the playlists (chart text only, no audio).").clicked() {
+                (self.open.menu, self.open.web) = (true, true); // Settings, on its Website charts tab
             }
         });
     }
@@ -408,7 +408,7 @@ impl App {
         let word = if mixed { "mixed" } else { match state { 1 => "included", -1 => "excluded", _ => "off" } };
         let (mark, colour) = if mixed { ("– ", DIM) } else { match state { 1 => ("✓ ", CHIP_ON), -1 => ("✕ ", CHIP_OFF), _ => ("", BORDER) } };
         let mut text = egui::text::LayoutJob::default();
-        let plain = egui::TextFormat { font_id: egui::FontId::proportional(theme::BODY), color: theme::TEXT, ..Default::default() };
+        let plain = egui::TextFormat { font_id: egui::FontId::proportional(theme::body()), color: theme::TEXT, ..Default::default() };
         text.append(mark, 0., egui::TextFormat { color: colour, ..plain.clone() });
         text.append(name, 0., plain);
         let mut b = egui::Button::new(text).stroke(Stroke::new(1., colour));
@@ -434,9 +434,9 @@ impl App {
     fn chip_rows<T>(&mut self, ui: &mut Ui, units: &[T], width: impl Fn(&Ui, &T) -> f32, mut add: impl FnMut(&mut Self, &mut Ui, &T)) {
         let ids: Vec<egui::Id> = units.iter().enumerate().map(|(i, u)| ui.scope_id().with(("chip", i, width(ui, u).to_bits()))).collect();
         let widths: Vec<f32> = units.iter().zip(&ids).map(|(u, id)| ui.ctx().data(|d| d.get_temp::<f32>(*id)).unwrap_or_else(|| width(ui, u))).collect();
-        for row in wrap_rows(&widths, ui.available_width(), CHIP_GAP) {
+        for row in wrap_rows(&widths, ui.available_width(), theme::px(CHIP_GAP)) {
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(CHIP_GAP, CHIP_GAP);
+                ui.spacing_mut().item_spacing = egui::vec2(theme::px(CHIP_GAP), theme::px(CHIP_GAP));
                 for i in row {
                     let drawn = ui.scope(|ui| add(self, ui, &units[i])).response.rect.width();
                     ui.ctx().data_mut(|d| d.insert_temp(ids[i], drawn));
@@ -593,7 +593,7 @@ impl App {
                 "skills" => {
                     let i = self.s.playlist;
                     ui.horizontal(|ui| {
-                        let label = ui.add_sized(egui::vec2(NAME, 16.), egui::Label::new("Name"));
+                        let label = ui.add_sized(egui::vec2(theme::px(NAME), theme::px(16.)), egui::Label::new("Name"));
                         let mut name = self.s.playlists[i].0.clone();
                         if ui.text_edit_singleline(&mut name).labelled_by(label.id).changed() && !name.trim().is_empty() {
                             self.s.playlists[i].0 = name;
@@ -662,7 +662,7 @@ impl App {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                if ui.button("Done").clicked() {
+                if theme::button(ui, "Done").clicked() {
                     self.views.get_mut(mode).expect("a tab").settings = false;
                 }
             });
@@ -679,15 +679,15 @@ impl App {
             let off = fmt::set_check(c, &self.obs).2;
             // form and first read: tooltip only (user 2026-11-21)
             let tip = [v.target_tip.clone(), (!off.is_empty()).then(|| format!("Not set yet: {}.", off.join("; "))), (!v.phase.is_empty()).then(|| v.phase.clone()),
-                       fmt::pick_note(c, &self.obs, self.card.as_deref()).map(|n| format!("{n}%: you haven't learned to read this map's SV yet"))]
+                       fmt::pick_note(c, &self.obs, self.card.as_deref()).map(|n| format!("{n}%: you haven't learned to read this map's SV yet")), fmt::learning_note(c)]
                 .into_iter().flatten().reduce(|a, b| format!("{a}\n{b}"));
-            egui::Frame::new().fill(theme::ROW_CURRENT).inner_margin(egui::Margin::symmetric(6, 5)).show(ui, |ui| {
+            theme::card_in(ui, theme::card_frame(theme::ROW_CURRENT).stroke(Stroke::new(1., CHIP_ON.gamma_multiply(0.7))), |ui| {
                 ui.set_width(ui.available_width());
                 // the number and the badges under it: a long skill name widens the column (≈5.5 px a character at 9.5 pt)
-                let marks: f32 = badges(c).iter().map(|b| 9. + 5.5 * b.0.chars().count() as f32).sum();
+                let marks: f32 = badges(c).iter().map(|b| theme::px(9. + 5.5 * b.0.chars().count() as f32)).sum();
                 ui.horizontal(|ui| {
                     ui.scope(|ui| {
-                        ui.set_max_width((ui.available_width() - if number.is_some() || marks > 0. { marks.max(104.) } else { 0. }).max(60.));
+                        ui.set_max_width((ui.available_width() - if number.is_some() || marks > 0. { marks.max(theme::px(104.)) } else { 0. }).max(theme::px(60.)));
                         theme::block(ui, &[(lines[0].clone(), 1), (lines[1].clone(), 2)], tip.as_deref());
                     });
                     ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
@@ -707,38 +707,36 @@ impl App {
                 }
             });
         } else if !v.target_msg.is_empty() {
-            theme::block(ui, &[(vec![fmt::plain(v.target_msg.clone())], 1)], v.target_tip.as_deref());
+            theme::card(ui, |ui| { ui.set_width(ui.available_width()); theme::block(ui, &[(vec![fmt::plain(v.target_msg.clone())], 1)], v.target_tip.as_deref()) });
         }
-        let note_height = if v.note.is_empty() { 0. } else { 18. };
         let (mut clicked, mut copied, mut snoozed) = (None, None, None);
-        let height = (ui.available_height() - note_height).max(40.);
+        let height = ui.available_height().max(40.);
         let (shown, loaded, status) = (v.shown.clone(), v.loaded, self.status_text.clone());
         let units = (self.units.client.clone(), self.units.miss_ratio);
         let area = ScrollArea::vertical().id_salt(mode).max_height(height).auto_shrink([false, false]).show(ui, |ui| {
             if shown.is_empty() {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(24.);
+                    ui.add_space(theme::px(24.));
                     let head = if loaded { "Nothing to suggest yet.".to_string() } else { format!("Loading {} suggestions…", if mode == "skills" { self.s.playlists[self.s.playlist].0.as_str() } else { mode_name(mode) }) };
                     theme::dim(ui, if status.is_empty() { head } else { format!("{head}\n\n{status}") });
                 });
             }
             let units = ms_rec::history::Shown { client: units.0.clone(), miss_ratio: units.1 };
-            ui.spacing_mut().item_spacing.y = 0.;
+            ui.spacing_mut().item_spacing.y = theme::px(4.);
             for (i, c) in shown.iter().enumerate() {
                 let (number, sub) = row_text(c, mode, &units);
                 let row = ui.scope_builder(UiBuilder::new().id_salt(i).sense(Sense::click()), |ui| {
                     ui.style_mut().interaction.selectable_labels = false; // selectable text took the hover from its row (user 2026-11-01)
-                    ui.spacing_mut().item_spacing.y = 2.;
-                    let fill = if ui.response().hovered() { theme::ROW_HOVER } else if i % 2 == 1 { theme::BUTTON } else { Color32::TRANSPARENT };
-                    let frame = egui::Frame::new().inner_margin(egui::Margin::symmetric(6, 7)).fill(fill);
-                    frame.show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = theme::px(2.);
+                    let frame = theme::card_frame(if ui.response().hovered() { theme::ROW_HOVER } else { theme::CARD });
+                    theme::card_in(ui, frame, |ui| {
                         ui.set_width(ui.available_width());
                         let number_rect = ui.horizontal(|ui| {
-                            let width = ui.available_width() - 104.;
+                            let width = ui.available_width() - theme::px(104.);
                             let mut line = vec![fmt::bold(format!("{:.2}×", c.rate)), fmt::plain("  ")];
-                            line.extend(fmt::pick_line(c));
+                            line.extend(fmt::map_line(&c.title, c.artist.as_deref(), c.song.as_deref(), c.version.as_deref(), None)); // the keymode: next row
                             ui.scope(|ui| {
-                                ui.set_max_width(width.max(60.));
+                                ui.set_max_width(width.max(theme::px(60.)));
                                 theme::line(ui, &line, 3);
                             });
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
@@ -785,14 +783,6 @@ impl App {
         if left {
             self.flush_pool(mode); // a list under the pointer never moves
         }
-        let v = &self.views[mode];
-        if !v.note.is_empty() {
-            let (note, tip) = (v.note.clone(), v.note_tip.clone());
-            let r = theme::dim_small(ui, note);
-            if !tip.is_empty() {
-                r.on_hover_text(tip);
-            }
-        }
         if let Some(text) = copied.and_then(|i| self.views[mode].shown.get(i)).map(|c| ms_rec::navigation::song_search(c, &self.units.client)) {
             self.copy(text);
         }
@@ -828,7 +818,8 @@ impl App {
     /// One tab; its cog when open. `playlist`: a custom playlist's index.
     fn tab(&mut self, ui: &mut Ui, m: &'static str, name: &str, playlist: Option<usize>, mode: &str) -> egui::Response {
         let active = !self.stats_open && m == mode && playlist.is_none_or(|i| i == self.s.playlist);
-        let tab = ui.add(egui::Button::selectable(active, name).sense(egui::Sense::click_and_drag())).on_hover_text(self.tab_tip(m, playlist));
+        // The open tab holds its cog inside its own outline (user 2026-11-21: "it shouldn't have 2 separate outlines").
+        let tab = ui.add(theme::Btn::new(name).selected(active).sense(egui::Sense::click_and_drag()).gap(if active { theme::px(GEAR + 2.) } else { 0. })).on_hover_text(self.tab_tip(m, playlist));
         if tab.clicked() {
             self.set_stats(false);
             if let Some(i) = playlist.filter(|i| *i != self.s.playlist) {
@@ -847,10 +838,11 @@ impl App {
         if active {
             let view = self.views.get_mut(m).expect("a tab");
             // Painted, not laid out: a glyph this big as a button would make the row taller (user 2026-11-01).
-            let (rect, gear) = ui.allocate_exact_size(egui::vec2(GEAR + 4., tab.rect.height()), egui::Sense::click());
+            let rect = egui::Rect::from_min_max(egui::pos2(tab.rect.right() - theme::px(GEAR + 4.) - tab.rect.height() * theme::SHEAR / 2., tab.rect.top()), egui::pos2(tab.rect.right() - tab.rect.height() * theme::SHEAR / 2., tab.rect.bottom()));
+            let gear = ui.interact(rect, tab.id.with("gear"), egui::Sense::click());
             gear.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "⚙"));
-            let color = ui.style().interact_selectable(&gear, view.settings).text_color();
-            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "⚙", egui::FontId::proportional(GEAR), color);
+            let color = if view.settings || gear.hovered() { theme::TEXT } else { theme::TEXT.gamma_multiply(0.7) };
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "⚙", egui::FontId::proportional(theme::px(GEAR)), color);
             if gear.on_hover_text("Settings for this tab").clicked() {
                 view.settings = !view.settings;
             }
@@ -965,7 +957,7 @@ impl App {
         if sliding || self.open.drag.is_some() {
             ui.ctx().request_repaint();
         }
-        if ui.button("+").on_hover_text("A new playlist with the open playlist's settings").clicked() {
+        if theme::button(ui, "+").on_hover_text("A new playlist with the open playlist's settings").clicked() {
             if self.mode() != "skills" {
                 let i = self.s.playlist;
                 self.s.open_playlist(i);
@@ -983,14 +975,14 @@ impl App {
                 let edit = ui.text_edit_singleline(&mut text).labelled_by(label.id);
                 edit.request_focus();
                 ui.horizontal(|ui| {
-                    if ui.button("OK").clicked() || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                    if theme::button(ui, "OK").clicked() || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                         if let Some(p) = self.s.playlists.get_mut(i).filter(|_| !text.trim().is_empty()) {
                             p.0 = text.trim().to_string();
                             self.request_save();
                         }
                         keep = false;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if theme::button(ui, "Cancel").clicked() {
                         keep = false;
                     }
                 });
@@ -1006,7 +998,7 @@ impl App {
         let last = self.s.playlists.len() == 1;
         let asked = self.open.delete == Some(i);
         let label = if asked { "Click again to delete" } else { "Delete" };
-        if ui.add_enabled(!last, egui::Button::new(label)).on_disabled_hover_text("Keep at least one playlist").clicked() {
+        if ui.add_enabled(!last, theme::Btn::new(label)).on_disabled_hover_text("Keep at least one playlist").clicked() {
             if asked {
                 self.open.delete = None;
                 self.s.remove_playlist(i);
@@ -1020,9 +1012,16 @@ impl App {
 
     pub fn playlist_ui(&mut self, ui: &mut Ui) {
         let mode = self.mode();
+        // The list follows the selected map; its settings and Stats keep the fixed backdrop (user 2026-11-21).
+        let ctx = ui.ctx().clone();
+        if self.stats_open || self.views[mode].settings {
+            theme::backdrop(ui, &[], false);
+        } else {
+            theme::backdrop(ui, &self.backdrop.layers(&ctx), self.s.black_bg);
+        }
         let enabled = self.next_enabled();
         ui.horizontal(|ui| {
-            let next = egui::Button::new(RichText::new("Next").color(Color32::WHITE)).fill(ACCENT.gamma_multiply(0.7));
+            let next = theme::Btn::new("Next").primary();
             let tip = if enabled { "Next pick from the open tab. A pick you haven't played is skipped: it stays away for about 12 h.".to_string() } else { self.status_text.clone() };
             let r = ui.add_enabled(enabled, next).on_hover_text(format!("{tip}\nRight-click: skip this pick for 12 h."));
             if r.clicked() {
@@ -1037,38 +1036,38 @@ impl App {
                     ui.close();
                 }
             });
-            if self.views[mode].warmup && ui.button("Skip warmup").on_hover_text("Already warm: drop the warm-up maps and the cold-session prior for PP, NPS and Skills").clicked() {
+            if self.views[mode].warmup && theme::button(ui, "Skip warmup").on_hover_text("Already warm: drop the warm-up maps and the cold-session prior for PP, NPS and Skills").clicked() {
                 self.q.put(Task::SkipWarmup);
             }
             if let Some(on) = self.tracking {
-                if ui.selectable_label(on, if on { "Tracking on" } else { "Tracking off" }).on_hover_text("Paused plays stay excluded after imports and restarts. Resume for the next play.").clicked() {
+                if ui.add(theme::Btn::new(if on { "Tracking on" } else { "Tracking off" }).selected(on)).on_hover_text("Paused plays stay excluded after imports and restarts. Resume for the next play.").clicked() {
                     self.tracking_toggled(!on);
                 }
             }
             // Top right, away from the playlist tabs (user 2026-11-09: "so that it doesnt compete with the tabs").
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Clicked again: back to the playlist that was open (user 2026-11-21).
-                if ui.selectable_label(self.stats_open, "Stats").clicked() {
+                if ui.add(theme::Btn::new("Stats").selected(self.stats_open)).clicked() {
                     self.set_stats(!self.stats_open);
                 }
             });
         });
-        ui.add_space(6.);
+        ui.add_space(theme::px(6.));
         // The selected map lives in the main window only (user 2026-11-02: "too much repeating information").
         if self.views[mode].target.is_none() {
-            theme::dim(ui, "Press Next for a map: its title is copied to your clipboard, paste it into osu!'s song search (Ctrl+V).");
+            theme::card(ui, |ui| theme::dim(ui, "Press Next for a map: its title is copied to your clipboard, paste it into osu!'s song search (Ctrl+V)."));
         }
         if let Some((lines, tip)) = &self.result {
-            theme::block(ui, &lines.iter().cloned().zip([1, 1, 2]).collect::<Vec<_>>(), Some(tip));
+            theme::card(ui, |ui| { ui.set_width(ui.available_width()); theme::block(ui, &lines.iter().cloned().zip([1, 2]).collect::<Vec<_>>(), Some(tip)) });
         }
-        ui.add_space(6.);
+        ui.add_space(theme::px(6.));
         // More tabs than room: the strip scrolls sideways under the mouse wheel; the open tab stays (user 2026-11-06).
         ui.style_mut().always_scroll_the_only_direction = true;
         egui::ScrollArea::horizontal().id_salt("tab-strip").scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
             ui.horizontal(|ui| self.tab_strip(ui, mode));
         });
         ui.style_mut().always_scroll_the_only_direction = false;
-        ui.separator();
+        ui.add_space(theme::px(4.));
         // The one status line and bar for the whole window, at the bottom (user 2026-10-30: "Analysing" three times).
         let analysing = if self.stats_open || self.bg_progress.is_some() { None } else { self.views[mode].analysing.clone() };
         let paused = analysing.as_ref().filter(|_| self.busy.load(std::sync::atomic::Ordering::Relaxed)).map_or("", |_| "paused while you play");
@@ -1077,12 +1076,26 @@ impl App {
         let text: Vec<&str> = [flash.as_str(), self.status_text.as_str(), analysing.as_ref().map_or("", |a| a.0.as_str()), paused].into_iter().filter(|t| !t.is_empty()).collect();
         let text = text.join(" · ").replace('\n', " · ");
         let (done, total) = self.bg_progress.or(analysing.as_ref().map(|a| (a.1, a.2))).unwrap_or((0, 0));
-        egui::Panel::bottom("rec-status").show_separator_line(false).show(ui, |ui| {
-            if total > 0 {
-                theme::bar(ui, done as f32 / total as f32);
-            }
-            if !text.is_empty() {
-                theme::dim_small(ui, text);
+        // the open list's own line (what it holds) above it, in the same card (user 2026-11-22: "both 1 bubble")
+        let note = Some(&self.views[mode]).filter(|v| !self.stats_open && !v.settings && !v.note.is_empty()).map(|v| (v.note.clone(), v.note_tip.clone()));
+        egui::Panel::bottom("rec-status").frame(egui::Frame::new().inner_margin(egui::Margin { top: 4, ..Default::default() })).show_separator_line(false).show(ui, |ui| {
+            if total > 0 || !text.is_empty() || note.is_some() {
+                // in a card like every text over the map's image (user 2026-11-22)
+                theme::card(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    if let Some((note, tip)) = note {
+                        let r = theme::dim_small(ui, note);
+                        if !tip.is_empty() {
+                            r.on_hover_text(tip);
+                        }
+                    }
+                    if total > 0 {
+                        theme::bar(ui, done as f32 / total as f32);
+                    }
+                    if !text.is_empty() {
+                        theme::dim_small(ui, text);
+                    }
+                });
             }
         });
         egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| {

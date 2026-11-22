@@ -70,6 +70,7 @@ pub struct Ui {
     pub auto_next: bool,
     pub keep_above: bool,
     pub overlay: bool,
+    pub black_bg: bool, // nothing but black between the cards: a stream's colour key
     pub details: bool,
     pub win: (f32, f32),
     pub recs_win: (f32, f32),
@@ -94,6 +95,13 @@ pub fn normalize_keys(v: &Value, default: &[i64]) -> Vec<i64> {
         _ => Vec::new(),
     }
 }
+
+/// The windows at 100 %. Resized, a window scales what it shows against these.
+pub const MAIN: (f32, f32) = (444., 305.);
+pub const LIST: (f32, f32) = (444., 484.);
+/// The sizes a first start opens with: the user's own on G835LX (2026-11-22, 501×344 and 501×542 px), which draw at 102.5 %.
+const MAIN_OPEN: (f32, f32) = (455.45, 312.73);
+const LIST_OPEN: (f32, f32) = (455.45, 492.73);
 
 fn file() -> PathBuf {
     config().join("ui.json")
@@ -270,9 +278,10 @@ impl Ui {
             skills_mix: v.get("skills_mix").map_or(PpMix { on: false, ..PpMix::default() }, pp_mix),
             display: Display { title: flag("title"), version: flag("version"), info: flag("info"), o2jam: d["o2jam"].as_bool().unwrap_or(false), prediction: flag("prediction"), rating: flag("rating"), nps: flag("nps"), timeline: flag("timeline"), status: flag("status"), skills: d["skills"].as_u64().map_or(3, |x| x as usize) },
             next_action: "auto".to_string(), auto_next: v["auto_next"].as_bool().unwrap_or(true), keep_above: v["keep_above"].as_bool().unwrap_or(false), overlay: cfg!(windows) && v["overlay"].as_bool().unwrap_or(false),
+            black_bg: v["black_bg"].as_bool().unwrap_or(false),
             details: v["details"].as_bool().unwrap_or(false),
-            // Defaults: the user's own sizes on G835LX (2026-10-30; main window measured on screen 2026-11-02).
-            win: pair(v, "w", "h", (442., 238.)), recs_win: pair(v, "recs_w", "recs_h", (442., 420.)),
+            // the main window's cards took 34 pt of height from the timeline (2026-11-22): a size saved before them grows once
+            win: { let (w, h) = pair(v, "w", "h", (MAIN_OPEN.0, MAIN_OPEN.1 - 34.)); (w, h + if v.get("cards").is_some() { 0. } else { 34. }) }, recs_win: pair(v, "recs_w", "recs_h", LIST_OPEN),
             win_pos: point(&v["pos"]), recs_pos: point(&v["recs_pos"]), recs_open: v["recs_open"].as_bool().unwrap_or(false),
             stats_keys: if v["stats_keys"] == "all" { None } else { Some(v["stats_keys"].as_i64().filter(|k| SUPPORTED_KEYS.contains(k)).unwrap_or(7)) },
             expanded: v["stats_expanded"].as_array().map_or_else(BTreeSet::new, |a| a.iter().filter_map(|x| { let (k, g) = x.as_str()?.split_once(':')?; Some((k.parse().ok()?, g.to_string())) }).collect()),
@@ -321,6 +330,8 @@ impl Ui {
                "stats_keys": self.stats_keys.map_or(json!("all"), |k| json!(k)), "stats_expanded": self.expanded.iter().map(|(k, g)| format!("{k}:{g}")).collect::<Vec<_>>(), "chart_hints": self.chart_hints});
         v["by_count"] = json!(self.by_count); // past json!'s recursion limit
         v["skill_by_count"] = json!(self.skill_by_count);
+        v["cards"] = json!(true);
+        v["black_bg"] = json!(self.black_bg);
         v
     }
 

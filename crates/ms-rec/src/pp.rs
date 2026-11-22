@@ -104,6 +104,11 @@ fn p_beat(mu: f64, sd: f64, needed: f64) -> f64 {
     0.5 * (1. + libm::erf(z / std::f64::consts::SQRT_2))
 }
 
+/// The chance a play now ends above `acc` (acc320), as the PP rows count theirs.
+pub fn beat_chance(p: &Prediction, acc: f64) -> f64 {
+    p_beat(p.mu + PESSIMISM * p.sdm, p.sda, acc)
+}
+
 /// Best counted pp per beatmap → total, and the exact change of replacing or adding one map's best.
 #[derive(Clone, Default)]
 pub struct Ledger {

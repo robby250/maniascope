@@ -301,6 +301,7 @@ pub fn apply(prm: &Params, res: &mut Dict, od: f64, rate: f64) {
     res.set("raw_overall", raw);
     let cf = vector(res, od);
     res.set("calibration_features", Val::floats(&cf));
+    let mut press_factor = None;
     if raw != 0.0 && res.has("structure") {
         let sk: Vec<(String, f64)> = res.dict("scores").unwrap().0.iter().map(|(k, v)| {
             let crate::val::Key::S(k) = k else { unreachable!() };
@@ -328,6 +329,25 @@ pub fn apply(prm: &Params, res: &mut Dict, od: f64, rate: f64) {
             let f = crate::flow::Flow::stored(e).unwrap_or_default();
             let factor = joint_shift(joint, &crate::flow::joint_row(&rv, res.fget("length", 0.0), raw, rate, f, &crate::flow::extra_inputs(&cf, e, od))).exp(); // `od`, not res["od"]: that is set below, so the window column read OD 8 (fixed 2026-11-04)
             res.dict_mut("execution").unwrap().set("joint_factor", factor);
+            // The press rating (compute: the chart's holds as taps, on the raw scale) takes the correction of that chart: this
+            // one's row with no hold in it (no LN skill, hold share, LN flow, presses under a hold) at the press level. On 352
+            // dan charts with ≥ 20 % holds it lands within 2.7 % of the Hold Off chart's own correction on average; the chart's
+            // own factor missed by 9 % (4K +11 %, 10K −14 %), and before 2026-11-22 the press rating had no correction at all
+            // (a chart without holds read its raw rating on the regular dans).
+            let press_raw = res.fget("press_overall", raw);
+            if (press_raw - raw).abs() > 1e-12 && press_raw > 0.0 {
+                let skp: Vec<(String, f64)> = sk.iter().map(|(k, v)| (k.clone(), if k.starts_with("ln") { 0.0 } else { py::round_digits(v * raw / press_raw, 4) })).collect();
+                let (mut ex, mut cfp, mut fp) = (res.dict("execution").unwrap().clone(), cf.clone(), f);
+                ex.set("ln_flow", 0.0);
+                for name in ["ln", "od_ln"] {
+                    if let Some(v) = FEATURES.iter().position(|x| *x == name).and_then(|i| cfp.get_mut(i)) {
+                        *v = 0.0;
+                    }
+                }
+                (fp.fast_ln, fp.hold_tap) = (0.0, [0.0; 2]);
+                let rvp = sr_vector(&skp, res.dict("structure").unwrap_or(&empty), &ex, res.dict("endurance").unwrap_or(&empty), rate, res.fget("length", 0.0), notes, keys, 0.0, stam, &cfp);
+                press_factor = Some(joint_shift(joint, &crate::flow::joint_row(&rvp, res.fget("length", 0.0), press_raw, rate, fp, &crate::flow::extra_inputs(&cfp, &ex, od))).exp());
+            }
         }
         res.dict_mut("execution").unwrap().set("residual_vector", Val::floats(&rv));
     }
@@ -335,6 +355,10 @@ pub fn apply(prm: &Params, res: &mut Dict, od: f64, rate: f64) {
     res.set("baseline_overall", base);
     let multiplier = if raw != 0.0 { final_from_base(base, res.dict("execution")) / 0.000001f64.max(raw) } else { 1.0 };
     res.dict_mut("scores").unwrap().map_values(|v| v * multiplier);
+    // the press rating on the ratings' scale: with its own correction, else (no holds, no families fit) the chart's
+    if let Some(press) = res.get("press_overall").map(Val::f) {
+        res.set("press_overall", press_factor.map_or(press * multiplier, |f| baseline_rating(prm, keys, press, res.dict("execution")) * f));
+    }
     if let Some(Val::List(tl)) = res.get_mut("timeline") {
         for v in tl.iter_mut() {
             *v = Val::F(v.f() * multiplier);

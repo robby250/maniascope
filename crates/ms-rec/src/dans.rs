@@ -5,8 +5,8 @@
 //! Series: LN-heavy charts are placed among LN dans, the rest among rice dans; 4K charts with sustained same-column runs
 //! are also placed among vibro dans. A chart mostly made of vibro runs shows the vibro dan alone: its mashing reads as fast
 //! rice/LN to the calculator (user 2026-10-01), unless the notes outside the runs are dense on their own: REFORM
-//! Iota/Kappa are 26/43 % vibro yet hard rice besides (user 2026-10-11). Vibro dans are placed by vibro speed together with
-//! stars: stars alone put Vibro 2–8 within 8.5–9.2★ out of order.
+//! Iota/Kappa are 26/43 % vibro yet hard rice besides (user 2026-10-11). Vibro dans are placed by the chart's vibro rating
+//! together with its vibro speed (`value_with`).
 use ms_data::codec::from_json;
 use ms_calc::val::Val;
 use ms_model::predict::{Consts, Feats};
@@ -49,7 +49,7 @@ type Tiers = Vec<(String, f64)>;
 
 struct Data {
     series: HashMap<String, Tiers>,
-    weights: (f64, f64),
+    weights: VibroWeights,
     length: (f64, f64), // (seconds, weight): length_scaled
 }
 
@@ -62,7 +62,7 @@ fn data() -> &'static Data {
         let series = v["series"].as_object().map_or_else(HashMap::new, |o| o.iter().map(|(k, tiers)| {
             (k.clone(), tiers.as_array().map_or_else(Vec::new, |t| t.iter().filter_map(|x| Some((x["tier"].as_str()?.to_string(), x["value"].as_f64()?))).collect()))
         }).collect());
-        Data { series, weights: (v["vibro_weights"][0].as_f64().unwrap_or(1.), v["vibro_weights"][1].as_f64().unwrap_or(0.)),
+        Data { series, weights: std::array::from_fn(|i| v["vibro_weights"][i].as_f64().unwrap_or(0.)),
                length: (v["length"]["seconds"].as_f64().unwrap_or(1.), v["length"]["weight"].as_f64().unwrap_or(0.)) }
     })
 }
@@ -131,10 +131,20 @@ fn value(series: &str, rating: f64, vibro: Option<&Vibro>) -> f64 {
     value_with(data().weights, series, rating, vibro)
 }
 
-/// The quantity a series' anchors are in: log stars, or for vibro dans weighted log speed + log stars.
-pub fn value_with(weights: (f64, f64), series: &str, rating: f64, vibro: Option<&Vibro>) -> f64 {
+/// The vibro dans' weights (`calib dan_table`, fitted on the courses): [difficulty, speed, at, slope, low, high].
+pub type VibroWeights = [f64; 6];
+
+/// The quantity a series' anchors are in: log stars. For vibro dans: difficulty × log vibro rating + speed × how much
+/// faster the runs are than the courses' at that rating (log speed − at − slope × log rating), counted only as far as the
+/// courses themselves differ (low…high). User 2026-11-22: "should take into account both difficulty and bpm not just bpm":
+/// by log speed + log stars a 5★ chart with half-second LN rolls at 20.8 hits/s per column read "Vibro W+++++" (the courses
+/// span 11.4–13.3; speed held 7 of their 12 tiers, so every hit/s past them added a tier). 12 courses left out one at a
+/// time: 1.19 tiers off (rating alone 1.55, the old rule 1.13); that chart reads about Vibro 1.
+pub fn value_with(weights: VibroWeights, series: &str, rating: f64, vibro: Option<&Vibro>) -> f64 {
     if series == "4K Vibro" {
-        return weights.0 * vibro.map_or(1f64, |v| v.speed.max(1.)).ln() + weights.1 * rating.max(1e-3).ln();
+        let [difficulty, speed, at, slope, low, high] = weights;
+        let (r, s) = vibro.map_or((0., 0.), |v| (v.rating.max(1e-3).ln(), v.speed.max(1.).ln()));
+        return difficulty * r + speed * (s - at - slope * r).clamp(low.min(high), high);
     }
     rating.max(1e-3).ln()
 }
@@ -187,7 +197,7 @@ pub fn label(keys: i64, rating: f64, press: f64, ln_share: f64, vibro: Option<&V
     // showed only "LN Yokaze−", "regular first everywhere"; 2026-10-01: a 29 % LN rice chart only "LN Gamma").
     let kinds: Vec<&str> = if ln_share >= LN_SHARE { vec!["rice", "ln"] } else { vec!["rice"] };
     let mut parts: Vec<String> = kinds.iter().filter(|_| !vibro.is_some_and(vibro_only)).filter_map(|k| place(series(keys, k)?, if *k == "rice" { press } else { rating }, None)).collect();
-    parts.extend(vibro.filter(|v| v.share >= VIBRO_SHARE).and_then(|v| place("4K Vibro", rating, Some(v))));
+    parts.extend(vibro.filter(|v| v.share >= VIBRO_SHARE).and_then(|v| place("4K Vibro", rating, Some(&Vibro { rating: length_scaled(data().length, v.rating, secs), ..*v }))));
     if parts.is_empty() { None } else { Some(parts.join(" · ")) }
 }
 
@@ -312,6 +322,16 @@ mod tests {
 #[cfg(test)]
 mod shipped_tests {
     use super::*;
+
+    /// User 2026-11-22: Satori De Pon! [Star Burst 2!] (5.02★, vibro rating 5.6; 9 % of its notes in half-second LN rolls
+    /// at 20.8 hits/s per column) read "Vibro W+++++" by its speed.
+    #[test]
+    fn a_fast_burst_on_an_easy_chart_reads_a_low_vibro_dan() {
+        let at = |speed: f64, rating: f64| position(tiers("4K Vibro").unwrap(), value("4K Vibro", 0., Some(&Vibro { share: 0.1, speed, rest: 10., rating })));
+        assert!(at(20.83, 5.63) < 1.5, "the burst chart reads {}", at(20.83, 5.63));
+        // the dans' own speeds still count: the W course (13.3 hits/s, 18.5) reads the top, and lower at the Vibro 1 speed
+        assert!(at(13.3, 18.5) > 10. && at(11.5, 18.5) < at(13.3, 18.5) - 0.5, "{} {}", at(13.3, 18.5), at(11.5, 18.5));
+    }
 
     #[test]
     fn shipped_dan_table_is_stamped_for_this_calculator() {

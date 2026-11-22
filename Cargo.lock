@@ -1797,6 +1797,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
+dependencies = [
+ "crc-catalog",
+]
+
+[[package]]
+name = "crc-catalog"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
+
+[[package]]
 name = "crc32c"
 version = "0.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4774,6 +4789,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lzma-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "297e814c836ae64db86b36cf2a557ba54368d03f6afcd7d947c266692f71115e"
+dependencies = [
+ "byteorder",
+ "crc",
+]
+
+[[package]]
 name = "macerator"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4937,11 +4962,12 @@ dependencies = [
 
 [[package]]
 name = "ms-app"
-version = "1.18.0"
+version = "1.19.0"
 dependencies = [
  "arboard",
  "eframe",
  "egui_kittest",
+ "image",
  "ms-calc",
  "ms-data",
  "ms-model",
@@ -5041,6 +5067,26 @@ dependencies = [
  "sha2",
  "ureq 2.12.1",
  "zip 2.6.1",
+]
+
+[[package]]
+name = "ms-tools"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "lzma-rs",
+ "md5",
+ "ms-calc",
+ "ms-convert",
+ "ms-data",
+ "ms-model",
+ "ms-rec",
+ "regex-lite",
+ "rosu-pp",
+ "rusqlite",
+ "serde_json",
+ "sha2",
+ "ureq 2.12.1",
 ]
 
 [[package]]

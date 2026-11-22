@@ -151,7 +151,7 @@ pub fn analyse(path: &Path, rate: f64, mods: &str, prm: &Params) -> Result<Analy
         path: path.to_path_buf(), rate, mods: mods.to_string(), keys, overall: sc.f("overall"), press: res.fget("press_overall", sc.f("overall")), notes: res.fget("notes", 0.) as usize, ln_notes: res.fget("ln_notes", 0.), nps: raw_nps(&chart, rate), peak_nps: peak_nps(&chart, rate), bid: beatmap_id(&data),
         span: (chart.len() >= 2).then(|| (chart.t[0], chart.last_end())), timeline: res.get("timeline").map_or_else(Vec::new, Val::list_f), entries, tags: describe(&res, &prm.k).1.into_iter().filter(|t| !t.starts_with("also ")).collect(), also: ms_calc::card::also(&res),
         bars: bars(&names, sc), names, tech,
-        dan_vibro: ms_rec::dans::vibro_runs(&chart, rate, &prm.k), title: chart.title.clone(), artist: chart.artist.clone(), version: chart.version.clone(), creator: chart.creator.clone(),
+        dan_vibro: ms_rec::dans::Vibro { rating: sc.fget("vibro", 0.), ..ms_rec::dans::vibro_runs(&chart, rate, &prm.k) }, title: chart.title.clone(), artist: chart.artist.clone(), version: chart.version.clone(), creator: chart.creator.clone(),
         o2jam: ms_rec::o2jam::level(keys, |k| sc.fget(k, 0.), res.fget("ln_notes", 0.) / res.fget("notes", 1.).max(1.), if chart.len() >= 2 { (chart.last_end() - chart.t[0]) / 1000. / rate } else { 0. }, res.fget("notes", 0.)),
     })
 }
@@ -259,6 +259,28 @@ mod tests {
         let (a, b) = (analyse(&path, 1., RANDOM_ESTIMATE, &prm).unwrap(), analyse(&path, 1., RANDOM_ESTIMATE, &prm).unwrap());
         assert_eq!((a.overall, &a.bars), (b.overall, &b.bars));
         assert!((a.overall / plain.overall - 1.).abs() > 0.01, "{} {}", a.overall, plain.overall);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// User 2026-11-22: "the regular dan should show for LN maps as if there are no holds", then: without a second analysis,
+    /// "very slightly harder than hold-off on average".
+    #[test]
+    fn the_regular_dan_of_a_chart_with_holds_reads_near_its_hold_off_rating_from_one_analysis() {
+        let dir = std::env::temp_dir().join(format!("ms-press-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ln.osu");
+        let mut text = "osu file format v14\n\n[General]\nMode: 3\n\n[Difficulty]\nCircleSize:4\nOverallDifficulty:8\n\n[HitObjects]\n".to_string();
+        for i in 0..600 {
+            let t = 1000 + i * 90;
+            // every third note a hold: the same hand presses under it (all-hold stairs, every press under three holds, read +12 %)
+            text.push_str(&if i % 3 == 0 { format!("{},192,{t},128,0,{}:0:0:0:0:\n", (i % 4) * 128 + 64, t + 300) } else { format!("{},192,{t},1,0,0:0:0:0:\n", (i % 4) * 128 + 64) });
+        }
+        std::fs::write(&path, text).unwrap();
+        let prm = standard_params();
+        let (held, off) = (analyse(&path, 1., "", &prm).unwrap(), analyse(&path, 1., "HO", &prm).unwrap());
+        assert_eq!(off.press, off.overall, "no holds: the press rating is the rating");
+        assert!((-0.01..0.06).contains(&(held.press / off.overall - 1.)), "at the Hold Off chart's rating or slightly over: {} {}", held.press, off.overall);
+        assert!((held.overall / held.press - 1.).abs() > 0.01, "holds change the rating: {} {}", held.overall, held.press);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

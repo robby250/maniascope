@@ -27,5 +27,9 @@ crates/ms-convert/LICENSE-Torosu.
 osu! and osu!lazer are trademarks of their respective owners; ManiaScope is an
 unaffiliated, third-party tool.
 
-Liberation Sans (crates/ms-app/assets), SIL Open Font License 1.1: see crates/ms-app/assets/LICENSE-Liberation.
+Nunito (crates/ms-app/assets), SIL Open Font License 1.1: see crates/ms-app/assets/LICENSE-Nunito.
+
+The mod icons (crates/ms-app/assets/mods) are from ppy/osu-resources (https://github.com/ppy/osu-resources),
+Copyright (c) ppy Pty Ltd, resized, under CC BY-NC 4.0 (https://creativecommons.org/licenses/by-nc/4.0/): they
+are not covered by ManiaScope's MIT license and may not be used commercially.
 DejaVu Sans icon subset (crates/ms-app/assets/Icons.ttf): see crates/ms-app/assets/LICENSE-DejaVu.

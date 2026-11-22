@@ -12,14 +12,14 @@ pub enum P {
     stream, jumpstream, handstream, jumptrill, splittrill, jackspeed, chordjack, ln, sv, delay,
     chordstream, jack, technical, bracket, dump, odd, rodd, pins, psw, oht, anc, rows, sv_raw,
     ln_rel, mj, sus, lj, shield, inv, hyb, vib, sv_fast, sv_slow, sv_accel, sv_stutter, sv_brake,
-    cover, stag, lnend, used,
+    cover, stag, lnend, used, ln_same,
 }
-pub const NP: usize = 40;
+pub const NP: usize = 41;
 pub const P_NAMES: [&str; NP] = [
     "stream", "jumpstream", "handstream", "jumptrill", "splittrill", "jackspeed", "chordjack", "ln", "sv", "delay",
     "chordstream", "jack", "technical", "bracket", "dump", "odd", "rodd", "pins", "psw", "oht", "anc", "rows",
     "sv_raw", "ln_rel", "mj", "sus", "lj", "shield", "inv", "hyb", "vib", "sv_fast", "sv_slow", "sv_accel",
-    "sv_stutter", "sv_brake", "cover", "stag", "lnend", "used",
+    "sv_stutter", "sv_brake", "cover", "stag", "lnend", "used", "ln_same",
 ];
 /// Every part in declaration order (P_NAMES' order).
 pub const ALL_P: [P; NP] = {
@@ -28,7 +28,7 @@ pub const ALL_P: [P; NP] = {
         stream, jumpstream, handstream, jumptrill, splittrill, jackspeed, chordjack, ln, sv, delay,
         chordstream, jack, technical, bracket, dump, odd, rodd, pins, psw, oht, anc, rows, sv_raw,
         ln_rel, mj, sus, lj, shield, inv, hyb, vib, sv_fast, sv_slow, sv_accel, sv_stutter, sv_brake,
-        cover, stag, lnend, used,
+        cover, stag, lnend, used, ln_same,
     ]
 };
 pub const PARTS_4K: [P; 9] = [P::stream, P::jumpstream, P::handstream, P::jumptrill, P::splittrill, P::jackspeed, P::chordjack, P::ln, P::sv];
@@ -36,11 +36,11 @@ pub const PARTS_5K: [P; 8] = [P::delay, P::stream, P::chordstream, P::jumptrill,
 pub const SV_KINDS: [P; 5] = [P::sv_fast, P::sv_slow, P::sv_accel, P::sv_stutter, P::sv_brake];
 const TAIL: [P; 30] = [
     P::technical, P::bracket, P::dump, P::odd, P::rodd, P::pins, P::psw, P::oht, P::anc, P::rows, P::sv_raw, P::ln_rel, P::mj, P::sus, P::lj, P::shield, P::inv, P::hyb,
-    P::vib, P::sv_fast, P::sv_slow, P::sv_accel, P::sv_stutter, P::sv_brake, P::cover, P::stag, P::lnend, P::used,
+    P::vib, P::sv_fast, P::sv_slow, P::sv_accel, P::sv_stutter, P::sv_brake, P::cover, P::stag, P::lnend, P::used, P::ln_same,
     // padding never read (TAIL_LEN)
-    P::stream, P::stream,
+    P::stream,
 ];
-const TAIL_LEN: usize = 28;
+const TAIL_LEN: usize = 29;
 
 /// Output order of the parts dict for a keymode.
 pub fn part_keys(wide: bool) -> Vec<P> {
@@ -58,7 +58,7 @@ fn add_burst(comp: &mut [f64], nbins: usize, burst: &[(usize, f64)], max: usize)
 
 #[inline]
 pub fn non_demand(p: P) -> bool {
-    matches!(p, P::odd | P::rodd | P::pins | P::psw | P::oht | P::anc | P::rows | P::sv_raw | P::mj | P::sus | P::lj | P::shield | P::inv | P::hyb | P::vib | P::cover | P::stag | P::lnend | P::used)
+    matches!(p, P::odd | P::rodd | P::pins | P::psw | P::oht | P::anc | P::rows | P::sv_raw | P::mj | P::sus | P::lj | P::shield | P::inv | P::hyb | P::vib | P::cover | P::stag | P::lnend | P::used | P::ln_same)
 }
 
 /// Part series, keyed like the Python dict (`keys` = its order).
@@ -891,6 +891,10 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
             hands[b * 3 + h] += rice + e_ln;
             fine[fb * 3 + h] += rice + e_ln;
             comp[(o(P::ln)) * nbins + b] += e_ln;
+            // what pressing costs more while the same hand holds: the physical part of the hold term (the press rating keeps it)
+            if held_same > 0.0 {
+                comp[(o(P::ln_same)) * nbins + b] += (rice + k.LN_BASE * share) * k.W_HOLD_SAME * held_same.powf(0.7);
+            }
             jrun[c] = if jacked { jrun[c] + 1 } else { 0 };
             // a Longjacks note: a tap in a column run whose row shares only this column with the run's previous row (more
             // shared columns are a chordjack)
@@ -1141,6 +1145,12 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
         }
     }
     crate::tick::lap("d.releases");
+    // as a share of the bin's hold term: the later stages scale `ln`, and a share stays one
+    for b in 0..nbins {
+        let ln = comp[(o(P::ln)) * nbins + b];
+        let same = &mut comp[(o(P::ln_same)) * nbins + b];
+        *same = if ln > 0.0 { (*same / ln).min(1.0) } else { 0.0 };
+    }
     add_burst(&mut comp, nbins, &burst, k.MJ_BURST);
     if !wide {
         for b in 0..nbins {

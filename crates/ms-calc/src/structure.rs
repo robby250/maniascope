@@ -297,6 +297,7 @@ pub struct Vibro {
     pub share: f64,
     pub speed: f64,
     pub rest: f64,
+    pub rating: f64, // the chart's vibro skill rating: 0 from `vibro_runs`, set by whoever places it on the vibro dans
 }
 
 /// Share of notes in vibro runs (`column_runs`), their median hits per second, and the other notes per second of chart.
@@ -311,7 +312,7 @@ pub fn vibro_runs(chart: &Chart, rate: f64, k: &Knobs) -> Vibro {
     let n = chart.len();
     let span = if n == 0 { 0. } else { (chart.t[n - 1] - chart.t[0]) / rate / 1000. };
     Vibro { share: inrun as f64 / n.max(1) as f64, speed: if gaps.is_empty() { 0. } else { 1000. / gaps[gaps.len() / 2] },
-            rest: if span != 0. { (n - jacks) as f64 / span } else { 0. } }
+            rest: if span != 0. { (n - jacks) as f64 / span } else { 0. }, rating: 0. }
 }
 
 /// Mostly vibro runs with little else: the rice/LN dan would name the wrong skill.

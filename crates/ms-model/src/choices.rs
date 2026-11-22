@@ -28,7 +28,13 @@ pub struct Choice {
     pub practice: String,     // skill_practice.describe_match, Skills lists only
     pub pred: Prediction,
     pub generated_at: f64,
+    /// Under the target at every rate of the range, offered at the nearest (predict::LEARN_FLOOR): a choice only while its
+    /// skill has fewer than LEARN_POOL charts at the target in the keymode (`Choices::learners`).
+    pub learning: bool,
 }
+
+/// Charts a learning slot keeps (`Choices::learners`): enough for a session's turns of one skill in one keymode.
+pub const LEARN_POOL: usize = 20;
 
 pub const REAL: u8 = 0;
 pub const WEB: u8 = 1;
@@ -41,6 +47,11 @@ impl Choice {
     /// Which how-often slider the chart answers to. An imported convert is still a convert.
     pub fn stream(&self) -> u8 {
         if self.convert { if self.source_web { WEB_CONVERT } else { CONVERT } } else if self.installed { REAL } else { WEB }
+    }
+
+    /// Offered under the Invert mod (the Inverse mod skill: such a chart counts as nothing else).
+    pub fn inverted(&self) -> bool {
+        self.matched.iter().any(|m| m == crate::skills::INVERT_MOD)
     }
 
     /// recommend.event_key
@@ -56,6 +67,7 @@ pub struct Proposal {
     pub rate: f64,
     pub keys: i64,
     pub group: String,
+    pub skill: bool, // the chart counts as a picked skill
 }
 
 /// One request's scored charts (the Builder's memo across its passes): per catalogue chart, unscored or
@@ -129,10 +141,46 @@ impl Choices {
         kept.into_iter().map(|(q, s, r)| (q, s.to_string(), r)).collect()
     }
 
+    /// The charts of a picked skill that no analysed rate fits yet, with the rate that would (inside `rates`: at an
+    /// end of the range it is too far off), in catalogue order. A skill's slot takes its turns from these few charts,
+    /// and a chart indexed at 1× only (Invert, converts) is a choice only when 1× happens to fit: 1,611 of 23,882 7K Invert
+    /// charts, 12 of 5,209 on 10K (2026-11-21), so the skill landed on the keymode with the most such luck.
+    /// A learning slot's charts are also analysed at the range's end, where their forecast is nearest the target: only they,
+    /// a keymode's whole too-hard tail (6,312 of 6,485 10K Invert charts, 2026-11-22) would be analysed for nothing.
+    pub fn slot_proposals(&self, refined: &HashSet<&str>, rates: (f64, f64)) -> Vec<(String, f64)> {
+        let learners = self.learners();
+        self.order.iter().zip(&self.slots).filter_map(|(sha, slot)| match slot {
+            Some((c, Some(p))) if p.skill && !refined.contains(sha.as_str()) && c.as_ref().is_none_or(|c| c.learning)
+                && ((p.rate > rates.0 && p.rate < rates.1) || learners.contains(sha.as_str())) => Some((sha.clone(), p.rate)),
+            _ => None,
+        }).collect()
+    }
+
+    /// The learning choices that stand: a (keymode, leading picked skill) with fewer than LEARN_POOL choices at the target
+    /// is filled up to that many with the nearest to it (user 2026-11-22: a picked skill with nothing on target in a
+    /// keymode offers its nearest charts; 10K Invert had 18 at the target and 1,359 near it, and no turn in 300 presses:
+    /// `deal` gives such a slot its slider's turns). A skill with LEARN_POOL charts at the target has none.
+    // ponytail: a slot counts every scored chart at the target, a website one too while its slider is at 0; split by stream if that shows.
+    fn learners(&self) -> HashSet<&str> {
+        fn slot(c: &Choice) -> (i64, &str) {
+            (c.keys, c.matched.first().map_or("", String::as_str))
+        }
+        let choices = || self.slots.iter().filter_map(|s| s.as_ref()?.0.as_deref());
+        let mut filled: HashMap<(i64, &str), usize> = HashMap::default();
+        choices().filter(|c| !c.learning).for_each(|c| *filled.entry(slot(c)).or_default() += 1);
+        let mut pools: HashMap<(i64, &str), Vec<&Choice>> = HashMap::default();
+        choices().filter(|c| c.learning).for_each(|c| pools.entry(slot(c)).or_default().push(c));
+        pools.into_iter().flat_map(|(slot, mut pool)| {
+            pool.sort_by(|a, b| b.acc_mid.total_cmp(&a.acc_mid).then(a.sha.cmp(&b.sha)));
+            pool.into_iter().take(LEARN_POOL.saturating_sub(filled.get(&slot).copied().unwrap_or(0))).map(|c| c.sha.as_str())
+        }).collect()
+    }
+
     /// The choices as they stand, in catalogue order (what a publication carries; later passes don't touch it).
     pub fn snapshot(&self) -> ChoiceList {
+        let learners = self.learners();
         ChoiceList {
-            items: self.slots.iter().filter_map(|s| s.as_ref().and_then(|(c, _)| c.clone())).collect(),
+            items: self.slots.iter().filter_map(|s| s.as_ref().and_then(|(c, _)| c.clone())).filter(|c| !c.learning || learners.contains(c.sha.as_str())).collect(),
             forecast: self.forecast.clone(),
         }
     }
@@ -209,7 +257,8 @@ impl ChoiceList {
             .filter(|(_, c)| !(c.installed && !local_shas(&c.sha)) && keys.contains(&c.keys) && (rates.0 - 1e-6..=rates.1 + 1e-6).contains(&c.rate))
             .map(|x| x.0).collect();
         let by_identity = kept.iter().map(|&i| (self.items[i].identity(), i)).collect();
-        Prepared { list: self.clone(), kept, by_identity }
+        let thin = kept.iter().map(|&i| &self.items[i]).filter(|c| c.learning).map(|c| (c.keys, c.matched.first().cloned().unwrap_or_default())).collect();
+        Prepared { list: self.clone(), kept, by_identity, thin }
     }
 }
 
@@ -218,6 +267,7 @@ pub struct Prepared {
     pub list: Arc<ChoiceList>,
     kept: Vec<usize>,
     by_identity: HashMap<String, usize>,
+    thin: HashSet<(i64, String)>, // the (keymode, skill) slots filled up with learning choices: `Tags::learning` of all their rows
 }
 
 /// The worker's ranking inputs besides the pool (Worker._pool).
@@ -276,11 +326,18 @@ impl Prepared {
         best
     }
 
-    /// Each keymode's NPS over `rows` (entry indices), sorted: what the NPS floor reads.
+    /// Each keymode's NPS over `rows` (entry indices), sorted: what the NPS floor reads. Invert maps are apart (`nps_slots`).
     pub fn nps_pool(&self, rows: &[usize]) -> std::collections::BTreeMap<i64, Vec<f64>> {
-        let mut pool: std::collections::BTreeMap<i64, Vec<f64>> = Default::default();
+        self.nps_slots(rows).into_iter().filter(|(k, _)| !k.1).map(|(k, ns)| (k.0, ns)).collect()
+    }
+
+    /// `nps_pool` per (keymode, under Invert): maps that fit under Invert are easy ones with few notes a second, so against
+    /// the keymode's floor nearly all of them left (7K: 1,582 → 104, 10K: 12 → 0; user 2026-11-21: "floor among Invert
+    /// maps only"). They are measured against each other; the others' floor is read without them.
+    pub fn nps_slots(&self, rows: &[usize]) -> std::collections::BTreeMap<(i64, bool), Vec<f64>> {
+        let mut pool: std::collections::BTreeMap<(i64, bool), Vec<f64>> = Default::default();
         for c in rows.iter().map(|&i| &self.list.items[i]).filter(|c| c.nps > 0.) {
-            pool.entry(c.keys).or_default().push(c.nps);
+            pool.entry((c.keys, c.inverted())).or_default().push(c.nps);
         }
         pool.values_mut().for_each(|ns| ns.sort_by(f64::total_cmp));
         pool
@@ -294,16 +351,16 @@ impl Prepared {
         let mut rows = self.family_best(&r.keys, r.web, r.convert);
         // The floor follows each keymode's eligible pool and the Variety ↔ NPS slider: far below it is not NPS practice
         // (user 2026-10-22: a 6 NPS map "should never appear"; 2026-11-13: "minimum nps should move with the nps/variety slider").
-        let mut floor: HashMap<i64, f64> = HashMap::default();
+        let mut floor: HashMap<(i64, bool), f64> = HashMap::default();
         // One floor for both tabs' slider (user 2026-11-14: the custom playlist's shows its map count too); off has none.
         if r.nps || r.shuffle.is_some() {
             let focus = r.shuffle.as_ref().map_or(0.5, |s| s.1);
-            for (k, ns) in self.nps_pool(&rows) {
+            for (k, ns) in self.nps_slots(&rows) {
                 floor.insert(k, nps_floor(&ns, focus));
             }
             rows.retain(|&i| {
                 let c = &items[i];
-                !(0. < c.nps && c.nps < NPS_CUT * floor.get(&c.keys).copied().unwrap_or(0.))
+                !(0. < c.nps && c.nps < NPS_CUT * floor.get(&(c.keys, c.inverted())).copied().unwrap_or(0.))
             });
         }
         if rows.is_empty() {
@@ -325,7 +382,7 @@ impl Prepared {
         for (&i, fr) in rows.iter().zip(&fresh) {
             let c = &items[i];
             let mut value = c.value + 0.65 * fr.powf(if relax { 0.3 } else { 1. }).max(0.001).ln();
-            let f = floor.get(&c.keys).copied().unwrap_or(0.);
+            let f = floor.get(&(c.keys, c.inverted())).copied().unwrap_or(0.);
             if f != 0. && c.nps > 0. {
                 value -= 24. * (f / c.nps).ln().max(0.);
             }
@@ -375,7 +432,8 @@ impl Prepared {
     /// What `deal` reads of an entry: its skill slot is its leading picked skill when the list has skill slots.
     pub fn tags(&self, i: usize, skills: bool) -> Tags {
         let c = &self.list.items[i];
-        Tags { keys: c.keys, skill: if skills { c.matched.first().cloned().unwrap_or_default() } else { String::new() }, stream: c.stream() }
+        let skill = if skills { c.matched.first().cloned().unwrap_or_default() } else { String::new() };
+        Tags { keys: c.keys, learning: skills && self.thin.contains(&(c.keys, skill.clone())), skill, stream: c.stream() }
     }
 }
 
@@ -440,6 +498,7 @@ pub struct Tags {
     pub keys: i64,
     pub skill: String,
     pub stream: u8,
+    pub learning: bool, // of a slot filled up with learning offers (`Choice::learning`): dealt by the skill's slider, not by its map count
 }
 
 /// The sliders a list is dealt by.
@@ -502,7 +561,7 @@ pub fn deal(pool: &[Tags], shares: &Shares, ledger: &[Tags], queue: &[Option<Tag
     let key_weight = |k: &i64| shares.keys.get(k).copied().unwrap_or(1. / keymodes.len().max(1) as f64).max(0.);
     let key_total: f64 = keymodes.iter().map(key_weight).sum();
     let mut maps: HashMap<&str, f64> = HashMap::default();
-    all().for_each(|t| *maps.entry(t.skill.as_str()).or_insert(0.) += 1.);
+    all().filter(|t| !t.learning).for_each(|t| *maps.entry(t.skill.as_str()).or_insert(0.) += 1.);
     let slots = |raw: Vec<f64>| -> Vec<Slot> {
         let total: f64 = raw.iter().sum();
         raw.iter().map(|r| Slot { share: if total > 0. { r / total } else { 1. / raw.len() as f64 }, owed: 0., on: true, last: 0 }).collect()
@@ -511,8 +570,12 @@ pub fn deal(pool: &[Tags], shares: &Shares, ledger: &[Tags], queue: &[Option<Tag
         let key_share = if key_total > 0. { key_weight(k) / key_total } else { 1. / keymodes.len() as f64 };
         let mut names: Vec<&str> = Vec::new();
         let (mut counts, mut streams): (Vec<f64>, Vec<u8>) = Default::default();
+        let mut learning: Vec<&str> = Vec::new(); // the skills with nothing at the target here: their nearest charts
         for t in all().filter(|t| t.keys == *k) {
             streams.push(t.stream);
+            if t.learning && !learning.contains(&t.skill.as_str()) {
+                learning.push(&t.skill);
+            }
             match names.iter().position(|n| *n == t.skill) {
                 Some(i) => counts[i] += 1.,
                 None => {
@@ -521,9 +584,11 @@ pub fn deal(pool: &[Tags], shares: &Shares, ledger: &[Tags], queue: &[Option<Tag
                 }
             }
         }
-        // a picked skill: its share × this keymode's part of its maps ÷ this keymode's part of the list; other maps: the rest
+        // a picked skill: its share × this keymode's part of its maps ÷ this keymode's part of the list; other maps: the rest.
+        // A skill filled up with learning offers here has too few maps to go by: it comes as often as its slider says (user
+        // 2026-11-22: "The skill's normal turns"; by its 20 charts among 4K's thousands 10K Invert got no turn in 300).
         let slider = |n: &str| shares.skills.as_ref().map_or(1., |s| s.get(n).copied().unwrap_or(0.));
-        let raw: Vec<f64> = names.iter().zip(&counts).map(|(n, c)| if n.is_empty() || key_share <= 0. { slider(n) } else { slider(n) * c / maps[n] / key_share }).collect();
+        let raw: Vec<f64> = names.iter().zip(&counts).map(|(n, c)| if n.is_empty() || key_share <= 0. || learning.contains(n) { slider(n) } else { slider(n) * c / maps[n] / key_share }).collect();
         let picked: f64 = names.iter().zip(&raw).filter(|(n, _)| !n.is_empty()).map(|(_, r)| r).sum();
         let raw = names.iter().zip(&raw).map(|(n, r)| if n.is_empty() && shares.skills.is_some() { (1. - picked).max(0.) } else { *r }).collect();
         let mut skills = slots(raw);
@@ -678,7 +743,7 @@ mod deal_tests {
     use super::*;
 
     fn row(keys: i64, skill: &str, stream: u8) -> Tags {
-        Tags { keys, skill: skill.into(), stream }
+        Tags { keys, skill: skill.into(), stream, learning: false }
     }
 
     fn rows(n: usize, keys: i64, skill: &str, stream: u8) -> Vec<Tags> {
@@ -795,6 +860,19 @@ mod deal_tests {
         assert!(count(&got, |t| t.keys == 10).abs_diff(60) <= 1, "the keymodes still take even turns");
     }
 
+    /// User 2026-11-22: 10K Invert reaches the target at no rate; its nearest charts come "the skill's normal turns".
+    #[test]
+    fn a_skill_with_only_learning_offers_in_a_keymode_comes_as_often_as_its_slider_says() {
+        let pool = |learning: bool| [rows(200, 4, "invert_mod", REAL), rows(200, 4, "", REAL), rows(200, 10, "", REAL), vec![Tags { learning, ..row(10, "invert_mod", REAL) }; 20]].concat();
+        let shares = Shares { skills: skills(&[("invert_mod", 0.15), ("", 0.85)]), ..Shares::default() };
+        let turns = |got: &[Tags], keys: i64| count(got, |t| t.keys == keys && t.skill == "invert_mod");
+        let got = presses(&pool(true), &shares, 120);
+        assert!(turns(&got, 10).abs_diff(9) <= 2 && turns(&got, 4).abs_diff(16) <= 2, "10K {} (0.15 of its 60), 4K {} (where the skill's maps are)", turns(&got, 10), turns(&got, 4));
+        // 20 charts at the target go by their count, as every skill does
+        let by_count = presses(&pool(false), &shares, 120);
+        assert!(turns(&by_count, 10) <= 3 && turns(&by_count, 4).abs_diff(16) <= 2, "{} {}", turns(&by_count, 10), turns(&by_count, 4));
+    }
+
     /// User 2026-11-18 (fixed in 1.15.0, kept here): 4K Vibro picked alone filled the list with other keymodes' maps without
     /// it; wide charts never fill a Vibro turn, they come only as "other maps".
     #[test]
@@ -895,7 +973,7 @@ mod list_tests {
 
     fn choice(sha: &str, nps: f64, group: &str) -> Choice {
         Choice { sha: sha.into(), md5: sha.into(), keys: 7, rate: 1., value: 0., installed: true, convert: false, source_web: false, playcount: -1., family: sha.into(), description: "Mixed".into(),
-                 group: group.into(), nps, length: 180., profile: vec![1.], acc_mid: 0.94, matched: Vec::new(), practice: String::new(), pred: Prediction::default(), generated_at: 0. }
+                 group: group.into(), nps, length: 180., profile: vec![1.], acc_mid: 0.94, matched: Vec::new(), practice: String::new(), pred: Prediction::default(), generated_at: 0., learning: false }
     }
 
     fn prepared(rows: Vec<Choice>, keys: &[i64]) -> Prepared {
@@ -983,6 +1061,56 @@ mod list_tests {
     }
 
     #[test]
+    fn a_picked_skills_chart_without_a_fitting_rate_asks_for_the_one_that_fits() {
+        let order: Vec<String> = ["fits", "skill", "other", "edge", "done"].iter().map(|s| s.to_string()).collect();
+        let mut memo = Choices::new(order, Forecast::default());
+        let want = |rate: f64, skill: bool| Some(Proposal { quality: 0., rate, keys: 10, group: "rice".into(), skill });
+        memo.slots[0] = Some((Some(Arc::new(choice("fits", 9., "rice"))), want(0.9, true))); // has a choice already
+        memo.slots[1] = Some((None, want(0.85, true)));
+        memo.slots[2] = Some((None, want(0.85, false))); // not the picked skill's: the frontier's business
+        memo.slots[3] = Some((None, want(0.75, true))); // the range's end: still too hard there
+        memo.slots[4] = Some((None, want(1.2, true)));
+        let done: HashSet<&str> = ["done"].into_iter().collect();
+        assert_eq!(memo.slot_proposals(&done, (0.75, 1.5)), vec![("skill".to_string(), 0.85)]);
+    }
+
+    #[test]
+    fn a_skill_with_nothing_at_the_target_in_a_keymode_offers_its_nearest_charts() {
+        // user 2026-11-22: 10K Invert reached the target at no rate and was never offered: "offer the easiest anyway"
+        let invert = |sha: String, acc: f64, learning: bool| Choice { keys: 10, acc_mid: acc, learning, matched: vec![crate::skills::INVERT_MOD.to_string()], ..choice(&sha, 3., "ln") };
+        let end = |skill: bool| Some(Proposal { quality: 0., rate: 0.75, keys: 10, group: "ln".into(), skill });
+        let order: Vec<String> = (0..25).map(|i| format!("l{i:02}")).chain(["other".to_string(), "fits".to_string()]).collect();
+        let mut memo = Choices::new(order, Forecast::default());
+        for i in 0..25 {
+            memo.slots[i] = Some((Some(Arc::new(invert(format!("l{i:02}"), 0.86 + 0.002 * i as f64, true))), end(true)));
+        }
+        // another skill of the keymode, with nothing at the target either: a slot of its own
+        memo.slots[25] = Some((Some(Arc::new(Choice { keys: 10, learning: true, matched: vec!["ln".to_string()], ..choice("other", 3., "ln") })), end(true)));
+        let shas = |m: &Choices| m.snapshot().items.iter().map(|c| c.sha.clone()).collect::<Vec<_>>();
+        let nearest: Vec<String> = (5..25).map(|i| format!("l{i:02}")).chain(["other".to_string()]).collect();
+        assert_eq!(shas(&memo), nearest, "the 20 nearest of 25, and the other skill's one");
+        assert_eq!(memo.slot_proposals(&HashSet::default(), (0.75, 1.5)).len(), 21, "they are analysed at the range's end, the other five are not");
+        // one chart at the target takes one of the 20 places
+        memo.slots[26] = Some((Some(Arc::new(invert("fits".to_string(), 0.96, false))), None));
+        assert_eq!(shas(&memo), (6..25).map(|i| format!("l{i:02}")).chain(["other".to_string(), "fits".to_string()]).collect::<Vec<_>>());
+        assert_eq!(memo.slot_proposals(&HashSet::default(), (0.75, 1.5)).len(), 20);
+    }
+
+    #[test]
+    fn invert_maps_have_a_floor_of_their_own() {
+        let invert = |sha: &str, nps: f64| Choice { matched: vec![crate::skills::INVERT_MOD.to_string()], ..choice(sha, nps, "ln") };
+        let mut rows: Vec<Choice> = (0..20).map(|i| choice(&i.to_string(), 25., "chords")).collect();
+        rows.extend((0..20).map(|i| invert(&format!("i{i}"), 5.)));
+        rows.push(invert("thin", 1.));
+        rows.push(choice("low", 6.2, "sv"));
+        let p = prepared(rows, &[7]);
+        let got = ranked(&p, Ask::default());
+        let kept = |sha: &str| got.iter().any(|c| c.0.sha == sha);
+        assert!(kept("i0") && !kept("thin") && !kept("low"), "5 NPS under Invert stays beside 25 NPS maps; 1 NPS is thin among Invert maps, 6.2 among the others");
+        assert_eq!(p.nps_pool(&(0..42).collect::<Vec<_>>())[&7].len(), 21, "the keymode's own floor is read without them");
+    }
+
+    #[test]
     fn nps_focus_changes_selection_without_changing_rate_targets() {
         let rows: Vec<Choice> = (0..100).map(|i| {
             let mut c = choice(&i.to_string(), if i < 80 { 22. } else { 34. }, "chords");
@@ -1030,8 +1158,8 @@ mod list_tests {
         let mut c = choice("a", 30., "chords");
         (c.matched, c.installed, c.convert, c.source_web) = (vec!["vibro".to_string(), "jackspeed".to_string()], false, true, true);
         let p = prepared(vec![c, choice("b", 30., "chords")], &[7]);
-        assert_eq!(p.tags(0, true), Tags { keys: 7, skill: "vibro".into(), stream: WEB_CONVERT });
-        assert_eq!((p.tags(0, false).skill.as_str(), p.tags(1, true)), ("", Tags { keys: 7, skill: String::new(), stream: REAL }));
+        assert_eq!(p.tags(0, true), Tags { keys: 7, skill: "vibro".into(), stream: WEB_CONVERT, learning: false });
+        assert_eq!((p.tags(0, false).skill.as_str(), p.tags(1, true)), ("", Tags { keys: 7, skill: String::new(), stream: REAL, learning: false }));
     }
 
     #[test]

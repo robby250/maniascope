@@ -86,6 +86,36 @@ fn inject_events(osu: String, events: &[String]) -> String {
     out
 }
 
+/// rosu-map reads `key:value` by splitting at every colon and keeps the second piece (0.2.1 `KeyValue::parse`): a value is
+/// cut at its own first colon, so lazer got "mona (CV" for `mona (CV: Natsukawa Shiina)` and the copied search, built
+/// from the full name, never found the convert (user 2026-11-21). → the `[Metadata]` values it cuts, whole.
+fn colon_values(text: &str) -> impl Iterator<Item = (&str, &str)> {
+    const TEXTS: [&str; 8] = ["Title", "TitleUnicode", "Artist", "ArtistUnicode", "Creator", "Version", "Source", "Tags"];
+    let lines = text.lines().map(|l| l.trim_start_matches('\u{feff}').trim()).skip_while(|l| *l != "[Metadata]").skip(1).take_while(|l| !l.starts_with('['));
+    lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim(), v.trim())).filter(|(k, v)| v.contains(':') && TEXTS.contains(k))
+}
+
+/// A convert or Invert chart of `source` made before 2026-11-21 has cut metadata: its bytes, and so its sha, changed.
+pub fn metadata_was_cut(source: &[u8]) -> bool {
+    colon_values(&String::from_utf8_lossy(source)).next().is_some()
+}
+
+fn restore_metadata(map: &mut rosu_map::Beatmap, text: &str) {
+    for (key, value) in colon_values(text) {
+        let field = match key {
+            "Title" => &mut map.title,
+            "TitleUnicode" => &mut map.title_unicode,
+            "Artist" => &mut map.artist,
+            "ArtistUnicode" => &mut map.artist_unicode,
+            "Creator" => &mut map.creator,
+            "Version" => &mut map.version,
+            "Source" => &mut map.source,
+            _ => &mut map.tags,
+        };
+        *field = value.to_string();
+    }
+}
+
 fn sanitize_filename(name: &str) -> String {
     name.chars().filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') && !c.is_control()).collect()
 }
@@ -98,6 +128,7 @@ pub fn convert(source: &[u8], target: usize) -> Result<Converted> {
 
 fn convert_chart(source: &[u8], target: usize) -> Result<Converted> {
     let mut map: rosu_map::Beatmap = rosu_map::from_bytes(source)?;
+    restore_metadata(&mut map, &String::from_utf8_lossy(source));
     let keys = mania::key_count(&map);
     if keys == target {
         bail!("the map is already {target}K");
@@ -121,6 +152,7 @@ pub fn invert(source: &[u8]) -> Result<Converted> {
 fn invert_chart(source: &[u8]) -> Result<Converted> {
     use rosu_map::section::hit_objects::{HitObject, HitObjectHold, HitObjectKind};
     let mut map: rosu_map::Beatmap = rosu_map::from_bytes(source)?;
+    restore_metadata(&mut map, &String::from_utf8_lossy(source));
     let keys = mania::key_count(&map);
     let beats: Vec<(f64, f64)> = map.control_points.timing_points.iter().filter(|p| p.beat_len > 0.).map(|p| (p.time, p.beat_len)).collect();
     let beat_at = |t: f64| beats.iter().rev().find(|b| b.0 <= t).or(beats.first()).map_or(1000., |b| b.1); // lazer's default: 1000 ms
@@ -169,6 +201,19 @@ mod tests {
             osu.push_str(&format!("{},192,{},1,0,0:0:0:0:\n", (step * 3 % 7) * 512 / 7 + 36, step * 125));
         }
         osu
+    }
+
+    #[test]
+    fn a_value_keeps_what_follows_its_colon() {
+        let osu = source().replace("Title:T", "Title:Re:A\nTags:x:y z").replace("Artist:A", "Artist:mona (CV: X)").replace("Version:Insane", "Version:a:b");
+        let value = |text: &str, key: &str| text.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix(':').map(|v| v.trim().to_string())).unwrap();
+        for out in [convert(osu.as_bytes(), 4).unwrap(), invert(osu.as_bytes()).unwrap()] {
+            let text = String::from_utf8(out.osu).unwrap();
+            assert_eq!((value(&text, "Title"), value(&text, "Artist"), value(&text, "Tags")), ("Re:A".into(), "mona (CV: X)".into(), "x:y z".into()));
+            assert_eq!(value(&text, "Version"), out.version);
+            assert!(metadata_was_cut(osu.as_bytes()) && !metadata_was_cut(source().as_bytes()));
+            assert!(out.version.starts_with("a:b (") && out.file_name.starts_with("mona (CV X) - ReA (C) [ab ("), "{} {}", out.version, out.file_name);
+        }
     }
 
     #[test]

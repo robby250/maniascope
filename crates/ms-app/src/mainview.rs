@@ -1,7 +1,7 @@
 //! The main window: glanceable difficulty of the selected map, kept small as an OBS source.
 use crate::app::{open_external, App};
 use crate::fmt::{self, bold, plain, small};
-use crate::theme::{self, ACCENT, BODY, DIM, SMALL, TEXT};
+use crate::theme::{self, px, ACCENT, DIM, TEXT};
 use crate::viewer::Analysis;
 use eframe::egui::{self, epaint::{text::{LayoutJob, TextFormat, TextWrapping}, Mesh, Vertex, WHITE_UV}, Align, Color32, FontId, Layout, RichText, Sense, Shape, Stroke, TextStyle, Ui, Vec2};
 use ms_model::skills;
@@ -15,6 +15,8 @@ const BAR_FULL: f32 = 10.; // fixed scale for the skill bars: comparable across 
 const BAR_ROW: f32 = 18.;
 const BAR_LABEL: f32 = 96.;  // the longest skill name
 const BAR_VALUE: f32 = 40.;  // "10.00" and its gap
+const CARD_GAP: f32 = 5.; // between the window's cards
+const CARD_PAD: f32 = 14.; // a card's own margins and outline, top and bottom
 const HEAD: f32 = 52.; // three lines of skills, or the rating badge
 const BARS_TIP: &str = "Each skill is the rating of the sections that show it, on the same scale as the overall number: a section can count toward several skills (Stream and Technical, Chordstream and Bracket); overall charges its work once. Bars: fixed 0–10, comparable across maps. Stamina is the hardest 4 minutes, a shorter map counted with rest.";
 
@@ -24,20 +26,24 @@ fn rows_for(skills: usize) -> usize {
 }
 
 fn head_height(skills: usize) -> f32 {
-    HEAD + (rows_for(skills) - 1) as f32 * BODY
+    px(HEAD) + (rows_for(skills) - 1) as f32 * theme::body()
 }
 
+/// The area under a curve, fading out downwards, with the curve drawn on top.
 fn strip(rect: egui::Rect, points: &[(f32, f32)], color: Color32) -> Shape {
     let mut m = Mesh::default();
     for (i, &(x, y)) in points.iter().enumerate() {
-        m.vertices.push(Vertex { pos: egui::pos2(x, y), uv: WHITE_UV, color });
-        m.vertices.push(Vertex { pos: egui::pos2(x, rect.bottom()), uv: WHITE_UV, color });
+        // as strong at a peak as at a valley's own height: the fade follows the card, not the curve
+        let at = |y: f32| color.gamma_multiply(0.08 + 0.5 * ((rect.bottom() - y) / rect.height().max(1.)).clamp(0., 1.));
+        m.vertices.push(Vertex { pos: egui::pos2(x, y), uv: WHITE_UV, color: at(y) });
+        m.vertices.push(Vertex { pos: egui::pos2(x, rect.bottom()), uv: WHITE_UV, color: at(rect.bottom()) });
         if i > 0 {
             let n = (2 * i) as u32;
             m.indices.extend([n - 2, n - 1, n, n - 1, n + 1, n]);
         }
     }
-    Shape::mesh(m)
+    let line = Shape::line(points.iter().map(|&(x, y)| egui::pos2(x, y)).collect(), Stroke::new(px(1.5), color));
+    Shape::Vec(vec![Shape::mesh(m), line])
 }
 
 /// 0–1 per skill, for type size and opacity: shrinks with distance from the top rating, and each entry is a step smaller
@@ -100,8 +106,8 @@ impl App {
         let top = (pts.iter().copied().fold(0., f64::max) * 1.05).max(1e-9); // own peak: no dead band under the text
         let n = (pts.len() - 1).max(1) as f32;
         let points: Vec<(f32, f32)> = pts.iter().enumerate().map(|(i, v)| (rect.left() + i as f32 * rect.width() / n, rect.bottom() - rect.height() * (*v / top) as f32)).collect();
-        let p = ui.painter_at(rect);
-        p.add(strip(rect, &points, TEXT.gamma_multiply(0.35)));
+        let p = ui.painter_at(rect.expand(px(4.))); // room for the marker's dot on a peak
+        p.add(strip(rect, &points, theme::PURPLE));
         if let (Some(live), Some((t0, t1))) = (self.live, a.span) {
             let f = (((live - t0) / (t1 - t0).max(1.)) as f32).clamp(0., 1.);
             let x = rect.left() + rect.width() * f;
@@ -110,9 +116,12 @@ impl App {
                 let t = (x - last.0) / (next.0 - last.0).max(1e-3);
                 done.push((x, last.1 + (next.1 - last.1) * t));
             }
-            let blue = Color32::from_rgba_unmultiplied(54, 133, 227, 230);
-            p.add(strip(rect, &done, blue));
-            p.rect_filled(egui::Rect::from_min_max(egui::pos2(x - 1., rect.top()), egui::pos2(x + 1., rect.bottom())), 0., Color32::from_rgb(54, 133, 227));
+            p.add(strip(rect, &done, ACCENT));
+            // where the play is: a line, and a dot riding the curve
+            p.vline(x, rect.y_range(), Stroke::new(px(1.5), TEXT.gamma_multiply(0.85)));
+            if let Some(&(_, y)) = done.last() {
+                p.circle(egui::pos2(x, y), px(3.5), TEXT, Stroke::new(px(1.5), ACCENT));
+            }
         }
         let Some(hover) = response.hover_pos() else { return };
         // x ↔ chart time over the notes' span, as the live marker.
@@ -166,26 +175,26 @@ impl App {
             let (text, pill) = fmt::rating_colours(v);
             let you = self.you(a.keys).and_then(|p| Some((p.groups.get("overall")?.value?, p)));
             let versus = you.map_or(String::new(), |(y, _)| format!("\n{:+.1} vs your {}K {:.1}{}", v - ms_rec::shown::stars(a.keys, y), a.keys, ms_rec::shown::stars(a.keys, y), ms_rec::dans::ability(a.keys, y, "overall").map_or(String::new(), |d| format!(" · ≈ {d}"))));
-            theme::gradient(&mut ui, &format!("{v:.2}"), BODY * 2.4, None, &text, Some(pill))
+            theme::gradient(&mut ui, &format!("{v:.2}"), theme::body() * 2.4, None, &text, Some(pill))
                 .on_hover_text(format!("Overall difficulty: level a well-rounded player needs for controlled, accurate play. Provisional calibration: one decimal is already generous.{versus}"));
-            ui.add_space(4.);
+            ui.add_space(theme::px(4.));
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if let (true, Some(v)) = (d.nps, a.nps) {
                 let peak = a.peak_nps.map_or(String::new(), |(n, at)| format!("\nDensest 2 s: {n:.1} NPS at {}", at_rate(at, a.rate)));
-                theme::gradient(ui, &format!("{v:.1}"), BODY * 1.9, Some((" NPS", BODY * 0.9)), &fmt::nps_colours(v), None).on_hover_text(format!("Notes per second, first to last note, at this rate{peak}"));
+                theme::gradient(ui, &format!("{v:.1}"), theme::body() * 1.9, Some((" NPS", theme::body() * 0.9)), &fmt::nps_colours(v), None).on_hover_text(format!("Notes per second, first to last note, at this rate{peak}"));
             }
             let first = a.entries.first().map_or(1., |e| e.rating);
             let sizes = skill_sizes(&a.entries.iter().map(|e| e.rating).collect::<Vec<_>>());
             let format = |i: usize| {
                 let (r, f) = (a.entries[i].rating / first, sizes[i]);
                 let family = if r >= 0.85 && i < 2 { egui::FontFamily::Name("bold".into()) } else { egui::FontFamily::Proportional };
-                TextFormat { font_id: FontId::new(BODY * (0.70 + 0.55 * f), family), color: TEXT.gamma_multiply(0.55 + 0.45 * f), ..TextFormat::default() }
+                TextFormat { font_id: FontId::new(theme::body() * (0.70 + 0.55 * f), family), color: TEXT.gamma_multiply(0.55 + 0.45 * f), ..TextFormat::default() }
             };
             // Names only, sized by rating: the overall is the card's one number, skill stars are in Details (user 2026-11-09).
             // A comma ends every skill but the row's last: without the old numbers, same-sized names ran together (user 2026-11-09).
             // A tag sits beside its name in the accent colour, Tech before it and Stamina after ("Tech Stream", "LN Release
-            // Stamina", user 2026-11-12), never under the theme's SMALL size ("the font on the modifier on the 3rd skill is way too small").
+            // Stamina", user 2026-11-12), never under the theme's theme::small() size ("the font on the modifier on the 3rd skill is way too small").
             let tagged = |i: usize| -> (String, String) {
                 let t = &a.entries[i].tags;
                 (t.iter().filter(|t| *t == "Tech").map(|t| format!("{t} ")).collect(), t.iter().filter(|t| *t != "Tech").map(|t| format!(" {t}")).collect())
@@ -197,9 +206,9 @@ impl App {
                 let mut j = LayoutJob::default();
                 for i in range.clone() {
                     let f = format(i);
-                    let small = TextFormat { font_id: FontId::new((f.font_id.size * 0.62).max(SMALL), egui::FontFamily::Proportional), color: ACCENT, valign: Align::TOP, ..TextFormat::default() };
+                    let small = TextFormat { font_id: FontId::new((f.font_id.size * 0.62).max(theme::small()), egui::FontFamily::Proportional), color: ACCENT, valign: Align::TOP, ..TextFormat::default() };
                     let (b, t) = tagged(i);
-                    let gap = if i > range.start { 8. } else { 0. };
+                    let gap = if i > range.start { px(8.) } else { 0. };
                     if !b.is_empty() {
                         j.append(&b, gap, small.clone());
                     }
@@ -222,9 +231,9 @@ impl App {
             let tags: Vec<String> = a.tags.iter().cloned().chain(ms_calc::card::also_line(&a.also, &shown)).collect();
             let tags = (!tags.is_empty()).then(|| tags.join(" · "));
             let lines = ui.fonts_mut(|f| {
-                let mut h = top.clone().map_or(BODY * 1.2, |j| f.layout_job(j).size().y);
+                let mut h = top.clone().map_or(theme::body() * 1.2, |j| f.layout_job(j).size().y);
                 h += f.layout_job(rest.clone()).size().y;
-                h + tags.as_ref().map_or(0., |_| BODY * 1.2)
+                h + tags.as_ref().map_or(0., |_| theme::body() * 1.2)
             });
             ui.allocate_ui_with_layout(ui.available_size(), Layout::top_down(Align::Min), |ui| {
                 ui.spacing_mut().item_spacing.y = 0.;
@@ -261,16 +270,16 @@ impl App {
     /// level for that skill as a faint tick.
     fn details(&self, ui: &mut Ui, a: &Arc<Analysis>) {
         let rows: Vec<&(String, String, f64)> = shown_bars(a).collect();
-        let (area, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), rows.len() as f32 * BAR_ROW), Sense::hover());
+        let (area, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), rows.len() as f32 * px(BAR_ROW)), Sense::hover());
         let p = ui.painter().clone();
-        let font = egui::FontId::proportional(theme::BODY);
+        let font = egui::FontId::proportional(theme::body());
         let page = self.you(a.keys);
         for (i, (key, name, value)) in rows.into_iter().enumerate() {
-            let row = egui::Rect::from_min_size(area.min + Vec2::new(0., i as f32 * BAR_ROW), Vec2::new(area.width(), BAR_ROW));
+            let row = egui::Rect::from_min_size(area.min + Vec2::new(0., i as f32 * px(BAR_ROW)), Vec2::new(area.width(), px(BAR_ROW)));
             let hover = ui.interact(row, ui.scope_id().with(("bar", i)), Sense::hover());
             p.text(row.left_center(), egui::Align2::LEFT_CENTER, name, font.clone(), theme::TEXT);
             p.text(row.right_center(), egui::Align2::RIGHT_CENTER, format!("{:.2}", ms_rec::shown::stars(a.keys, *value)), font.clone(), theme::TEXT);
-            let track = egui::Rect::from_min_max(egui::pos2(row.left() + BAR_LABEL, row.center().y - 3.), egui::pos2(row.right() - BAR_VALUE, row.center().y + 3.));
+            let track = egui::Rect::from_min_max(egui::pos2(row.left() + px(BAR_LABEL), row.center().y - px(3.)), egui::pos2(row.right() - px(BAR_VALUE), row.center().y + px(3.)));
             p.rect_filled(track, 3., theme::BUTTON);
             let mut fill = track;
             fill.set_width(track.width() * (*value as f32 / BAR_FULL).clamp(0., 1.));
@@ -285,8 +294,16 @@ impl App {
     }
 
     /// The context line, each part with its own explanation.
+    /// The chart's length at this rate, or what is left of it in play, with its tooltip.
+    fn length(&self, a: &Analysis) -> Option<(String, String)> {
+        let (t0, t1) = a.span?;
+        let playing = self.live;
+        let left = (t1 - playing.unwrap_or(t0).max(t0)).max(0.) / 1000. / a.rate;
+        // no "left": the number going down says so (user 2026-11-22)
+        Some((fmt::clock(left), if playing.is_some() { "Time left at this rate." } else { "First to last note at this rate." }.into()))
+    }
+
     fn context_line(&self, ui: &mut Ui, a: &Arc<Analysis>) {
-        let (_, _, known) = self.effective();
         let ln_share = a.ln_notes / a.notes.max(1) as f64;
         let dan = ms_rec::dans::label(a.keys, a.overall, a.press, ln_share, Some(&a.dan_vibro), a.seconds());
         let mut parts: Vec<(String, String)> = vec![(format!("{}K", a.keys), "Keymode".into())];
@@ -294,20 +311,17 @@ impl App {
             parts.push((d, "The dan this map's difficulty matches. Tap dans under 22% LN, LN dans from 50%, both in between; a 4K map with 10% of its notes in fast same-column runs reads on the Vibro dans too.".into()));
         }
         if let Some(l) = a.o2jam.filter(|_| self.s.display.o2jam) {
-            parts.push((format!("O2Jam Lv. {l:.0}"), format!("O2Jam level {l:.1} at this rate: our calc's ratings mapped onto O2Jam levels, fitted on 4,400 O2Jam charts and osu! converts named with their level (typically off by 5–8 levels). Trained mostly on LN-heavy O2Jam charts: pure rice charts may read off.")));
+            parts.push((format!("O2Jam Lv. {l:.0}"), format!("O2Jam level {l:.1} at this rate: our calc's ratings mapped onto O2Jam levels, fitted on 4,400 O2Jam charts, 2,600 osu! conversions of them and osu! maps named with their level (typically off by 5–6 levels). Trained mostly on LN-heavy O2Jam charts: pure rice charts may read off.")));
         }
-        parts.push((format!("{:.2}×{}", a.rate, if known { "" } else { " (osu! rate unknown)" }), if known { "Rate read from osu!'s mods.".into() } else { "osu! hasn't reported a rate yet: 1.00× assumed.".into() }));
-        for m in ms_calc::mods::Mods::from_tag(&a.mods).labels() {
-            parts.push((m, "A mod that is on in osu!: the difficulty, the skills and the dan are those of the chart as it is played with it.".into()));
-        }
+        // The rate and the mods are the pills beside the title (`mods`, user 2026-11-21); an unknown rate is not said
+        // (user 2026-11-22: "remove x1.00 (osu rate unknown) text from the card").
         if a.mods.ends_with(crate::viewer::RANDOM_ESTIMATE) {
             parts.push(("≈ Random".into(), "Random is on and osu! hasn't dealt its shuffle yet: the difficulty and skills are the average over three shuffles.".into()));
         }
         // Chart length, or time left (real seconds at this rate) in play.
-        if let Some((t0, t1)) = a.span {
-            let playing = self.live;
-            let left = (t1 - playing.unwrap_or(t0).max(t0)).max(0.) / 1000. / a.rate;
-            parts.push((format!("{}{}", fmt::clock(left), if playing.is_some() { " left" } else { "" }), if playing.is_some() { "Time left at this rate." } else { "First to last note at this rate." }.into()));
+        // beside the graph when that shows (user 2026-11-22)
+        if let Some(length) = self.length(a).filter(|_| !self.s.display.timeline) {
+            parts.push(length);
         }
         // Long-note heads / all note heads: each LN counts once.
         parts.push((format!("LN {:.0}%", 100. * ln_share), format!("{:.0} long notes of {} notes", a.ln_notes, a.notes)));
@@ -349,12 +363,57 @@ impl App {
         });
     }
 
-    /// Title and difficulty lines: a click copies the search text, a right-click opens the map menu.
+    /// The rate and the mods that are on, as lazer's song select lists them: right-aligned pills, in lazer's order
+    /// (the rate first from the left).
+    /// Every mod that is on in osu!, as lazer lists them (user 2026-11-22: "show all mods just like lazer").
+    fn mod_pills(&self, ui: &mut Ui) {
+        let Some(list) = &self.obs.mods else { return };
+        let changes = "The difficulty, the skills and the dan are those of the chart as it is played with it.";
+        let mods: Vec<theme::ModShown> = list.iter().filter_map(|m| {
+            let acronym = m.get("acronym").or(Some(m)).and_then(|a| a.as_str())?.to_uppercase();
+            let setting = |k: &str| m.get("settings").and_then(|s| s.get(k)).and_then(serde_json::Value::as_f64);
+            // lazer's `ExtendedIconInformation`: a rate that is not the mod's own, Difficulty Adjust's accuracy
+            let (more, tip) = match acronym.as_str() {
+                "DT" | "NC" | "HT" | "DC" => {
+                    let own = if matches!(acronym.as_str(), "DT" | "NC") { 1.5 } else { 0.75 };
+                    (setting("speed_change").filter(|r| (r - own).abs() > 1e-6).map(|r| format!("{r:.2}x")), "The rate everything here is shown at.")
+                }
+                "DA" => (setting("overall_difficulty").map(|od| format!("OD {od:.1}")), changes),
+                "IN" | "HO" | "CS" | "NR" | "RD" | "WU" | "WD" | "HR" | "EZ" => (None, changes),
+                _ => (None, ""),
+            };
+            // osu! lists only the settings that are not the mod's own
+            let custom = more.is_some() || m.get("settings").and_then(|s| s.as_object()).is_some_and(|s| !s.is_empty() && acronym != "DT" && acronym != "NC" && acronym != "HT" && acronym != "DC" || s.keys().any(|k| k != "speed_change"));
+            Some((acronym, more, tip.to_string(), custom))
+        }).collect();
+        if !mods.is_empty() {
+            theme::mod_row(ui, &mods);
+        }
+    }
+
+    /// The map's card: title and difficulty name left, the mods top right.
+    fn title_card(&mut self, ui: &mut Ui, a: &Arc<Analysis>) {
+        let d = self.s.display.clone();
+        if !(d.title || d.version || d.info) {
+            return;
+        }
+        theme::card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                self.mod_pills(ui);
+                ui.with_layout(Layout::top_down(Align::Min), |ui| self.title(ui, a));
+            });
+            if d.info {
+                self.context_line(ui, a);
+            }
+        });
+    }
+
     fn title(&mut self, ui: &mut Ui, a: &Arc<Analysis>) {
         let d = self.s.display.clone();
         let mut lines = Vec::new();
         if d.title {
-            let job = theme::job(&vec![bold(if a.title.is_empty() { "?" } else { &a.title }), plain("  "), small(a.artist.clone())], 1, ui.available_width());
+            let job = theme::title_job(if a.title.is_empty() { "?" } else { &a.title }, &a.artist, ui.available_width());
             lines.push(ui.add(egui::Label::new(job).sense(Sense::click())));
         }
         if d.version {
@@ -377,58 +436,87 @@ impl App {
         }
         if let Some(c) = self.card.as_ref().filter(|c| c.sure) {
             let (line, tip) = fmt::prediction_line(c, self.card_is_pp(), &self.units);
-            theme::line(ui, &line, 1).on_hover_text(tip);
+            // the pick shown here, offered under the target: why
+            let learning = self.views[self.mode()].target.as_ref().filter(|p| ms_rec::navigation::same_map(p, None, Some(&c.md5), c.bid)).and_then(|p| fmt::learning_note(p));
+            theme::line(ui, &line, 1).on_hover_text(learning.map_or(tip.clone(), |l| format!("{tip}\n{l}")));
         } else if let (None, Some(note)) = (&self.card, &self.card_note) {
             theme::dim_small(ui, note);
         }
     }
 
+    /// The saved shape is 100 %: the tighter side sets the scale, so nothing is ever cut (user 2026-11-22). The
+    /// details' rows are not part of the shape: they come on top of it.
+    pub fn main_scale(&self, window: Vec2) -> f32 {
+        let (w, h) = crate::settings::MAIN;
+        theme::fit((window.x / w).min((window.y - self.extra) / h))
+    }
+
     pub fn main_ui(&mut self, ui: &mut Ui) {
-        ui.spacing_mut().item_spacing.y = 2.;
+        ui.spacing_mut().item_spacing.y = px(2.);
         ui.horizontal(|ui| {
-            if ui.add(egui::Button::new("☰  Playlist").selected(self.s.recs_open)).on_hover_text("Show or hide the playlist window (Next, Skip, Tracking, PP/NPS/Skills lists)").clicked() {
+            if ui.add(theme::Btn::new("☰  Playlist").selected(self.s.recs_open)).on_hover_text("Show or hide the playlist window (Next, Skip, Tracking, PP/NPS/Skills lists)").clicked() {
                 self.s.recs_open = !self.s.recs_open;
                 self.request_save();
             }
             // Next to Playlist, not beside the NPS where it read as part of it (user 2026-11-02).
-            if ui.add(egui::Button::new(if self.s.details { "▴  Details" } else { "▾  Details" }).selected(self.s.details)).on_hover_text("Skill details: one bar per skill the map has").clicked() {
+            if ui.add(theme::Btn::new(if self.s.details { "▴  Details" } else { "▾  Details" }).selected(self.s.details)).on_hover_text("Skill details: one bar per skill the map has").clicked() {
                 self.toggle_details(ui.ctx());
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("⋯").on_hover_text("Settings").clicked() {
-                    self.open.menu = !self.open.menu;
-                }
-            });
+            // Beside Details, by name (user 2026-11-21: "get rid of the '...' button and add a \"Settings\" button").
+            if ui.add(theme::Btn::new("Settings").selected(self.open.menu)).on_hover_text("Settings and website charts").clicked() {
+                self.open.menu = !self.open.menu;
+            }
         });
-        ui.add_space(4.);
+        ui.add_space(theme::px(4.));
         let analysis = self.analysis().cloned();
         let d = self.s.display.clone();
-        let foot = if d.status { 22. } else { 0. };
+        let foot = if d.status { px(22.) } else { 0. };
         let rows = analysis.as_ref().map_or(0, |a| shown_bars(a).count()) as f32;
-        let detail_height = if self.s.details { rows * BAR_ROW + 6. } else { 0. };
+        let detail_height = if self.s.details { rows * px(BAR_ROW) + px(CARD_PAD) + px(CARD_GAP) } else { 0. };
         // Details add their rows under an unchanged timeline (user 2026-11-02: a separate details size grew the graph).
         // Without an analysis the window keeps what it has.
         let extra = if analysis.is_some() || !self.s.details { detail_height } else { self.extra };
+        // the same rows at a new scale: the window was resized by hand, the graph gives or takes the difference
+        let rescaled = self.extra > 0. && extra > 0. && (extra / theme::scale() - self.extra / self.extra_scale).abs() < 0.5;
+        if rescaled {
+            (self.extra, self.extra_scale) = (extra, theme::scale());
+            ui.ctx().request_repaint();
+        }
         if extra != self.extra {
-            self.extra = extra;
+            (self.extra, self.extra_scale) = (extra, theme::scale());
             let (w, h) = self.s.win;
             self.resized = Some((w, h + extra));
             crate::resize::inner(ui.ctx(), "ManiaScope", Vec2::new(w, h + extra));
         }
         if let Some(a) = &analysis {
-            self.title(ui, a);
-            if d.info {
-                self.context_line(ui, a);
-            }
-            self.prediction(ui);
-            self.head(ui, a);
-            if self.s.display.timeline {
-                self.timeline(ui, a, (ui.available_height() - foot - detail_height).max(30.));
-            }
+            ui.spacing_mut().item_spacing.y = px(CARD_GAP);
+            self.title_card(ui, a);
+            theme::card(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = px(2.);
+                self.prediction(ui);
+                self.head(ui, a);
+                if self.s.display.timeline {
+                    let height = (ui.available_height() - foot - detail_height - px(CARD_PAD)).max(px(30.));
+                    ui.horizontal(|ui| {
+                        // the length right of the graph, at the card's edge, in the body's size (user 2026-11-22: "too small
+                        // and takes too much of the graph")
+                        let length = self.length(a);
+                        let room = length.as_ref().map_or(0., |_| ui.painter().layout_no_wrap("00:00".into(), FontId::proportional(theme::body()), DIM).size().x + px(6.));
+                        let width = ui.available_width() - room;
+                        ui.spacing_mut().item_spacing.x = 0.;
+                        ui.allocate_ui(Vec2::new(width, height), |ui| self.timeline(ui, a, height));
+                        if let Some((text, tip)) = length {
+                            ui.allocate_ui_with_layout(Vec2::new(room, height), Layout::right_to_left(Align::Center), |ui| theme::dim(ui, text).on_hover_text(tip));
+                        }
+                    });
+                }
+            });
             if self.s.details {
-                self.details(ui, a);
+                theme::card(ui, |ui| self.details(ui, a));
             }
         } else if let Some(p) = &self.pending {
+            theme::card(ui, |ui| {
+            ui.set_width(ui.available_width());
             if d.title {
                 theme::line(ui, &vec![bold(p.title.clone()), plain("  "), small(p.artist.clone())], 1);
             }
@@ -440,17 +528,21 @@ impl App {
             }
             self.prediction(ui);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("…").size(BODY * 3.).color(Color32::from_gray(0x55)));
+                ui.label(RichText::new("…").size(theme::body() * 3.).color(theme::BORDER));
                 ui.label("Calculating…");
             });
+            });
         } else {
+            theme::card(ui, |ui| {
+            ui.set_width(ui.available_width());
             let text = self.shown.as_ref().and_then(|s| s.result.as_ref().err().cloned()).unwrap_or_else(|| "Select a mania map in osu!".to_string());
             if let Some(s) = &self.shown {
                 ui.label(s.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
             }
             ui.horizontal(|ui| {
-                ui.label(RichText::new("–").size(BODY * 3.).color(Color32::from_gray(0x55)));
+                ui.label(RichText::new("–").size(theme::body() * 3.).color(theme::BORDER));
                 ui.label(text);
+            });
             });
         }
         if !d.status {
@@ -467,7 +559,7 @@ impl App {
         let busy = total > 0 && done < total;
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             if busy {
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 3.), egui::Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), px(3.)), egui::Sense::hover());
                 let mut fill = rect;
                 fill.set_width(rect.width() * (done as f32 / total as f32).clamp(0., 1.));
                 ui.painter().rect_filled(rect, 1., theme::BUTTON);
@@ -477,7 +569,8 @@ impl App {
                 // Drawn here: the watcher replaces self.foot on every status, which erased a stored notice.
                 let continuing = self.web.continued && self.web.info.as_ref().is_some_and(|i| i.running);
                 let flash = self.flash.as_ref().filter(|f| f.1 > Instant::now()).map_or("", |f| f.0.as_str());
-                if let Some(f) = &self.flash {
+                // once, when it ends: asked for after it had ended too, an old notice repainted the app without pause
+                if let Some(f) = self.flash.as_ref().filter(|f| f.1 > Instant::now()) {
                     ui.ctx().request_repaint_after(f.1.saturating_duration_since(Instant::now()));
                 }
                 let progress = if busy { note.as_str() } else { "" };

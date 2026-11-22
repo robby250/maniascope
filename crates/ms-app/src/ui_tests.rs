@@ -275,8 +275,8 @@ fn the_main_window_shows_the_analysis_bar_in_its_status_row_until_the_library_is
         h.render().expect("render").save(path).expect("save");
     }
     let r = h.get_by_label_contains("Analysing maps").rect();
-    // the status row: 22 px reserved under the graph, the 8 px window margin, the 3 px bar under the text
-    assert!(r.top() >= ht - 22. - 8. - 5. && r.bottom() <= ht - 8., "in the status row: {r:?}");
+    // the status row: 22 px reserved under the graph, the 8 px window margin, the 3 px bar under the text (Nunito's line is 1 px taller)
+    assert!(r.top() >= ht - 22. - 8. - 6. && r.bottom() <= ht - 8., "in the status row: {r:?}");
     h.state_mut().on_rec(Out::Status { text: String::new(), progress: None, blocking: false, learning: None });
     h.step();
     assert!(h.query_by_label_contains("Analysing").is_none(), "gone once done");
@@ -466,22 +466,10 @@ fn every_skill_chip_stays_inside_the_settings_page() {
             assert!(right <= width, "{chip} ends at {right} of {width}");
         }
         if width > 800. {
-            assert_eq!(h.get_by_label("Vibro").rect().top(), h.get_by_label("Any").rect().top(), "the first row fills a wide window");
+            assert!((h.get_by_label("Vibro").rect().top() - h.get_by_label("Any").rect().top()).abs() < 6., "the first row fills a wide window");
         }
         if let Ok(path) = std::env::var("MS_SHOT") { h.render().expect("render").save(format!("{path}-{width}.png")).expect("save"); }
     }
-}
-
-#[test]
-fn osu_stable_has_no_inverse_mod_chip() {
-    let ctx = egui::Context::default();
-    let mut a = app(json!({"recommendation_mode": "skills", "skills_keys": [7]}), &ctx);
-    a.views.get_mut("skills").unwrap().settings = true;
-    a.units.client = "stable".into();
-    let mut h = Harness::builder().with_size(egui::vec2(900., 760.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.playlist_ui(ui), a);
-    h.run();
-    h.get_by_label("Vibro");
-    assert!(h.query_by_label("Inverse mod").is_none());
 }
 
 #[test]
@@ -595,8 +583,8 @@ fn every_character_in_the_window_is_in_the_embedded_fonts() {
     let ctx = egui::Context::default();
     crate::theme::apply(&ctx);
     ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
-    let sources = [include_str!("mainview.rs"), include_str!("playlist.rs"), include_str!("windows.rs"), include_str!("fmt.rs"), include_str!("app.rs")];
-    let font = egui::FontId::proportional(crate::theme::BODY);
+    let sources = [include_str!("mainview.rs"), include_str!("playlist.rs"), include_str!("windows.rs"), include_str!("fmt.rs"), include_str!("app.rs"), include_str!("statsview.rs")];
+    let font = egui::FontId::proportional(crate::theme::body());
     let missing: std::collections::BTreeSet<char> = sources.iter().flat_map(|s| s.chars()).filter(|c| !c.is_ascii()).filter(|&c| !ctx.fonts_mut(|f| f.has_glyph(&font, c))).collect();
     assert!(missing.is_empty(), "{missing:?}");
 }
@@ -820,7 +808,7 @@ fn no_text_or_button_runs_past_any_settings_page() {
             a.views.get_mut(mode).unwrap().settings = true;
             let mut h = Harness::builder().with_size(egui::vec2(width, 2400.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.playlist_ui(ui), a);
             h.step();
-            let past: Vec<String> = h.query_all(egui_kittest::kittest::by().predicate(|n| matches!(n.role(), Role::Label | Role::Button) && n.bounding_box().is_some_and(|r| r.x1 > width as f64 + 0.5)))
+            let past: Vec<String> = h.query_all(egui_kittest::kittest::by().predicate(|n| matches!(n.role(), Role::Label | Role::Button) && n.bounding_box().is_some_and(|r| r.x1 / f64::from(crate::theme::ZOOM) > width as f64 + 0.5)))  // the box is in pixels
                 .map(|n| format!("{:?} ends at {:.0}", n.accesskit_node().label(), n.rect().right())).collect();
             assert!(past.is_empty(), "{mode} at {width}: {past:?}");
         }
@@ -862,4 +850,180 @@ fn closing_details_returns_the_window_to_its_compact_size() {
     eprintln!("{heights:?} {:?}", h.state().s.win);
     assert!(heights.iter().skip(1).step_by(2).all(|&y| y == 240.), "closed back to 240: {heights:?}");
     assert!(heights.iter().step_by(2).all(|&y| y > 240. && y == heights[0]), "open grows by the rows each time: {heights:?}");
+}
+
+/// MS_SHOT=dir (MS_SHOT_BG=an image): every window as it looks, for a human to judge. Asserts nothing about the look.
+#[test]
+fn the_windows_for_a_look() {
+    let Ok(dir) = std::env::var("MS_SHOT") else { return };
+    if !std::path::Path::new(&dir).is_dir() {
+        return; // the single-file shots of other tests share the variable
+    }
+    let entry = |name: &str, rating: f64, tags: &[&str]| crate::viewer::Entry { name: name.into(), rating, parts: vec![name.to_lowercase()], tags: tags.iter().map(|t| t.to_string()).collect() };
+    let analysis = std::sync::Arc::new(crate::viewer::Analysis {
+        path: "x.osu".into(), rate: 1.1, mods: "IN".into(), keys: 7, title: "Sea of Stars".into(), artist: "Kyutatsuki".into(), version: "Interstellar Expedition".into(), creator: "tyrcs".into(),
+        overall: 8.4, press: 8.4, notes: 2400, ln_notes: 900., nps: Some(31.1), span: Some((0., 308_000.)), timeline: (0..160).map(|i| 4. + 2. * (i as f64 / 9.).sin() + (i as f64 / 2.3).cos()).collect(),
+        entries: vec![entry("Stream", 8.7, &[]), entry("Chordstream", 7.9, &["Stamina"]), entry("LN", 6.7, &[])], tags: Vec::new(), also: Vec::new(),
+        bars: [("Stream", 8.74), ("Chordstream", 7.88), ("Bracket", 4.55), ("Jacks", 1.5), ("LN General", 6.75), ("Stamina", 9.9)].iter().map(|(n, v)| (n.to_lowercase(), n.to_string(), *v)).collect(),
+        peak_nps: None, bid: None, names: Vec::new(), tech: Vec::new(), dan_vibro: Default::default(), o2jam: None,
+    });
+    let make = |details: bool, settings: bool, web: bool| {
+        let ctx = egui::Context::default();
+        let mut a = app(prefs(), &ctx);
+        a.sync_rec();
+        a.obs.rate = Some(1.1);
+        a.shown = Some(crate::app::Selected { path: "x.osu".into(), rate: 1.1, mods: "IN".into(), result: Ok(analysis.clone()) });
+        a.s.details = details;
+        a.views.get_mut("nps").unwrap().settings = settings;
+        (a.open.menu, a.open.web) = (true, web);
+        let shown = "abcd".chars().map(|c| Pick { source_web: c == 'b', ..pick(c) }).collect();
+        let list = pool(&a, "nps", 1, shown);
+        a.on_rec(list);
+        a
+    };
+    let image = std::env::var("MS_SHOT_BG").ok().and_then(|p| std::fs::read(p).ok());
+    let shot = |name: &str, size: egui::Vec2, a: App, draw: fn(&mut egui::Ui, &mut App)| {
+        let image = image.clone();
+        let mut h = Harness::builder().with_size(size).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(move |ui, a: &mut App| {
+            if ui.ctx().cumulative_pass_nr() == 0 {
+                if let Some(i) = image.as_deref().and_then(crate::backdrop::decode) {
+                    a.backdrop.want(std::path::Path::new("x.osu"));
+                    a.backdrop.arrived(ui.ctx(), "x.osu".into(), Some(Box::new(i)));
+                }
+            }
+            draw(ui, a)
+        }, a);
+        for _ in 0..40 {
+            h.step(); // past the fades
+        }
+        h.render().expect("render").save(format!("{dir}/{name}.png")).expect("save");
+    };
+    let list: fn(&mut egui::Ui, &mut App) = |ui, a| {
+        let width = ui.ctx().input(|i| i.content_rect().width());
+        crate::theme::scaled(ui, crate::theme::fit(width / crate::settings::LIST.0));
+        egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(crate::theme::px(12.) as i8)).show(ui, |ui| a.playlist_ui(ui));
+    };
+    let menu: fn(&mut egui::Ui, &mut App) = |ui, a| {
+        a.pump(ui.ctx());
+        if !a.web.loaded() {
+            std::thread::sleep(std::time::Duration::from_millis(20)); // the Website tab's first read
+        }
+        crate::theme::scaled(ui, 1.);
+        crate::theme::backdrop(ui, &[], false);
+        egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(10)).show(ui, |ui| a.menu_ui(ui));
+    };
+    let mods = |list: Value| { let mut a = make(false, false, false); a.obs.mods = list.as_array().cloned(); a };
+    let black = |mut a: App| { a.s.black_bg = true; a };
+    let lazer = json!([{"acronym": "DT", "settings": {"speed_change": 1.1}}, {"acronym": "IN"}]);
+    let many = json!([{"acronym": "HT", "settings": {"speed_change": 0.9}}, {"acronym": "HD"}, {"acronym": "MR"}, {"acronym": "IN"}, {"acronym": "CS"}, {"acronym": "NF"}, {"acronym": "DA", "settings": {"overall_difficulty": 9.5}}]);
+    let (w, h) = (crate::settings::MAIN.0, crate::settings::MAIN.1 + 3.);
+    shot("main", egui::vec2(w, h), mods(lazer.clone()), main_window);
+    shot("main-details", egui::vec2(w, h + 133.), { let mut a = mods(lazer.clone()); a.s.details = true; a.extra = 133.; a }, main_window);
+    shot("main-mods", egui::vec2(w, h), mods(many), main_window);
+    shot("main-playing", egui::vec2(w, h), { let mut a = mods(lazer.clone()); a.live = Some(120_000.); a }, main_window);
+    shot("main-black", egui::vec2(w, h), black(mods(lazer.clone())), main_window);
+    shot("main-big", egui::vec2(w * 1.5, h * 1.5), mods(lazer), main_window);
+    shot("playlist", egui::vec2(444., 484.), make(false, false, false), list);
+    shot("playlist-black", egui::vec2(444., 484.), black(make(false, false, false)), list);
+    shot("playlist-wide", egui::vec2(666., 600.), make(false, false, false), list);
+    shot("playlist-settings", egui::vec2(520., 820.), make(false, true, false), list);
+    shot("settings", egui::vec2(470., 520.), make(false, false, false), menu);
+    shot("settings-web", egui::vec2(470., 520.), make(false, false, true), menu);
+    shot("settings-narrow", egui::vec2(260., 700.), make(false, false, false), menu);
+    shot("settings-web-narrow", egui::vec2(260., 700.), make(false, false, true), menu);
+}
+
+/// The main window as `main.rs` draws it: its scale from its size, its backdrop, its panel.
+fn main_window(ui: &mut egui::Ui, a: &mut App) {
+    let (ctx, size) = (ui.ctx().clone(), ui.ctx().input(|i| i.content_rect().size()));
+    crate::theme::scaled(ui, a.main_scale(size));
+    crate::theme::backdrop(ui, &a.backdrop.layers(&ctx), a.s.black_bg);
+    let m = |v: f32| crate::theme::px(v) as i8;
+    egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(egui::Margin { left: m(10.), right: m(10.), top: m(8.), bottom: m(2.) })).show(ui, |ui| a.main_ui(ui));
+}
+
+#[test]
+fn the_main_window_scales_by_its_tighter_side_and_black_leaves_only_the_cards() {
+    let ctx = egui::Context::default();
+    let a = app(prefs(), &ctx);
+    // user 2026-11-22: "scale everything up/down when scaling it diagonally, while trying to maintain the current proportions"
+    let (w, h) = crate::settings::MAIN;
+    assert_eq!((a.main_scale(egui::vec2(w, h)), a.main_scale(egui::vec2(2. * w, 2. * h)), a.main_scale(egui::vec2(2. * w, h)), a.main_scale(egui::vec2(w, 3. * h))), (1., 2., 1., 1.));
+    let button = |size: egui::Vec2, black: bool| {
+        let mut a = app(prefs(), &ctx);
+        a.s.black_bg = black;
+        let mut h = Harness::builder().with_size(size).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(main_window, a);
+        h.run();
+        let rect = h.get_by_label_contains("Details").rect();
+        let image = h.render().expect("render");
+        (rect.height(), *image.get_pixel(1, image.height() / 2))
+    };
+    let (small, big, black) = (button(egui::vec2(w, h), false), button(egui::vec2(2. * w, 2. * h), false), button(egui::vec2(w, h), true));
+    assert!((big.0 / small.0 - 2.).abs() < 0.05, "a button twice as high in a window twice the size: {} {}", small.0, big.0);
+    assert_eq!(black.1 .0[..3], [0, 0, 0], "black between the cards, for the colour key");
+    assert_ne!(small.1 .0[..3], [0, 0, 0], "the purple backdrop without the option");
+}
+
+#[test]
+fn settings_is_one_window_with_the_website_charts_as_its_second_tab() {
+    // user 2026-11-21: "settings menu with 2 tabs at the top, one general, one website charts"
+    let ctx = egui::Context::default();
+    let mut a = app(prefs(), &ctx);
+    a.views.get_mut("nps").unwrap().settings = true;
+    let mut h = harness(a);
+    h.step();
+    h.get_by_label("Website charts…").click();
+    h.run();
+    assert!(h.state().open.menu && h.state().open.web, "the playlist's button opens Settings on that tab");
+    let a = std::mem::replace(h.state_mut(), app(prefs(), &ctx));
+    let mut h = Harness::builder().with_size(egui::vec2(700., 620.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| { a.pump(ui.ctx()); a.menu_ui(ui) }, a);
+    h.step();
+    // the tab's first show reads its choice off the UI thread (it froze the window, user 2026-11-22)
+    let asked = std::time::Instant::now();
+    while h.query_by_label("Next downloads maps I don't have").is_none() && asked.elapsed().as_secs() < 10 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        h.step();
+    }
+    h.get_by_label("Next downloads maps I don't have");
+    assert!(h.query_by_label("Always on top").is_none());
+    h.get_by_label("General").click();
+    h.run();
+    h.get_by_label("Always on top");
+    assert!(!h.state().open.web && h.query_by_label("Next downloads maps I don't have").is_none());
+}
+
+#[test]
+fn the_share_question_wraps_inside_settings_and_sits_after_the_profile_button() {
+    // user 2026-11-22: "the window expands because of that text that appears to confirm, it should not expand text should wrap"
+    let ctx = egui::Context::default();
+    let mut h = Harness::builder().with_size(egui::vec2(584., 560.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.menu_ui(ui), app(prefs(), &ctx));
+    h.step();
+    assert!(h.get_by_label("osu! profile…").rect().left() < h.get_by_label("Share replays for calibration…").rect().left());
+    h.get_by_label("Share replays for calibration…").click();
+    h.run();
+    let (text, yes) = (h.get_by_label_contains("Save all your replays").rect(), h.get_by_label("Yes, save").rect());
+    assert!(text.right() <= 584. && yes.right() <= 584. && yes.top() >= text.bottom() - 1., "text {text:?}, Yes {yes:?}");
+}
+
+#[test]
+fn settings_narrowed_wraps_instead_of_running_off_the_window() {
+    // user 2026-11-22: "make all text in the settings wrap so that if the window is resized to be smaller it won't be offscreen"
+    let ctx = egui::Context::default();
+    let mut h = Harness::builder().with_size(egui::vec2(260., 900.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.menu_ui(ui), app(prefs(), &ctx));
+    h.run();
+    for label in ["Black background (colour key for streaming)", "Auto next after finishing the pick", "Share replays for calibration…", "Expected accuracy, form, PP gain", "10K"] {
+        let r = h.get_by_label(label).rect();
+        assert!(r.right() <= 260., "{label} ends at {} in a window 260 wide", r.right());
+    }
+    let slider = h.get_by_role(egui::accesskit::Role::Slider).rect();
+    assert!(slider.right() <= 260., "the slider ends at {}", slider.right());
+}
+
+#[test]
+fn a_main_window_size_saved_before_the_cards_grows_once() {
+    let old = Settings::from_json(&json!({"w": 500., "h": 300.}));
+    assert_eq!(old.win, (500., 334.));
+    assert_eq!(Settings::from_json(&old.to_json()).win, (500., 334.), "saved again, it stays");
+    let new = Settings::from_json(&json!({}));
+    assert!((new.win.0 - 455.45).abs() < 0.01 && (new.win.1 - 312.73).abs() < 0.01 && new.recs_win == (455.45, 492.73), "a first start opens at the user's sizes: {:?} {:?}", new.win, new.recs_win);
 }

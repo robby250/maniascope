@@ -410,7 +410,9 @@ impl Builder {
         let rows: Vec<(String, String, Option<String>)> = db.prepare("SELECT sha, source, md5 FROM mod_charts WHERE tag=?")?.query_map([tag], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
         let mut hashed = Vec::new();
         for (sha, source, md5) in rows {
-            let Some(src) = self.catalog.get(&source).filter(|i| i.installed && i.convert_of.is_none()) else { continue };
+            // a convert is in the catalogue while its keymode's converts are on: under Invert it is a source like your own maps
+            // (user 2026-11-21: 10K has few easy maps of its own); a website chart isn't
+            let Some(src) = self.catalog.get(&source).filter(|i| i.installed || i.convert_of.is_some()) else { continue };
             // its md5 is what a play of it records (worker::as_played); rows from before the md5 column are hashed once
             let Some(md5) = md5.or_else(|| {
                 let md5 = crate::engine::hashes(&crate::modcharts::bytes(db, &sha)?).1;
@@ -443,7 +445,9 @@ impl Builder {
         let root = crate::catalog::local_origin(&r.client).1;
         for sha in &self.order {
             let inst = &self.catalog[sha];
-            if !inst.installed || inst.convert_of.is_some() || inst.invert_of.is_some() || done.contains(sha) {
+            // stable's Invert chart is written beside its source: only a map already in Songs
+            let holds = inst.installed || (inst.convert_of.is_some() && tag != crate::modcharts::STABLE_INVERT);
+            if !holds || inst.invert_of.is_some() || done.contains(sha) {
                 continue;
             }
             // Invert turns gaps into holds: its rating is the source's under `invert_rating`, ±its spread, at this tab's rates
@@ -772,11 +776,26 @@ impl Builder {
                     let analyzed = { let store = self.store.read().unwrap(); self.catalog.keys().filter(|s| store.current(s)).count() };
                     (self.emit)(Update::Progress { mode: r.mode.clone(), revision: r.revision, generation: r.generation, total: self.catalog.len(), analyzed, failed: bad.len() });
                 }
-                if !self.wait_idle() || !(self.index_converts(db, r, web.as_ref(), reaches.as_ref())? || self.index_inverts(db, r, reaches.as_ref())?) {
+                if !self.wait_idle() {
                     return Ok(());
                 }
-                memo = Choices::new(self.order.clone(), memo_forecast.clone());
-                continue;
+                // A picked skill's charts are analysed at the rate that fits them, the whole slot, behind the list: the
+                // frontier above only reaches the best of the library (`Choices::slot_proposals`). Twice a chart at most.
+                let twice: HashSet<&str> = refined_counts.iter().filter(|x| *x.1 >= 2).map(|x| x.0.as_str()).chain(bad.keys().map(String::as_str)).collect();
+                let rest: Vec<(String, f64)> = {
+                    let store = self.store.read().unwrap();
+                    memo.slot_proposals(&twice, r.rates).into_iter().map(|(sha, rate)| (sha, snap(rate, &r.client))).filter(|(sha, rate)| !store.has_rate(sha, *rate)).take(256).collect()
+                };
+                drop(twice);
+                if rest.is_empty() {
+                    if !(self.index_converts(db, r, web.as_ref(), reaches.as_ref())? || self.index_inverts(db, r, reaches.as_ref())?) {
+                        return Ok(());
+                    }
+                    memo = Choices::new(self.order.clone(), memo_forecast.clone());
+                    continue;
+                }
+                rest.iter().for_each(|(sha, _)| *refined_counts.entry(sha.clone()).or_insert(0) += 1);
+                jobs = rest;
             }
             // A pass analyses for at least as long as its bookkeeping took: a fixed ~50 maps a pass left the tail of a
             // re-analysis at ~10/s.
@@ -907,7 +926,7 @@ pub fn prepared_pick(prepared: &ms_model::choices::Prepared, i: usize, catalog: 
         description: c.description.clone(), family: Some(c.family.clone()), group: Some(c.group.clone()), profile: c.profile.clone(), playcount: inst.playcount, value: c.value,
         practice_skills: if mode == "skills" { skills::normalize(selected) } else { Vec::new() }, matched_skills: c.matched.clone(), practice_description: c.practice.clone(),
         f: store.feats(&c.sha, c.rate).cloned().map(Arc::new), pred: c.pred.clone(), generated_at: c.generated_at, best_rank: 100000, convert_of: inst.convert_of.clone(), source_keys: inst.source_keys,
-        source_web: inst.source_web, set_id: inst.set_id, invert_of: inst.invert_of.clone(), ..Pick::default()
+        source_web: inst.source_web, set_id: inst.set_id, invert_of: inst.invert_of.clone(), learning: c.learning, ..Pick::default()
     })
 }
 
@@ -944,6 +963,29 @@ mod convert_tests {
         // turned off: gone, imported or not
         b.apply_converts(&db, &[]).unwrap();
         assert!(b.catalog.is_empty() && b.order.is_empty(), "{:?}", b.order);
+        let _ = std::fs::remove_dir_all(Path::new(&dir));
+    }
+
+    /// User 2026-11-21: "invert for converts for every keymode": 10K has few easy maps of its own to hold under Invert.
+    #[test]
+    fn a_convert_is_an_invert_source_while_its_keymodes_converts_are_on() {
+        let dir = std::env::temp_dir().join(format!("ms-invert-convert-test-{}", std::process::id()));
+        let db = ms_data::store::connect(&dir.join("rec.db")).unwrap();
+        row(&db, "src", "out", 10, 7);
+        for (sha, source) in [("inv", "out"), ("webinv", "web")] {
+            db.execute("INSERT INTO mod_charts VALUES (?,?,'IN','m')", [sha, source]).unwrap();
+        }
+        let mut b = builder();
+        b.catalog.insert("web".into(), Arc::new(Inst { sha256: "web".into(), keys: 10, ..Inst::default() })); // a website chart: nothing to turn Invert on
+        b.order.push("web".into());
+        b.apply_converts(&db, &[(10, vec![7])]).unwrap();
+        b.apply_inverts(&db, Some("IN")).unwrap();
+        let i = &b.catalog["inv"];
+        assert_eq!((i.invert_of.as_deref(), i.convert_of.as_deref(), i.installed, i.keys), (Some("out"), Some("src"), false, 10));
+        assert!(!b.catalog.contains_key("webinv"));
+        b.apply_converts(&db, &[]).unwrap();
+        b.apply_inverts(&db, Some("IN")).unwrap();
+        assert!(!b.catalog.contains_key("inv"), "converts off: its Invert chart leaves with it");
         let _ = std::fs::remove_dir_all(Path::new(&dir));
     }
 

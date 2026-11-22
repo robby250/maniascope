@@ -193,7 +193,7 @@ impl Consts {
     /// 2026-11-10: "never anywhere near delta"). The dan label's note rule, not the calc's vibro share: sk vibro ≥ .4 also
     /// took REFORM Iota/Kappa and Delta–Eta songs, hard rice with vibro sections (user 2026-11-11).
     pub fn vibro_chart(&self, f: &Feats) -> bool {
-        ms_calc::structure::vibro_only(&ms_calc::structure::Vibro { share: f.vibro.0, speed: 0., rest: f.vibro.1 })
+        ms_calc::structure::vibro_only(&ms_calc::structure::Vibro { share: f.vibro.0, speed: 0., rest: f.vibro.1, rating: 0. })
     }
 
     pub fn family(&self, skill: &str) -> usize {
@@ -382,7 +382,7 @@ impl PredModel {
         for (r, j) in scored.into_iter().zip(jobs) {
             let slot = match r? {
                 None => (None, None),
-                Some((best, prop, e)) => {
+                Some((best, prop, e, learning)) => {
                     let choice = match (best, e) {
                         (Some((rate, value)), Some(p)) => {
                             let entry = entries(&j.sha).iter().find(|x| x.offer.rate == rate).unwrap();
@@ -401,12 +401,13 @@ impl PredModel {
                                 practice, group: groups()[self.group(feats)].0.to_string(), nps: entry.offer.nps, length: entry.offer.play_span.unwrap_or(0.) / rate,
                                 family: entry.offer.family.clone(), description: entry.offer.description.clone(), profile: entry.profile.clone(), acc_mid: p.acc_mid, matched,
                                 sha: j.sha.clone(), md5: j.md5.clone(), keys: j.keys, rate, value, installed: j.installed, convert: j.convert, source_web: j.source_web,
-                                playcount: j.playcount, pred: p, generated_at: now,
+                                playcount: j.playcount, pred: p, generated_at: now, learning,
                             }))
                         }
                         _ => None,
                     };
-                    (choice, prop.map(|(quality, rate, group)| Proposal { quality, rate, keys: j.keys, group: group.to_string() }))
+                    let slotted = || entries(&j.sha).iter().find_map(|x| Some((x.feats.as_ref()?, x.skill.as_ref()?))).is_some_and(|(f, s)| !s.matched(&sel[crate::skills::tree_index(f.keys)]).is_empty());
+                    (choice, prop.map(|(quality, rate, group)| Proposal { quality, rate, keys: j.keys, group: group.to_string(), skill: skills && slotted() }))
                 }
             };
             let at = choices.slot(&j.sha).ok_or_else(|| err(&format!("{} is not in this catalogue", j.sha)))?;
@@ -996,6 +997,10 @@ impl Prediction {
 
 pub const BAND_Z: f64 = 1.2816 * 0.75; // recommend.BAND_Z
 
+/// A learning offer's lowest forecast (user 2026-11-22: "At least 85 %"): a picked skill with no chart at the target in a
+/// keymode offers its nearest charts instead (`Choice::learning`), and under this none.
+pub const LEARN_FLOOR: f64 = 0.85;
+
 // Mashing a map far above you still scores ~60–70 % (user 2026-11-06: "it's very hard to get below 50% acc"; own lowest
 // completed lazer accuracy 68 % over 12,387 plays; the dumps hold top scores only, so this is not fitted). A soft minimum
 // of miss rates: 90 % moves < 0.1 pp, 80 % ~0.3 pp, a model 30 % reads ~61 %.
@@ -1035,10 +1040,10 @@ impl PredModel {
     }
 
     /// score_into for one chart: None (nothing rateable) or (best (rate, value), proposal (quality, rate, group),
-    /// the best rate's prediction).
+    /// the best rate's prediction, whether the best is a learning offer: under the target at every rate of the range).
     #[allow(clippy::type_complexity)]
     fn score_chart(&self, ctx: &Ctx, sel: &[Selection], entries: &[Entry], key: &str, bid: Option<i64>, session: &PredSession)
-                   -> Res<Option<(Option<(f64, f64)>, Option<(f64, f64, &'static str)>, Option<Prediction>)>> {
+                   -> Res<Option<(Option<(f64, f64)>, Option<(f64, f64, &'static str)>, Option<Prediction>, bool)>> {
         let paced = Ctx { rates: self.vibro_rates(entries, ctx.rates), ..*ctx };
         let ctx = &paced;
         let mut rated: Vec<(&Offer, &Feats, Prediction, Option<f64>)> = Vec::new();
@@ -1131,12 +1136,30 @@ impl PredModel {
                 }
             }
         }
+        // No rate of the range reaches the target: on the Skills tab the rate nearest to it stands as a learning offer (user
+        // 2026-11-22: 10K Invert never reached 96 % at any rate, so the skill was never offered there; "offer the easiest
+        // anyway"). Too hard only: a chart held back by its cold opening is not one, and under LEARN_FLOOR none is.
+        let mut learning = false;
+        if best.is_none() && ctx.skills {
+            let low = ctx.band().0 - 0.1 * ctx.err();
+            for (i, &(o, _, ref e, s)) in rated.iter().enumerate() {
+                if missed(o.rate).is_some() || !(LEARN_FLOOR..low).contains(&e.acc_mid) || o.special().is_some_and(|i| !ctx.wants_special[crate::skills::tree_index(f.keys)][i]) {
+                    continue;
+                }
+                if let Some(v) = ctx.value(o, s, o.nps, e, e.acc_mid, o.rate, target) {
+                    if best.is_none_or(|b| nearer((e.acc_mid, v), (rated[b.0].2.acc_mid, b.1), target)) {
+                        best = Some((i, v));
+                    }
+                }
+            }
+            learning = best.is_some();
+        }
         // Picked with the first rate's target (as the Builder did); valued with its own, as the worker's re-score did.
         let best_out = best.and_then(|(i, _)| {
             let (o, e, s) = (rated[i].0, &rated[i].2, rated[i].3);
             ctx.value(o, s, o.nps, e, e.acc_mid, o.rate, ctx.central()).map(|v| (o.rate, v))
         });
-        Ok(Some((best_out, prop, best.map(|(i, _)| rated.swap_remove(i).2))))
+        Ok(Some((best_out, prop, best.map(|(i, _)| rated.swap_remove(i).2), learning)))
     }
     /// nps._group: the chart's leading pattern family (GROUPS index): the strongest of each fit family's members.
     pub fn group(&self, f: &Feats) -> usize {

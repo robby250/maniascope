@@ -163,6 +163,7 @@ pub struct Pick {
     pub source_web: bool, // from the website: a convert's source, or the map itself once its download is installed (it keeps its WEB badge)
     pub set_id: Option<i64>,
     pub invert_of: Option<String>, // played as its source with the Invert mod on
+    pub learning: bool, // under the target at every rate: its skill has nothing nearer in the keymode (`Choice::learning`)
 }
 
 impl Pick {

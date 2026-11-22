@@ -122,6 +122,33 @@ pub fn forecast_chart(state: Option<Value>, sha: Option<&str>, md5: Option<&str>
     Some(state)
 }
 
+/// The top own score on a chart and the chance a play now passes it.
+#[derive(Clone)]
+pub struct Beat {
+    pub stats: ms_data::store::Stats,
+    pub score: Option<i64>,
+    pub rate: f64,
+    pub chance: f64,
+    pub multipliers: (f64, f64), // osu!mania's score multiplier of this play's mods and of the top score's
+}
+
+/// osu!mania's score multiplier of a mod list played at `rate` (the mods' product). lazer: `ManiaScoreMultiplierCalculator`,
+/// checked on the user's 9,053 lazer scores against unmodded ones at the same accuracy (2026-11-22): HT 0.9× 0.50, 0.8× 0.40,
+/// 0.7× 0.30, 0.6× 0.20, 0.5× 0.10; NF 0.50; AS 0.49; CS·HT 0.8× 0.36; DT 1.0–1.5× 1.00 (lazer's source now gives a sped-up
+/// play more: not in these scores, so not here); MR, RD 1. stable: Easy, No Fail and Half Time halve.
+pub fn score_multiplier(mods: &[Value], rate: f64, stable: bool) -> f64 {
+    mods.iter().filter_map(|m| m["acronym"].as_str()).map(|a| match a {
+        "EZ" | "NF" => 0.5,
+        "HT" | "DC" if stable => 0.5,
+        "HT" | "DC" if rate < 1. => 0.6 + (rate * 10. + 1e-9).floor() / 10. - 1.,
+        _ if stable => 1.,
+        "DA" | "WU" | "WD" | "AS" => 0.5,
+        "NR" | "CS" | "HO" => 0.9,
+        k if k.strip_suffix('K').is_some_and(|n| n.parse::<u8>().is_ok()) => 0.9, // the key mods, since lazer 2025.718
+        _ => 1.,
+    }).product()
+}
+
 #[derive(Clone, Default)]
 pub struct Card {
     pub bid: Option<i64>,
@@ -147,6 +174,9 @@ pub struct Card {
     pub nps: Option<f64>,
     pub pp: Option<(f64, f64, Option<f64>, f64, f64)>, // pp_lo, pp_hi, best, gain, p_up
     pub pp_expected: Option<f64>, // shown on every map with stars, unranked too
+    /// The player's top own score on this chart (its judgements) and the chance to beat its accuracy now: for the
+    /// maps `pp` does not cover (user 2026-11-22: "on every selected map not just ranked pp maps").
+    pub beat: Option<Beat>,
     pub plays_like: Option<(f64, i64)>,
     pub unread: Option<String>, // `Prediction::read_note`, tooltip only: acc_mid/lo/hi carry the deficit
     pub random: bool, // Random before its seed: the mean over three shuffles (worker::mean_card)
@@ -358,7 +388,8 @@ impl Engine {
     }
 
     /// Stats for the chart the game has selected, at its rate: the same numbers a list entry shows.
-    pub fn card(&mut self, db: &Db, data: &[u8], rate: f64, n: &Now) -> Result<Option<Card>> {
+    /// `multiplier`: `score_multiplier` of the mods this play would have.
+    pub fn card(&mut self, db: &Db, data: &[u8], rate: f64, multiplier: f64, n: &Now) -> Result<Option<Card>> {
         let (sha, md5) = hashes(data);
         // a modded chart goes by its sha, as its plays do (evidence_rows): its affinity and reads are found under it
         let chart = if crate::modcharts::source_of(db, &sha).is_some() { sha.clone() } else { md5.clone() };
@@ -382,10 +413,25 @@ impl Engine {
             sha.clone() // a store file is named by its sha
         };
         let pp = ranked.then(|| estimates(&e.pp, stars.unwrap(), hits, bid, &self.r.ledger));
+        // The score on top of osu!'s local list, whatever its rate and mods, and the chance this play's score passes it
+        // (user 2026-11-22). osu!mania scores a play by its mods (`score_multiplier`: 0.92× at 94.7 % = 408k where 1× gives
+        // ~830k), so a play that scores less against a top that scored more has to do that much better: the accuracy
+        // needed comes from the top's own score-for-accuracy, score ∝ multiplier · accuracy^p.
+        let best: Option<(String, f64, Option<f64>, Option<i64>, Option<String>)> = db.query_row("SELECT stats,acc,rate,total,mods FROM scores WHERE src!='public' AND (sha256=?1 OR md5=?2) AND stats IS NOT NULL ORDER BY total DESC, acc DESC LIMIT 1",
+            rusqlite::params![sha, md5], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).ok();
+        let beat = best.and_then(|(stats, acc, top_rate, total, mods)| {
+            // a stable score keeps its mods as osu!'s bit mask
+            let mods: Value = mods.and_then(|m| serde_json::from_str(&m).ok()).unwrap_or(Value::Null);
+            let list = mods.as_i64().map(ms_data::share::stable_mods).unwrap_or_else(|| mods.clone());
+            let (now, then) = (multiplier, score_multiplier(list.as_array().map_or(&[][..], Vec::as_slice), top_rate.unwrap_or(1.), mods.is_i64()));
+            let share = total.map_or(0., |t| t as f64 / 1e6 / then); // of a full score at its multiplier
+            let needed = if now == then || !(0.01..0.999).contains(&share) || !(0.01..0.9999).contains(&acc) { if now >= then { acc } else { 1. } } else { (share * then / now).powf(acc.ln() / share.ln()).min(1.) };
+            Some(Beat { stats: ms_data::store::parse_stats(&stats)?, score: total, rate: top_rate.unwrap_or(1.), chance: crate::pp::beat_chance(&e.pp, needed), multipliers: (now, then) })
+        });
         let plays_like = self.plays_like(&f, b, rate);
         let nps = f.dict("nps").and_then(|d| d.get("nps")).filter(|v| !v.is_none()).map(Val::f); // None under two notes (structure.rs)
         Ok(Some(Card { mods: Vec::new(), without: Vec::new(), bid, md5, keys: feats.keys, title, var: rate_label_pp(rate), rate, ranked, artist, song, version, acc_mid: e.shown.acc_mid, acc_lo: e.shown.acc_lo, acc_hi: e.shown.acc_hi, unread: e.shown.read_note(crate::evidence::now_months()), random: false, sure: self.own_plays(feats.keys) >= SURE_PLAYS,
-                       form: n.session.form_state(feats.keys), length: f.f("length") / 1000. / rate, skill: top_skill(&f), nps, pp, pp_expected: stars.map(|s| crate::pp::expected(&e.pp, s, hits)), plays_like }))
+                       form: n.session.form_state(feats.keys), length: f.f("length") / 1000. / rate, skill: top_skill(&f), nps, pp, beat, pp_expected: stars.map(|s| crate::pp::expected(&e.pp, s, hits)), plays_like }))
     }
 
     /// (stars, scores) the public scores say a chart plays like at this rate, its stars moved by its map effect; None
@@ -533,6 +579,21 @@ impl Charts {
 mod tests {
     use super::*;
     use ms_model::predict::{ByKeys, Pop};
+
+    #[test]
+    fn osu_mania_pays_a_play_by_its_mods() {
+        // the user's own lazer scores against unmodded ones at the same accuracy (2026-11-22): the medians
+        let lazer = |mods: &[&str], rate: f64| score_multiplier(&mods.iter().map(|m| json!({"acronym": m})).collect::<Vec<_>>(), rate, false);
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        for (rate, seen) in [(0.92, 0.5), (0.9, 0.5), (0.85, 0.4), (0.8, 0.4), (0.75, 0.3), (0.7, 0.3), (0.6, 0.2), (0.5, 0.1)] {
+            assert!(close(lazer(&["HT"], rate), seen), "{rate}: {}", lazer(&["HT"], rate));
+        }
+        assert!(close(lazer(&["DT"], 1.3), 1.) && close(lazer(&["NF"], 1.), 0.5) && close(lazer(&["HT", "NF"], 0.8), 0.2) && close(lazer(&["CS", "HT"], 0.8), 0.36));
+        assert!(close(lazer(&[], 1.), 1.) && close(lazer(&["MR", "RD", "IN", "HD"], 1.), 1.) && close(lazer(&["10K"], 1.), 0.9));
+        // stable halves under Half Time whatever the rate, and knows no key-mod cut on a keymode's own map
+        let stable = |mods: &[&str]| score_multiplier(&mods.iter().map(|m| json!({"acronym": m})).collect::<Vec<_>>(), 0.75, true);
+        assert!(close(stable(&["HT"]), 0.5) && close(stable(&["HT", "EZ"]), 0.25) && close(stable(&["DT"]), 1.));
+    }
 
     fn pop() -> Pop {
         let mut p = Pop { slope: ByKeys { map: [(0, 2.), (4, 2.)].into_iter().collect() }, knee: 4., ..Pop::default() };

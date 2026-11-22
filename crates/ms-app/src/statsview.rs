@@ -58,7 +58,7 @@ fn date(t: f64, f: &str) -> String {
 
 /// Hover: the nearest tier's full name and level, names hidden for space included.
 fn dan_axis(ui: &mut Ui, keys: i64, scale: Scale, width: f32) {
-    let (r, response) = ui.allocate_exact_size(vec2(width, 18.), Sense::hover());
+    let (r, response) = ui.allocate_exact_size(vec2(width, theme::px(18.)), Sense::hover());
     let p = ui.painter();
     let mut last = f32::MIN;
     let ticks = dan_ticks(keys, scale.lo, scale.hi, scale.dan);
@@ -83,7 +83,7 @@ fn dan_axis(ui: &mut Ui, keys: i64, scale: Scale, width: f32) {
 /// ● your level, a faint band for its uncertainty, ○ this session (only once warm), and the line another hovered bar
 /// set (one shared level across all bars).
 fn skill_bar(ui: &mut Ui, keys: i64, g: Option<&Group>, scale: Scale, session: bool, width: f32, line: Option<f64>) -> egui::Response {
-    let (r, response) = ui.allocate_exact_size(vec2(width, 22.), Sense::hover());
+    let (r, response) = ui.allocate_exact_size(vec2(width, theme::px(22.)), Sense::hover());
     let p = ui.painter();
     let y = r.center().y;
     let ink = TEXT.gamma_multiply(0.10);
@@ -239,7 +239,7 @@ fn skill_insights(keys: i64, page: &Page, parents: &[&Skill]) -> Vec<String> {
 
 fn history_chart(ui: &mut Ui, keys: i64, h: &[(i64, f64, f64)], peak: (i64, f64), page: &Page, hints: &mut u32) {
     let dan = 1.;
-    let (r, response, fx, marked) = zoomable(ui, ("history", keys), 110., |r| (r.left() + 8., r.right() - 74.));
+    let (r, response, fx, marked) = zoomable(ui, ("history", keys), theme::px(110.), |r| (r.left() + theme::px(8.), r.right() - theme::px(74.)));
     let values: Vec<f64> = h.iter().map(|x| x.1).collect();
     let lo = values.iter().copied().fold(f64::MAX, f64::min) * 0.97;
     let hi = values.iter().copied().fold(f64::MIN, f64::max) * 1.03;
@@ -323,7 +323,7 @@ fn form_chart(ui: &mut Ui, form: &FormHistory, keys: Option<&[Vec<i64>]>, hints:
         count += 2;
     }
     let top = dots.iter().map(|d| d.1.abs()).fold(0.5, f64::max);
-    let (r, response, fx, marked) = zoomable(ui, "form", 90., |r| (r.left() + 6., r.right() - 6.));
+    let (r, response, fx, marked) = zoomable(ui, "form", theme::px(90.), |r| (r.left() + 6., r.right() - 6.));
     let x = |i: usize| fx(i as f64 / count.max(1) as f64);
     let y = |v: f64| r.center().y - (r.height() / 2. - 6.) * (v / top) as f32;
     let p = ui.painter_at(r);
@@ -436,7 +436,7 @@ impl App {
         let value = overall.and_then(|g| g.value);
         ui.horizontal(|ui| match value {
             Some(v) => {
-                ui.label(RichText::new(format!("{:.1}", st(keys, v))).size(theme::BODY * 2.2).family(egui::FontFamily::Name("bold".into())));
+                ui.label(RichText::new(format!("{:.1}", st(keys, v))).size(theme::body() * 2.2).family(egui::FontFamily::Name("bold".into())));
                 ui.label(RichText::new(format!("your {keys}K level")).family(egui::FontFamily::Name("bold".into())));
                 if let Some(d) = dans::ability(keys, v, "overall") {
                     ui.label(format!("·  ≈ {d}"));
@@ -478,7 +478,7 @@ impl App {
             form_chart(ui, form, None, &mut self.s.chart_hints);
             ui.horizontal(|ui| {
                 for (name, colour) in FORM {
-                    ui.label(RichText::new("●").color(colour).size(theme::SMALL));
+                    ui.label(RichText::new("●").color(colour).size(theme::small()));
                     theme::dim_small(ui, name);
                 }
             });
@@ -506,7 +506,7 @@ impl App {
         let text = |t: String| egui::WidgetText::from(t).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body).size().x;
         let open = |p: &Skill| self.s.expanded.contains(&(keys, p.key.clone()));
         let name = parents.iter().flat_map(|p| std::iter::once(text(format!("▸ {}", p.name)) + 2. * ui.spacing().button_padding.x).chain(p.children.iter().filter(|_| open(p)).map(|c| 22. + text(c.name.to_string())))).fold(60., f32::max) + 8.;
-        let l = Layout { name, tail: 150., bar: (width - name - 150. - 16.).max(80.) };
+        let l = Layout { name, tail: theme::px(150.), bar: (width - name - theme::px(166.)).max(theme::px(80.)) };
         theme::dim(ui, format!("● level   band: uncertainty{}", if page.session { "   ○ this session" } else { "" }));
         ui.horizontal(|ui| {
             ui.add_space(l.name + 8.);
@@ -606,7 +606,7 @@ impl App {
                         form_chart(ui, &form, Some(&keys), &mut self.s.chart_hints);
                         ui.horizontal(|ui| {
                             for (name, colour) in FORM {
-                                ui.label(RichText::new("●").color(colour).size(theme::SMALL));
+                                ui.label(RichText::new("●").color(colour).size(theme::small()));
                                 theme::dim_small(ui, name);
                             }
                         });

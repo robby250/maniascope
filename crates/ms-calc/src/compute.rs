@@ -84,6 +84,12 @@ fn sides(runs: Vec<Run>) -> (Vec<f64>, Parts) {
     }
 }
 
+/// Share of the same-hand hold load (`P::ln_same`) the press rating keeps. The user (2026-11-22): a chart with holds reads
+/// "very slightly harder than hold-off on average, because some parts of the LN are physical". Searched on the 352 dan
+/// charts with ≥ 20 % holds against the Hold Off chart's own rating: mean −1.8 % at 0, +1.9 % at 0.2, +3.7 % at 0.3, +14.9 %
+/// at 1 (7K +21.7 %); about +2 % was asked: 0.2 (0.15–0.25 give +1.0 to +2.8 %). There: 4K −0.8 %, 7K +4.1 %, 10K +3.3 %.
+const PRESS_SAME: f64 = 0.2;
+
 pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, prm: &Params) -> Result<Dict, String> {
     let _runs = crate::structure::RunScope::open();
     let k = &prm.k;
@@ -235,12 +241,15 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
 
     let overall = skills::rating(&total, &judged, keys, k);
     sc.set("overall", overall);
-    // The press rating: the chart with its holds as taps (each bin without the LN parts' share, releases not judged). The regular
-    // dans read it: an LN chart's regular dan is what hitting its notes asks, not its hold control (user 2026-11-19: the LN
-    // Stellium course read "Reg Stellium+"). No second analysis: one more rating of the series.
+    // The press rating: the chart with its holds as taps (releases not judged, each bin without its hold term but for what
+    // pressing costs more while the same hand holds: `P::ln_same`). The regular dans read it: an LN chart's regular dan is
+    // what hitting its notes asks, not its hold control (user 2026-11-19: the LN Stellium course read "Reg Stellium+"; 2026-11-22:
+    // "ignore the release part of the LN, but … holding a LN makes pressing other notes with the same hand physically harder",
+    // no second analysis). One more rating of the series; `model::apply` gives it the correction of the chart as taps.
     let lean = shared.lean;
     let press = if !lean && !shared.stored && parts.keys.contains(&P::ln) && parts.get(P::ln).iter().any(|&v| v != 0.0) {
-        let rice: Vec<f64> = total.iter().zip(parts.get(P::ln)).map(|(t, l)| (t - l).max(0.0)).collect();
+        let same = parts.get(P::ln_same);
+        let rice: Vec<f64> = total.iter().zip(parts.get(P::ln)).enumerate().map(|(b, (t, l))| (t - l * (1.0 - PRESS_SAME * same[b])).max(0.0)).collect();
         skills::rating(&rice, &skills::Judged::new(&g.times, &g.times, total.len(), judged.fatigue.clone(), k), keys, k)
     } else {
         overall

@@ -305,8 +305,9 @@ fn parse_inner(data: &[u8], keep: bool) -> Result<(Chart, Option<Vec<Object>>), 
     ch.od = if od.is_finite() { od } else { 5.0 };
     let get = |k: &str| meta.iter().find(|(mk, _)| mk == k).map(|(_, v)| v.clone());
     let nonempty = |k: &str| get(k).filter(|v| !v.is_empty());
-    ch.title = nonempty("TitleUnicode").or_else(|| get("Title")).unwrap_or_default();
-    ch.artist = nonempty("ArtistUnicode").or_else(|| get("Artist")).unwrap_or_default();
+    // romanised first (user 2026-11-22: "show the titles in english/romaji instead of japanese/kanji")
+    ch.title = nonempty("Title").or_else(|| get("TitleUnicode")).unwrap_or_default();
+    ch.artist = nonempty("Artist").or_else(|| get("ArtistUnicode")).unwrap_or_default();
     ch.version = get("Version").unwrap_or_default();
     ch.creator = get("Creator").unwrap_or_default();
     ch.sv = scroll(&tps, ch.last_end());
@@ -397,6 +398,15 @@ mod tests {
         assert_eq!(super::lines("a\r\nb\rc\n\nd\r\r\ne\n"), ["a", "b", "c", "", "d", "", "e"]);
         assert_eq!(super::lines("a\r"), ["a", ""]);
         assert_eq!(super::lines(""), [""]);
+    }
+
+    #[test]
+    fn the_romanised_title_shows_and_the_original_only_without_one() {
+        let osu = |meta: &str| format!("osu file format v14\n[General]\nMode: 3\n[Metadata]\n{meta}\n[Difficulty]\nCircleSize:4\nOverallDifficulty:8\n[HitObjects]\n64,192,1000,1,0,0:0:0:0:\n");
+        let c = super::parse(osu("Title:Hoshi\nTitleUnicode:星\nArtist:Ai\nArtistUnicode:愛").as_bytes()).unwrap();
+        assert_eq!((c.title.as_str(), c.artist.as_str()), ("Hoshi", "Ai"));
+        let c = super::parse(osu("Title:\nTitleUnicode:星\nArtistUnicode:愛").as_bytes()).unwrap();
+        assert_eq!((c.title.as_str(), c.artist.as_str()), ("星", "愛"));
     }
 
     #[test]

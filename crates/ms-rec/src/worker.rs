@@ -528,6 +528,7 @@ impl Worker {
         });
         let carrying = self.carry_played()?;
         crate::modcharts::restore_invert_flags(&self.db).map_err(|e| e.to_string())?;
+        converts::drop_colon_cut(&self.db, &crate::catalog::local_origin(&self.shown.client).1).map_err(|e| e.to_string())?;
         lap("carry", &mut laps);
         self.prune_calculators();
         const STEPS: usize = 4;
@@ -897,7 +898,7 @@ impl Worker {
             let stream = if i["convert"].as_bool() == Some(true) { if i["source_web"].as_bool() == Some(true) { WEB_CONVERT } else { CONVERT } } else if i["web"].as_bool() == Some(true) { WEB } else { REAL };
             match i["mode"].as_str() {
                 Some("pp") => Tags { stream: PP, ..Tags::default() },
-                Some(m) if m == mode => Tags { keys: i["keys"].as_i64().unwrap_or(0), skill: i["matched_skills"].get(0).and_then(Value::as_str).filter(|_| by_skill).unwrap_or("").to_string(), stream },
+                Some(m) if m == mode => Tags { keys: i["keys"].as_i64().unwrap_or(0), skill: i["matched_skills"].get(0).and_then(Value::as_str).filter(|_| by_skill).unwrap_or("").to_string(), stream, learning: false },
                 _ => Tags::default(),
             }
         }).collect();
@@ -997,9 +998,9 @@ impl Worker {
             let (recent_sets, recent_convert_sets) = if active.is_empty() { Default::default() } else { self.recent_sets(&n)? };
             let web = web_factor(self.web_bias[mode]);
             // the slider counts the maps its floor keeps from this, while dragging, without asking the worker
-            let nps_pool = prepared.nps_pool(&prepared.family_best(&self.keys[mode], web, convert));
-            floor = nps_pool.iter().map(|(k, ns)| (*k, ms_model::choices::nps_floor(ns, if focus >= 0. { focus } else { 0.5 }))).collect();
-            self.nps_pool.insert(mode, nps_pool);
+            let best = prepared.family_best(&self.keys[mode], web, convert);
+            floor = prepared.nps_slots(&best).iter().map(|(k, ns)| (*k, ms_model::choices::nps_floor(ns, if focus >= 0. { focus } else { 0.5 }))).collect();
+            self.nps_pool.insert(mode, prepared.nps_pool(&best));
             shares = Shares { keys: self.key_shares(mode), skills: skill_shares, sliders: [web, convert], weighted: [self.web_weighted[mode], active.iter().any(|s| s.weighted)], pp_every: 0 };
             ledger = Self::ledger(&n, mode, by_skill);
             let seed = Some(n.session.shuffle_seed().to_string()); // one shuffle per run of offers: a quit (user 2026-11-15) or a pick must not re-draw it
@@ -1072,8 +1073,12 @@ impl Worker {
                 if local.is_some() {
                     // off the target now, or far under the tab's density floor (G835LX 2026-10-22: dEKA, 6 NPS, queued under a
                     // cold start's list, was offered after seven such maps)
-                    let thin = c.nps.is_some_and(|x| x > 0. && x < ms_model::choices::NPS_CUT * floor.get(&c.keys).copied().unwrap_or(0.));
-                    if thin || !rec.model().eligible(&expected.shown, rec.model().target_for(c.f.as_ref()?, target), warm) {
+                    let thin = c.nps.is_some_and(|x| x > 0. && x < ms_model::choices::NPS_CUT * floor.get(&(c.keys, c.invert_of.is_some())).copied().unwrap_or(0.));
+                    // a learning offer also stands under the target, down to its floor; over the band it leaves like any other
+                    // (replay 2026-11-22: one read 97.3 % by now and came five times as "the closest chart")
+                    let aim = rec.model().target_for(c.f.as_ref()?, target);
+                    let stands = rec.model().eligible(&expected.shown, aim, warm) || (c.learning && (ms_model::predict::LEARN_FLOOR..aim).contains(&expected.shown.acc_mid));
+                    if thin || !stands {
                         return None;
                     }
                 }
@@ -1085,7 +1090,7 @@ impl Worker {
                         (c.pp_lo, c.pp_hi, c.best, c.gain, c.p_up) = (Some(lo), Some(hi), best, Some(gain), Some(up));
                     }
                 }
-                let tags = if local.is_some() { Tags { keys: c.keys, skill: c.matched_skills.first().filter(|_| by_skill).cloned().unwrap_or_default(), stream: c.stream() } } else { Tags::default() };
+                let tags = if local.is_some() { Tags { keys: c.keys, skill: c.matched_skills.first().filter(|_| by_skill).cloned().unwrap_or_default(), stream: c.stream(), learning: by_skill && c.learning } } else { Tags::default() };
                 Some((c, tags))
             })());
         }
@@ -1154,19 +1159,14 @@ impl Worker {
         } else if !incomplete {
             note += &format!(" · {} maps", crate::engine::commas(st.total)); // else the window's bottom bar counts them
         }
-        let missing = shown.iter().filter(|c| c.stream() == WEB).count();
-        if missing != 0 {
-            note += &format!(" · {missing} to download");
-        }
+        // no count of website rows either: their WEB mark says it (user 2026-11-22)
         if mode == "skills" {
             note = format!("{} · {note}", skills::label(&self.practice_skills));
         }
         if shown.is_empty() && !st.build_failed {
             note += &if incomplete { " · looking for maps that fit your target…".to_string() } else { format!(" · no map fits your accuracy target at {} (try another target, rate range or keymode)", rate_text(self.rate_range(mode))) };
         }
-        if st.failed != 0 {
-            note += &format!(" · {} unreadable", st.failed);
-        }
+        // charts that could not be read are not counted here (user 2026-11-22: "hide that")
         if !st.error.is_empty() {
             note += &format!(" · {}", st.error);
         }
@@ -1771,14 +1771,16 @@ impl Worker {
                     // Every mod list gets a forecast: of the chart as its modelled mods make it, without the others (named on the card).
                     let played = as_played(&self.db, &data, rate, &m);
                     let r = played.rate;
+                    // what osu!mania pays this play: its mods' score multiplier ("X% to beat")
+                    let paid = crate::engine::score_multiplier(&m, r, self.shown.client.starts_with("stable"));
                     if let Ok(n) = self.session() {
-                        c = self.rec.as_mut().unwrap().card(&self.db, &played.data, r, &n).ok().flatten();
+                        c = self.rec.as_mut().unwrap().card(&self.db, &played.data, r, paid, &n).ok().flatten();
                     }
                     // unseeded Random: the plain card until the three shuffles are rated, then their mean
                     let shuffled = shuffles(&self.db, &data, &played);
                     if let (false, Some(plain), Ok(n)) = (shuffled.is_empty(), c.as_ref(), self.session()) {
                         let rec = self.rec.as_mut().unwrap();
-                        let cards: Vec<Card> = shuffled.iter().filter_map(|p| rec.card(&self.db, &p.data, p.rate, &n).ok().flatten()).collect();
+                        let cards: Vec<Card> = shuffled.iter().filter_map(|p| rec.card(&self.db, &p.data, p.rate, paid, &n).ok().flatten()).collect();
                         if cards.len() == shuffled.len() {
                             let plain = Card { mods: played.m.labels(), without: played.m.without.clone(), ..plain.clone() };
                             c = Some(mean_card(plain, &cards));
@@ -2103,7 +2105,7 @@ impl Worker {
                 c.installed = true;
                 let copy = Some(crate::navigation::song_search(&c, &self.shown.client));
                 let first = if self.shown.client == "stable" { "press F5 in song select, then Ctrl+V" } else { "press Ctrl+V in song select" };
-                let msg = format!("Ready: {first} · set {} manually", c.var);
+                let msg = crate::navigation::with_invert(&c, format!("Ready: {first} · set {} manually", c.var));
                 self.targets.insert(mode.clone(), c.clone());
                 self.target = Some(c.clone());
                 (self.h.emit)(Out::Target { mode, revision: self.revision, selection_id: self.selection_id, c: Some(c), msg, copy });

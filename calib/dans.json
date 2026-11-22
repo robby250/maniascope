@@ -1,8 +1,12 @@
 {
   "calc": "cc36b2f14526",
   "vibro_weights": [
-    27.5548357965595,
-    3.8974640856037057
+    9.13977276554006,
+    26.911357939150456,
+    2.184505869421887,
+    0.12094579973684301,
+    -0.03373794792145923,
+    0.05285605527231374
   ],
   "length": {
     "seconds": 240.0,
@@ -12,55 +16,55 @@
     "10K Regular": [
       {
         "tier": "Lv.0",
-        "value": 0.71152
+        "value": 0.71166
       },
       {
         "tier": "Lv.1",
-        "value": 0.92448
+        "value": 0.95482
       },
       {
         "tier": "Lv.2",
-        "value": 1.22086
+        "value": 1.37238
       },
       {
         "tier": "Lv.3",
-        "value": 1.39908
+        "value": 1.55135
       },
       {
         "tier": "Lv.4",
-        "value": 1.48681
+        "value": 1.56227
       },
       {
         "tier": "Lv.5",
-        "value": 1.6434
+        "value": 1.70383
       },
       {
         "tier": "Lv.6",
-        "value": 1.74271
+        "value": 1.89114
       },
       {
         "tier": "Lv.7",
-        "value": 1.82414
+        "value": 1.92589
       },
       {
         "tier": "Lv.8",
-        "value": 1.91858
+        "value": 2.01366
       },
       {
         "tier": "Lv.9",
-        "value": 2.08665
+        "value": 2.16005
       },
       {
         "tier": "Lv.10",
-        "value": 2.25092
+        "value": 2.2514
       },
       {
         "tier": "Lv.XI",
-        "value": 2.36701
+        "value": 2.38988
       },
       {
         "tier": "Virtuoso",
-        "value": 2.47271
+        "value": 2.54004
       }
     ],
     "4K LN": [
@@ -136,231 +140,231 @@
     "4K REFORM": [
       {
         "tier": "Intro 1",
-        "value": 0.48763
+        "value": 0.09797
       },
       {
         "tier": "Intro 2",
-        "value": 0.85559
+        "value": 0.62176
       },
       {
         "tier": "Intro 3",
-        "value": 1.3154
+        "value": 1.12711
       },
       {
         "tier": "Reform 1",
-        "value": 1.40174
+        "value": 1.25913
       },
       {
         "tier": "Reform 2",
-        "value": 1.52125
+        "value": 1.36368
       },
       {
         "tier": "Reform 3",
-        "value": 1.54998
+        "value": 1.37984
       },
       {
         "tier": "Reform 4",
-        "value": 1.73432
+        "value": 1.57346
       },
       {
         "tier": "Reform 5",
-        "value": 1.89096
+        "value": 1.69031
       },
       {
         "tier": "Reform 6",
-        "value": 1.95652
+        "value": 1.77383
       },
       {
         "tier": "Reform 7",
-        "value": 2.06678
+        "value": 1.84685
       },
       {
         "tier": "Reform 8",
-        "value": 2.17568
+        "value": 1.98032
       },
       {
         "tier": "Reform 9",
-        "value": 2.22425
+        "value": 2.04694
       },
       {
         "tier": "Reform 10",
-        "value": 2.32601
+        "value": 2.15435
       },
       {
         "tier": "Alpha",
-        "value": 2.42438
+        "value": 2.24029
       },
       {
         "tier": "Beta",
-        "value": 2.4351
+        "value": 2.29234
       },
       {
         "tier": "Gamma",
-        "value": 2.54148
+        "value": 2.43974
       },
       {
         "tier": "Delta",
-        "value": 2.66867
+        "value": 2.60775
       },
       {
         "tier": "Epsilon",
-        "value": 2.85797
+        "value": 2.90017
       },
       {
         "tier": "Zeta",
-        "value": 2.96959
+        "value": 2.99857
       },
       {
         "tier": "Eta",
-        "value": 3.09035
+        "value": 3.12017
       },
       {
         "tier": "Theta",
-        "value": 3.23987
+        "value": 3.12573
       },
       {
         "tier": "Iota",
-        "value": 3.3657
+        "value": 3.21141
       },
       {
         "tier": "Kappa",
-        "value": 3.46966
+        "value": 3.31537
       }
     ],
     "4K Vibro": [
       {
         "tier": "Vibro 1",
-        "value": 75.38002
+        "value": 17.81936
       },
       {
         "tier": "Vibro 2",
-        "value": 75.61057
+        "value": 19.57927
       },
       {
         "tier": "Vibro 3",
-        "value": 77.12288
+        "value": 21.33918
       },
       {
         "tier": "Vibro 4",
-        "value": 77.28508
+        "value": 21.62038
       },
       {
         "tier": "Vibro 5",
-        "value": 77.63469
+        "value": 22.03256
       },
       {
         "tier": "Vibro 6",
-        "value": 77.9843
+        "value": 22.44474
       },
       {
         "tier": "Vibro 7",
-        "value": 79.03932
+        "value": 23.71827
       },
       {
         "tier": "Vibro 8",
-        "value": 80.09435
+        "value": 24.9918
       },
       {
         "tier": "Vibro 9",
-        "value": 81.14937
+        "value": 26.26533
       },
       {
         "tier": "Vibro 10",
-        "value": 81.50292
+        "value": 26.48877
       },
       {
         "tier": "Vibro O",
-        "value": 81.85647
+        "value": 27.07734
       },
       {
         "tier": "Vibro W",
-        "value": 83.74946
+        "value": 28.09118
       }
     ],
     "6K Regular": [
       {
         "tier": "0th",
-        "value": 0.91564
+        "value": 0.7907
       },
       {
         "tier": "1st",
-        "value": 1.17864
+        "value": 1.052
       },
       {
         "tier": "2nd",
-        "value": 1.35322
+        "value": 1.20673
       },
       {
         "tier": "3rd",
-        "value": 1.51985
+        "value": 1.34719
       },
       {
         "tier": "4th",
-        "value": 1.64264
+        "value": 1.45775
       },
       {
         "tier": "5th",
-        "value": 1.67487
+        "value": 1.48466
       },
       {
         "tier": "6th",
-        "value": 1.78672
+        "value": 1.58199
       },
       {
         "tier": "7th",
-        "value": 1.85317
+        "value": 1.64068
       },
       {
         "tier": "8th",
-        "value": 1.91371
+        "value": 1.71492
       },
       {
         "tier": "9th",
-        "value": 1.97855
+        "value": 1.79581
       },
       {
         "tier": "10th",
-        "value": 2.04521
+        "value": 1.86375
       },
       {
         "tier": "Extra 1st",
-        "value": 2.10017
+        "value": 1.91507
       },
       {
         "tier": "Extra 2nd",
-        "value": 2.11366
+        "value": 1.93545
       },
       {
         "tier": "Extra 3rd",
-        "value": 2.16893
+        "value": 2.00851
       },
       {
         "tier": "Extra 4th",
-        "value": 2.2238
+        "value": 2.06327
       },
       {
         "tier": "Extra 5th",
-        "value": 2.27748
+        "value": 2.12097
       },
       {
         "tier": "Extra 6th",
-        "value": 2.31652
+        "value": 2.17434
       },
       {
         "tier": "Extra 7th",
-        "value": 2.40621
+        "value": 2.27067
       },
       {
         "tier": "Extra 8th",
-        "value": 2.42275
+        "value": 2.29799
       },
       {
         "tier": "Extra 9th",
-        "value": 2.51045
+        "value": 2.39215
       },
       {
         "tier": "Extra Final",
-        "value": 2.57859
+        "value": 2.44225
       }
     ],
     "7K LN": [
@@ -428,63 +432,63 @@
     "7K Regular": [
       {
         "tier": "0th",
-        "value": 1.5801
+        "value": 1.49615
       },
       {
         "tier": "1st",
-        "value": 1.70685
+        "value": 1.69507
       },
       {
         "tier": "2nd",
-        "value": 1.882
+        "value": 1.8321
       },
       {
         "tier": "3rd",
-        "value": 1.93477
+        "value": 1.88744
       },
       {
         "tier": "4th",
-        "value": 2.03491
+        "value": 1.9279
       },
       {
         "tier": "5th",
-        "value": 2.08199
+        "value": 2.01387
       },
       {
         "tier": "6th",
-        "value": 2.17308
+        "value": 2.12678
       },
       {
         "tier": "7th",
-        "value": 2.23491
+        "value": 2.17767
       },
       {
         "tier": "8th",
-        "value": 2.32198
+        "value": 2.27842
       },
       {
         "tier": "9th",
-        "value": 2.36954
+        "value": 2.37535
       },
       {
         "tier": "10th",
-        "value": 2.46588
+        "value": 2.47919
       },
       {
         "tier": "Gamma",
-        "value": 2.55309
+        "value": 2.55958
       },
       {
         "tier": "Azimuth",
-        "value": 2.69898
+        "value": 2.71385
       },
       {
         "tier": "Zenith",
-        "value": 2.83004
+        "value": 2.83714
       },
       {
         "tier": "Stellium",
-        "value": 3.00613
+        "value": 2.99688
       }
     ]
   },
@@ -697,7 +701,7 @@
           },
           "stream_family": 0.6949,
           "chordjack_card": 0.0,
-          "description": "Stream",
+          "description": "Tech Stream",
           "endurance": {
             "load": 0.28266596412890066,
             "peak": 0.542698969664055
@@ -1064,7 +1068,7 @@
           },
           "stream_family": 0.6403,
           "chordjack_card": 0.0,
-          "description": "Stream / LN General",
+          "description": "Tech Stream / LN General",
           "endurance": {
             "load": 0.25057828477652927,
             "peak": 0.40117891892669766
@@ -1624,7 +1628,7 @@
           },
           "stream_family": 0.7157,
           "chordjack_card": 0.3622,
-          "description": "Stream",
+          "description": "Tech Stream",
           "endurance": {
             "load": 0.35893761829246074,
             "peak": 0.6200899438624119
@@ -1996,7 +2000,7 @@
           },
           "stream_family": 0.7305,
           "chordjack_card": 0.2364,
-          "description": "Stream",
+          "description": "Tech Stream",
           "endurance": {
             "load": 0.44128192889519147,
             "peak": 0.7859937939440611
@@ -3267,7 +3271,7 @@
           },
           "stream_family": 0.5868,
           "chordjack_card": 0.3494,
-          "description": "Stream / Chordstream",
+          "description": "Tech Stream / Chordstream",
           "endurance": {
             "load": 0.39853233662371296,
             "peak": 0.7520623179534134
@@ -13301,7 +13305,7 @@
             "stamina": 0.8511
           },
           "chordjack_card": 0.4464,
-          "description": "LN General / Jumpstream",
+          "description": "LN General / Tech Jumpstream",
           "endurance": {
             "load": 0.4337790091734375,
             "peak": 0.7007997882980745
@@ -18284,7 +18288,7 @@
             "stamina": 0.8632
           },
           "chordjack_card": 0.6075,
-          "description": "Tech Chordjack / LN Inverse",
+          "description": "Chordjack / LN Inverse",
           "endurance": {
             "load": 0.4540090290092531,
             "peak": 0.7777197083431675
@@ -22056,7 +22060,7 @@
             "stamina": 0.8068
           },
           "chordjack_card": 0.3402,
-          "description": "Tech Dump",
+          "description": "Dump",
           "endurance": {
             "load": 0.4211913489608127,
             "peak": 0.7734245974870795
@@ -50518,7 +50522,7 @@
           },
           "stream_family": 0.631,
           "chordjack_card": 0.3791,
-          "description": "Stream / LN General",
+          "description": "Tech Stream / LN General",
           "endurance": {
             "load": 0.30935921982525183,
             "peak": 0.5740954463392836
@@ -54590,7 +54594,7 @@
           },
           "stream_family": 0.7026,
           "chordjack_card": 0.483,
-          "description": "Stream",
+          "description": "Tech Stream",
           "endurance": {
             "load": 0.3620958222939301,
             "peak": 0.571975699408199
@@ -61183,7 +61187,7 @@
           },
           "stream_family": 0.4072,
           "chordjack_card": 0.6621,
-          "description": "Chordjack / Minijacks",
+          "description": "Tech Chordjack / Minijacks",
           "endurance": {
             "load": 0.3561311869717357,
             "peak": 0.6491531204233136
@@ -61742,7 +61746,7 @@
           },
           "stream_family": 0.4964,
           "chordjack_card": 0.5127,
-          "description": "Minijacks",
+          "description": "Tech Minijacks",
           "endurance": {
             "load": 0.41142263670923623,
             "peak": 0.7314010015893624
@@ -77732,7 +77736,7 @@
           },
           "stream_family": 0.4677,
           "chordjack_card": 0.3691,
-          "description": "Tech LN Inverse",
+          "description": "LN Inverse",
           "endurance": {
             "load": 0.4256698899839095,
             "peak": 0.7365385054541205
@@ -78871,7 +78875,7 @@
           },
           "stream_family": 0.575,
           "chordjack_card": 0.5352,
-          "description": "Stream Stamina / Chordjack",
+          "description": "Stream Stamina / Tech Chordjack",
           "endurance": {
             "load": 0.45481599514153825,
             "peak": 0.7604771302027465
@@ -88878,7 +88882,7 @@
           },
           "stream_family": 0.53,
           "chordjack_card": 0.5224,
-          "description": "Tech Bracket / Stream",
+          "description": "Bracket / Stream",
           "endurance": {
             "load": 0.4131265766424316,
             "peak": 0.6873701694101603
@@ -89754,7 +89758,7 @@
           },
           "stream_family": 0.5302,
           "chordjack_card": 0.5221,
-          "description": "Tech Bracket / Stream",
+          "description": "Bracket / Stream",
           "endurance": {
             "load": 0.4120732932380131,
             "peak": 0.685343598453115
@@ -92045,7 +92049,7 @@
           },
           "stream_family": 0.5546,
           "chordjack_card": 0.4003,
-          "description": "Bracket / Tech Stream",
+          "description": "Bracket / Stream",
           "endurance": {
             "load": 0.4029926321316605,
             "peak": 0.6808561522540564
@@ -93193,7 +93197,7 @@
           },
           "stream_family": 0.6963,
           "chordjack_card": 0.1405,
-          "description": "Tech Stream",
+          "description": "Stream",
           "endurance": {
             "load": 0.3877698897519442,
             "peak": 0.6716010163604154

@@ -31,6 +31,7 @@ pub enum Msg {
     Analysed(viewer::Done),
     Raise,
     Web(Box<crate::windows::WebInfo>),
+    Backdrop(std::path::PathBuf, Option<Box<crate::backdrop::Images>>),
 }
 
 /// Sends to the UI and wakes it: a hidden window still runs `logic`.
@@ -99,6 +100,7 @@ pub struct Open {
     pub rename: Option<(usize, String)>, // a playlist being renamed: (index, text)
     pub delete: Option<usize>,           // a playlist whose Delete waits for a second click
     pub drag: Option<(usize, f32)>,      // a tab being dragged: its strip place and where the pointer holds it
+    pub share: bool,                     // "Share replays for calibration…" waits for its Yes
 }
 
 pub struct App {
@@ -114,6 +116,7 @@ pub struct App {
     pub client_name: Arc<Mutex<String>>,
     pub db: Db,
     pub viewer: Arc<Viewer>,
+    pub backdrop: crate::backdrop::Backdrop,
     pub obs: Obs,
     pub shown: Option<Selected>,
     pub pending: Option<Pending>,
@@ -146,6 +149,7 @@ pub struct App {
     pub web: crate::windows::WebView,
     pub resized: Option<(f32, f32)>,
     pub extra: f32, // height the details rows add to the window now
+    pub extra_scale: f32, // the window's scale `extra` was measured at
     pub clipboard: Option<arboard::Clipboard>,
     pub flash: Option<(String, Instant)>, // a short footer note ("Copied") and when it goes
     profile_asked: bool, // the Stats pages are built once in the background for the main window's "you" comparisons
@@ -185,12 +189,13 @@ impl App {
         let play = Arc::new(Mutex::new(None));
         let tracking = tracking_switch(&db, debug);
         let list_open = Arc::new(AtomicBool::new(s.recs_open));
+        let backdrop = crate::backdrop::Backdrop::new(mail.clone());
         let mut app = App {
-            s, rx, list_open, mail, q, halt, play, busy, game, client_name: Arc::new(Mutex::new(client.clone())), viewer: Arc::default(), db,
+            s, rx, list_open, mail, q, halt, play, busy, game, client_name: Arc::new(Mutex::new(client.clone())), viewer: Arc::default(), backdrop, db,
             obs: Obs { note: "starting…".into(), ..Obs::default() }, shown: None, pending: None, generation: 0, requested: None, live: None, card: None, card_note: None,
             views: MODES.into_iter().map(|m| (m, view())).collect(), stats: None, stats_open: false, stats_wait: None, chips_open: HashSet::new(), revision: 0, selection_id: 0,
             units: Shown { client, miss_ratio }, result: None, status_text: String::new(), delivery: None, bg_progress: None, bg_main: false, blocker: None, foot: String::new(), recs_opened: None, open: Open::default(), save_at: None, page: None, tracking, debug,
-            web: Default::default(), resized: None, extra: 0., clipboard: arboard::Clipboard::new().ok(), flash: None, profile_asked: false, keys_checked: None,
+            web: Default::default(), resized: None, extra: 0., extra_scale: 1., clipboard: arboard::Clipboard::new().ok(), flash: None, profile_asked: false, keys_checked: None,
         };
         app.auto_keys(true);
         if !debug && asks_profile(&app.db) {
@@ -577,6 +582,7 @@ impl App {
             if self.requested.as_ref() != Some(&key) {
                 self.requested = Some(key);
                 self.generation += 1;
+                self.backdrop.want(&path);
                 let request = viewer::Request { generation: self.generation, path: path.clone(), rate, mods };
                 match self.viewer.cached(&request) {
                     Some(hit) => {
@@ -597,11 +603,11 @@ impl App {
         let meta = std::fs::read(path).ok().and_then(|d| ms_data::lazer_index::metadata(&d)).unwrap_or_default();
         let get = |a: &str, b: &str| meta.get(a).or_else(|| meta.get(b)).cloned().unwrap_or_default();
         let keys = get("CircleSize", "CircleSize").split('.').next().unwrap_or("").to_string();
-        let mut title = get("TitleUnicode", "Title");
+        let mut title = get("Title", "TitleUnicode");
         if title.is_empty() {
             title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         }
-        Pending { title, artist: get("ArtistUnicode", "Artist"), version: get("Version", "Version"), creator: get("Creator", "Creator"), context: format!("{}{rate:.2}×", if keys.is_empty() { String::new() } else { format!("{keys}K  ·  ") }) }
+        Pending { title, artist: get("Artist", "ArtistUnicode"), version: get("Version", "Version"), creator: get("Creator", "Creator"), context: format!("{}{rate:.2}×", if keys.is_empty() { String::new() } else { format!("{keys}K  ·  ") }) }
     }
 
     fn on_analysed(&mut self, d: viewer::Done) {
@@ -681,6 +687,7 @@ impl App {
                 Msg::Analysed(d) => self.on_analysed(d),
                 Msg::Raise => ctx.send_viewport_cmd(egui::ViewportCommand::Focus),
                 Msg::Web(info) => self.web_show(*info),
+                Msg::Backdrop(chart, images) => self.backdrop.arrived(ctx, chart, images),
                 Msg::Watch(Event::Obs(o)) => self.on_obs(o),
                 Msg::Watch(Event::Status(t)) => self.foot = t,
                 Msg::Watch(Event::Score { score, path, fresh, attempt }) => self.on_score(score, path, fresh, attempt),

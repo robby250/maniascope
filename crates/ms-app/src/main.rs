@@ -1,6 +1,7 @@
 //! ManiaScope: glanceable osu!mania difficulty for the selected map, and what to play next.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 mod app;
+mod backdrop;
 mod fmt;
 mod mainview;
 mod playlist;
@@ -151,13 +152,19 @@ impl eframe::App for Shell {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let Some(app) = &mut self.app else {
-            egui::CentralPanel::default().show(ui, |ui| {
+            theme::scaled(ui, 1.);
+            theme::backdrop(ui, &[], false);
+            egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(12)).show(ui, |ui| {
                 ui.label("ManiaScope could not start");
                 ui.label(format!("{}\nPlease send the log files in\n{}", self.error.as_deref().unwrap_or(""), cache().display()));
             });
             return;
         };
-        egui::CentralPanel::default().frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 2 })).show(ui, |ui| app.main_ui(ui));
+        let size = ctx.input(|i| i.content_rect().size());
+        theme::scaled(ui, app.main_scale(size));
+        theme::backdrop(ui, &app.backdrop.layers(&ctx), app.s.black_bg);
+        let m = |v: f32| theme::px(v) as i8;
+        egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(egui::Margin { left: m(10.), right: m(10.), top: m(8.), bottom: m(2.) })).show(ui, |ui| app.main_ui(ui));
         app.track_window(&ctx);
         if app.list_open.swap(app.s.recs_open, Ordering::Relaxed) != app.s.recs_open && app.s.recs_open {
             app.q.put(ms_rec::worker::Task::Refresh); // closed, nothing was built: catch up now
@@ -168,7 +175,7 @@ impl eframe::App for Shell {
             // Kept from opening: fed the tracked values, egui re-sends every change as a resize or move on each repaint, and
             // repaints run constantly in game (a player: only this window, only in game, only once moved and resized).
             let ((w, h), at) = *app.recs_opened.get_or_insert((app.s.recs_win, app.s.recs_pos));
-            let mut b = ViewportBuilder::default().with_title("ManiaScope · Playlist").with_inner_size([w, h]).with_app_id("maniascope");
+            let mut b = ViewportBuilder::default().with_title("ManiaScope · Playlist").with_inner_size(theme::window_in(&ctx, [w, h])).with_app_id("maniascope");
             if let Some(p) = at {
                 b = b.with_position(p); // Windows/X11 only: Wayland ignores it (a compositor window rule places them there)
             }
@@ -177,7 +184,10 @@ impl eframe::App for Shell {
             }
             let closed = ctx.show_viewport_immediate(windows::playlist_id(), b, |ui, _| {
                 theme::dark_frame(ui.ctx());
-                egui::CentralPanel::default().frame(egui::Frame::central_panel(ui.style()).inner_margin(14)).show(ui, |ui| app.playlist_ui(ui));
+                // width sets the scale, height only shows more or fewer rows (user 2026-11-22)
+                let width = ui.ctx().input(|i| i.content_rect().width());
+                theme::scaled(ui, theme::fit(width / settings::LIST.0));
+                egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(theme::px(12.) as i8)).show(ui, |ui| app.playlist_ui(ui));
                 let c = ui.ctx().clone();
                 app.track_playlist(&c);
                 c.input(|i| i.viewport().close_requested())
@@ -272,7 +282,7 @@ fn main() {
     crash_log();
     let s = settings::Ui::load();
     let (w, h) = s.win; // details add their rows once an analysis shows
-    let mut view = ViewportBuilder::default().with_title("ManiaScope").with_app_id("maniascope").with_inner_size([w, h]).with_min_inner_size([200., 120.]);
+    let mut view = ViewportBuilder::default().with_title("ManiaScope").with_app_id("maniascope").with_inner_size(theme::window([w, h])).with_min_inner_size(theme::window([200., 120.]));
     if let Some(p) = s.win_pos {
         view = view.with_position(p);
     }

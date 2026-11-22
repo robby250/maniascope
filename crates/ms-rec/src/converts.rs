@@ -166,6 +166,13 @@ pub fn bytes(i: &Inst, root: &Path) -> Option<Vec<u8>> {
     bytes_kept(i, root, &kept_dir())
 }
 
+/// An indexed convert's chart by its sha, wherever its source is (`modcharts::bytes`: the source of an Invert chart).
+pub fn bytes_by_sha(db: &Db, sha: &str) -> Option<Vec<u8>> {
+    let (source, keys, web): (String, i64, bool) = db.query_row("SELECT source_sha, target, web FROM converts WHERE sha=?", [sha], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0))).ok()?;
+    let root = [paths::lazer_data(), paths::stable_store()].into_iter().find(|root| web || paths::local_file(&source, root).is_some_and(|p| p.is_file()))?;
+    bytes(&Inst { sha256: sha.to_string(), keys, convert_of: Some(source), source_web: web, ..Inst::default() }, &root)
+}
+
 fn bytes_kept(i: &Inst, root: &Path, dir: &Path) -> Option<Vec<u8>> {
     let path = dir.join(format!("{}.osu.z", i.sha256));
     let back = std::fs::read(&path).ok().and_then(|z| {
@@ -203,6 +210,34 @@ pub fn prune_kept(db: &Db) -> rusqlite::Result<usize> {
     let gone: Vec<PathBuf> = dir.flatten().map(|e| e.path()).filter(|p| p.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".osu.z")).is_none_or(|sha| !names.contains(sha))).collect();
     gone.iter().for_each(|p| { let _ = std::fs::remove_file(p); });
     Ok(gone.len())
+}
+
+/// Converts (and stable's Invert charts) of a source whose metadata the converter cut at a colon leave the index, once:
+/// their bytes changed with the fix (`ms_convert::metadata_was_cut`), so the indexed sha could never be delivered. The
+/// index passes make them again.
+pub fn drop_colon_cut(db: &Db, root: &Path) -> Result<usize> {
+    const DONE: &str = "colon_cut_converts_dropped";
+    if ms_data::store::kv_get(db, DONE).is_some() {
+        return Ok(0);
+    }
+    let cut = |path: Option<PathBuf>| path.and_then(|p| std::fs::read(p).ok()).is_some_and(|d| ms_convert::metadata_was_cut(&d));
+    let converts: Vec<(String, bool)> = db.prepare("SELECT DISTINCT source_sha, web FROM converts WHERE sha IS NOT NULL")?.query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)))?.collect::<Result<_>>()?;
+    let inverts: Vec<String> = db.prepare("SELECT DISTINCT source FROM mod_charts WHERE tag=?")?.query_map([crate::modcharts::STABLE_INVERT], |r| r.get(0))?.collect::<Result<_>>()?;
+    let tx = db.unchecked_transaction()?;
+    let mut gone = 0;
+    for (source, web) in converts {
+        if cut(source_path(&source, web, root)) {
+            gone += tx.execute("DELETE FROM converts WHERE source_sha=?", [&source])?;
+        }
+    }
+    for source in inverts {
+        if cut(crate::pp::chart_path(Some(&source))) {
+            gone += tx.execute("DELETE FROM mod_charts WHERE source=? AND tag=?", [source.as_str(), crate::modcharts::STABLE_INVERT])?;
+        }
+    }
+    ms_data::store::kv_set(&tx, DONE, &serde_json::json!(gone))?;
+    tx.commit()?;
+    Ok(gone)
 }
 
 fn is_chart(name: &str) -> bool {
@@ -391,7 +426,11 @@ pub fn deliver(p: &Pick, db: &Db, client: &str, root: &Path, picked: Instant, re
     let set = p.set_id.unwrap_or(0);
     let data = std::fs::read(source_path(source, p.source_web, root).ok_or("the source chart is gone")?).map_err(|e| e.to_string())?;
     let out = ms_convert::convert(&data, p.keys as usize).map_err(|e| e.to_string())?;
-    if p.sha.as_deref() != Some(&hashes(&out.osu).0) {
+    // an Invert pick of a convert is the convert, played with the mod on
+    let sha = p.invert_of.as_deref().or(p.sha.as_deref()).unwrap_or("");
+    if sha != hashes(&out.osu).0 {
+        // its row goes, so the next index pass makes it again
+        let _ = db.execute("DELETE FROM converts WHERE sha=?", [sha]);
         return Err("the converter changed: the list will catch up".to_string());
     }
     stage("converted");
@@ -402,7 +441,7 @@ pub fn deliver(p: &Pick, db: &Db, client: &str, root: &Path, picked: Instant, re
         }
     }
     let dir = import_dir(client)?;
-    let name = format!("{} {}", p.sha.as_deref().unwrap_or("")[..12].to_owned(), out.file_name.trim_end_matches(".osu"));
+    let name = format!("{} {}", &sha[..12], out.file_name.trim_end_matches(".osu"));
     let name = if stable { set.to_string() } else { name.chars().take(120).collect::<String>().trim_end().to_string() };
     let path = dir.join(format!("{name}.osz"));
     let mut owned: Vec<(String, Vec<u8>)> = Vec::new();
@@ -434,7 +473,7 @@ pub fn deliver(p: &Pick, db: &Db, client: &str, root: &Path, picked: Instant, re
     if client == "stable" {
         return Ok(()); // stable writes its database when it closes: nothing to confirm against
     }
-    imported(p, "osu! didn't import the convert (is it running?)", report)?;
+    imported(sha, "osu! didn't import the convert (is it running?)", report)?;
     stage("in osu!'s store");
     let _ = std::fs::remove_file(&path);
     Ok(())
@@ -466,14 +505,14 @@ fn deliver_website(p: &Pick, client: &str, report: Report) -> std::result::Resul
         return Ok(()); // stable imports the .osz from Songs on entering song select
     }
     // The website chart's sha is its .osu's: the set landed when lazer stores that file (an updated map never does).
-    imported(p, "osu! didn't import the map (is it running, or was it updated on the website?)", report)?;
+    imported(p.sha.as_deref().unwrap_or(""), "osu! didn't import the map (is it running, or was it updated on the website?)", report)?;
     let _ = std::fs::remove_file(&path);
     Ok(())
 }
 
 /// lazer stores a chart under its hash: the import landed when the pick's file is there.
-fn imported(p: &Pick, timeout: &str, report: Report) -> std::result::Result<(), String> {
-    let (wanted, start) = (paths::local_file(p.sha.as_deref().unwrap_or(""), &paths::lazer_data()).ok_or("no sha")?, Instant::now());
+fn imported(sha: &str, timeout: &str, report: Report) -> std::result::Result<(), String> {
+    let (wanted, start) = (paths::local_file(sha, &paths::lazer_data()).ok_or("no sha")?, Instant::now());
     while !wanted.is_file() {
         if start.elapsed() > CONFIRM {
             return Err(timeout.to_string());
@@ -535,6 +574,24 @@ mod tests {
         assert_eq!(first_ok(&["a", "b"], |m| { asked.push(m.to_string()); if m == "a" { Err("503".into()) } else { Ok(()) } }), Ok(()));
         assert_eq!(asked, ["a", "b"]);
         assert_eq!(first_ok(&["a", "b"], |m| Err(format!("{m} down"))), Err("a down · b down".to_string()));
+    }
+
+    #[test]
+    fn converts_of_a_source_with_a_colon_in_its_name_are_indexed_again_once() {
+        let dir = std::env::temp_dir().join(format!("ms-colon-{}", std::process::id()));
+        let db = ms_data::store::connect(&dir.join("rec.db")).unwrap();
+        for (c, osu) in [('a', chart()), ('b', chart().replace("Artist:A", "Artist:mona (CV: X)"))] {
+            let sha = c.to_string().repeat(64);
+            let path = paths::local_file(&sha, &dir).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, osu).unwrap();
+            db.execute("INSERT INTO converts(source_sha,target,converter,sha,web) VALUES (?,10,?,?,0)", params![sha, ms_convert::CONVERTER_ID, format!("{c}1")]).unwrap();
+        }
+        assert_eq!(drop_colon_cut(&db, &dir).unwrap(), 1);
+        assert_eq!(known(&db, 10).unwrap(), HashSet::from(["a".repeat(64)]));
+        db.execute("INSERT INTO converts(source_sha,target,converter,sha,web) VALUES (?,10,?,'b2',0)", params!["b".repeat(64), ms_convert::CONVERTER_ID]).unwrap();
+        assert_eq!(drop_colon_cut(&db, &dir).unwrap(), 0, "once: the row made again stays");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

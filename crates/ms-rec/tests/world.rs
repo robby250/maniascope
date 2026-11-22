@@ -231,7 +231,7 @@ fn the_card_matches_its_list_entry_and_a_custom_rate_shows_no_pp() {
     let c = rows.iter().find(|c| c.rate == 1. && c.gain.unwrap_or(0.) > 0. && shas.iter().any(|s| Some(&s.1) == c.md5.as_ref())).expect("an improvable chart");
     let path = ms_data::paths::local_file(c.sha.as_ref().unwrap(), &sandbox()).unwrap();
     let data = std::fs::read(&path).unwrap();
-    let card = e.card(&w.db, &data, c.rate, &n).unwrap().unwrap();
+    let card = e.card(&w.db, &data, c.rate, 1., &n).unwrap().unwrap();
     let close = |a: f64, b: f64| (a - b).abs() < 1e-6 * b.abs().max(1.);
     assert!(close(card.acc_mid, c.pred.acc_mid), "{} {}", card.acc_mid, c.pred.acc_mid);
     let (lo, hi, _, gain, chance) = card.pp.unwrap();
@@ -240,5 +240,5 @@ fn the_card_matches_its_list_entry_and_a_custom_rate_shows_no_pp() {
     assert!(c.pp_pred.as_ref().unwrap().mu != c.pred.mu);
     let fs = Engine::analyse(&data, 1.2, &e.prm).unwrap();
     e.store(&w.db, c.sha.as_ref().unwrap(), &fs).unwrap();
-    assert!(!e.card(&w.db, &data, 1.2, &n).unwrap().unwrap().ranked);
+    assert!(!e.card(&w.db, &data, 1.2, 1., &n).unwrap().unwrap().ranked);
 }
