@@ -58,6 +58,30 @@ fn name_scale(sk: Sk) -> f64 {
 pub const CARD_MAX: usize = 6;
 /// A row shows from this share of the top row (1.9.0, user 2026-11-12: "i kinda want the old way").
 pub const SHOW: f64 = 0.3;
+/// A skill is present in a bin when its series reaches this share of the bin's strongest (a parent and its subskill both are).
+pub const PRESENT: f64 = 0.5;
+
+/// Per skill series, the share of the chart's bins with demand where it is present (`PRESENT`): how much of the map is that
+/// skill, beside how hard it is. Skill practice and the Stats groups ask a skill to cover a share of the map
+/// (`ms_model::skills::PRESENCE_MIN`, user 2026-11-23: Vibro offered on a chart with 4.5 s of vibro in 82).
+pub fn presence(series: &Series) -> Dict {
+    let keys: Vec<Sk> = series.keys.iter().copied().filter(|k| !k.name().starts_with('_') && k.name() != "switch").collect();
+    let (mut playing, mut hits) = (0usize, vec![0usize; keys.len()]);
+    for b in 0..series.nbins {
+        let at = |k: Sk| series.get(k).get(b).copied().unwrap_or(0.0);
+        let top = keys.iter().map(|&k| at(k)).fold(0.0, f64::max);
+        if top <= 0.0 {
+            continue;
+        }
+        playing += 1;
+        keys.iter().zip(&mut hits).filter(|(&k, _)| at(k) >= PRESENT * top).for_each(|(_, h)| *h += 1);
+    }
+    let mut out = Dict::new();
+    for (k, h) in keys.iter().zip(hits) {
+        out.set(k.name(), Val::F(h as f64 / playing.max(1) as f64));
+    }
+    out
+}
 /// A tag goes on a row this share of the top row or more (1.9.0's ARCH_MATERIAL, its bar for Tech and Stamina names)…
 pub const TAG_ROW: f64 = 0.6;
 /// …that keeps this share of its rating sustained (1.9.0).

@@ -19,6 +19,7 @@ const COURSES: &str = include_str!("../../../calib/dan_courses.tsv");
 const OFFSETS: &str = include_str!("../../../calib/stats_offsets.tsv");
 pub const VIBRO_SHARE: f64 = 0.06; // share of notes in vibro runs: 119/132 vibro dan charts, 4/139 other 4K dan charts (2026-11-13 run rule)
 const LN_SHARE: f64 = 0.22;   // LN dans' charts hold >= 25% LN notes, rice dans' <= 19% (2026-10-01)
+const LN_SHOWN: f64 = 0.30;   // a chart reads on the LN dans too from this share of LN notes, or when an LN skill leads its card (user 2026-11-22)
 
 pub fn series(keys: i64, kind: &str) -> Option<&'static str> {
     match (keys, kind) {
@@ -188,14 +189,21 @@ pub fn kind(ln_share: f64) -> &'static str {
     if ln_share >= LN_SHARE { "ln" } else { "rice" }
 }
 
+/// Whether a card row's skill (`Sk` name) is an LN skill: such a chart reads on the LN dans whatever its share of LN notes
+/// (user 2026-11-22: a 13 % LN chart led by LN Shields showed the regular dan alone).
+pub fn ln_skill(skill: &str) -> bool {
+    ms_calc::skills::Sk::from_name(skill).is_some_and(|s| ms_calc::taxonomy::of(s).family == "ln")
+}
+
 /// `press`: the rating with holds as taps (compute's `press_overall`), what the regular dans are read and built with.
-pub fn label(keys: i64, rating: f64, press: f64, ln_share: f64, vibro: Option<&Vibro>, secs: f64) -> Option<String> {
+/// `ln_led`: the card's first row is an LN skill (`ln_skill`).
+pub fn label(keys: i64, rating: f64, press: f64, ln_share: f64, ln_led: bool, vibro: Option<&Vibro>, secs: f64) -> Option<String> {
     let (rating, press) = (length_scaled(data().length, rating, secs), length_scaled(data().length, press, secs));
     // Vibro last: the rice/LN dan is the main reading (user 2026-10-01).
     let vibro = vibro.filter(|_| keys == 4);
     // Every chart reads on the regular dans first; an LN chart on the LN dans too (user 2026-11-15: a 71 % LN chart
     // showed only "LN Yokaze−", "regular first everywhere"; 2026-10-01: a 29 % LN rice chart only "LN Gamma").
-    let kinds: Vec<&str> = if ln_share >= LN_SHARE { vec!["rice", "ln"] } else { vec!["rice"] };
+    let kinds: Vec<&str> = if ln_led || ln_share >= LN_SHOWN { vec!["rice", "ln"] } else { vec!["rice"] };
     let mut parts: Vec<String> = kinds.iter().filter(|_| !vibro.is_some_and(vibro_only)).filter_map(|k| place(series(keys, k)?, if *k == "rice" { press } else { rating }, None)).collect();
     parts.extend(vibro.filter(|v| v.share >= VIBRO_SHARE).and_then(|v| place("4K Vibro", rating, Some(&Vibro { rating: length_scaled(data().length, v.rating, secs), ..*v }))));
     if parts.is_empty() { None } else { Some(parts.join(" · ")) }
@@ -283,10 +291,13 @@ mod tests {
 
     #[test]
     fn every_chart_reads_a_regular_dan_and_ln_charts_an_ln_dan_too() {
-        let kinds = |share: f64| label(7, 12.0, 12.0, share, None, 180.).unwrap_or_default().split(" · ").map(|p| p.starts_with("LN ")).collect::<Vec<_>>();
-        assert_eq!(kinds(0.05), [false], "a rice chart: the regular dan only");
-        assert_eq!(kinds(0.3), [false, true], "a mixed chart: regular first");
-        assert_eq!(kinds(0.71), [false, true], "an LN chart: regular first too");
+        let kinds = |share: f64, led: bool| label(7, 12.0, 12.0, share, led, None, 180.).unwrap_or_default().split(" · ").map(|p| p.starts_with("LN ")).collect::<Vec<_>>();
+        assert_eq!(kinds(0.05, false), [false], "a rice chart: the regular dan only");
+        assert_eq!(kinds(0.25, false), [false], "a quarter LN under a rice skill: still the regular dan only");
+        assert_eq!(kinds(0.3, false), [false, true], "30 % LN: regular first");
+        assert_eq!(kinds(0.71, false), [false, true], "an LN chart: regular first too");
+        assert_eq!(kinds(0.13, true), [false, true], "few holds, but an LN skill leads the card (AXION [Pew's Insane], LN Shields)");
+        assert!(ln_skill("shield") && ln_skill("ln_release") && !ln_skill("stream") && !ln_skill("no such skill"));
     }
 
     #[test]

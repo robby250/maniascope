@@ -288,6 +288,8 @@ pub struct PredModel {
     pub shape: HashMap<i64, (Vec<f64>, Vec<f64>, Vec<f64>)>, // keys → (zmean, zscale, beta)
     /// keys → (centre ln rating, personal steepness): log miss per ln rating beyond the population curve
     pub steep: HashMap<i64, (f64, f64)>,
+    pub far: HashMap<i64, (f64, f64)>, // `Fit::far`
+    pub centre: HashMap<i64, f64>, // `Fit::centre`
     pub recent: HashMap<i64, (Vec<f64>, Vec<f64>, Vec<f64>)>,
     pub aff: HashMap<String, (f64, f64)>,
     pub rate_aff: HashMap<String, (Vec<f64>, Vec<f64>, Vec<f64>)>, // chart → (log rates, values, counts)
@@ -343,7 +345,7 @@ pub struct ScoreJob {
 impl PredModel {
     /// A population-only model: `base_of` for many plays.
     pub fn population(c: Arc<Consts>, pop: Arc<Pop>) -> PredModel {
-        PredModel { c, pop, levels: HashMap::default(), level: HashMap::default(), glob: 0., sd_all: 0., shape: HashMap::default(), steep: HashMap::default(),
+        PredModel { c, pop, levels: HashMap::default(), level: HashMap::default(), glob: 0., sd_all: 0., shape: HashMap::default(), steep: HashMap::default(), far: HashMap::default(), centre: HashMap::default(),
                     recent: HashMap::default(), aff: HashMap::default(), rate_aff: HashMap::default(), rate_support: HashMap::default(),
                     rate_bandwidth: [(0, 1.)].into_iter().collect(), tau2_c: 0., kap_c: 1., shown: (0., 1.), judged_ln: 0., retry: 0., reading: Default::default(), plays: HashMap::default(),
                     sd_att: HashMap::default(), slopes: Arc::new(Slopes::default()), modes: ByKeys::default(),
@@ -357,7 +359,7 @@ impl PredModel {
         let rate_aff = fit.rate_aff.iter().map(|(c, a)| {
             (c.clone(), (a.iter().map(|x| x.0.ln()).collect(), a.iter().map(|x| x.1).collect(), a.iter().map(|x| x.2).collect()))
         }).collect();
-        PredModel { c, pop, levels, level, glob: fit.glob, sd_all: fit.sd_all, shape, steep: fit.steep.clone(), recent: fit.recent.clone(), aff: fit.aff.clone(), rate_aff,
+        PredModel { c, pop, levels, level, glob: fit.glob, sd_all: fit.sd_all, shape, steep: fit.steep.clone(), far: fit.far.clone(), centre: fit.centre.clone(), recent: fit.recent.clone(), aff: fit.aff.clone(), rate_aff,
                     rate_support: fit.rate_support.clone(), rate_bandwidth: fit.rate_bandwidth.iter().map(|(&k, &v)| (k, v)).collect(), tau2_c: fit.tau2_c,
                     kap_c: fit.kap_c, shown, judged_ln, retry: fit.retry, reading: fit.reading, plays: fit.plays.clone(), sd_att: fit.sd_att.clone(), slopes: Arc::new(warmup.slopes.clone()),
                     modes: warmup.modes.iter().map(|(&k, v)| (k, v.clone())).collect(), fallback: warmup.fallback.clone(), vibro: None, vibro_pace: None }
@@ -582,7 +584,8 @@ impl SkillValues {
                 }
             }
         }
-        let percent = crate::skills::percentiles(f).into_iter().map(|(p, r)| ((100. * p).round() as u8, (100. * r).round() as u8)).collect();
+        // a skill to practise covers its share of the map (skills::present); avoidance still reads the raw standing
+        let percent = crate::skills::percentiles(f).into_iter().zip(&tree.members).map(|((p, r), m)| (if crate::skills::present(f, m) { (100. * p).round() as u8 } else { 0 }, (100. * r).round() as u8)).collect();
         SkillValues { values, practice, percent }
     }
 
@@ -855,6 +858,7 @@ pub struct Feats {
     pub vibro: (f64, f64), // share of notes in vibro runs, notes/s outside them (structure v4)
     pub vibro_speed: f64,  // median same-column hits/s inside the vibro runs at this rate; 0 = none or not analysed yet
     pub unhittable: f64,   // share of judgements stacked notes lose (structure v6): the shown accuracy's ceiling is 1 − this
+    pub shape: f64,        // the note model's curve over ability (`note_far`: the share of the 10 % loss left 2 abilities higher); NaN without one
 }
 
 impl Feats {
@@ -878,7 +882,7 @@ impl Feats {
 
     /// A chart known by its rating alone (nps.reach's search).
     pub fn bare(keys: i64, overall: f64, od: f64, c: &Consts) -> Feats {
-        Feats { keys, overall, od, window: 0., length: 0., sk: vec![0.; c.names.len()], dom: c.family("rice"), z_tail: [0.; 5], width: 0., geometry: None, vibro: (0., 0.), vibro_speed: 0., unhittable: 0. }
+        Feats { keys, overall, od, window: 0., length: 0., sk: vec![0.; c.names.len()], dom: c.family("rice"), z_tail: [0.; 5], width: 0., geometry: None, vibro: (0., 0.), vibro_speed: 0., unhittable: 0., shape: f64::NAN }
     }
 
     pub fn of(f: &Dict, c: &Consts) -> Res<Feats> {
@@ -925,6 +929,7 @@ impl Feats {
             vibro: (sub("nps", "vibro_runs", 0.), sub("nps", "vibro_rest", 0.)),
             vibro_speed: sub("nps", "vibro_speed", 0.),
             unhittable: sub("nps", "unhittable", 0.),
+            shape: f.get("note_far").map_or(f64::NAN, Val::f),
         })
     }
 }
@@ -997,6 +1002,11 @@ impl Prediction {
 
 pub const BAND_Z: f64 = 1.2816 * 0.75; // recommend.BAND_Z
 
+/// The blended forecast's distance from the player's usual ln loss, × this (`PredModel::blend`). Own walk-forward audit
+/// 2026-11-23, 1,345 plays, emulated on the forecasts: 1.05 −0.0087, 1.1 −0.0134, 1.15 −0.0134, 1.2 −0.0094, 1.25 −0.0008 pp of
+/// mean |error|; vertex 1.125, flat 1.08–1.17.
+pub const BLEND_STRETCH: f64 = 1.125;
+
 /// A learning offer's lowest forecast (user 2026-11-22: "At least 85 %"): a picked skill with no chart at the target in a
 /// keymode offers its nearest charts instead (`Choice::learning`), and under this none.
 pub const LEARN_FLOOR: f64 = 0.85;
@@ -1032,7 +1042,13 @@ impl PredModel {
         let y = |acc: f64| ((1. - unmash(acc)).max(1e-9).ln() - a - judged) / bb;
         let shown = |y: f64| mash_floor(0f64.max(1f64.min(1. - (20f64.min(a + bb * y + judged)).exp())));
         let ceiling = 1. - f.unhittable; // the per-note forecast reads the hittable notes only
-        let step = 0.5 * (y(acc) - y(p.acc_mid / ceiling));
+        let own = y(p.acc_mid / ceiling);
+        let mut step = 0.5 * (y(acc) - own);
+        // Two forecasts that are each right on average are, averaged, too close to the player's usual accuracy (own audit
+        // 2026-11-23: the actual ln loss moved 1.05× the model's, 0.99× the net's, 1.13–1.21× their average's).
+        if let Some(c) = self.centre.get(&f.keys) {
+            step += (BLEND_STRETCH - 1.) * (own + step - c);
+        }
         (p.mu, p.shift) = (p.mu + step, p.shift + step);
         for v in [&mut p.acc_mid, &mut p.acc_lo, &mut p.acc_hi, &mut p.opening_acc] {
             *v = ceiling * shown(y(*v / ceiling) + step);
@@ -1213,8 +1229,14 @@ impl PredModel {
         let mut out = Vec::new();
         for (p, cs) in parts {
             let members = &self.c.gap_idx[*p];
-            let share = if members.is_empty() { 1. } else { members.iter().map(|&x| f.sk[x]).fold(0., f64::max).min(1.) };
-            let mean = means.map_or(0., |m| m[*p]);
+            // "shape": the chart's own curve over ability from the note model, nothing on a chart it did not rate
+            // (a keymode borrowing the curves reads it against its own charts' mean)
+            let shape = self.c.gap_part_names[*p] == "shape";
+            let share = if shape { f.shape } else if members.is_empty() { 1. } else { members.iter().map(|&x| f.sk[x]).fold(0., f64::max).min(1.) };
+            if share.is_nan() {
+                continue;
+            }
+            let mean = if shape { self.pop.share_mean.get(f.keys).or(means) } else { means }.map_or(0., |m| m[*p]);
             let mut s = 0.;
             for (c, h) in cs.iter().zip(&hats) {
                 s += c * h;
@@ -1299,6 +1321,9 @@ impl PredModel {
         let mut mu = l + base;
         if let Some(&(centre, steep)) = self.steep.get(&k) {
             mu += steep * (f.overall.max(0.05).ln() - centre);
+        }
+        if let Some(&(centre, far)) = self.far.get(&k).filter(|_| f.shape.is_finite()) {
+            mu += far * (f.shape - centre);
         }
         if let Some((zm, zs, beta)) = self.shape.get(&k) {
             let z = self.zvec(f, mu);
@@ -1509,7 +1534,7 @@ mod model_tests {
     fn model(pop: Pop) -> PredModel {
         let c = Arc::new(Consts::standard());
         PredModel { c, pop: Arc::new(Pop { tau2: 0.1, kappa: 3., knee: 4., ..pop }), levels: HashMap::default(), level: [(7, (-3., 0.01, 0.2))].into_iter().collect(), glob: -3., sd_all: 0.2,
-                    shape: HashMap::default(), steep: HashMap::default(), recent: HashMap::default(), aff: [("known".to_string(), (-0.6, 10.))].into_iter().collect(), rate_aff: HashMap::default(),
+                    shape: HashMap::default(), steep: HashMap::default(), far: HashMap::default(), centre: HashMap::default(), recent: HashMap::default(), aff: [("known".to_string(), (-0.6, 10.))].into_iter().collect(), rate_aff: HashMap::default(),
                     rate_support: [("known".to_string(), (1., 1.))].into_iter().collect(), rate_bandwidth: ByKeys { map: [(0, 0.18), (7, 0.12)].into_iter().collect() }, tau2_c: 0.12, kap_c: 2.,
                     shown: (0.75f64.ln(), 1.), judged_ln: 0., retry: 0., reading: Default::default(), plays: HashMap::default(), sd_att: [(7, 0.2)].into_iter().collect(), slopes: Arc::new(Slopes::default()), modes: ByKeys::default(), fallback: Mode::default(), vibro: None, vibro_pace: None }
     }
@@ -1557,6 +1582,27 @@ mod model_tests {
         let mut p = Prediction { acc_mid: 0.96, ..Prediction::default() };
         m.blend(&mut p, &vibro, 0.7);
         assert_eq!(p.acc_mid, 0.96);
+    }
+
+    /// Own audit 2026-11-23: the plain average of the model's and the net's forecast sat too close to the player's usual accuracy.
+    #[test]
+    fn the_blend_lands_past_the_average_on_the_far_side_of_the_players_usual_loss() {
+        let mut m = model(Pop::default());
+        let f = plain(&m);
+        let (a, bb) = m.shown;
+        let y = |acc: f64| ((1. - acc).ln() - a) / bb;
+        let blended = |m: &PredModel| {
+            let mut p = Prediction { acc_mid: 0.93, mu: y(0.93), ..Prediction::default() };
+            m.blend(&mut p, &f, 0.91);
+            p
+        };
+        let average = blended(&m); // no centre: the plain average
+        assert!((y(average.acc_mid) - 0.5 * (y(0.93) + y(0.91))).abs() < 0.02, "{}", average.acc_mid);
+        m.centre.insert(f.keys, y(0.96));
+        let stretched = blended(&m);
+        let ratio = (y(stretched.acc_mid) - y(0.96)) / (y(average.acc_mid) - y(0.96));
+        assert!((ratio - BLEND_STRETCH).abs() < 0.02 && stretched.acc_mid < average.acc_mid, "{ratio} {} {}", stretched.acc_mid, average.acc_mid);
+        assert!(((stretched.mu - average.mu) - (y(stretched.acc_mid) - y(average.acc_mid))).abs() < 0.01); // the model scale moves by the same step
     }
 
     #[test]
@@ -1772,6 +1818,23 @@ mod model_tests {
         let centred = with(vec![(7, vec![(chords, vec![0.3; 5])])], vec![(7, means)]);
         let of = |share: f64| shift(&centred, &feats(7, 5., serde_json::json!({"chordstream": share}), &centred.c), at);
         assert!(of(0.5) == 0. && of(1.) > 0. && 0. > of(0.));
+        // "shape" reads the note model's curve of the chart (`note_far`), centred the same way; a chart the note model did not
+        // rate gets nothing; a keymode borrowing the curves centres it on its own charts' mean
+        let shape = part(&c, "shape");
+        let mut means = vec![0.; c.gap_part_names.len()];
+        means[shape] = -1.2;
+        let mut six = vec![0.; c.gap_part_names.len()];
+        six[shape] = -0.9;
+        let shaped = with(vec![(7, vec![(shape, vec![0.3; 5])])], vec![(7, means), (6, six)]);
+        let of = |keys: i64, far: f64| shift(&shaped, &Feats { shape: far, ..feats(keys, 5., serde_json::json!({"stream": 1.}), &shaped.c) }, at);
+        assert!((of(7, -0.9) - 0.09).abs() < 1e-12 && (of(7, -1.5) + 0.09).abs() < 1e-12 && of(7, -1.2) == 0., "a flat curve costs a player over the chart more");
+        assert!(of(7, f64::NAN) == 0. && of(6, -0.9) == 0. && (of(6, -0.6) - 0.09).abs() < 1e-12 && (of(5, -0.9) - 0.09).abs() < 1e-12, "6K: its own mean; 5K: none stored, 7K's");
+        // the player's own answer to the curve (`Fit::far`): slope × (the chart's curve − their plays' centre) on their forecast
+        let mut own = shaped;
+        let mu = |m: &PredModel, far: f64| m.personal(&Feats { shape: far, ..feats(7, 5., serde_json::json!({"stream": 1.}), &m.c) }, "x", None, 1.).0;
+        let (plain, none) = (mu(&own, -0.9), mu(&own, f64::NAN));
+        own.far.insert(7, (-1.2, 0.5));
+        assert!((mu(&own, -0.9) - plain - 0.15).abs() < 1e-12 && mu(&own, f64::NAN) == none, "{} {plain}", mu(&own, -0.9));
     }
 }
 

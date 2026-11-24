@@ -5,18 +5,21 @@ use std::sync::OnceLock;
 
 /// osu!-scale stars for a fitted rating of a `keys`-key chart or player (k clamped to the fitted 4–10).
 pub fn stars(keys: i64, s: f64) -> f64 {
-    static ANCHOR: OnceLock<(Vec<Vec<f64>>, Vec<Vec<f64>>)> = OnceLock::new();
-    let (poly, range) = ANCHOR.get_or_init(|| {
+    static ANCHOR: OnceLock<(Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<f64>)> = OnceLock::new();
+    let (poly, range, tail) = ANCHOR.get_or_init(|| {
         let v: serde_json::Value = serde_json::from_str(include_str!("../../../calib/anchor.json")).expect("anchor.json");
-        (serde_json::from_value(v["poly"].clone()).expect("anchor poly"), serde_json::from_value(v["range"].clone()).expect("anchor range"))
+        let at = |name: &str| v[name].clone();
+        (serde_json::from_value(at("poly")).expect("anchor poly"), serde_json::from_value(at("range")).expect("anchor range"), serde_json::from_value(at("tail")).expect("anchor tail"))
     });
-    curve(poly, range, keys, s)
+    curve(poly, range, tail, keys, s)
 }
 
 /// The anchor curve: ln stars = a polynomial in l = ln s whose coefficients (`poly`, lowest power first) are quadratics in
-/// k − 7, inside the keymode's fitted `range` of l (4K first). Past its top it continues along the tangent (a cubic would turn
-/// down); below its bottom stars stay proportional to the rating, so 0 reads 0.
-pub fn curve(poly: &[Vec<f64>], range: &[Vec<f64>], keys: i64, s: f64) -> f64 {
+/// k − 7, inside the keymode's fitted `range` of l (4K first): the ranked charts at 1.0×. Past its top ln stars rise by the
+/// keymode's `tail` per unit of l, the slope osu!'s stars keep over charts at every rate (the cubic's own tangent there was
+/// nearly flat: 4K 25 → 9.8, REFORM Kappa at 2× read 10 beside osu!'s 22, user 2026-11-22); below its bottom stars stay
+/// proportional to the rating, so 0 reads 0.
+pub fn curve(poly: &[Vec<f64>], range: &[Vec<f64>], tail: &[f64], keys: i64, s: f64) -> f64 {
     if s <= 0. {
         return s;
     }
@@ -25,7 +28,7 @@ pub fn curve(poly: &[Vec<f64>], range: &[Vec<f64>], keys: i64, s: f64) -> f64 {
     let co: Vec<f64> = poly.iter().map(|c| c.iter().fold(0., |acc, v| acc * x + v)).collect();
     let (lo, hi) = (range[(k - 4) as usize][0], range[(k - 4) as usize][1]);
     let (l, c) = (s.ln(), s.ln().clamp(lo, hi));
-    let slope = if l < lo { 1. } else { co.iter().enumerate().skip(1).rev().fold(0., |acc, (j, v)| acc * c + j as f64 * v) };
+    let slope = if l < lo { 1. } else { tail[(k - 4) as usize] };
     (co.iter().rev().fold(0., |acc, v| acc * c + v) + slope * (l - c)).exp()
 }
 

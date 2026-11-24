@@ -159,6 +159,16 @@ knobs! {
     ROW_FAST_LO: f64 = 0.08,
     ROW_FAST_HI: f64 = 0.2,
     FLAM: f64 = 0.045,
+    FLAM_RUN: f64 = 1.0, // kern::v_run on a hand's and a column's gaps: share of a run's speed a gap under FLAM keeps when the gap before it is short too (0 = every such gap a lone flam). Screen 2026-11-22: 0 / 0.5 the same, 1.2 and 1.4 worse
+    FLAM_RUN_KEYS: f64 = 1.0, // FLAM_RUN × (4 / max(keys, 4))^this: a wide hand's short gaps are rolled chords (7K select +1.8 % at 0). 0.5 / 1 / 2: all keymodes' map error ×0.9970 / 0.9960 / 0.9956, flat from 1
+    // The population's note model (notenet::Pop) corrects the rating: × e^(w · how far its rating sits over the keymode's level
+    // curve), w = NOTE_W up to the level's place notenet::TAPER_FROM, falling to NOTE_W_TOP at TAPER_TO (model::note_correction).
+    // Both 0 = off: the calculator alone, what the families fit and the note records are made with. Dev map error 2026-11-23
+    // (4K / 7K / 6K / 10K, base .1878 / .1777 / .1835 / .3431): flat .4 → .1776 / .1592 / .1734 / .2939, flat .8 → .1892 / .1703 /
+    // .1848 / .2889, .5 → .3: .1762 / .1562 / .1727 / .2897, .7 → .3: .1782 / .1557 / .1724 / .2896, .6 → .2: .1761 / .1548 / .1702 /
+    // .2918. Flat within ± .002 around the last.
+    NOTE_W: f64 = 0.6,
+    NOTE_W_TOP: f64 = 0.2,
     MASH_SPAN: f64 = 1.0, // Chart::mashed: rows on other columns within this share of the great window, one gesture (0 = off)
     MASH_EASE: f64 = 0.5, // share of a bin's demand eased where its written rows merged into one gesture, × great window / OD 8's (compute.rs)
     MASH_RAMP: f64 = 0.4, // a merged roll eases in full from this share of the span inside it, in proportion before (0 = at once)

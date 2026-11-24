@@ -294,6 +294,14 @@ pub fn sr_vector(sk_raw: &[(String, f64)], st: &Dict, ex: &Dict, en: &Dict, rate
     values.into_iter().map(|v| if v.is_finite() { v } else { 0.0 }).collect()
 }
 
+/// The skill ratios of a chart's taps view (the press rating's row): no skill of the LN family, the others on the press level.
+/// By name ("ln…") LN Shields stayed in, and the row's LN column reads the strongest of the family (user 2026-11-22: AXION
+/// [Pew's Insane], led by LN Shields, read a lower regular dan than with Hold Off; correction ×1.006 against ×1.057).
+fn press_skills(sk: &[(String, f64)], scale: f64) -> Vec<(String, f64)> {
+    let ln = |k: &str| crate::skills::Sk::from_name(k).is_some_and(|s| crate::taxonomy::of(s).family == "ln");
+    sk.iter().map(|(k, v)| (k.clone(), if ln(k) { 0.0 } else { py::round_digits(v * scale, 4) })).collect()
+}
+
 /// difficulty_model.apply on the result dict.
 pub fn apply(prm: &Params, res: &mut Dict, od: f64, rate: f64) {
     let keys = res.f("keys") as usize;
@@ -330,13 +338,13 @@ pub fn apply(prm: &Params, res: &mut Dict, od: f64, rate: f64) {
             let factor = joint_shift(joint, &crate::flow::joint_row(&rv, res.fget("length", 0.0), raw, rate, f, &crate::flow::extra_inputs(&cf, e, od))).exp(); // `od`, not res["od"]: that is set below, so the window column read OD 8 (fixed 2026-11-04)
             res.dict_mut("execution").unwrap().set("joint_factor", factor);
             // The press rating (compute: the chart's holds as taps, on the raw scale) takes the correction of that chart: this
-            // one's row with no hold in it (no LN skill, hold share, LN flow, presses under a hold) at the press level. On 352
+            // one's row with no hold in it (no LN skill, hold share, LN flow, presses under a hold) at the press level.
             // dan charts with ≥ 20 % holds it lands within 2.7 % of the Hold Off chart's own correction on average; the chart's
             // own factor missed by 9 % (4K +11 %, 10K −14 %), and before 2026-11-22 the press rating had no correction at all
             // (a chart without holds read its raw rating on the regular dans).
             let press_raw = res.fget("press_overall", raw);
             if (press_raw - raw).abs() > 1e-12 && press_raw > 0.0 {
-                let skp: Vec<(String, f64)> = sk.iter().map(|(k, v)| (k.clone(), if k.starts_with("ln") { 0.0 } else { py::round_digits(v * raw / press_raw, 4) })).collect();
+                let skp = press_skills(&sk, raw / press_raw);
                 let (mut ex, mut cfp, mut fp) = (res.dict("execution").unwrap().clone(), cf.clone(), f);
                 ex.set("ln_flow", 0.0);
                 for name in ["ln", "od_ln"] {
@@ -369,3 +377,47 @@ pub fn apply(prm: &Params, res: &mut Dict, od: f64, rate: f64) {
     res.set("structural_correction", sc - res.f("baseline_overall"));
 }
 
+/// The note correction's weight at a level's place (`notenet::Pop::place`): NOTE_W, falling to NOTE_W_TOP over `notenet::TAPER_FROM` … `TAPER_TO`.
+pub fn note_weight(prm: &Params, place: f64) -> f64 {
+    let (k, from, to) = (&prm.k, crate::notenet::TAPER_FROM, crate::notenet::TAPER_TO);
+    k.NOTE_W + (k.NOTE_W_TOP - k.NOTE_W) * ((place - from) / (to - from)).clamp(0.0, 1.0)
+}
+
+/// The population's note model on top of `apply`: every rating × e^(w · the net's disagreement with the calculator's overall),
+/// `note` = the net's rating of the chart-rate. The weights' search: params.rs NOTE_W.
+pub fn note_correction(prm: &Params, res: &mut Dict, net: &crate::notenet::Pop, note: f64) {
+    let keys = res.f("keys") as usize;
+    let overall = res.dict("scores").map_or(0.0, |s| s.f("overall"));
+    let w = note_weight(prm, net.place(keys, overall).unwrap_or(0.0));
+    let factor = (w * net.over(keys, note, overall, res.fget("notes", 0.0))).exp();
+    res.set("note_rating", note);
+    res.set("note_factor", factor);
+    if factor == 1.0 {
+        return;
+    }
+    res.dict_mut("scores").unwrap().map_values(|v| v * factor);
+    if let Some(press) = res.get("press_overall").map(Val::f) {
+        res.set("press_overall", press * factor);
+    }
+    if let Some(Val::List(tl)) = res.get_mut("timeline") {
+        for v in tl.iter_mut() {
+            *v = Val::F(v.f() * factor);
+        }
+    }
+    let sc = res.dict("scores").unwrap().f("overall");
+    res.set("structural_correction", sc - res.f("baseline_overall"));
+}
+
+#[cfg(test)]
+mod press_tests {
+    use super::*;
+
+    #[test]
+    fn the_taps_view_of_a_chart_keeps_no_skill_of_the_ln_family() {
+        let sk: Vec<(String, f64)> = [("stream", 0.5), ("ln", 0.6), ("ln_release", 0.4), ("shield", 0.6), ("technical", 0.7)].map(|(k, v)| (k.to_string(), v)).into();
+        let taps = press_skills(&sk, 1.2);
+        let at = |k: &str| taps.iter().find(|x| x.0 == k).unwrap().1;
+        assert_eq!((at("ln"), at("ln_release"), at("shield")), (0., 0., 0.), "LN Shields is an LN skill too");
+        assert_eq!((at("stream"), at("technical")), (0.6, 0.84));
+    }
+}

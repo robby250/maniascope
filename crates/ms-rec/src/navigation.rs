@@ -188,8 +188,10 @@ pub fn delivers(p: &Pick, auto: bool) -> bool {
 /// copy/msg/sent; never starts the game or automatically changes mods.
 pub fn perform(p: &mut Pick, action: &str, client: &str, auto: bool) -> Performed {
     if delivers(p, auto) {
-        // the worker delivers it
-        return Performed { msg: if p.convert_of.is_some() { format!("Converting to {}K…", p.keys) } else { "Downloading the map…".to_string() }, ..Performed::default() };
+        // The worker delivers it. Its search is copied now, not when the import has landed (user 2026-11-22: "it kinda copies
+        // late"): the text is the same either way, and it can be pasted the moment the map is in.
+        let query = song_search(p, client);
+        return Performed { copy: (!query.is_empty()).then_some(query), msg: if p.convert_of.is_some() { format!("Converting to {}K…", p.keys) } else { "Downloading the map…".to_string() }, ..Performed::default() };
     }
     let original = p.convert_of.is_some() && !p.installed; // a website convert, looked at first: its original opens
     if p.installed {
@@ -275,6 +277,14 @@ mod tests {
         assert!(delivers(&web, true) && delivers(&web_convert, true) && delivers(&own_convert, true));
         assert!(!delivers(&web, false) && !delivers(&web_convert, false) && delivers(&own_convert, false));
         assert!(!delivers(&Pick { installed: true, ..web }, true));
+    }
+
+    #[test]
+    fn a_delivered_pick_copies_its_search_when_picked() {
+        let mut convert = Pick { convert_of: Some("s".into()), artist: Some("A".into()), song: Some("T".into()), version: Some("V (7K to 10K)".into()), keys: 10, ..Pick::default() };
+        let done = perform(&mut convert, "auto", "lazer", true);
+        assert_eq!(done.copy.as_deref(), Some(song_search(&convert, "lazer").as_str()));
+        assert!(done.msg.starts_with("Converting"));
     }
 
     #[test]

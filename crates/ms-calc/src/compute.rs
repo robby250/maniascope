@@ -84,12 +84,6 @@ fn sides(runs: Vec<Run>) -> (Vec<f64>, Parts) {
     }
 }
 
-/// Share of the same-hand hold load (`P::ln_same`) the press rating keeps. The user (2026-11-22): a chart with holds reads
-/// "very slightly harder than hold-off on average, because some parts of the LN are physical". Searched on the 352 dan
-/// charts with ≥ 20 % holds against the Hold Off chart's own rating: mean −1.8 % at 0, +1.9 % at 0.2, +3.7 % at 0.3, +14.9 %
-/// at 1 (7K +21.7 %); about +2 % was asked: 0.2 (0.15–0.25 give +1.0 to +2.8 %). There: 4K −0.8 %, 7K +4.1 %, 10K +3.3 %.
-const PRESS_SAME: f64 = 0.2;
-
 pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, prm: &Params) -> Result<Dict, String> {
     let _runs = crate::structure::RunScope::open();
     let k = &prm.k;
@@ -249,7 +243,7 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     let lean = shared.lean;
     let press = if !lean && !shared.stored && parts.keys.contains(&P::ln) && parts.get(P::ln).iter().any(|&v| v != 0.0) {
         let same = parts.get(P::ln_same);
-        let rice: Vec<f64> = total.iter().zip(parts.get(P::ln)).enumerate().map(|(b, (t, l))| (t - l * (1.0 - PRESS_SAME * same[b])).max(0.0)).collect();
+        let rice: Vec<f64> = total.iter().zip(parts.get(P::ln)).enumerate().map(|(b, (t, l))| (t - l * (1.0 - demand::PRESS_SAME * same[b])).max(0.0)).collect();
         skills::rating(&rice, &skills::Judged::new(&g.times, &g.times, total.len(), judged.fatigue.clone(), k), keys, k)
     } else {
         overall
@@ -339,6 +333,9 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
         res.set("tech_where", Val::List(card::tech_where(&series, &parts, chart.t[0] / 1000.0, rate, k)));
     }
     crate::tick::lap("tech_where");
+    if !lean {
+        res.set("presence", Val::Dict(card::presence(&series)));
+    }
     if !lean && !shared.stored {
         res.set("timeline", Val::floats(&skills::local_levels(&total, k.LOCAL_WINDOW, k)));
     }
@@ -400,6 +397,21 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     crate::tick::lap("flow");
     model::apply(prm, &mut res, chart.od, rate);
     crate::tick::lap("model::apply");
+    // The population's note model reads the notes as written and this pass's strain, as its records were made (`notefeat::
+    // chart_records`); not in the physical sub-pass, and not in a trace (the records' own source).
+    // on top of the fitted calculator only: the net's level curves are fitted against its ratings
+    if !lean && !tracing && (k.NOTE_W != 0.0 || k.NOTE_W_TOP != 0.0) && prm.model["joint"]["modes"][chart.keys.to_string()].is_object() {
+        let shipped = res.dict("scores").map_or(0.0, |s| s.f("overall"));
+        if let Some(net) = crate::notenet::Pop::shipped().filter(|n| n.moves(chart.keys, res.fget("notes", 0.0), shipped)) {
+            let named = |n: &str| series.keys.iter().find(|p| p.name() == n).map_or(&[][..], |&p| series.get(p));
+            let records = crate::notefeat::records_of(written, rate, &total, named("chordjack"), k.BIN, net.need());
+            crate::tick::lap("note records");
+            let (note, far) = net.rating(&records, shipped, chart.keys, &total, &named, k.BIN);
+            model::note_correction(prm, &mut res, net, note);
+            res.set("note_far", far); // the chart's curve over ability: the forecast's "shape" part (ms-model gap_parts)
+        }
+    }
+    crate::tick::lap("note model");
     if tracing {
         let tr = Trace { total, series, switch, parts, result: res.clone(), densities };
         let t = shared.trace.as_mut().unwrap();

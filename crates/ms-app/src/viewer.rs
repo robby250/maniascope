@@ -17,6 +17,14 @@ pub struct Entry {
     pub tags: Vec<String>, // modifier tags beside the name (Tech, Stamina, Mash)
 }
 
+impl Analysis {
+    /// The dan of the chart as shown (`ms_rec::dans::label`).
+    pub fn dan(&self) -> Option<String> {
+        let ln_led = self.entries.first().and_then(|e| e.parts.first()).is_some_and(|p| ms_rec::dans::ln_skill(p));
+        ms_rec::dans::label(self.keys, self.overall, self.press, self.ln_notes / self.notes.max(1) as f64, ln_led, Some(&self.dan_vibro), self.seconds())
+    }
+}
+
 pub struct Tech {
     pub t: f64,
     pub pattern: f64,

@@ -79,7 +79,7 @@ pub struct Public {
 const MAGIC: &[u8; 8] = b"MSPUB001";
 
 /// Evidence fitted by older links is replaced when the current bundle can be fetched.
-pub const POP_VERSION: i64 = 2;
+pub const POP_VERSION: i64 = 3;
 
 pub fn write(path: &Path, meta: &Meta, records: &[(i64, f64, Vec<u8>)]) -> Result<(), String> {
     blobs::write(path, MAGIC, &serde_json::to_vec(meta).map_err(|e| e.to_string())?, records)

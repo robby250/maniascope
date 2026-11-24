@@ -287,6 +287,33 @@ fn the_main_window_shows_the_analysis_bar_in_its_status_row_until_the_library_is
 }
 
 #[test]
+fn the_difficulty_row_stays_one_row_and_runs_under_the_mod_pill() {
+    // user 2026-11-22: "[Xceon feat. Mayumi Morinaga - Tsumi to Batsu]  Trixta" put the mapper on a row of its own although the
+    // row had room under the rate pill; one that does not fit ends in …
+    let card = |version: &str, width: f32| {
+        let ctx = egui::Context::default();
+        let mut a = app(prefs(), &ctx);
+        let analysis = crate::viewer::Analysis {
+            path: "x.osu".into(), rate: 1.01, mods: String::new(), keys: 4, title: "4k Speed Training Pack Vol.6".into(), artist: "Various Artists".into(), version: version.into(), creator: "Trixta".into(),
+            overall: 7.05, press: 7.05, notes: 2400, ln_notes: 0., nps: Some(28.1), span: Some((0., 105_000.)), timeline: (0..60).map(|i| 4. + (i as f64 / 6.).sin()).collect(),
+            entries: Vec::new(), tags: Vec::new(), also: Vec::new(), bars: Vec::new(), peak_nps: None, bid: None, names: Vec::new(), tech: Vec::new(), dan_vibro: Default::default(), o2jam: None,
+        };
+        a.shown = Some(crate::app::Selected { path: "x.osu".into(), rate: 1.01, mods: String::new(), result: Ok(std::sync::Arc::new(analysis)) });
+        a.obs.mods = Some(vec![serde_json::json!({"acronym": "DT", "settings": {"speed_change": 1.01}})]);
+        let mut h = Harness::builder().with_size(egui::vec2(width, 250.)).allow_missing_glyphs().with_context_setup(crate::theme::apply).build_ui_state(|ui, a: &mut App| a.main_ui(ui), a);
+        h.step();
+        let row = h.get_by_label_contains("Trixta").rect();
+        (row, h.get_by_label_contains("4K").rect().top())
+    };
+    let (short, below_short) = card("Easy", 500.);
+    let (long, below_long) = card("Xceon feat. Mayumi Morinaga - Tsumi to Batsu", 500.);
+    assert_eq!((long.height(), below_long), (short.height(), below_short), "one row, the line under it where it was");
+    let (cut, below_cut) = card("Xceon feat. Mayumi Morinaga - Tsumi to Batsu and a good deal more than the card is wide", 500.);
+    assert_eq!((cut.height(), below_cut), (short.height(), below_short), "too long: still one row");
+    assert!(cut.right() <= 500. && cut.right() > 500. - 30., "cut at the card's edge, under the pill: {cut:?}");
+}
+
+#[test]
 fn next_uses_the_finished_list_and_a_hover_only_defers_painting() {
     let ctx = egui::Context::default();
     let mut a = app(prefs(), &ctx);

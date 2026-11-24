@@ -12,6 +12,19 @@ pub fn v(d: f64, knee: f64, taper: f64) -> f64 {
     (if taper == 2.0 { x * x } else if taper == 0.5 { x.sqrt() } else { x.powf(taper) }) / knee
 }
 
+/// `v` at taper 2 with the gap before it (`prev`, 0 = none); `share` (FLAM_RUN) of the run's speed is kept. A lone flam is a chord: it moves at the speed of the gap before it.
+/// A run of flams is a stream: no slower than the knee's speed, and than its pairs come (1 / two gaps). The plain taper fell
+/// toward 0 for every gap under the knee, so past 22 a second a faster chart or rate rated lower (user 2026-11-22: REFORM
+/// Theta, Iota and Kappa met at 2×, raw 48.8 / 49.9 at 1.75× / 2×; 61 % of Kappa's rows are under the knee at 1.0×).
+#[inline]
+pub fn v_run(d: f64, prev: f64, knee: f64, share: f64) -> f64 {
+    let own = v(d, knee, 2.0);
+    if d >= knee || prev <= 0.0 {
+        return own;
+    }
+    own.max(share * (1.0 / knee).min(1.0 / prev).max(1.0 / (d + prev)))
+}
+
 #[inline]
 pub fn smooth(x: f64, lo: f64, hi: f64) -> f64 {
     let x = (x - lo) / (hi - lo);
@@ -59,5 +72,26 @@ mod tests {
         assert_eq!(inner(0b1000001, 7), 0b0111110);
         assert_eq!(inner(0b11, 7), 0);
         assert_eq!(inner(0, 7), 0);
+    }
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+
+    /// A run under the flam knee never slows as it speeds up; a lone flam is a chord at the speed of the gap before it.
+    #[test]
+    fn a_run_under_the_flam_knee_keeps_rising_with_speed() {
+        let knee = 0.045;
+        let mut last = 0.0;
+        for step in 0..60 {
+            let d = 0.06 * 0.95f64.powi(step);
+            let speed = v_run(d, d, knee, 1.0);
+            assert!(speed >= last - 1e-9, "{d}: {speed} under {last}");
+            last = speed;
+        }
+        assert!(last > 2.0 / knee, "a run at a twentieth of the knee is far past the knee's speed: {last}");
+        assert_eq!(v_run(0.01, 0.3, knee, 1.0), 1.0 / 0.3);
+        assert_eq!(v_run(0.01, 0.3, knee, 0.0), v(0.01, knee, 2.0));
     }
 }

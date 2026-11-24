@@ -1176,6 +1176,8 @@ pub struct Fit {
     pub zscale: HashMap<i64, Vec<f64>>,
     pub shape_validation: HashMap<i64, ShapeReport>,
     pub steep: HashMap<i64, (f64, f64)>,
+    pub far: HashMap<i64, (f64, f64)>, // keys → (centre, slope) on the chart's curve over ability (`note_far`)
+    pub centre: HashMap<i64, f64>, // the own plays' usual ln loss on the model scale (recency-weighted): `PredModel::blend` stretches about it
     pub recent: HashMap<i64, (Vec<f64>, Vec<f64>, Vec<f64>)>,
     pub session_validation: SessionReport,
     pub aff: HashMap<String, (f64, f64)>,
@@ -1198,6 +1200,11 @@ pub struct Fit {
 
 /// The steepness ridge, in ln-rating variance per unit weight: a keymode whose ratings spread less than this keeps under half its slope.
 pub const STEEP_RIDGE: f64 = 0.005; // walk-forward audit 2026-11-14: MAE .9836 (none) → .9728 (0.005), .9773 (0.02), .9756 (0.08)
+
+/// The same ridge for the slope on the chart's curve over ability, in its variance per unit weight. Own walk-forward audit
+/// 2026-11-23 (1,446 plays, mean |error| against none): 0.01 −.0025 ± .0029, 0.05 −.0023 ± .0020, 0.25 −.0009 ± .0008: flat
+/// from 0.01 to 0.05, the steadier end taken.
+pub const FAR_RIDGE: f64 = 0.05;
 
 /// (centre, slope) of a ridge of `u` on ln rating `lr` around its weighted mean; None without weight or with ridge = ∞.
 fn steepness(lr: &[f64], u: &[f64], w: &[f64], ridge: f64) -> Option<(f64, f64)> {
@@ -1280,6 +1287,9 @@ pub fn personal_fit(c: &Consts, mut rows: Vec<Row>, feats: &[Feats], now: f64, l
         }
         let sdk = average(s.iter().map(|&i| ((e[i] - l_at[i]).powi(2), w[i]))).sqrt();
         out.level.insert(k, curve[len - 1]);
+        if s.iter().any(|&i| !rows[i].public) {
+            out.centre.insert(k, average(s.iter().filter(|&&i| !rows[i].public).map(|&i| (e[i] + rows[i].base, w[i] * w_rec[i]))));
+        }
         out.sd.insert(k, sdk);
         out.level_var.insert(k, sdk * sdk / den[len - 1].max(1.));
         out.curve.insert(k, (g0, curve));
@@ -1303,6 +1313,22 @@ pub fn personal_fit(c: &Consts, mut rows: Vec<Row>, feats: &[Feats], now: f64, l
         }
         out.steep.insert(k, (centre, beta));
     }
+    // Personal response to the chart's curve over ability (the note model's `note_far`; plan 2026-11-22: as a per-player
+    // slope it takes 0.3 % (4K) / 0.8 % (7K) off the public held-out error): the same ridge on what the steepness leaves.
+    let mut far_at = vec![0.; n];
+    let far_ridge = std::env::var("MS_FAR").ok().and_then(|v| v.parse().ok()).unwrap_or(FAR_RIDGE);
+    for &k in &keys {
+        let s: Vec<usize> = of_keys(k).into_iter().filter(|&i| fe(i).shape.is_finite()).collect();
+        let pick = |v: &[f64]| s.iter().map(|&i| v[i]).collect::<Vec<f64>>();
+        let ww: Vec<f64> = s.iter().map(|&i| w[i] * w_rec[i]).collect();
+        let far: Vec<f64> = s.iter().map(|&i| fe(i).shape).collect();
+        let Some((centre, beta)) = steepness(&far, &pick(&u), &ww, far_ridge) else { continue };
+        for &i in &s {
+            far_at[i] = beta * (fe(i).shape - centre);
+            u[i] -= far_at[i];
+        }
+        out.far.insert(k, (centre, beta));
+    }
     let rust = fit_rust(&rows, feats, &u, &w);
     let shape_report = |s: &Shape, zc: &[f64], p: usize| -> ShapeReport {
         let column = |j: usize| zc.iter().skip(j).step_by(p).copied();
@@ -1322,7 +1348,7 @@ pub fn personal_fit(c: &Consts, mut rows: Vec<Row>, feats: &[Feats], now: f64, l
         if s.len() < 200 || k == 10 {
             continue;
         }
-        let z: Vec<f64> = s.iter().flat_map(|&i| c.zvec(fe(i), rows[i].base + l_at[i] + steep_at[i])).collect();
+        let z: Vec<f64> = s.iter().flat_map(|&i| c.zvec(fe(i), rows[i].base + l_at[i] + steep_at[i] + far_at[i])).collect();
         let p = z.len() / s.len();
         let ww: Vec<f64> = s.iter().map(|&i| w[i] * w_rec[i]).collect();
         let (zm, scale) = standardise(&z, p, &ww);

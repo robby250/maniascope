@@ -23,15 +23,15 @@ use std::sync::{Arc, Mutex};
 
 /// recommend.predictor_id of the model the Rust port reproduces: forecasts stay comparable across the port. A change to
 /// the prediction model takes a new id, so old forecasts are not read as this model's.
-pub const PREDICTOR_ID: &str = "532ce129f6fa"; // predictor families from the skill table (2026-11-11); was a6d61e058f5d
-pub const CALC_ID: &str = "cc36b2f14526";
+pub const PREDICTOR_ID: &str = "ccd235ed0c07"; // population link fitted with the drift, blend stretched (2026-11-23); was 532ce129f6fa
+pub const CALC_ID: &str = "c5bd17fecc20";
 /// Differ from CALC_ID in calibration only (calib/carry.json), newest first: a crawl still running holds the website rows back a whole
 /// calculator, so those can start older than the library's. Each carry keeps its source row.
 // Every shipped calculator, newest last: a ship that leaves its predecessor out drops the scores whose chart file is gone
 // (1.10.0: 7K evidence 8718 → 3959 plays on a copy without the files).
-pub const CARRIED_CALCS: [&str; 34] = ["2f01eca5e738", "7cee1dfdba7f", "a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f",
+pub const CARRIED_CALCS: [&str; 38] = ["2f01eca5e738", "7cee1dfdba7f", "a88aea03e865", "f9622a2b09c8", "65c0a4cb63d6", "9148bd02bce2", "7a35f25f603a", "faff7ab286c4", "a4e17d09c2b6", "3c695ee7a23f",
                                        "4ccede2d49cf", "09639faa6673", "d3a86f7b014f", "f92680b7b136", "0f9f7da275f1", "a386c60fbb06", "a990d0ea0ada", "2789b337ae54", "bc901ee5b05a", "4c42635f416e", "5f0c6b2fdd16",
-                                       "29a02d72f4a7", "eea12425de4c", "6f3c526261aa", "83c4b154d906", "8b4eb56bb201", "c4681b3a3229", "da01b4c516f3", "0c5d5c8a61e7", "fc49ee7e2b64", "635154fd6f71", "009e2b28af08", "ea60729870d6", "14be0f41537b"];
+                                       "29a02d72f4a7", "eea12425de4c", "6f3c526261aa", "83c4b154d906", "8b4eb56bb201", "c4681b3a3229", "da01b4c516f3", "0c5d5c8a61e7", "fc49ee7e2b64", "635154fd6f71", "009e2b28af08", "ea60729870d6", "14be0f41537b", "cc36b2f14526", "de3508de0955", "cbaeacb93fe7", "feea592c863e"];
 const SURE_PLAYS: usize = 50; // of the player's own, on a keymode: fewer and the model is mostly the population's guess
 pub const ACTIVE_KEYS: std::ops::RangeInclusive<i64> = 4..=10;
 

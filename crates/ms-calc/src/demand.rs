@@ -1,6 +1,6 @@
 //! Per-action effort → per-bin demand (skill_calc._demand_geometry/_demand and their row evidence).
 use crate::chart::Chart;
-use crate::kern::{inner, off_grid, smooth, v};
+use crate::kern::{inner, off_grid, smooth, v, v_run};
 use crate::params::Knobs;
 use crate::py;
 
@@ -55,6 +55,13 @@ fn add_burst(comp: &mut [f64], nbins: usize, burst: &[(usize, f64)], max: usize)
         if burst.len() <= max { comp[(P::mj as usize) * nbins + b] += w } else { comp[(P::sus as usize) * nbins + b] += 1.0 }
     }
 }
+
+/// Share of the same-hand hold load the press rating keeps (`P::ln_same`, compute's `press_overall`). The user (2026-11-22): a
+/// chart with holds reads "very slightly harder than hold-off on average, because some parts of the LN are physical".
+/// On the 181 dan charts with ≥ 20 % holds against the Hold Off chart's own rating (2026-11-22, per-hand removal, no LN
+/// skill in the row): mean +0.9 % at 0 (45 % of the charts under Hold Off), +2.1 % at 0.07 (29 %; 4K +0.8 %, 7K +3.4 %),
+/// +2.6 % at 0.1, +4.2 % at 0.2; about +2 % was asked.
+pub const PRESS_SAME: f64 = 0.07;
 
 #[inline]
 pub fn non_demand(p: P) -> bool {
@@ -625,6 +632,7 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
     let mut seen = 0u32;
     let mut last_head = [0.0f64; 32];
     let mut last_end = [0.0f64; 32];
+    let mut col_gap = [0.0f64; 32]; // a column's previous head-to-head gap (0 = none yet)
     let mut last_size = [0usize; 32];
     let mut hold_weight = [0.0f64; 32];
     let mut nseen = 0usize;
@@ -654,6 +662,7 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
     let keys_out = part_keys(wide);
     let mut comp = vec![0.0f64; NP * nbins];
     let mut hands = vec![0.0f64; 3 * nbins];
+    let mut dropped = vec![0.0f64; 2 * nbins]; // per hand: the hold load the press rating drops
     let mut fine = vec![0.0f64; 3 * nfine];
     let mut plain_x = if want_plain { vec![0.0f64; nbins] } else { Vec::new() };
     let mut plain_fine_x = if want_plain { vec![0.0f64; nfine] } else { Vec::new() };
@@ -667,6 +676,11 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
     let mut hand_recent: [Vec<f64>; 2] = [Vec::new(), Vec::new()]; // a hand's note heads in the last RHD_SPAN s
     let mut shape_count: [Vec<(u32, u32)>; 2] = [Vec::new(), Vec::new()]; // (shape, times in the window)
     let flam = k.FLAM;
+    // Rows keep the plain taper (the run rule on row gaps moved no keymode's map error and the top charts by 1 %).
+    // The curve is fitted over 4K–10K: under 4K it stops at 4K's share (4 / keys would give a 1K run 4× its speed). The column
+    // gap's part moves no keymode's map error (no public play has a column re-hit under the knee): it is what keeps charts
+    // apart once sped up past it (REFORM Theta / Kappa at 2×: 70.2 / 71.1 without it, 74.6 / 83.4 with).
+    let flam_run = k.FLAM_RUN * (4.0 / keys.max(4) as f64).powf(k.FLAM_RUN_KEYS);
     crate::tick::lap("d.alloc");
     for (ri, row) in rows.iter().enumerate() {
         let (i, j) = (row.start, row.end);
@@ -827,8 +841,9 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
             }
             let was = seen >> c & 1 == 1;
             let dj = if was { (t - last_head[c]).min(1.0) } else { 1.0 };
-            let vdj = v(dj, flam, 2.0);
-            let vdh = if dh != 0.0 { v(dh, flam, 2.0) } else { 0.0 };
+            // the gap before a column's gap is its previous one; before a hand's, what the finger's own gap leaves (`v_run`)
+            let vdj = v_run(dj, col_gap[c], flam, flam_run);
+            let vdh = if dh != 0.0 { v_run(dh, if was { dj - dh } else { 0.0 }, flam, flam_run) } else { 0.0 };
             let e_hand = if dh != 0.0 {
                 k.W_HAND * (vdh * vdj).sqrt() * share * above_one(vdh / v_fast, k.SPEED_P)
             } else {
@@ -891,10 +906,9 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
             hands[b * 3 + h] += rice + e_ln;
             fine[fb * 3 + h] += rice + e_ln;
             comp[(o(P::ln)) * nbins + b] += e_ln;
-            // what pressing costs more while the same hand holds: the physical part of the hold term (the press rating keeps it)
-            if held_same > 0.0 {
-                comp[(o(P::ln_same)) * nbins + b] += (rice + k.LN_BASE * share) * k.W_HOLD_SAME * held_same.powf(0.7);
-            }
+            // the hand's hold load the press rating drops: all of it but PRESS_SAME of what pressing costs more while the same
+            // hand holds (the physical part of the hold term)
+            dropped[b * 2 + h] += e_ln - if held_same > 0.0 { PRESS_SAME * (rice + k.LN_BASE * share) * k.W_HOLD_SAME * held_same.powf(0.7) } else { 0.0 };
             jrun[c] = if jacked { jrun[c] + 1 } else { 0 };
             // a Longjacks note: a tap in a column run whose row shares only this column with the run's previous row (more
             // shared columns are a chordjack)
@@ -1016,6 +1030,7 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
         for ni in i..j {
             let c = columns[ni] as usize & C;
             let e = ends[ni];
+            col_gap[c] = if seen >> c & 1 == 1 { t - last_head[c] } else { 0.0 };
             if seen >> c & 1 == 0 {
                 order[nseen & C] = c;
                 nseen += 1;
@@ -1125,6 +1140,7 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
         let b = (nbins - 1).min(((e - t0) / bin) as usize);
         let fb = (nfine - 1).min(((e - t0) * phases as f64 / bin) as usize);
         hands[b * 3 + h] += eff;
+        dropped[b * 2 + h] += eff;
         fine[fb * 3 + h] += eff;
         comp[(o(P::ln)) * nbins + b] += eff;
         comp[(o(P::ln_rel)) * nbins + b] += eff;
@@ -1145,11 +1161,19 @@ pub fn demand_with(chart: &Chart, g: &Geometry, base: &Base, centre_left: bool, 
         }
     }
     crate::tick::lap("d.releases");
-    // as a share of the bin's hold term: the later stages scale `ln`, and a share stays one
+    // `ln_same`: the share s of the bin's hold term for which total − ln·(1 − PRESS_SAME·s) is the bin without each hand's
+    // dropped load, √(left² + right²) + cross on what the hands keep. A share, because the later stages scale `ln`. Taking the
+    // dropped load off the total in proportion read a chart whose holds sit on one hand under its own Hold Off chart (user
+    // 2026-11-22: AXION [Pew's Insane] "Reg 1st+", "Reg 2nd−" with Hold Off; press 5.68 against 5.94).
     for b in 0..nbins {
-        let ln = comp[(o(P::ln)) * nbins + b];
-        let same = &mut comp[(o(P::ln_same)) * nbins + b];
-        *same = if ln > 0.0 { (*same / ln).min(1.0) } else { 0.0 };
+        let (left, right, cv, ln) = (hands[b * 3], hands[b * 3 + 1], hands[b * 3 + 2], comp[(o(P::ln)) * nbins + b]);
+        let total = (left * left + right * right).sqrt() + cv;
+        comp[(o(P::ln_same)) * nbins + b] = if ln > 0.0 && total > 0.0 {
+            let kept = ((left - dropped[b * 2]).max(0.0).powi(2) + (right - dropped[b * 2 + 1]).max(0.0).powi(2)).sqrt() + cv;
+            (1.0 - (total - kept) * (left + right + cv) / (total * ln)) / PRESS_SAME
+        } else {
+            0.0
+        };
     }
     add_burst(&mut comp, nbins, &burst, k.MJ_BURST);
     if !wide {

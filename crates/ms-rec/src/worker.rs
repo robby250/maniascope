@@ -2100,9 +2100,7 @@ impl Worker {
                 (self.h.emit)(Out::Copy { text: crate::navigation::song_search(&pick, &self.shown.client), msg: format!("Ready: {first}") });
             }
             None if current => {
-                let mut c = pick;
-                c.source_web |= !c.installed; // a downloaded website map keeps its WEB badge (user 2026-11-15)
-                c.installed = true;
+                let c = Box::new(pick.imported());
                 let copy = Some(crate::navigation::song_search(&c, &self.shown.client));
                 let first = if self.shown.client == "stable" { "press F5 in song select, then Ctrl+V" } else { "press Ctrl+V in song select" };
                 let msg = crate::navigation::with_invert(&c, format!("Ready: {first} · set {} manually", c.var));

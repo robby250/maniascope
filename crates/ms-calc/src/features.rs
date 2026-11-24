@@ -108,7 +108,7 @@ pub fn recalibrated(f: &Dict, after: &Params, rate: f64, flow: &dyn Fn() -> Opti
     // The rating `after` gives, computed, not the stored one times after/before: a fresh analysis matches final_rating to
     // ±1 %, but a row carried several times kept what each older calibration's ratio left behind (10K +.21 log, 2026-11-04).
     let (overall, baseline) = (
-        model::final_rating(after, keys, raw, f.dict("execution")),
+        model::final_rating(after, keys, raw, f.dict("execution")) * f.fget("note_factor", 1.),
         model::baseline_rating(after, keys, raw, f.dict("execution")),
     );
     if !overall.is_finite() || overall <= 0. || (overall - f.f("overall")).abs() < 1e-12 {
@@ -152,7 +152,11 @@ pub fn rules_stamp(prm: &Params) -> String {
     prm.rules
         .get_or_init(|| {
             use sha2::Digest;
-            let knobs = serde_json::to_string(&prm.k.dump()).unwrap_or_default();
+            let mut knobs = serde_json::to_string(&prm.k.dump()).unwrap_or_default();
+            // a row rated with another note model is another analysis
+            if prm.k.NOTE_W != 0.0 || prm.k.NOTE_W_TOP != 0.0 {
+                knobs += crate::notenet::Pop::id();
+            }
             sha2::Sha256::digest(knobs.as_bytes()).iter().take(6).map(|b| format!("{b:02x}")).collect()
         })
         .clone()
@@ -193,7 +197,10 @@ pub fn features_of(res: &Dict, prm: &Params) -> Dict {
     f.set("od", res.get("od").cloned().unwrap_or(Val::F(0.)));
     // a re-rating (`carried`) keeps them too: the calc 14be → cc36 carry dropped "invert" from 52k Invert charts, which
     // then read as their source's skills (Vibro offered inverted, user 2026-11-21)
-    for kept in ["window_shift", "invert"] {
+    // `note_factor`: what the population's note model did to the ratings (`model::note_correction`); a calibration move
+    // without the chart's file keeps it (`recalibrated`)
+    // `presence`: how much of the map each skill is (card::presence)
+    for kept in ["window_shift", "invert", "note_factor", "note_rating", "note_far", "presence"] {
         if let Some(v) = res.get(kept) {
             f.set(kept, v.clone());
         }

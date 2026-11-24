@@ -172,6 +172,15 @@ impl Pick {
         if self.convert_of.is_some() { if self.source_web { ms_model::choices::WEB_CONVERT } else { ms_model::choices::CONVERT } } else if self.installed { ms_model::choices::REAL } else { ms_model::choices::WEB }
     }
 
+    /// The pick once its download or its convert is in the client. Only a website map itself gains the WEB mark by it (user
+    /// 2026-11-15: a downloaded one keeps its badge): a convert is not installed before it is written either, and one of an
+    /// installed chart is no website convert (user 2026-11-22: Leia 7K → 10K of an installed 7K showed WEB).
+    pub fn imported(mut self) -> Pick {
+        self.source_web |= !self.installed && self.convert_of.is_none();
+        self.installed = true;
+        self
+    }
+
     /// recommend.event_key
     pub fn identity(&self) -> Option<String> {
         ms_data::events::event_key(&serde_json::json!({"md5": self.md5, "sha": self.sha, "bid": self.bid}))
@@ -218,4 +227,18 @@ pub fn rate_label(rate: f64) -> String {
 
 pub fn num(v: &Value, k: &str) -> Option<f64> {
     v.get(k).and_then(Value::as_f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pick;
+
+    #[test]
+    fn only_a_website_map_itself_becomes_web_when_imported() {
+        let web = Pick::default().imported();
+        assert!(web.installed && web.source_web, "a downloaded website map keeps its mark");
+        let convert = Pick { convert_of: Some("installed 7K".into()), ..Pick::default() };
+        assert!(!convert.clone().imported().source_web, "a convert of an installed chart");
+        assert!(Pick { source_web: true, ..convert }.imported().source_web, "a convert of a website chart stays one");
+    }
 }

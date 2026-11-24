@@ -98,6 +98,28 @@ pub fn member_value<S: AsRef<str>>(f: &ms_calc::val::Dict, members: &[S]) -> f64
     members.iter().filter_map(|m| if m.as_ref() == INVERT_MOD { Some(f.fget("invert", 0.)) } else { Some(sk?.get(m.as_ref())?.f().max(0.)) }).fold(0f64, f64::max)
 }
 
+/// Per skill series (4K, 5K–10K): the median share of the map it is present in (`ms_calc::card::presence`) over the charts
+/// it counts on (≥ SHOW of the top family; 53,449 local charts at 1.0×, 2026-11-23; a tree under 200 charts takes both's).
+/// A practice offer for a skill needs at least that much of it (user 2026-11-23: Vibro offered on BanYa - Moonlight with
+/// vibro in 5 % of the map, "minimum 30-40 of that skill throughout the map"; one flat share would leave Jumptrill, Shield,
+/// LN Tech and the other short-burst skills nothing: their median is 0.5–9 %).
+const PRESENCE_FLOOR: [(&str, f64, f64); 29] = [
+    ("stream", 0.191, 0.476), ("jumpstream", 0.400, 0.399), ("handstream", 0.208, 0.208), ("jumptrill", 0.068, 0.073), ("splittrill", 0.089, 0.089),
+    ("jackspeed", 0.163, 0.164), ("chordjack", 0.256, 0.137), ("minijack", 0.073, 0.081), ("longjack", 0.128, 0.131), ("vibro", 0.258, 0.143),
+    ("ln", 0.350, 0.547), ("ln_general", 0.289, 0.363), ("ln_tech", 0.005, 0.004), ("ln_inverse", 0.029, 0.022), ("ln_release", 0.055, 0.068),
+    ("shield", 0.069, 0.040), ("mash", 0.065, 0.104), ("chordstream", 0.399, 0.399), ("bracket", 0.238, 0.238), ("trill1h", 0.090, 0.101),
+    ("anchor", 0.105, 0.122), ("dump", 0.117, 0.117), ("quadstream", 0.113, 0.153), ("sv", 0.163, 0.136), ("sv_fast", 0.088, 0.074),
+    ("sv_slow", 0.068, 0.068), ("sv_accel", 0.060, 0.055), ("sv_stutter", 0.028, 0.028), ("sv_brake", 0.081, 0.086),
+];
+
+/// Whether a dimension (its `members`) covers enough of the chart to be practised on it: any member at its `PRESENCE_FLOOR`.
+/// Charts analysed before `presence` existed, and members without a floor (Technical, Inverse mod, Stamina), pass.
+pub fn present<S: AsRef<str>>(f: &ms_calc::val::Dict, members: &[S]) -> bool {
+    let (Some(p), t) = (f.dict("presence"), tree_index(f.get("keys").map_or(7, |k| k.f() as i64))) else { return true };
+    let floors: Vec<(f64, f64)> = members.iter().filter_map(|m| Some((PRESENCE_FLOOR.iter().find(|x| x.0 == m.as_ref())?, p.get(m.as_ref())?.f()))).map(|(x, v)| (if t == 0 { x.1 } else { x.2 }, v)).collect();
+    floors.is_empty() || floors.iter().any(|(floor, v)| v >= floor)
+}
+
 /// skill_practice.strengths and practice_strengths of one chart-rate: (key, raw, practice) per dimension.
 fn strengths(f: &ms_calc::val::Dict) -> Vec<(&'static str, f64, f64)> {
     let keys = f.get("keys").map_or(7, |k| k.f() as i64);
@@ -436,6 +458,22 @@ mod tests {
         let d = demanded(&f);
         assert!(d.contains(&"stream") && d.contains(&"trills") && !d.contains(&"ln"), "{d:?}");
         assert_eq!(relative(&f, 3.), 1.);
+    }
+
+    #[test]
+    fn a_skill_is_practised_only_where_it_covers_the_map() {
+        let mut f = ms_calc::val::Dict::new();
+        f.set("keys", 4i64);
+        assert!(present(&f, &["vibro"]), "analysed before presence");
+        let mut p = ms_calc::val::Dict::new();
+        p.set("vibro", 0.051); // BanYa - Moonlight 1.1×: 4.5 s of vibro in 82
+        p.set("jumpstream", 0.45);
+        p.set("stream", 0.3); // 4K's median .191, 5K–10K's .476
+        f.set("presence", ms_calc::val::Val::Dict(p));
+        assert!(!present(&f, &["vibro"]) && present(&f, &["jumpstream"]) && present(&f, &["technical"]));
+        assert!(present(&f, &["vibro", "jumpstream"]) && present(&f, &["stream"]), "a dimension passes on any member");
+        f.set("keys", 7i64);
+        assert!(!present(&f, &["stream"]), "5K–10K reads its own floor");
     }
 
     #[test]

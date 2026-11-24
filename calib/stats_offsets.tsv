@@ -1,5 +1,5 @@
 player	series	offset	n
-own	4K REFORM	-0.1216	1
-own	7K LN	-0.1409	2
-own	7K Regular	-0.3100	8
-tester	7K LN	0.0145	2
+own	4K REFORM	0.1093	1
+own	7K LN	-0.0093	2
+own	7K Regular	-0.4506	8
+tester	7K LN	-0.0373	2

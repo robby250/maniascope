@@ -8,3 +8,4 @@ edition = "2021"
 burn = { version = "0.22.1", default-features = false, features = ["std", "wgpu", "autodiff", "optim"] }
 serde_json = "1"
 memmap2 = "0.9"
+half = "2"

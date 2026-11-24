@@ -588,7 +588,11 @@ pub fn deal(pool: &[Tags], shares: &Shares, ledger: &[Tags], queue: &[Option<Tag
         // A skill filled up with learning offers here has too few maps to go by: it comes as often as its slider says (user
         // 2026-11-22: "The skill's normal turns"; by its 20 charts among 4K's thousands 10K Invert got no turn in 300).
         let slider = |n: &str| shares.skills.as_ref().map_or(1., |s| s.get(n).copied().unwrap_or(0.));
-        let raw: Vec<f64> = names.iter().zip(&counts).map(|(n, c)| if n.is_empty() || key_share <= 0. || learning.contains(n) { slider(n) } else { slider(n) * c / maps[n] / key_share }).collect();
+        // The Inverse mod skill too, in every keymode (user 2026-11-22: "i want the share per keymode to be equal to that
+        // keymode's share … not whichever keymode has more available maps"): any chart can be played under Invert, so its
+        // map counts say where charts are, not where the skill is.
+        let even = |n: &str| learning.contains(&n) || n == crate::skills::INVERT_MOD;
+        let raw: Vec<f64> = names.iter().zip(&counts).map(|(n, c)| if n.is_empty() || key_share <= 0. || even(n) { slider(n) } else { slider(n) * c / maps[n] / key_share }).collect();
         let picked: f64 = names.iter().zip(&raw).filter(|(n, _)| !n.is_empty()).map(|(_, r)| r).sum();
         let raw = names.iter().zip(&raw).map(|(n, r)| if n.is_empty() && shares.skills.is_some() { (1. - picked).max(0.) } else { *r }).collect();
         let mut skills = slots(raw);
@@ -863,14 +867,24 @@ mod deal_tests {
     /// User 2026-11-22: 10K Invert reaches the target at no rate; its nearest charts come "the skill's normal turns".
     #[test]
     fn a_skill_with_only_learning_offers_in_a_keymode_comes_as_often_as_its_slider_says() {
-        let pool = |learning: bool| [rows(200, 4, "invert_mod", REAL), rows(200, 4, "", REAL), rows(200, 10, "", REAL), vec![Tags { learning, ..row(10, "invert_mod", REAL) }; 20]].concat();
-        let shares = Shares { skills: skills(&[("invert_mod", 0.15), ("", 0.85)]), ..Shares::default() };
-        let turns = |got: &[Tags], keys: i64| count(got, |t| t.keys == keys && t.skill == "invert_mod");
+        let pool = |learning: bool| [rows(200, 4, "ln", REAL), rows(200, 4, "", REAL), rows(200, 10, "", REAL), vec![Tags { learning, ..row(10, "ln", REAL) }; 20]].concat();
+        let shares = Shares { skills: skills(&[("ln", 0.15), ("", 0.85)]), ..Shares::default() };
+        let turns = |got: &[Tags], keys: i64| count(got, |t| t.keys == keys && t.skill == "ln");
         let got = presses(&pool(true), &shares, 120);
         assert!(turns(&got, 10).abs_diff(9) <= 2 && turns(&got, 4).abs_diff(16) <= 2, "10K {} (0.15 of its 60), 4K {} (where the skill's maps are)", turns(&got, 10), turns(&got, 4));
         // 20 charts at the target go by their count, as every skill does
         let by_count = presses(&pool(false), &shares, 120);
         assert!(turns(&by_count, 10) <= 3 && turns(&by_count, 4).abs_diff(16) <= 2, "{} {}", turns(&by_count, 10), turns(&by_count, 4));
+    }
+
+    #[test]
+    fn the_inverse_mod_skill_takes_its_slider_of_every_keymodes_turns() {
+        // user 2026-11-22: 7K has thousands of charts that fit under Invert, 10K a few: 10K still gets its keymode's share
+        let pool = [rows(400, 7, "invert_mod", REAL), rows(200, 7, "", REAL), rows(30, 10, "invert_mod", REAL), rows(200, 10, "", REAL)].concat();
+        let shares = Shares { keys: [(7, 0.4), (10, 0.6)].into(), skills: skills(&[("invert_mod", 0.5), ("", 0.5)]), ..Shares::default() };
+        let got = presses(&pool, &shares, 100);
+        let turns = |keys: i64| count(&got, |t| t.keys == keys && t.skill == "invert_mod");
+        assert!(turns(7).abs_diff(20) <= 2 && turns(10).abs_diff(30) <= 2, "7K {} of its 40, 10K {} of its 60", turns(7), turns(10));
     }
 
     /// User 2026-11-18 (fixed in 1.15.0, kept here): 4K Vibro picked alone filled the list with other keymodes' maps without

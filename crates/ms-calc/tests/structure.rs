@@ -75,6 +75,30 @@ fn the_calculator_applies_the_calibration_its_rows_are_fitted_on() {
 }
 
 #[test]
+fn the_note_model_rates_the_records_its_training_rows_hold() {
+    // popfit trains on `chart_records` (a traced pass) with the calculator's own rating as an input; the analysis builds the
+    // records from its pass's series and corrects that rating: both must be the same numbers.
+    let Some(net) = ms_calc::notenet::Pop::shipped() else { return };
+    let prm = standard_params();
+    let masks: [&[u8]; 4] = [&[0, 1, 2], &[3, 4, 5], &[1, 2, 6], &[0, 3, 5]];
+    for (keys, rate) in [(7usize, 1.), (4, 1.5)] {
+        let c = chart((0..500).map(|i| { let t = 95. * i as f64; (t, if i % 9 == 0 { t + 300. } else { t }, masks[i % 4][i % 3] % keys as u8) }).collect(), keys, 8.);
+        let res = run(&c, rate);
+        let (overall, factor, note) = (res.dict("scores").unwrap().f("overall"), res.f("note_factor"), res.f("note_rating"));
+        let alone = overall / factor;
+        // the traced pass poprows writes its records and skill series from
+        let mut shared = ms_calc::compute::Shared { trace: Some(Vec::new()), ..Default::default() };
+        ms_calc::compute::compute_inner(&c, rate, true, &mut shared, &prm).unwrap();
+        let trace = &shared.trace.as_ref().unwrap().iter().find(|x| x.0).unwrap().1;
+        let named = |n: &str| trace.series.keys.iter().find(|p| p.name() == n).map_or(&[][..], |&p| trace.series.get(p));
+        let want = net.rating(&ms_calc::notefeat::records_of(&c, rate, &trace.total, named("chordjack"), prm.k.BIN, ms_calc::notefeat::Need::ALL), alone, keys, &trace.total, &named, prm.k.BIN).0;
+        assert!((note / want).ln().abs() < 1e-5, "{keys}K {rate}×: {note} against {want}");
+        let w = ms_calc::model::note_weight(&prm, net.place(keys, alone).unwrap());
+        assert!((factor.ln() - w * net.over(keys, note, alone, c.t.len() as f64)).abs() < 1e-9 && factor != 1., "{keys}K {rate}×: {factor}");
+    }
+}
+
+#[test]
 fn a_column_run_is_vibro_when_simple_and_fast_and_longjacks_when_its_chords_change() {
     // user 2026-11-13: jacks are sustained strain on one column/hand; "super hard chordjacks with constantly shifting
     // patterns should show as chordjack at 360 bpm too not vibro"; simple repetition is vibro down to ~160 BPM

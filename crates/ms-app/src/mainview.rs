@@ -305,10 +305,10 @@ impl App {
 
     fn context_line(&self, ui: &mut Ui, a: &Arc<Analysis>) {
         let ln_share = a.ln_notes / a.notes.max(1) as f64;
-        let dan = ms_rec::dans::label(a.keys, a.overall, a.press, ln_share, Some(&a.dan_vibro), a.seconds());
+        let dan = a.dan();
         let mut parts: Vec<(String, String)> = vec![(format!("{}K", a.keys), "Keymode".into())];
         if let Some(d) = dan {
-            parts.push((d, "The dan this map's difficulty matches. Tap dans under 22% LN, LN dans from 50%, both in between; a 4K map with 10% of its notes in fast same-column runs reads on the Vibro dans too.".into()));
+            parts.push((d, "The dan this map's difficulty matches. Every map reads on the tap dans by its notes as taps; one led by an LN skill or with 30% LN or more on the LN dans too; a 4K map with 10% of its notes in fast same-column runs reads on the Vibro dans too.".into()));
         }
         if let Some(l) = a.o2jam.filter(|_| self.s.display.o2jam) {
             parts.push((format!("O2Jam Lv. {l:.0}"), format!("O2Jam level {l:.1} at this rate: our calc's ratings mapped onto O2Jam levels, fitted on 4,400 O2Jam charts, 2,600 osu! conversions of them and osu! maps named with their level (typically off by 5–6 levels). Trained mostly on LN-heavy O2Jam charts: pure rice charts may read off.")));
@@ -400,8 +400,10 @@ impl App {
         theme::card(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                let full = ui.available_width();
                 self.mod_pills(ui);
-                ui.with_layout(Layout::top_down(Align::Min), |ui| self.title(ui, a));
+                let pills = ui.min_rect().bottom();
+                ui.with_layout(Layout::top_down(Align::Min), |ui| self.title(ui, a, full, pills));
             });
             if d.info {
                 self.context_line(ui, a);
@@ -409,7 +411,8 @@ impl App {
         });
     }
 
-    fn title(&mut self, ui: &mut Ui, a: &Arc<Analysis>) {
+    /// `full` = the card's width, `pills` = the bottom of the mod pills right of the title.
+    fn title(&mut self, ui: &mut Ui, a: &Arc<Analysis>, full: f32, pills: f32) {
         let d = self.s.display.clone();
         let mut lines = Vec::new();
         if d.title {
@@ -417,7 +420,12 @@ impl App {
             lines.push(ui.add(egui::Label::new(job).sense(Sense::click())));
         }
         if d.version {
-            lines.push(ui.add(egui::Label::new(RichText::new(format!("[{}]  {}", a.version, a.creator)).color(DIM)).sense(Sense::click())));
+            // One row, never two: under the mod pills it has the card's whole width, and past that it ends in … (user
+            // 2026-11-22: "Trixta" wrapped to a row of its own beside the free space under the pill).
+            // (a quarter line of overlap is the row's own headroom: the pill is a little taller than the title row)
+            let width = if ui.cursor().top() + theme::body() * 0.25 >= pills { full } else { ui.available_width() };
+            let label = egui::Label::new(RichText::new(format!("[{}]  {}", a.version, a.creator)).color(DIM)).truncate().sense(Sense::click());
+            lines.push(ui.allocate_ui(Vec2::new(width, 0.), |ui| ui.add(label)).inner);
         }
         for r in lines {
             let r = r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Click: copy “Artist - Title [Version]” for osu!'s search. Right-click: more.");
@@ -521,7 +529,7 @@ impl App {
                 theme::line(ui, &vec![bold(p.title.clone()), plain("  "), small(p.artist.clone())], 1);
             }
             if d.version {
-                theme::dim(ui, format!("[{}]  {}", p.version, p.creator));
+                ui.add(egui::Label::new(RichText::new(format!("[{}]  {}", p.version, p.creator)).color(DIM)).truncate());
             }
             if d.info {
                 theme::dim(ui, p.context.clone());
