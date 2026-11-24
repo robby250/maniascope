@@ -117,3 +117,14 @@ fn a_column_run_is_vibro_when_simple_and_fast_and_longjacks_when_its_chords_chan
     assert_eq!(runs(anchored(true)).iter().find(|r| r.0 == 30), Some(&(30, false)));
     assert!(runs(anchored(false)).iter().all(|r| r.1));
 }
+
+#[test]
+fn whole_hands_in_turn_have_no_shapes_and_a_stream_has_many() {
+    // MikuaBot's anemone 10K: the left hand's five keys, then the right's, for the whole song
+    let hands = rice((0..200).flat_map(|i| (0..5u8).map(move |c| (150. * i as f64, c + 5 * (i % 2) as u8))), 10, 8.);
+    let [fill, variety] = ms_calc::features::shapes(&hands);
+    assert!((fill - 0.5).abs() < 1e-9 && variety == 2. / 200., "{fill} {variety}");
+    let stream = rice((0..200).map(|i| (100. * i as f64, ((i * 7) % 10) as u8)), 10, 8.);
+    assert_eq!(ms_calc::features::shapes(&stream), [0.1, 10. / 200.]);
+    assert_eq!(ms_calc::features::shapes(&rice([(0., 0)], 10, 8.)), [0., 1.], "too short to judge");
+}

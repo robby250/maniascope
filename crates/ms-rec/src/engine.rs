@@ -522,6 +522,19 @@ pub fn played_names(db: &ms_data::store::Db) -> rusqlite::Result<std::collection
         .map(|x| x.map(|(sha, rate)| format!("{sha}@{:.3}", ms_calc::py::round_digits(rate.max(0.) + f64::from(u8::from(rate == 0.)), 3)))).collect()
 }
 
+/// Once: the stored rows of this calculator get their chart's `shapes` (`ms_calc::features::shapes`, added after it shipped),
+/// so a shapeless chart is offered as Mash only (user 2026-11-25) from this launch, not from the next calculator change.
+/// true: rows were looked at (the list is built again).
+pub fn add_shapes(db: &ms_data::store::Db) -> std::result::Result<bool, String> {
+    const DONE: &str = "shapes_added";
+    if ms_data::store::kv_get(db, DONE).is_some() {
+        return Ok(false);
+    }
+    let charts = Charts::new(db).map_err(|e| e.to_string())?;
+    let n = ms_data::store::add_feature(db, CALC_ID, "shapes", &|sha| charts.counted(sha), &|c| ms_calc::val::Val::floats(&ms_calc::features::shapes(c))).map_err(|e| e.to_string())?;
+    ms_data::store::kv_set(db, DONE, &serde_json::json!(n)).map_err(|e| e.to_string()).map(|_| true)
+}
+
 /// Stored website features moved the same way.
 pub fn carry_web(db: &ms_data::store::Db) -> std::result::Result<(), String> {
     ms_data::webmaps::forget_in_client()?;

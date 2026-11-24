@@ -376,8 +376,11 @@ impl Builder {
     /// leaves with its setting.
     fn apply_converts(&mut self, db: &Db, enabled: &[(i64, Vec<i64>)]) -> Result<()> {
         let mut gone: HashSet<String> = HashSet::new();
+        // a convert leaves with its source: a chart deleted or hidden in lazer (user 2026-11-25) is no longer in `installed`
+        let library: HashSet<String> = db.prepare("SELECT sha256 FROM installed")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         for row in crate::converts::rows(db)? {
-            let enabled = enabled.iter().any(|(t, s)| *t == row.keys && s.contains(&row.source_keys));
+            let present = row.source_web || row.convert_of.as_ref().is_some_and(|s| library.contains(s));
+            let enabled = present && enabled.iter().any(|(t, s)| *t == row.keys && s.contains(&row.source_keys));
             let sha = row.sha256.clone();
             match self.catalog.get_mut(&sha) {
                 Some(_) if !enabled => {
@@ -937,6 +940,7 @@ mod convert_tests {
 
     fn row(db: &Db, source: &str, sha: &str, target: i64, keys: i64) {
         db.execute("INSERT INTO converts VALUES (?,?,?,?,?,'m','A','T','V (7K to 10K)','C',5,NULL,8,90,1,0)", rusqlite::params![source, target, ms_convert::CONVERTER_ID, keys, sha]).unwrap();
+        db.execute("INSERT OR IGNORE INTO installed(sha256, keys) VALUES (?, ?)", rusqlite::params![source, keys]).unwrap(); // its source is in the library
     }
 
     fn builder() -> Builder {
@@ -960,6 +964,10 @@ mod convert_tests {
         row(&db, "src2", "out2", 10, 7);
         b.apply_converts(&db, &[(10, vec![7])]).unwrap();
         assert!(!b.catalog["out2"].installed && b.catalog.len() == 2);
+        // its source deleted or hidden in lazer: it leaves too (user 2026-11-25)
+        db.execute("DELETE FROM installed WHERE sha256='src2'", []).unwrap();
+        b.apply_converts(&db, &[(10, vec![7])]).unwrap();
+        assert!(!b.catalog.contains_key("out2") && b.catalog.len() == 1);
         // turned off: gone, imported or not
         b.apply_converts(&db, &[]).unwrap();
         assert!(b.catalog.is_empty() && b.order.is_empty(), "{:?}", b.order);

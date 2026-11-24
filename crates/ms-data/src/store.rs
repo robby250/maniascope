@@ -128,6 +128,42 @@ pub fn carry_feats(db: &Db, from: &str, to: &str, after: &ms_calc::params::Param
     Ok(keys.len())
 }
 
+/// Stored rows of `calc` without `key` get it from their chart once (`add`), without analysing the chart again: a value added
+/// to the analysis under one calculator would otherwise reach the library only at the next calculator change. Rows whose
+/// chart is gone stay as they are. Returns the rows changed.
+pub fn add_feature(db: &Db, calc: &str, key: &str, chart: &(dyn Fn(&str) -> Option<ms_calc::chart::Chart> + Sync), add: &(dyn Fn(&ms_calc::chart::Chart) -> ms_calc::val::Val + Sync)) -> Result<usize> {
+    let all: Vec<(String, Sql)> = db.prepare("SELECT key, data FROM feats WHERE key LIKE ? ORDER BY key")?.query_map([format!("%|{calc}")], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_>>()?;
+    let decode = |data: &Sql| match data {
+        Sql::Blob(b) => crate::codec::decode(b).ok(),
+        Sql::Text(t) => serde_json::from_str(t).ok().map(|v| crate::codec::from_json(&v)),
+        _ => None,
+    };
+    let lacking: Vec<(String, ms_calc::val::Dict)> = all.iter().filter_map(|(k, d)| match decode(d) {
+        Some(ms_calc::val::Val::Dict(f)) if f.get(key).is_none() => Some((k.clone(), f)),
+        _ => None,
+    }).collect();
+    let sha_of = |k: &str| k.rsplit_once('|').map_or(k, |n| n.0).rsplit_once('@').map_or("", |n| n.0).to_string();
+    let charts: Vec<&[(String, ms_calc::val::Dict)]> = lacking.chunk_by(|a, b| sha_of(&a.0) == sha_of(&b.0)).collect();
+    let mut changed = 0;
+    for batch in charts.chunks(1000) {
+        let rows = ms_calc::background::background_map(batch, carry_threads(), |group| {
+            let Some(c) = chart(&sha_of(&group[0].0)) else { return Ok(Vec::new()) };
+            let v = add(&c);
+            Ok(group.iter().map(|(k, f)| {
+                let mut f = f.clone();
+                f.set(key, v.clone());
+                (k.clone(), crate::codec::encode(&ms_calc::val::Val::Dict(f)))
+            }).collect::<Vec<_>>())
+        });
+        let tx = db.unchecked_transaction()?;
+        for (k, data) in rows.into_iter().flatten().flatten() {
+            changed += tx.execute("UPDATE feats SET data=? WHERE key=?", params![data, k])?;
+        }
+        tx.commit()?;
+    }
+    Ok(changed)
+}
+
 /// Rows of every other calculator go and the file shrinks: they are only ever read to carry them, and one calculator costs
 /// about 1 GB (G835LX held eight). Nothing without rows of `calc`, so a failed carry can't cost the analyses. A VACUUM that
 /// other connections block leaves the deleted rows' pages free and the next call finishes it.
@@ -535,6 +571,30 @@ mod tests {
         assert_eq!((rows, events, kv_get(&db, "k")), (1, 1, Some(json!(1))));
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_new_feature_reaches_stored_rows_with_a_chart_once() {
+        use ms_calc::val::{Dict, Val};
+        let db = db();
+        let row = |done: bool| {
+            let mut f = Dict::new();
+            f.set("overall", 5.);
+            if done {
+                f.set("x", 7.);
+            }
+            crate::codec::encode(&Val::Dict(f))
+        };
+        for (key, data) in [("a@1.000|c", row(false)), ("a@1.500|c", row(false)), ("gone@1.000|c", row(false)), ("b@1.000|c", row(true)), ("a@1.000|old", row(false))] {
+            db.execute("INSERT INTO feats VALUES (?,?)", params![key, data]).unwrap();
+        }
+        let chart = |sha: &str| (sha != "gone").then(ms_calc::chart::Chart::default);
+        assert_eq!(add_feature(&db, "c", "x", &chart, &|_| Val::F(1.)).unwrap(), 2, "both rates of a; b had it, gone has no file");
+        let x = |key: &str| {
+            let Val::Dict(f) = crate::codec::decode(&db.query_row("SELECT data FROM feats WHERE key=?", [key], |r| r.get::<_, Vec<u8>>(0)).unwrap()).unwrap() else { panic!() };
+            (f.get("x").map(Val::f), f.f("overall"))
+        };
+        assert_eq!([x("a@1.500|c"), x("b@1.000|c"), x("gone@1.000|c"), x("a@1.000|old")], [(Some(1.), 5.), (Some(7.), 5.), (None, 5.), (None, 5.)]);
     }
 
     #[test]

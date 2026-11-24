@@ -565,6 +565,7 @@ fn a_restart_keeps_the_saved_lists_converts() {
     let rec = l.w.rec.as_mut().unwrap();
     rec.r.installed = Arc::new(rec.r.installed.iter().filter(|(_, i)| i.sha256 != saved).map(|(k, i)| (k.clone(), i.clone())).collect()); // a convert has no library row
     l.world.db.execute("INSERT INTO converts VALUES ('src',7,?,4,?,'m','A','T','V','C',5,NULL,8,90,1,0)", rusqlite::params![ms_convert::CONVERTER_ID, saved]).unwrap();
+    l.world.db.execute("INSERT OR IGNORE INTO installed(sha256, keys) VALUES ('src', 4)", []).unwrap(); // its source is in the library
     l.w.converts.get_mut("nps").unwrap().insert(7, Setting { on: true, sources: vec![4], often: 0.5, weighted: true });
     l.w.restored.clear();
     l.w.restore_local("nps").unwrap();

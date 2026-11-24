@@ -147,6 +147,30 @@ pub fn carried(f: &Dict, after: &Params, rate: f64, chart: &dyn Fn() -> Option<s
     Some(fresh)
 }
 
+/// [fill, variety] of the chart's rows (notes at one time): fill = mean notes a row over the keys; variety = distinct key sets
+/// over the most it could hold (rows, or every non-empty set of the keys). A chart that strikes most keys at once and only a
+/// few ways is not patterned (`ms_model` offers it as Mash only). [0, 1] under 20 rows.
+pub fn shapes(chart: &chart::Chart) -> [f64; 2] {
+    let mut rows: Vec<u64> = Vec::new();
+    for (i, &c) in chart.col.iter().enumerate() {
+        let bit = 1u64 << c.min(63);
+        match rows.last_mut() {
+            Some(r) if i > 0 && chart.t[i] == chart.t[i - 1] => *r |= bit,
+            _ => rows.push(bit),
+        }
+    }
+    if rows.len() < 20 || chart.keys == 0 {
+        return [0., 1.];
+    }
+    let notes: u32 = rows.iter().map(|r| r.count_ones()).sum();
+    let n = rows.len();
+    rows.sort_unstable();
+    rows.dedup();
+    let distinct = rows.len();
+    let most = n.min((1usize << chart.keys.min(20)) - 1);
+    [notes as f64 / n as f64 / chart.keys as f64, distinct as f64 / most as f64]
+}
+
 /// The rules a row was analysed under: the rule knobs' hash (calibration moves without a new analysis).
 pub fn rules_stamp(prm: &Params) -> String {
     prm.rules
@@ -199,8 +223,8 @@ pub fn features_of(res: &Dict, prm: &Params) -> Dict {
     // then read as their source's skills (Vibro offered inverted, user 2026-11-21)
     // `note_factor`: what the population's note model did to the ratings (`model::note_correction`); a calibration move
     // without the chart's file keeps it (`recalibrated`)
-    // `presence`: how much of the map each skill is (card::presence)
-    for kept in ["window_shift", "invert", "note_factor", "note_rating", "note_far", "presence"] {
+    // `presence`: how much of the map each skill is (card::presence); `shapes`: its chords' fill and variety (`shapes`)
+    for kept in ["window_shift", "invert", "note_factor", "note_rating", "note_far", "presence", "shapes"] {
         if let Some(v) = res.get(kept) {
             f.set(kept, v.clone());
         }

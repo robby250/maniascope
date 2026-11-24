@@ -336,6 +336,7 @@ pub fn compute_inner(chart: &Chart, rate: f64, sv: bool, shared: &mut Shared, pr
     if !lean {
         res.set("presence", Val::Dict(card::presence(&series)));
     }
+    res.set("shapes", Val::floats(&crate::features::shapes(chart)));
     if !lean && !shared.stored {
         res.set("timeline", Val::floats(&skills::local_levels(&total, k.LOCAL_WINDOW, k)));
     }

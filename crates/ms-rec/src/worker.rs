@@ -558,6 +558,13 @@ impl Worker {
         self.request_nps();
         self.publish(None).map_err(|e| e.to_string())?;
         self.start_fill();
+        // after the first list, not before the fit: on G835LX it held the card's forecast and the list 40 s (user 2026-11-25)
+        let (path, q) = (self.db_path.clone(), self.q.clone());
+        std::thread::Builder::new().name("shapes".into()).spawn(move || match connect(&path).map_err(|e| e.to_string()).and_then(|db| crate::engine::add_shapes(&db)) {
+            Ok(true) => q.put(Task::Refresh), // the list leaves out the shapeless charts it just learned of
+            Ok(false) => {}
+            Err(e) => eprintln!("chord shapes not added: {e}"),
+        }).expect("shapes thread");
         lap("list", &mut laps);
         // where a slow start goes (user 2026-11-21: "Fitting your prediction model" long on every launch)
         eprintln!("startup {}", laps.iter().map(|(n, t)| format!("{n} {t:.1} s")).collect::<Vec<_>>().join(" · "));

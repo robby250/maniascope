@@ -466,6 +466,19 @@ impl PredModel {
     }
 }
 
+/// A chart is shapeless from this fill (mean notes a row over the keys)…
+const SHAPELESS_FILL: f64 = 0.5;
+/// …under this variety of its rows' key sets (`ms_calc::features::shapes`). User 2026-11-25: 10K "mashing all keys", "0 real
+/// patterns". Of 6,072 local 9K+ charts 8 are under it (MikuaBot's anemone .007, a "blingo" guitar 10K .015, Muscle Pack
+/// converts .09/.14), the next real chordjack .285; of 24,520 public top-play charts in every keymode none. Fill alone or
+/// variety alone takes real maps (low variety under .5 fill: finger-training and Fool Moon CRASH 10K).
+const SHAPELESS_VARIETY: f64 = 0.2;
+
+/// Charts analysed before `shapes` existed are patterned.
+fn shapeless(f: &Dict) -> bool {
+    f.get("shapes").map(Val::list_f).is_some_and(|s| s.len() == 2 && s[0] >= SHAPELESS_FILL && s[1] < SHAPELESS_VARIETY)
+}
+
 /// What nps.candidates_from reads of one analysed chart-rate besides the prediction.
 struct Offer {
     rate: f64,
@@ -477,12 +490,17 @@ struct Offer {
     drill: f64,
     family: String, // nps family (the chart's shape hash)
     description: String,
+    shapeless: bool, // `shapeless`: big chords struck only a few ways
 }
 
 impl Offer {
     /// 0 Vibro, 1 Mash: the card's lead skill when it is one of them. Not a map to play for its rating: a 7-key chord re-struck
     /// for two minutes (user 2026-11-14, offered 96 %, played 72 %) had no single-column runs for the structure's vibro test.
+    /// A shapeless chart counts as Mash whatever its card leads with (MikuaBot's anemone, whole hands in turn, read Jumptrill).
     fn special(&self) -> Option<usize> {
+        if self.shapeless {
+            return Some(1);
+        }
         let lead = self.description.split(" / ").next().unwrap_or("");
         ["Vibro", "Mash"].iter().position(|s| *s == lead)
     }
@@ -506,6 +524,7 @@ impl Offer {
                 let d = text(v).replace("Delay", "Stream");
                 d.split_once(" / ").filter(|(a, b)| a == b).map_or(d.clone(), |(a, _)| a.to_string())
             }),
+            shapeless: shapeless(f),
         }
     }
 
@@ -2049,7 +2068,7 @@ mod target_tests {
     #[test]
     fn density_counts_by_the_keymodes_warm_up_not_the_family_just_played() {
         let offer = Offer { rate: 1., notes: 2000., length: 150_000., version: None, nps: 16., play_span: Some(150.), drill: 0.,
-                            family: String::new(), description: String::new() };
+                            family: String::new(), description: String::new(), shapeless: false };
         let value = |activation: f64, warmth: f64| {
             let p = Prediction { acc_mid: 0.96, sdm: 0.4, activation, warmth, ..prediction(0.96, 0.96) };
             ctx(0.96, false).value(&offer, None, 16., &p, 0.96, 1., 0.96).unwrap()
@@ -2088,15 +2107,24 @@ mod target_tests {
 
     #[test]
     fn lazer_rates_half_to_double_are_offerable() {
-        let offer = |rate| Offer { rate, notes: 500., length: 60000., version: Some(1), nps: 8., play_span: None, drill: 0., family: String::new(), description: String::new() };
+        let offer = |rate| Offer { rate, notes: 500., length: 60000., version: Some(1), nps: 8., play_span: None, drill: 0., family: String::new(), description: String::new(), shapeless: false };
         assert!([0.5, 0.55, 1.8, 2.0].iter().all(|&r| offer(r).static_ok(1)));
         assert!(!offer(0.45).static_ok(1) && !offer(2.05).static_ok(1));
     }
 
     #[test]
     fn charts_led_by_vibro_or_mash_are_special() {
-        let led = |d: &str| Offer { rate: 1., notes: 500., length: 60000., version: Some(1), nps: 8., play_span: None, drill: 0., family: String::new(), description: d.into() }.special();
+        let offer = |d: &str, shapeless| Offer { rate: 1., notes: 500., length: 60000., version: Some(1), nps: 8., play_span: None, drill: 0., family: String::new(), description: d.into(), shapeless };
+        let led = |d: &str| offer(d, false).special();
         assert_eq!((led("Vibro"), led("Mash / Stream"), led("Chordjack / Mash"), led("")), (Some(0), Some(1), None, None));
+        assert_eq!(offer("Jumptrill Stamina / Chordjack", true).special(), Some(1), "shapeless: Mash whatever leads");
+        let shapes = |s: [f64; 2]| {
+            let mut f = Dict::new();
+            f.set("shapes", Val::floats(&s));
+            shapeless(&f)
+        };
+        // MikuaBot's anemone 10K; a real 10K chordjack convert; Fool Moon CRASH 10K (few shapes, small chords)
+        assert!(shapes([0.61, 0.007]) && !shapes([0.56, 0.285]) && !shapes([0.34, 0.086]) && !shapeless(&Dict::new()));
     }
 
     #[test]
